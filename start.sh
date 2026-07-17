@@ -19,17 +19,33 @@ yellow() { printf "\033[33m%s\033[0m\n" "$1"; }
 red() { printf "\033[31m%s\033[0m\n" "$1"; }
 
 command -v python3 >/dev/null || { red "缺少 python3"; exit 1; }
-python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' \
-  || { red "需要 Python 3.11+（插件用到标准库 tomllib）；当前 $(python3 -V)"; exit 1; }
 command -v node >/dev/null || { red "缺少 node（前端需要）"; exit 1; }
+
+# 建 venv 用的解释器：需 Python 3.11 或 3.12。
+#  · 下限 3.11——插件发现用了标准库 tomllib（3.11 才有）。
+#  · 上限 <3.13——OCR 依赖 rapidocr_onnxruntime→onnxruntime/numpy 在全新 Python 上常无预编译 wheel，3.13 装依赖会失败。
+# 优先显式的 python3.12 / python3.11，其次默认 python3（若其恰在区间内）。仅新建 venv 时才需要它。
+pick_py() {
+  for c in python3.12 python3.11 python3; do
+    command -v "$c" >/dev/null 2>&1 || continue
+    "$c" -c 'import sys; raise SystemExit(0 if (3,11) <= sys.version_info < (3,13) else 1)' 2>/dev/null \
+      && { echo "$c"; return 0; }
+  done
+  return 1
+}
 
 # requirements/package.json 指纹：用系统 python3 算 sha256（跨平台，免依赖 shasum/sha256sum 差异）
 sha256() { python3 -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$1"; }
 
 # ---- 后端依赖：venv 不存在则建；requirements 变了(如新增 alembic)则自动同步，避免启动缺库 ----
 if [ ! -d "$BACKEND/.venv" ]; then
-  yellow "首次运行：创建 Python 虚拟环境…"
-  python3 -m venv "$BACKEND/.venv"
+  VENV_PY="$(pick_py)" || {
+    red "需要 Python 3.11 或 3.12 建环境（3.13+ 暂不支持：OCR 依赖 onnxruntime 尚无 3.13 预编译包）。"
+    red "当前默认 $(python3 -V)。装个 3.12 再跑，例如：brew install python@3.12  或  pyenv install 3.12"
+    exit 1
+  }
+  yellow "首次运行：用 $("$VENV_PY" -V) 创建 Python 虚拟环境…"
+  "$VENV_PY" -m venv "$BACKEND/.venv"
   "$PY_BIN" -m pip install --quiet --upgrade pip
 fi
 REQ_STAMP="$BACKEND/.venv/.requirements.sha256"

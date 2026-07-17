@@ -69,7 +69,7 @@ soroban/
 后端：
 ```bash
 cd backend
-python3 -m venv .venv && source .venv/bin/activate     # 需 Python 3.11+
+python3.12 -m venv .venv && source .venv/bin/activate   # 需 Python 3.11 或 3.12（3.13 暂不支持，见下）
 pip install -r requirements.txt                        # 或 requirements.lock.txt（锁定版本）
 cp .env.example .env
 python -c "import secrets;print(secrets.token_hex(32))" # 把输出填进 .env 的 SECRET_KEY=
@@ -86,7 +86,8 @@ npm run dev                   # http://localhost:8621 （代理 /api → :8620�
 
 ## 全新机器部署
 
-**前置**：`git`、**Python 3.11+**（插件用到标准库 `tomllib`）、`node`/`npm`。
+**前置**：`git`、**Python 3.11 或 3.12**、`node`/`npm`。
+> 版本范围：下限 3.11（插件发现用标准库 `tomllib`）；**上限 3.12——3.13 暂不支持**：OCR 依赖 `rapidocr_onnxruntime`→`onnxruntime`/`numpy` 在 3.13 上常无预编译 wheel，装依赖会失败。`start.sh` 会自动优先挑 `python3.12`/`python3.11` 建 venv，挑不到会明确报错。
 
 ```bash
 git clone https://github.com/Gosoki/soroban.git
