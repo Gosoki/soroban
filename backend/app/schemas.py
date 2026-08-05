@@ -1,14 +1,24 @@
 """Request/response schemas. Keep money as Decimal/int (P1). Validate fx range (P6)."""
 
 import datetime as dt
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Optional
 
 from pydantic import field_validator, model_validator
 from sqlmodel import Field, SQLModel
 
 from .config import FX_MAX, FX_MIN, FX_QUANTUM
-from .models import ShipmentStatus, Source, StagingStatus, OrderStatus
+from .models import (
+    MiscExpense,
+    Order,
+    OrderItem,
+    OrderStaging,
+    OrderStatus,
+    ShipmentOrder,
+    ShipmentStatus,
+    StagingStatus,
+    TagOption,
+)
 
 _FX_Q = FX_QUANTUM           # 汇率量化到 4 位（唯一真相见 config.FX_QUANTUM）
 _CNY_Q = Decimal("0.01")     # 人民币量化到分
@@ -16,19 +26,70 @@ _CNY_MAX = Decimal("9999999999.99")   # Numeric(12,2) 上限：防 DB 溢出 + �
 _JPY_MAX = 2_147_483_647              # 有符号 INT 上限（MySQL）：防溢出报 500
 
 
-def _q_money(v: Optional[Decimal], label: str = "金额") -> Optional[Decimal]:
-    """人民币金额：量化到分 + 非负 + 有限性/上限校验。
-    先卡有限性与量级再 quantize——否则超大/NaN 输入会让 Decimal.quantize 抛 InvalidOperation
-    （ArithmeticError，非 ValueError），Pydantic 不转 422 → 直接 500。"""
+def _len(model, column: str) -> int:
+    """该列建表时声明的 VARCHAR 长度。**以模型为唯一真相**，改列长不必再改校验。
+
+    为什么必须校验：所有 str 列都是定长 VARCHAR。超长时 SQLite 静默照存、MySQL 直接
+    「Data too long」→ OperationalError → 500。不卡这一刀就是双引擎发散（与 TagIn 已有的
+    max_length 同一个理由，这里把它补齐到全部输入列）。"""
+    return model.__table__.columns[column].type.length
+
+
+def _clip(v: Optional[str], limit: int) -> Optional[str]:
+    """短文本列：超长**截断**而不是拒绝。
+
+    只用于「物品名 / 杂项名」这类**显示标签**：255 字远超实际所需，超长多半是误粘贴，
+    截尾比 422 打断整批同步划算，且与 routers/common.build_items 里既有的 [:255] 同口径。
+    真正会天然超长的商品标题（`shop`）已经放宽成 TEXT 列、不再截断（见迁移 d0e1f2a3b4c5）。
+    标识类列（订单号/快递号/账号…）不走这里——那种超长是脏输入，宁可 422。"""
+    return v if v is None else v[:limit]
+
+
+def norm_code(v: Optional[str]) -> Optional[str]:
+    """单号类列归一：去首尾空格 + 转大写；空串归 NULL。
+
+    为什么必须归一：这些值是**匹配键**（集运「内含快递」截图靠 express_no 精确匹配商品订单）。
+    OCR 提取时就 `.upper()` 了，用户手输可能小写或带粘贴带来的首尾空格；而字符串精确比较在
+    **SQLite 上区分大小写、MySQL 默认不区分**——不归一就是「同一份数据两种后端行为不同」。
+    历史数据由迁移 d0e1f2a3b4c5 一并补齐。"""
+    if v is None:
+        return None
+    return v.strip().upper() or None
+
+
+def norm_id(v: Optional[str]) -> Optional[str]:
+    """有唯一约束的单号（订单号/集运单号）：**只**去首尾空格，不改大小写。
+
+    不转大写是因为这两列上有唯一索引：批量改写历史数据可能撞约束、让升级直接失败；
+    而它们实际都是纯数字或「数字-数字」，大小写本就不构成问题。去空格则纯赚——
+    粘贴带来的首尾空格会让唯一约束形同虚设（" 123" 与 "123" 被当成两张单）。"""
+    if v is None:
+        return None
+    return v.strip() or None
+
+
+def _q_decimal(v: Optional[Decimal], max_value: Decimal, quantum: Decimal,
+               label: str) -> Optional[Decimal]:
+    """定点小数列的通用入口：非有限/超上限 → 422，否则量化到该列精度，最后拒负数。
+
+    顺序很讲究：**先**卡有限性与量级、**再** quantize——否则超大/NaN 输入会让
+    Decimal.quantize 抛 InvalidOperation（ArithmeticError，不是 ValueError），
+    Pydantic 不会转 422 → 直接 500。
+    上限对应 DB 里的 Numeric(p,s)：超了 MySQL 报 Out of range → 500，SQLite 静默存 → 双引擎发散。"""
     if v is None:
         return None
     v = Decimal(v)
-    if not v.is_finite() or abs(v) > _CNY_MAX:
-        raise ValueError(f"{label}数值超出可接受范围（上限 {_CNY_MAX}）")
-    v = v.quantize(_CNY_Q, rounding=ROUND_HALF_UP)
+    if not v.is_finite() or abs(v) > max_value:
+        raise ValueError(f"{label}数值超出可接受范围（上限 {max_value}）")
+    v = v.quantize(quantum, rounding=ROUND_HALF_UP)
     if v < 0:
         raise ValueError(f"{label}不能为负数（退款/取消请用状态标记，自动不计入合计）")
     return v
+
+
+def _q_money(v: Optional[Decimal], label: str = "金额") -> Optional[Decimal]:
+    """人民币金额：量化到分 + 非负 + 有限性/上限校验（Numeric(12,2)）。"""
+    return _q_decimal(v, _CNY_MAX, _CNY_Q, label)
 
 
 def _q_fx(v: Optional[Decimal]) -> Optional[Decimal]:
@@ -55,8 +116,9 @@ def _bounded_jpy(v: Optional[int], label: str = "金额") -> Optional[int]:
     return v
 
 
+_WEIGHT_MAX = Decimal("999999.99")    # ShipmentOrder.weight = Numeric(8,2) 的上限
+
 _STAGING_STATUS = {s.value for s in StagingStatus}
-_SOURCES = {s.value for s in Source}
 _ORDER_STATUS = {s.value for s in OrderStatus}
 _SHIPMENT_STATUS = {s.value for s in ShipmentStatus}
 
@@ -67,7 +129,9 @@ class MoneyIn(SQLModel):
     price_cny: Optional[Decimal] = None
     fx_rate: Optional[Decimal] = None
     jpy_override: Optional[int] = None
-    override_note: Optional[str] = None
+    # override_note 来自 LedgerBase，三张账本表列长相同；LedgerBase 不是表、没有 __table__，
+    # 所以拿 Order 当代表取长度。
+    override_note: Optional[str] = Field(default=None, max_length=_len(Order, "override_note"))
 
     @field_validator("price_cny")
     @classmethod
@@ -158,6 +222,11 @@ class ItemInBase(SQLModel):
     def _q_item_price(cls, v: Optional[Decimal]) -> Optional[Decimal]:
         return _q_money(v, "物品单价")
 
+    @field_validator("name")
+    @classmethod
+    def _clip_name(cls, v: str) -> str:
+        return _clip(v, _len(OrderItem, "name"))
+
 
 class OrderItemIn(ItemInBase):
     pass
@@ -189,20 +258,36 @@ class ItemListRead(SQLModel):
     express_no: Optional[str] = None
 
 
-class OrderBase(MoneyIn, PostageIn):
-    date: dt.date
-    order_no: Optional[str] = None
-    shop: Optional[str] = None
-    url: Optional[str] = None
-    category: Optional[str] = None
-    status: str = OrderStatus.paid.value
-    platform: Optional[str] = None
-    express_no: Optional[str] = None
-    express_company: Optional[str] = None
-    platform_account: Optional[str] = None
+class OrderFieldsIn(SQLModel):
+    """订单可写字段的长度/归一约束（Create/Update 共用；两边字段一致，别再各写一份而漂移）。
+    标识类列超长 → 422；单号类列写入即归一（见 norm_code / norm_id）；
+    商品标题 shop 是 Text 列，不限长也不截断。"""
+    order_no: Optional[str] = Field(default=None, max_length=_len(Order, "order_no"))
+    shop: Optional[str] = None                     # Text 列，无长度上限
+    url: Optional[str] = None                      # Text 列，无长度上限
+    category: Optional[str] = Field(default=None, max_length=_len(Order, "category"))
+    platform: Optional[str] = Field(default=None, max_length=_len(Order, "platform"))
+    express_no: Optional[str] = Field(default=None, max_length=_len(Order, "express_no"))
+    express_company: Optional[str] = Field(default=None, max_length=_len(Order, "express_company"))
+    platform_account: Optional[str] = Field(default=None, max_length=_len(Order, "platform_account"))
     shipment_order_id: Optional[int] = None
     payer_id: Optional[int] = None
-    note: Optional[str] = None
+    note: Optional[str] = None                     # Text 列，无长度上限
+
+    @field_validator("express_no")
+    @classmethod
+    def _norm_express(cls, v: Optional[str]) -> Optional[str]:
+        return norm_code(v)
+
+    @field_validator("order_no")
+    @classmethod
+    def _norm_order_no(cls, v: Optional[str]) -> Optional[str]:
+        return norm_id(v)
+
+
+class OrderBase(MoneyIn, PostageIn, OrderFieldsIn):
+    date: dt.date
+    status: str = OrderStatus.paid.value
 
     @field_validator("status")
     @classmethod
@@ -226,21 +311,10 @@ class OrderCreate(OrderBase):
         return self
 
 
-class OrderUpdate(MoneyIn, PostageIn):
+class OrderUpdate(MoneyIn, PostageIn, OrderFieldsIn):
     version: int                                   # 乐观锁必填
     date: Optional[dt.date] = None
-    order_no: Optional[str] = None
-    shop: Optional[str] = None
-    url: Optional[str] = None
-    category: Optional[str] = None
     status: Optional[str] = None
-    platform: Optional[str] = None
-    express_no: Optional[str] = None
-    express_company: Optional[str] = None
-    platform_account: Optional[str] = None
-    shipment_order_id: Optional[int] = None
-    payer_id: Optional[int] = None
-    note: Optional[str] = None
     items: Optional[list[OrderItemIn]] = None      # 给了就整体替换
 
     @field_validator("status")
@@ -274,53 +348,62 @@ class OrderRead(MoneyOut):
 
 # --- 集运订单 ---------------------------------------------------------------
 
-class ShipmentBase(MoneyIn):
-    date: dt.date
-    shipment_no: Optional[str] = None
+class ShipmentFieldsIn(SQLModel):
+    """集运可写字段的长度/取值约束（Create/Update 共用）。"""
+    shipment_no: Optional[str] = Field(default=None, max_length=_len(ShipmentOrder, "shipment_no"))
     weight: Optional[Decimal] = None
-    intl_tracking_no: Optional[str] = None
-    status: str = ShipmentStatus.packing.value
+    intl_tracking_no: Optional[str] = Field(
+        default=None, max_length=_len(ShipmentOrder, "intl_tracking_no"))
     special_fee_jpy: Optional[int] = None
-    recipient: Optional[str] = None
+    recipient: Optional[str] = Field(default=None, max_length=_len(ShipmentOrder, "recipient"))
     payer_id: Optional[int] = None
-    note: Optional[str] = None
+    note: Optional[str] = None                     # Text 列，无长度上限
+
+    @field_validator("special_fee_jpy")
+    @classmethod
+    def _nonneg_fee(cls, v: Optional[int]) -> Optional[int]:
+        return _bounded_jpy(v, "特殊费")
+
+    @field_validator("weight")
+    @classmethod
+    def _q_weight(cls, v: Optional[Decimal]) -> Optional[Decimal]:
+        # weight 是 Numeric(8,2)：不卡上限的话 MySQL 会 Out of range → 500，SQLite 静默存
+        return _q_decimal(v, _WEIGHT_MAX, Decimal("0.01"), "重量")
+
+    @field_validator("intl_tracking_no")
+    @classmethod
+    def _norm_intl(cls, v: Optional[str]) -> Optional[str]:
+        return norm_code(v)
+
+    @field_validator("shipment_no")
+    @classmethod
+    def _norm_shipment_no(cls, v: Optional[str]) -> Optional[str]:
+        return norm_id(v)
+
+
+class ShipmentBase(MoneyIn, ShipmentFieldsIn):
+    date: dt.date
+    status: str = ShipmentStatus.packing.value
 
     @field_validator("status")
     @classmethod
     def _status(cls, v: str) -> str:
         return _check(v, _SHIPMENT_STATUS, "集运状态")
 
-    @field_validator("special_fee_jpy")
-    @classmethod
-    def _nonneg_fee(cls, v: Optional[int]) -> Optional[int]:
-        return _bounded_jpy(v, "特殊费")
-
 
 class ShipmentCreate(ShipmentBase):
     pass
 
 
-class ShipmentUpdate(MoneyIn):
+class ShipmentUpdate(MoneyIn, ShipmentFieldsIn):
     version: int
     date: Optional[dt.date] = None
-    shipment_no: Optional[str] = None
-    weight: Optional[Decimal] = None
-    intl_tracking_no: Optional[str] = None
     status: Optional[str] = None
-    special_fee_jpy: Optional[int] = None
-    recipient: Optional[str] = None
-    payer_id: Optional[int] = None
-    note: Optional[str] = None
 
     @field_validator("status")
     @classmethod
     def _status(cls, v: Optional[str]) -> Optional[str]:
         return v if v is None else _check(v, _SHIPMENT_STATUS, "集运状态")
-
-    @field_validator("special_fee_jpy")
-    @classmethod
-    def _nonneg_fee(cls, v: Optional[int]) -> Optional[int]:
-        return _bounded_jpy(v, "特殊费")
 
 
 class OrderBrief(SQLModel):
@@ -362,25 +445,31 @@ class ShipmentOcrAttachResult(SQLModel):
 
 # --- 杂项 -------------------------------------------------------------------
 
-class MiscBase(MoneyIn):
+class MiscFieldsIn(SQLModel):
+    """杂项可写字段的长度约束（Create/Update 共用）。name 是自由文本 → 截断，见 _clip。"""
+    category: Optional[str] = Field(default=None, max_length=_len(MiscExpense, "category"))
+    payer_id: Optional[int] = None
+    note: Optional[str] = None                     # Text 列，无长度上限
+
+    @field_validator("name", check_fields=False)
+    @classmethod
+    def _clip_name(cls, v: Optional[str]) -> Optional[str]:
+        return _clip(v, _len(MiscExpense, "name"))
+
+
+class MiscBase(MoneyIn, MiscFieldsIn):
     date: dt.date
     name: str
-    category: Optional[str] = None
-    payer_id: Optional[int] = None
-    note: Optional[str] = None
 
 
 class MiscCreate(MiscBase):
     pass
 
 
-class MiscUpdate(MoneyIn):
+class MiscUpdate(MoneyIn, MiscFieldsIn):
     version: int
     date: Optional[dt.date] = None
     name: Optional[str] = None
-    category: Optional[str] = None
-    payer_id: Optional[int] = None
-    note: Optional[str] = None
 
 
 class MiscRead(MoneyOut):
@@ -446,14 +535,16 @@ class StagingItemRead(SQLModel):
 
 
 class StagingBase(PostageIn):
-    order_no: Optional[str] = None
-    platform_account: Optional[str] = None
-    platform: Optional[str] = None           # 来源平台（淘宝/闲鱼/京东）；导入时随单迁移到账本
-    shop: Optional[str] = None
+    # 长度上限对齐 OrderStaging 建表定义（导入时这些值会原样搬进账本，两边列长一致）
+    order_no: Optional[str] = Field(default=None, max_length=_len(OrderStaging, "order_no"))
+    platform_account: Optional[str] = Field(
+        default=None, max_length=_len(OrderStaging, "platform_account"))
+    platform: Optional[str] = Field(default=None, max_length=_len(OrderStaging, "platform"))
+    shop: Optional[str] = None               # 商品标题，Text 列，无长度上限
     price_cny: Optional[Decimal] = None
     fx_rate: Optional[Decimal] = None
     order_date: Optional[dt.date] = None
-    express_no: Optional[str] = None
+    express_no: Optional[str] = Field(default=None, max_length=_len(OrderStaging, "express_no"))
     order_status: Optional[str] = None       # 淘宝订单真实状态（已付/已发/…），导入后与账本联动
 
     @field_validator("price_cny")
@@ -465,6 +556,16 @@ class StagingBase(PostageIn):
     @classmethod
     def _fx_range(cls, v: Optional[Decimal]) -> Optional[Decimal]:
         return _q_fx(v)
+
+    @field_validator("express_no")
+    @classmethod
+    def _norm_express(cls, v: Optional[str]) -> Optional[str]:
+        return norm_code(v)
+
+    @field_validator("order_no")
+    @classmethod
+    def _norm_order_no(cls, v: Optional[str]) -> Optional[str]:
+        return norm_id(v)
 
     @field_validator("order_status")
     @classmethod
@@ -521,7 +622,7 @@ class LayoutUpdate(SQLModel):
 # --- 标签选项（列头可管理的下拉集）------------------------------------------
 
 class TagIn(SQLModel):
-    value: str = Field(max_length=128)   # 与 TagOption.value 列一致，防超长在 MySQL 报 500、SQLite 静默存
+    value: str = Field(max_length=_len(TagOption, "value"))   # 长度以 TagOption.value 列为准
 
 
 # --- 爬虫插件配置 -----------------------------------------------------------

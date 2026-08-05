@@ -295,16 +295,35 @@ async function findByOrderNo(orderNo) {
 const STATUS_RANK = { 待付款: 0, 待发货: 1, 待收货: 2, 已签收: 3, 集运中: 4, 已到达: 5 }
 function statusRank(s) { return STATUS_RANK[s] ?? -1 }
 
-// 命中同订单号：下单时间总是回填；状态仅「推进」时更新（如补上快递单号→待收货）；
-// 其余字段仅在原值为空时补齐（不覆盖已有数据）
-// 命中 patch：下单时间总回填；状态仅前进；其余字段仅在原值为空时补齐（对 base 版本重算）
+// 这单还「没有真实价格」吗？= 物品全是系统占位(auto) 且合计为 0。
+// 只有这种单才允许 OCR 回填成交价；用户手填过任一单价的单绝不覆盖。
+function hasNoRealPrice(base) {
+  const items = base.items || []
+  if (!items.length) return true
+  if (!items.every((it) => it.auto)) return false
+  const sum = items.reduce((s, it) => s + Number(it.price_cny || 0) * (Number(it.quantity) || 1), 0)
+  return sum === 0 && Number(base.postage_cny || 0) === 0
+}
+
+// 命中同订单号：下单时间总回填；状态仅「推进」时更新（如补上快递单号→待收货）；
+// 其余字段仅在原值为空时补齐（对 base 版本重算，不覆盖已有数据）。
 function buildMergePatch(base, data) {
   const patch = { version: base.version }
   if (data.date) patch.date = data.date
   if (data.status && statusRank(data.status) > statusRank(base.status)) patch.status = data.status
-  for (const k of ['platform', 'shop', 'express_company', 'express_no', 'price_cny']) {
+  for (const k of ['platform', 'shop', 'express_company', 'express_no']) {
     const cur = base[k]
     if (data[k] != null && data[k] !== '' && (cur == null || cur === '')) patch[k] = data[k]
+  }
+  // 成交价要单独处理：price_cny 是**派生列**（= Σ单价×数量 + 邮费），单发它后端会直接忽略
+  // ——曾经就是这么写的，结果 OCR 补价永远落不进去，界面却报「已更新」。改价必须走物品：
+  // 把成交价当「种子价」连同一份**都不带单价**的物品一起发过去，由后端 build_items 用与
+  // 新建单同一套规则折成单价（种子价 → 第一条物品的单价）。
+  if (data.price_cny != null && data.price_cny !== '' && hasNoRealPrice(base)) {
+    patch.price_cny = data.price_cny
+    patch.items = (base.items || []).length
+      ? base.items.map((it) => ({ name: it.name, quantity: it.quantity, price_cny: null, auto: true }))
+      : [{ name: patch.shop || base.shop || '未命名物品', quantity: 1, price_cny: null, auto: true }]
   }
   return patch
 }

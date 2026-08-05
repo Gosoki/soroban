@@ -78,8 +78,9 @@ def _pick_color(counts: Counter) -> int:
     return min(range(_N_COLORS), key=lambda i: (counts[i], i))
 
 
-def _sync(session: Session, field: str) -> list[TagOption]:
-    """确保该字段所有标签都在库、都有颜色：补登记数据里出现的新值、回填历史空颜色。"""
+def _sync(session: Session, field: str, used: set[str]) -> list[TagOption]:
+    """确保该字段所有标签都在库、都有颜色：补登记数据里出现的新值、回填历史空颜色。
+    used = 该字段在数据里实际用到的值（由调用方算好传入，见 _list：一次扫描两处用）。"""
     rows = session.exec(
         select(TagOption).where(TagOption.field == field).order_by(TagOption.id)
     ).all()
@@ -92,7 +93,7 @@ def _sync(session: Session, field: str) -> list[TagOption]:
             counts[r.color] += 1
             session.add(r)
             changed = True
-    for v in sorted(_data_values(session, field) - existing):   # 自动登记数据里的新值
+    for v in sorted(used - existing):               # 自动登记数据里的新值
         color = _pick_color(counts)
         counts[color] += 1
         # 原子去重插入：并发 GET/写同时首见同一新值也安全（撞唯一键则忽略，不会让 GET 抛 409）
@@ -110,8 +111,10 @@ def _sync(session: Session, field: str) -> list[TagOption]:
 
 
 def _list(session: Session, field: str) -> list[TagOut]:
-    rows = _sync(session, field)
+    # _data_values 是几张大表的 DISTINCT 扫描：算一次给 _sync（补登记）和 in_use 共用，
+    # 别在同一个请求里扫两遍。
     used = _data_values(session, field)
+    rows = _sync(session, field, used)
     return [TagOut(value=r.value, color=r.color, in_use=r.value in used) for r in rows]
 
 

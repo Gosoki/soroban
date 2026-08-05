@@ -30,19 +30,37 @@ def _brief(order: Order) -> OrderBrief:
     )
 
 
+def _shipment_read(s: ShipmentOrder, children: list[Order]) -> ShipmentRead:
+    """只用本表的列构造响应，再挂上调用方过滤好的子订单。
+
+    刻意不用 ShipmentRead.model_validate(s)：那样会为了填 orders 字段去懒加载 s.orders
+    关系——每行一条 SQL、且**连已软删的子订单一起拉**，随后又被这份过滤过的列表整个覆盖，
+    纯属白跑（正是本函数批量化想省掉的那部分）。"""
+    scalars = {k: getattr(s, k) for k in ShipmentRead.model_fields if k != "orders"}
+    return ShipmentRead(**scalars, orders=[_brief(c) for c in children])
+
+
+def _read_many(session: Session, shipments: list[ShipmentOrder]) -> list[ShipmentRead]:
+    """批量构造响应，其中 orders 只含未软删的关联商品订单（不泄露已删数据）。
+
+    一次 IN 查询取回**整页**的子订单（再用 selectinload 一次取回它们的物品），而不是每行
+    各查一次——列表页一屏 50 行时，这是 1+1 条 SQL 与 50+50 条的差别。"""
+    ids = [s.id for s in shipments]
+    by_parent: dict[int, list[Order]] = {}
+    if ids:
+        children = session.exec(
+            select(Order)
+            .where(Order.shipment_order_id.in_(ids), Order.is_delete.is_(False))
+            .options(selectinload(Order.items))
+            .order_by(Order.date.desc(), Order.id.desc())
+        ).all()
+        for c in children:
+            by_parent.setdefault(c.shipment_order_id, []).append(c)
+    return [_shipment_read(s, by_parent.get(s.id, [])) for s in shipments]
+
+
 def _read(session: Session, order: ShipmentOrder) -> ShipmentRead:
-    """构造响应，其中 orders 只含未软删的关联淘宝订单（不泄露已删数据）。"""
-    r = ShipmentRead.model_validate(order)
-    children = session.exec(
-        select(Order)
-        .where(
-            Order.shipment_order_id == order.id,
-            Order.is_delete.is_(False),
-        )
-        .options(selectinload(Order.items))   # 批量载入子订单物品，避免 N+1
-    ).all()
-    r.orders = [_brief(c) for c in children]
-    return r
+    return _read_many(session, [order])[0]
 
 
 @router.get("")
@@ -73,7 +91,7 @@ def list_orders(
         .offset(offset)
         .limit(limit)
     ).all()
-    return {"items": [_read(session, r) for r in rows], "total": total}
+    return {"items": _read_many(session, rows), "total": total}
 
 
 @router.post("/ocr")
@@ -204,7 +222,12 @@ def update_order(order_id: int, payload: ShipmentUpdate, session: Session = Depe
 @router.post("/{shipment_id}/order/{order_id}", response_model=ShipmentRead)
 def attach_order(shipment_id: int, order_id: int, session: Session = Depends(get_session)):
     """把一个商品订单挂到本集运单（点选添加）。同一个外键 shipment_order_id，与商品页共用。
-    仅允许「未挂靠」的商品单：已挂在别的集运单 → 422（先移除再加，防误抢）。"""
+    仅允许「未挂靠」的商品单：已挂在别的集运单 → 422（先移除再加，防误抢）。
+
+    **刻意不改订单状态**（与 /{id}/ocr-express 的自动挂靠不同，那边会推进到「集运中」）：
+    点选挂靠表达的是「我打算把这单放进这个包裹」，货可能还没发出、更没到集运仓；
+    而「内含快递」截图来自集运方的装箱清单，出现在上面就意味着货**确实已在包裹里**，
+    才够格推进到「集运中」。两边的差别是业务语义上的，不是遗漏。"""
     shipment = session.get(ShipmentOrder, shipment_id)
     if not shipment or shipment.is_delete:
         not_found("集运订单")

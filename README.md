@@ -112,7 +112,9 @@ SOROBAN_ADMIN_PASS='你的强密码' ./start.sh     # 首次即设定管理员�
 cd frontend && npm run build          # 产出 frontend/dist
 cd ../backend && BACKEND_PORT=8620 .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8620   # 不加 --reload
 ```
-后端检测到 `frontend/dist` 会自动托管它（`/api/*` 走后端、其余回退到前端），于是**只需一个进程、一个端口(8620)**，前端相对 `/api` 天然同源、无跨域。可再用 macOS `launchd` / Linux `systemd` 做开机自启+崩溃重启。
+后端检测到 `frontend/dist` 会自动托管它（`/api/*` 走后端、其余交给静态目录），于是**只需一个进程、一个端口(8620)**，前端相对 `/api` 天然同源、无跨域。可再用 macOS `launchd` / Linux `systemd` 做开机自启+崩溃重启。
+> 路由用的是 **hash 模式**（`/#/orders`），所以浏览器只会向后端请求 `/`，不需要 SPA history 回退。
+> 若将来改成 history 模式，得给后端补一条「未知路径返回 index.html」的兜底，否则刷新子页面会 404。
 
 ## 更新（git）
 
@@ -192,6 +194,22 @@ python -m scripts.migrate_sqlite_to_mysql --src sqlite:///./soroban.db
 - **命令行**：首次部署用 `SOROBAN_ADMIN_PASS='强密码' ./start.sh` 直接设定。
 
 局域网/多人使用前请务必改掉默认密码。
+
+## 测试
+
+```bash
+cd backend
+.venv/bin/python -m pip install pytest    # 只需一次（pytest 不在 requirements.txt 里）
+.venv/bin/python -m pytest
+```
+
+跑在**临时库**上（`conftest.py` 在导入 app 前把 `DATABASE_URL` 指到临时目录、`SCRAPER_DIR`
+指到空目录），不碰 `soroban.db`、也不会启动真实爬虫插件。覆盖范围与各文件职责见
+[backend/tests/README.md](backend/tests/README.md)。
+
+其中 `test_consistency.py` 值得单独一提：订单状态枚举、状态生命周期序、爬虫的状态映射、
+列布局白名单、前端写死的 API 路径——这些「三处各写一份、只能靠约定同步」的常量被写成了断言，
+改后端忘了改前端/爬虫就会红。
 
 ## 状态
 

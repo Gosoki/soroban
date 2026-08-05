@@ -35,7 +35,10 @@ if errorlevel 1 goto bad_python
 
 REM ---- backend deps: auto-sync into the conda env when requirements.txt changes ----
 REM fingerprint requirements.txt (sha256 via python); reinstall only when it changed or first time
-set "REQ_STAMP=%BACKEND%\.requirements.sha256"
+REM The stamp lives INSIDE the environment it describes (like start.sh keeps it in .venv/), never
+REM in the source tree: a stamp under backend/ would be committed by accident and then a fresh
+REM clone whose stamp matches requirements.txt would skip pip install and start with no deps.
+set "REQ_STAMP=%CONDA_PREFIX%\.soroban-requirements.sha256"
 for /f "usebackq delims=" %%H in (`python -c "import hashlib;print(hashlib.sha256(open(r'%BACKEND%\requirements.txt','rb').read()).hexdigest())"`) do set "REQ_HASH=%%H"
 set "REQ_OLD="
 if exist "%REQ_STAMP%" set /p REQ_OLD=<"%REQ_STAMP%"

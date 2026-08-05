@@ -124,13 +124,14 @@ def run_migrations(url: str) -> None:
     # env.py 里 get_section 读回时插值自动还原为真实 URL。
     cfg.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
 
+    # build_engine 每次都造新引擎（绝不会是 _control_engine/_data_engine 本身），用完必须释放，
+    # 否则每次迁移都漏一个连接池。
     check_engine = build_engine(url)
     try:
         with check_engine.connect() as conn:
             tables = set(sa_inspect(conn).get_table_names())
     finally:
-        if check_engine is not _control_engine and check_engine is not _data_engine:
-            check_engine.dispose()
+        check_engine.dispose()
 
     # 判 pre-Alembic 旧库时要排除控制表（app_db_config / db_connection）——它们由 control.ensure_schema
     # 常驻创建，否则「全新业务库 + 已存在控制表」会被误判为旧库、错误 stamp 到 baseline 而不建表

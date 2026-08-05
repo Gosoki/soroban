@@ -139,7 +139,6 @@ const open = reactive(new Set())
 const newRow = reactive({})
 const cols = ref([])
 let savedLayout = []
-let dirtyDuringLoad = false   // 用户在初始拉取期间改过布局？改过就别用 GET 结果覆盖
 const tagOptions = reactive({})   // { field: [值...] } 标签下拉集（供 select 选项）
 const tagMeta = reactive({})      // { field: { 值: {color, in_use} } } 每标签的颜色序号 + 是否在用
 const newTag = reactive({})       // { field: 输入中的新标签名 }
@@ -174,18 +173,15 @@ onMounted(async () => {
   loadTags()
   if (props.tableName) {
     try {
-      const r = await layoutApi.get(props.tableName)
-      if (!dirtyDuringLoad) {          // 拉取期间用户已拖拽/拖宽过 → 保留用户改动，不覆盖
-        savedLayout = r.columns || []
-        buildCols()
-      }
+      // 拉取期间不可能有用户改动：拖拽/拖宽都由 layoutReady 门控，而它到本函数末尾才置 true。
+      savedLayout = (await layoutApi.get(props.tableName)).columns || []
+      buildCols()
     } catch (_) { /* 忽略：用默认列 */ }
   }
   layoutReady.value = true   // 布局就绪，开放拖拽/拖宽
 })
 function saveLayout() {
   if (!props.tableName || !layoutReady.value) return   // 布局未就绪不保存，避免用默认序覆盖已存布局
-  dirtyDuringLoad = true
   // 只有 minWidth、没有 width 的列：持久化其 minWidth（而非默认 160），否则一拖动排序就把
   // 这些列的宽度悄悄写成 160、并永久盖掉原本的 minWidth。
   savedLayout = cols.value.map((c) => ({ key: c.key, width: Math.round(c.width || c.minWidth || DEFAULT_COL_W) }))

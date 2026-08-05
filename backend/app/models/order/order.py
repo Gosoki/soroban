@@ -33,7 +33,10 @@ class Order(LedgerBase, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     order_no: Optional[str] = Field(default=None, max_length=64)   # 淘宝订单号
-    shop: Optional[str] = Field(default=None, max_length=255)      # 店铺
+    # 「商品」列存的是**商品标题**（不是店铺名，见 docs 与爬虫 normalize）。用 Text 而非
+    # VARCHAR(255)：一单多件时爬虫会把各件标题拼成「A / B / C」，轻易超过 255；定长列会逼得
+    # 入口层截断（悄悄丢字）或 422（打回整批同步）。本列不参与索引/唯一约束，Text 无代价。
+    shop: Optional[str] = Field(default=None, sa_type=Text)
     url: Optional[str] = Field(default=None, sa_column=Column(Text))  # 商品链接（可能很长）
     category: Optional[str] = Field(default=None, max_length=64)   # 分类
     status: str = Field(default=OrderStatus.paid.value, max_length=32, index=True)

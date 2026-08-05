@@ -31,6 +31,9 @@ MANIFEST
 #   before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+# 但 soroban.spec 是**手写并需要提交**的：pyinstaller.bat 直接调它，被这条通配忽略掉的话，
+# 全新 clone 打包会在最后一步报「spec 找不到」——整条打包链在别人机器上是断的。
+!soroban.spec
 
 # Installer logs
 pip-log.txt
@@ -228,6 +231,15 @@ frontend/dist/
 
 # soroban backups
 backups/
+
+# 依赖安装指纹：描述的是**本机环境**装了哪一版 requirements，绝不能进版本库——
+# 一旦提交，别人 clone 下来指纹恰好等于 requirements.txt 的哈希，start 脚本就会跳过
+# pip install，得到一个「以为装好了、其实什么都没装」的环境。
+.requirements.sha256
+.soroban-requirements.sha256
+
+# pytest 缓存（测试库建在系统临时目录，见 backend/tests/conftest.py，不落仓库）
+.pytest_cache/
 
 # --- 爬虫（各平台各自成库，soroban 不跟踪其代码，只保留 scraper/README.md 说明）---
 /scraper/*/

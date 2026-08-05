@@ -6,14 +6,16 @@ from typing import Optional
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import func
 from sqlalchemy import update as sa_update
+from sqlalchemy.orm import selectinload
 from sqlmodel import Session, select
 
 from ..auth import get_current_user
 from ..database import get_session
 from ..models import ShipmentOrder, OrderItem, StagingStatus, Order, OrderStaging, utcnow
-from ..schemas import OrderCreate, OrderRead, OrderUpdate
+from ..schemas import OrderCreate, OrderRead, OrderUpdate, norm_code, norm_id
 from .common import (
-    build_items, conflict, guarded_bump, mirror_to_staging, not_found, run_ocr, soft_delete,
+    build_items, conflict, goods_seed, guarded_bump, mirror_to_staging, not_found,
+    run_ocr, soft_delete,
 )
 
 router = APIRouter(
@@ -40,7 +42,9 @@ def _check_shipment(session: Session, shipment_id):
 @router.get("")
 def list_orders(
     session: Session = Depends(get_session),
-    id: Optional[int] = Query(None, description="定位单条：供集运页点订单号跳转过来隔离显示"),
+    # 对外仍叫 ?id=（前端在用）；Python 侧换个名字，别遮蔽内建 id()
+    only_id: Optional[int] = Query(
+        None, alias="id", description="定位单条：供集运页点订单号跳转过来隔离显示"),
     date_from: Optional[dt.date] = None,
     date_to: Optional[dt.date] = None,
     status: Optional[str] = None,
@@ -55,8 +59,8 @@ def list_orders(
     offset: int = Query(0, ge=0),
 ):
     conds = [Order.is_delete.is_(False)]
-    if id is not None:
-        conds.append(Order.id == id)
+    if only_id is not None:
+        conds.append(Order.id == only_id)
     if unassigned:
         conds.append(Order.shipment_order_id.is_(None))
     if date_from:
@@ -70,11 +74,13 @@ def list_orders(
     if platform_account:
         conds.append(Order.platform_account == platform_account)
     if express_no:
-        conds.append(Order.express_no == express_no)
+        # 按写入时的同一套规则归一再比：库里存的是 UPPER(TRIM(...))，查询侧不归一就永远差一点
+        conds.append(Order.express_no == norm_code(express_no))
     if shipment_order_id is not None:
         conds.append(Order.shipment_order_id == shipment_order_id)
     if order_no:
-        conds.append(Order.order_no == order_no)   # 精确：OCR 去重靠它，不受子串 q 的 20 条上限影响
+        # 精确匹配：OCR 去重靠它，不受子串 q 的 20 条上限影响。同样按写入规则归一（只去首尾空格）
+        conds.append(Order.order_no == norm_id(order_no))
     if q:   # 统一模糊搜：物品名 / 商品标题 / 订单号 / 快递号（物品名用 EXISTS 子查询，不重复行）
         conds.append(
             Order.order_no.contains(q, autoescape=True)
@@ -87,6 +93,7 @@ def list_orders(
     rows = session.exec(
         select(Order)
         .where(*conds)
+        .options(selectinload(Order.items))   # OrderRead 带 items：一次取回整页，避免每单懒加载(N+1)
         .order_by(Order.date.desc(), Order.id.desc())
         .offset(offset)
         .limit(limit)
@@ -113,7 +120,7 @@ def create_order(payload: OrderCreate, session: Session = Depends(get_session)):
         order.fx_rate = current_rate(session)
     # 最小单位是物品：至少 1 条（无物品则按商品名+货款自动生成，灰显可改）。
     # 播种用「货款」= 订单价种子 - 邮费，避免把邮费也摊进物品单价（否则 sync 加邮费会重复计）。
-    seed_goods = (payload.price_cny - (payload.postage_cny or 0)) if payload.price_cny is not None else None
+    seed_goods = goods_seed(payload.price_cny, payload.postage_cny)
     order.items = [OrderItem(**d) for d in build_items(payload.items, seed_goods, payload.shop)]
     order.sync_from_items()                   # price_cny = Σ(单价×数量) + 邮费，并重算日元
     session.add(order)
@@ -151,15 +158,22 @@ def update_order(order_id: int, payload: OrderUpdate, session: Session = Depends
     for key, value in data.items():
         setattr(order, key, value)
 
-    # seed 兜底（货款口径）：物品都无单价时用「订单当前价 - 邮费」重播种，避免把邮费摊进单价再被 sync 重复加
-    seed = payload.price_cny if payload.price_cny is not None else order.price_cny
-    seed_goods = (seed - (order.postage_cny or 0)) if seed is not None else None
     built = None
     if payload.items is not None:            # 给了 items 就整体替换（[] → 自动补 1 条占位）
+        # 种子价**只**认本次显式传来的 price_cny，绝不回退到订单当前价。
+        # 回退过会造成两处反直觉：① 用户把所有单价清空再保存，旧总价会整个折到第一条物品上
+        # （而「只清空部分单价」是记 0 待补价——同一个动作两种结果）；② 同一次请求既改邮费又
+        # 送无单价物品时，货款被重算成「旧总价 − 新邮费」，总价看着没变、货款却悄悄改了。
+        # 现在没给种子就是「不知道单价」，一律记 0 + auto（灰显待补价），与部分清空口径一致。
+        seed_goods = goods_seed(payload.price_cny, order.postage_cny)
         built = build_items(payload.items, seed_goods, order.shop)
         order.items = [OrderItem(**d) for d in built]
-    elif not order.items:                    # 兜底：历史订单可能无物品 → 补占位，守住「≥1 物品」不变量
-        order.items = [OrderItem(**d) for d in build_items([], seed_goods, order.shop)]
+    elif not order.items:
+        # 兜底：历史订单可能一条物品都没有 → 补占位，守住「≥1 物品」不变量。
+        # 这条路径**必须**用订单当前价当种子：此时价格只存在于订单行上，不接过来就丢了。
+        seed = payload.price_cny if payload.price_cny is not None else order.price_cny
+        order.items = [OrderItem(**d)
+                       for d in build_items([], goods_seed(seed, order.postage_cny), order.shop)]
     order.sync_from_items()                  # 无论是否改物品：价格恒由物品派生，并按新 fx/override 重算日元
     mirror_to_staging(session, order, built)  # 若由暂存导入：镜像回暂存行，避免删单后重导丢失编辑
 

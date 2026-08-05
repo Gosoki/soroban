@@ -9,6 +9,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy import update as sa_update
+from sqlalchemy.orm import selectinload
 from sqlmodel import Session, select
 
 from ..auth import get_current_user
@@ -24,7 +25,7 @@ from ..models import (
     utcnow,
 )
 from ..schemas import StagingCreate, StagingItemRead, StagingRead, StagingUpdate, OrderRead
-from .common import build_items, conflict, guarded_bump, not_found
+from .common import build_items, conflict, goods_seed, guarded_bump, not_found
 
 router = APIRouter(
     prefix="/api/staging", tags=["staging"], dependencies=[Depends(get_current_user)]
@@ -53,10 +54,9 @@ def _linked_order(session: Session, row: OrderStaging) -> Optional[Order]:
     return order if order and not order.is_delete else None
 
 
-def _read(session: Session, row: OrderStaging) -> StagingRead:
+def _overlay(row: OrderStaging, order: Optional[Order]) -> StagingRead:
     """已导入行的共享字段用账本的实时值覆盖显示（单一真源，两页永远一致）。"""
     data = StagingRead.model_validate(row)
-    order = _linked_order(session, row)
     if order is not None:
         data.order_date = order.date
         data.order_no = order.order_no
@@ -73,6 +73,25 @@ def _read(session: Session, row: OrderStaging) -> StagingRead:
             for it in order.items
         ]
     return data
+
+
+def _read_many(session: Session, rows: list[OrderStaging]) -> list[StagingRead]:
+    """批量构造响应：一次 IN 查询取回整页已导入行对应的账本订单（连同物品），
+    而不是逐行 session.get + 逐单懒加载 items——一屏 100 行时那是 200 条 SQL。"""
+    ids = [r.imported_order_id for r in rows if r.imported_order_id is not None]
+    linked: dict[int, Order] = {}
+    if ids:
+        for o in session.exec(
+            select(Order)
+            .where(Order.id.in_(ids), Order.is_delete.is_(False))
+            .options(selectinload(Order.items))
+        ).all():
+            linked[o.id] = o
+    return [_overlay(r, linked.get(r.imported_order_id)) for r in rows]
+
+
+def _read(session: Session, row: OrderStaging) -> StagingRead:
+    return _overlay(row, _linked_order(session, row))
 
 
 @router.get("")
@@ -109,11 +128,12 @@ def list_staging(
     rows = session.exec(
         select(OrderStaging)
         .where(*conds)
+        .options(selectinload(OrderStaging.items))   # 一次取回整页的物品，避免每行懒加载(N+1)
         .order_by(OrderStaging.scraped_at.desc(), OrderStaging.id.desc())
         .offset(offset)
         .limit(limit)
     ).all()
-    return {"items": [_read(session, r) for r in rows], "total": total}
+    return {"items": _read_many(session, rows), "total": total}
 
 
 @router.post("", response_model=StagingRead)
@@ -124,7 +144,7 @@ def create_staging(payload: StagingCreate, session: Session = Depends(get_sessio
     if row.fx_rate is None:                  # 按下单日期匹配汇率；无记录则退回当前(入库当天)汇率
         row.fx_rate = rate_for_date(session, row.order_date)
     # 最小单位是物品：至少 1 条。播种用「货款」= 种子价 - 邮费，避免邮费摊进单价再被 sync 重复计
-    seed_goods = (payload.price_cny - (payload.postage_cny or 0)) if payload.price_cny is not None else None
+    seed_goods = goods_seed(payload.price_cny, payload.postage_cny)
     row.items = [StagingItem(**d) for d in build_items(payload.items, seed_goods, payload.shop)]
     row.sync_from_items()                    # price_cny = Σ(单价×数量) + 邮费
     session.add(row)
@@ -156,8 +176,8 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
             elif key == "status":
                 row.status = value
         if payload.items is not None:                   # 物品写穿账本（单一真源）+ 暂存镜像，两页一致
-            seed = payload.price_cny if payload.price_cny is not None else order.price_cny
-            seed_goods = (seed - (order.postage_cny or 0)) if seed is not None else None
+            # 种子只认本次显式传来的 price_cny，不回退到当前价——理由同 orders.update_order
+            seed_goods = goods_seed(payload.price_cny, order.postage_cny)
             built = build_items(payload.items, seed_goods, order.shop)
             order.items = [OrderItem(**d) for d in built]
             row.items = [StagingItem(**d) for d in built]
@@ -173,9 +193,8 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
     for key, value in data.items():
         setattr(row, key, value)
     if payload.items is not None:                       # 给了 items 就整体替换（[] → 自动补 1 条占位）
-        # seed 兜底（货款口径）：物品无单价时用「当前价 - 邮费」重播种，绝不清零、也不重复计邮费
-        seed = payload.price_cny if payload.price_cny is not None else row.price_cny
-        seed_goods = (seed - (row.postage_cny or 0)) if seed is not None else None
+        # 种子只认本次显式传来的 price_cny，不回退到当前价——理由同 orders.update_order
+        seed_goods = goods_seed(payload.price_cny, row.postage_cny)
         row.items = [StagingItem(**d) for d in build_items(payload.items, seed_goods, row.shop)]
     row.sync_from_items()
     session.add(row)
@@ -252,7 +271,7 @@ def import_staging(row_id: int, session: Session = Depends(get_session)):
                        for it in row.items]
     else:
         # 0 物品兜底：种子用货款(总价-邮费)，避免 sync 再加邮费重复计（对齐其它 build_items 站点）
-        seed_goods = (row.price_cny - (row.postage_cny or 0)) if row.price_cny is not None else None
+        seed_goods = goods_seed(row.price_cny, row.postage_cny)
         order.items = [OrderItem(**d) for d in build_items([], seed_goods, row.shop)]
     order.sync_from_items()
     session.add(order)
@@ -271,6 +290,9 @@ def import_staging(row_id: int, session: Session = Depends(get_session)):
         )
     )
     if claimed.rowcount != 1:                    # 被别人抢先导入 → 回滚刚建的订单
+        # 显式 rollback：get_session 的 with 块退出时 Session.close() 也会回滚，但那是隐式副作用。
+        # 这里刚 flush 过一张 Order，把「不提交」写成代码而不是靠调用方的清理顺序。
+        session.rollback()
         raise HTTPException(status_code=409, detail="该记录已导入")
 
     session.commit()                            # order_no 与账本冲突 → IntegrityError → 全局 409
