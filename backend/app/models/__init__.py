@@ -19,11 +19,13 @@
 
 from .base import (
     EXCLUDED_STATUSES,
+    ORDER_STATUS_RANK,
     LedgerBase,
     ShipmentStatus,
     Source,
     StagingStatus,
     OrderStatus,
+    order_status_rank,
     utcnow,
 )
 from .config.layout import ColumnLayout
@@ -46,6 +48,8 @@ __all__ = [
     "ShipmentStatus",
     "StagingStatus",
     "EXCLUDED_STATUSES",
+    "ORDER_STATUS_RANK",
+    "order_status_rank",
     "utcnow",
     # 表
     "User",

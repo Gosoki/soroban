@@ -39,9 +39,28 @@ class OrderStatus(str, Enum):
     unpaid = "待付款"       # 等待买家付款
     paid = "待发货"         # 买家已付款、待卖家发货
     shipped = "待收货"      # 卖家已发货
-    received = "交易成功"
+    received = "已签收"     # 国内快递被集运仓签收（闲鱼页面显示「交易成功」）
+    consolidating = "集运中"  # 已挂靠集运单，等待打包/发出
+    arrived = "已到达"      # 终态：国际段送达、本人收到货
     refunded = "退款"
     cancelled = "交易关闭"
+
+
+# 交易状态生命周期序：只准前进不回退（挂靠/OCR 合并时据此判定）。
+# 退款/交易关闭是旁支终态，不参与推进 → 用 order_status_rank() 取 -1。
+ORDER_STATUS_RANK = {
+    OrderStatus.unpaid.value: 0,
+    OrderStatus.paid.value: 1,
+    OrderStatus.shipped.value: 2,
+    OrderStatus.received.value: 3,
+    OrderStatus.consolidating.value: 4,
+    OrderStatus.arrived.value: 5,
+}
+
+
+def order_status_rank(status: Optional[str]) -> int:
+    """状态在生命周期里的序号；退款/交易关闭/未知一律 -1（不参与「只前进」判定）。"""
+    return ORDER_STATUS_RANK.get(status or "", -1)
 
 
 class ShipmentStatus(str, Enum):

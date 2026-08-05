@@ -289,8 +289,10 @@ async function findByOrderNo(orderNo) {
   } catch (_) { return null }
 }
 
-// 交易状态生命周期序：只准前进（待付款→待发货→待收货→交易成功），不回退；终态/未知取 -1
-const STATUS_RANK = { 待付款: 0, 待发货: 1, 待收货: 2, 交易成功: 3 }
+// 交易状态生命周期序：只准前进（待付款→待发货→待收货→已签收→集运中→已到达），不回退；
+// 退款/交易关闭是旁支终态、未知值同样取 -1。必须与后端 models/base.py 的 ORDER_STATUS_RANK 一致
+// ——集运页「内含快递」自动挂靠也按同一张表判定是否把订单推进到「集运中」。
+const STATUS_RANK = { 待付款: 0, 待发货: 1, 待收货: 2, 已签收: 3, 集运中: 4, 已到达: 5 }
 function statusRank(s) { return STATUS_RANK[s] ?? -1 }
 
 // 命中同订单号：下单时间总是回填；状态仅「推进」时更新（如补上快递单号→待收货）；

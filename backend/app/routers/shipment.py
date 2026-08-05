@@ -3,21 +3,31 @@
 import datetime as dt
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from sqlalchemy import func, or_
 from sqlalchemy import update as sa_update
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, select
 
 from ..auth import get_current_user
 from ..database import get_session
-from ..models import ShipmentOrder, Order, utcnow
-from ..schemas import ShipmentCreate, ShipmentRead, ShipmentUpdate, OrderItemRead, OrderBrief
-from .common import conflict, guarded_bump, not_found, soft_delete
+from ..models import OrderStatus, ShipmentOrder, Order, order_status_rank, utcnow
+from ..schemas import (
+    ShipmentCreate, ShipmentOcrAttachResult, ShipmentRead, ShipmentUpdate, OrderItemRead, OrderBrief,
+)
+from .common import conflict, guarded_bump, mirror_to_staging, not_found, run_ocr, soft_delete
 
 router = APIRouter(
     prefix="/api/shipment", tags=["shipment"], dependencies=[Depends(get_current_user)]
 )
+
+
+def _brief(order: Order) -> OrderBrief:
+    return OrderBrief(
+        id=order.id, order_no=order.order_no, date=order.date, shop=order.shop,
+        status=order.status, jpy_settled=order.jpy_settled,
+        items=[OrderItemRead(id=it.id, name=it.name, quantity=it.quantity) for it in order.items],
+    )
 
 
 def _read(session: Session, order: ShipmentOrder) -> ShipmentRead:
@@ -31,12 +41,7 @@ def _read(session: Session, order: ShipmentOrder) -> ShipmentRead:
         )
         .options(selectinload(Order.items))   # 批量载入子订单物品，避免 N+1
     ).all()
-    r.orders = [
-        OrderBrief(id=c.id, order_no=c.order_no, date=c.date, shop=c.shop,
-                    status=c.status, jpy_settled=c.jpy_settled,
-                    items=[OrderItemRead(id=it.id, name=it.name, quantity=it.quantity) for it in c.items])
-        for c in children
-    ]
+    r.orders = [_brief(c) for c in children]
     return r
 
 
@@ -69,6 +74,90 @@ def list_orders(
         .limit(limit)
     ).all()
     return {"items": [_read(session, r) for r in rows], "total": total}
+
+
+@router.post("/ocr")
+async def ocr_shipment(file: UploadFile = File(...)):
+    """识别集运「支付详情」截图。成品包裹页 → 集运单号/国际单号/订单时间/渠道；
+    内含快递页 → 快递单号列表（要联动挂靠请改用 /{id}/ocr-express）。不落库。"""
+    from ..services.ocr import recognize_shipment
+
+    return await run_ocr(file, recognize_shipment)
+
+
+@router.post("/{shipment_id}/ocr-express", response_model=ShipmentOcrAttachResult)
+async def ocr_attach_express(
+    shipment_id: int,
+    file: UploadFile = File(...),
+    session: Session = Depends(get_session),
+):
+    """识别「内含快递」截图，把截图里的快递单号对应的商品订单挂到本集运单并置「集运中」。
+
+    单号匹配不上商品订单 → 只在 unmatched 里回报（不建占位单）；已挂在别的集运单 → 跳过
+    不强改（沿用 attach_order 的防误抢语义）。重复上传同一张截图是幂等的。
+    路由为 async（run_ocr 要 await 读文件）；DB 用同步 Session，SQLite 建连时已
+    check_same_thread=False，本地库单次查询亚毫秒级，不构成事件循环阻塞。"""
+    from ..services.ocr import recognize_shipment
+
+    shipment = session.get(ShipmentOrder, shipment_id)
+    if not shipment or shipment.is_delete:
+        not_found("集运订单")
+
+    fields = await run_ocr(file, recognize_shipment)
+    express_nos = fields.get("express_nos") or []
+
+    consolidating = OrderStatus.consolidating.value
+    rank_consolidating = order_status_rank(consolidating)
+    attached: list[Order] = []
+    skipped: list[Order] = []
+    unmatched: list[str] = []
+
+    for no in express_nos:
+        matches = session.exec(
+            select(Order).where(Order.express_no == no, Order.is_delete.is_(False))
+        ).all()
+        if not matches:
+            unmatched.append(no)
+            continue
+        for od in matches:
+            if od.shipment_order_id is not None and od.shipment_order_id != shipment_id:
+                skipped.append(od)                       # 已挂别的集运单：交给用户手动处理
+                continue
+            values = {"shipment_order_id": shipment_id,
+                      "version": Order.version + 1, "updated_at": utcnow()}
+            # 状态只前进不回退：已是「已到达」的单不该被拉回「集运中」
+            if order_status_rank(od.status) < rank_consolidating:
+                values["status"] = consolidating
+            # 原子挂靠，守卫与 attach_order 同款：仍未挂靠（或已挂本单，幂等）、未软删、
+            # 且集运单在极小竞态窗内没被并发软删。靠 rowcount 判定，避免「读-判断-写」双挂。
+            res = session.execute(
+                sa_update(Order)
+                .where(
+                    Order.id == od.id,
+                    Order.is_delete.is_(False),
+                    or_(Order.shipment_order_id.is_(None),
+                        Order.shipment_order_id == shipment_id),
+                    select(ShipmentOrder.id)
+                    .where(ShipmentOrder.id == shipment_id, ShipmentOrder.is_delete.is_(False))
+                    .exists(),
+                )
+                .values(**values)
+            )
+            if res.rowcount != 1:                        # 并发被抢走/集运单被并发删除
+                skipped.append(od)
+                continue
+            session.refresh(od)                          # 裸 UPDATE 绕过身份映射，重读拿新状态
+            mirror_to_staging(session, od, None)         # 若由暂存导入：把新状态镜像回暂存行
+            attached.append(od)
+
+    session.commit()
+    return ShipmentOcrAttachResult(
+        shipment=_read(session, shipment),
+        attached=[_brief(o) for o in attached],
+        skipped=[_brief(o) for o in skipped],
+        unmatched=unmatched,
+        express_nos=express_nos,
+    )
 
 
 @router.post("", response_model=ShipmentRead)

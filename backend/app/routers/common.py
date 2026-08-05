@@ -1,14 +1,17 @@
-"""Shared router helpers: optimistic lock (DB-level guard), soft delete, errors, item building."""
+"""Shared router helpers: optimistic lock (DB-level guard), soft delete, errors, item building,
+OCR 截图上传（校验 + 线程池执行）。"""
 
 from decimal import ROUND_HALF_UP, Decimal
+from typing import Callable
 
-from fastapi import HTTPException, status
+from fastapi import HTTPException, UploadFile, status
 from sqlalchemy import update as sa_update
 from sqlmodel import Session
 
 from ..models import utcnow
 
 _CNY_Q = Decimal("0.01")     # 人民币量化到分
+MAX_OCR_BYTES = 10 * 1024 * 1024      # 截图上限 10MB（手机截图通常 < 2MB）
 
 
 def build_items(items_in, seed_total, shop):
@@ -70,3 +73,54 @@ def guarded_bump(session: Session, model, obj_id: int, expected_version: int) ->
 
 def soft_delete(obj) -> None:
     obj.is_delete = True
+
+
+def mirror_to_staging(session: Session, order, built_items) -> None:
+    """若此商品单由暂存导入而来：把账本当前的共享字段(+物品)镜像回其暂存行，保持「暂存=账本镜像」。
+    否则删单/清账本会把暂存复位为待处理、再导入时用到陈旧的暂存快照，丢掉在订单页做的物品/价格编辑。
+    built_items 为 build_items 的产物（非空才镜像物品；None=仅镜像共享字段，如只改了状态）。
+
+    订单页 PATCH 与集运页「内含快递」自动挂靠都会改 order.status，故放 common 供两处共用。"""
+    from sqlmodel import select
+
+    from ..models import OrderStaging, StagingItem
+
+    st = session.exec(
+        select(OrderStaging).where(OrderStaging.imported_order_id == order.id)
+    ).first()
+    if st is None:
+        return
+    st.order_date, st.order_no, st.shop = order.date, order.order_no, order.shop
+    st.platform_account, st.platform, st.express_no = order.platform_account, order.platform, order.express_no
+    st.postage_cny, st.fx_rate, st.order_status = order.postage_cny, order.fx_rate, order.status
+    if built_items is not None:
+        st.items = [StagingItem(**d) for d in built_items]
+    st.sync_from_items()
+    st.updated_at = utcnow()
+    st.version = st.version + 1   # 镜像也算一次对暂存行的写：必须自增乐观锁版本，
+    #                              否则暂存页拿旧 version 保存不会 409，会用陈旧表单悄悄覆盖镜像值。
+    session.add(st)
+
+
+async def run_ocr(file: UploadFile, recognizer: Callable[[bytes], dict]) -> dict:
+    """校验上传的截图并在线程池里跑 recognizer（商品订单/集运订单两条 OCR 路由共用）。
+
+    OCR 为 CPU 密集且较慢（首次还要加载模型），放线程池 → 不阻塞事件循环，前端可连续上传；
+    真正的串行化在 services/ocr.py 的 _infer_lock（RapidOCR 引擎非保证可重入）。"""
+    from fastapi.concurrency import run_in_threadpool
+
+    from ..services.ocr import OcrUnavailable
+
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="请上传图片文件")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="图片为空")
+    if len(data) > MAX_OCR_BYTES:
+        raise HTTPException(status_code=413, detail="图片过大（上限 10MB）")
+    try:
+        return await run_in_threadpool(recognizer, data)
+    except OcrUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))

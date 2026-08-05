@@ -12,20 +12,22 @@ export const authApi = {
     http.post('/auth/change-password', { old_password, new_password }),
 }
 
+// 截图上传：首次调用要加载 OCR 模型，耗时可能超默认 15s，故单独放宽超时
+function postImage(url, file) {
+  const form = new FormData()
+  form.append('file', file)
+  return http.post(url, form, {
+    headers: { 'Content-Type': 'multipart/form-data' }, timeout: 60000,
+  })
+}
+
 export const ordersApi = {
   list: (params) => http.get('/orders', { params }),
   get: (id) => http.get(`/orders/${id}`),
   create: (data) => http.post('/orders', data),
   update: (id, data) => http.patch(`/orders/${id}`, data),
   remove: (id) => http.delete(`/orders/${id}`),
-  ocr: (file) => {
-    const form = new FormData()
-    form.append('file', file)
-    // 首次调用要加载 OCR 模型，耗时可能超默认 15s，故单独放宽超时
-    return http.post('/orders/ocr', form, {
-      headers: { 'Content-Type': 'multipart/form-data' }, timeout: 60000,
-    })
-  },
+  ocr: (file) => postImage('/orders/ocr', file),
 }
 
 export const shipmentApi = {
@@ -36,6 +38,8 @@ export const shipmentApi = {
   remove: (id) => http.delete(`/shipment/${id}`),
   attachOrder: (shipmentId, orderId) => http.post(`/shipment/${shipmentId}/order/${orderId}`),
   detachOrder: (shipmentId, orderId) => http.delete(`/shipment/${shipmentId}/order/${orderId}`),
+  ocr: (file) => postImage('/shipment/ocr', file),                       // 成品包裹截图 → 建单字段
+  ocrExpress: (id, file) => postImage(`/shipment/${id}/ocr-express`, file), // 内含快递截图 → 联动挂靠
 }
 
 export const miscApi = {

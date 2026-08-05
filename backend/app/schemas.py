@@ -351,6 +351,15 @@ class ShipmentRead(MoneyOut):
     orders: list[OrderBrief] = []
 
 
+class ShipmentOcrAttachResult(SQLModel):
+    """「内含快递」截图识别 + 联动挂靠的结果。分三类回报，前端据此拼提示。"""
+    shipment: ShipmentRead
+    attached: list[OrderBrief] = []      # 本次挂上（或已在本单）的商品订单
+    skipped: list[OrderBrief] = []       # 已挂在别的集运单 → 跳过不强改
+    unmatched: list[str] = []            # 截图里有、但商品订单里找不到的快递号
+    express_nos: list[str] = []          # 截图识别出的全部快递号（供人工核对）
+
+
 # --- 杂项 -------------------------------------------------------------------
 
 class MiscBase(MoneyIn):

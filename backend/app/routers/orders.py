@@ -10,11 +10,11 @@ from sqlmodel import Session, select
 
 from ..auth import get_current_user
 from ..database import get_session
-from ..models import ShipmentOrder, OrderItem, StagingItem, StagingStatus, Order, OrderStaging, utcnow
+from ..models import ShipmentOrder, OrderItem, StagingStatus, Order, OrderStaging, utcnow
 from ..schemas import OrderCreate, OrderRead, OrderUpdate
-from .common import build_items, conflict, guarded_bump, not_found, soft_delete
-
-_MAX_OCR_BYTES = 10 * 1024 * 1024   # 截图一般 <2MB，限 10MB 防大图拖垮识别
+from .common import (
+    build_items, conflict, guarded_bump, mirror_to_staging, not_found, run_ocr, soft_delete,
+)
 
 router = APIRouter(
     prefix="/api/orders", tags=["orders"], dependencies=[Depends(get_current_user)]
@@ -35,27 +35,6 @@ def _check_shipment(session: Session, shipment_id):
         ).first()
         if alive is None:
             raise HTTPException(status_code=422, detail="所属集运订单不存在或已删除")
-
-
-def _mirror_to_staging(session: Session, order: Order, built_items) -> None:
-    """若此淘宝单由暂存导入而来：把账本当前的共享字段(+物品)镜像回其暂存行，保持「暂存=账本镜像」。
-    否则删单/清账本会把暂存复位为待处理、再导入时用到陈旧的暂存快照，丢掉在淘宝页做的物品/价格编辑。
-    built_items 为 build_items 的产物（非空才镜像物品；None=仅镜像共享字段，如只改了状态）。"""
-    st = session.exec(
-        select(OrderStaging).where(OrderStaging.imported_order_id == order.id)
-    ).first()
-    if st is None:
-        return
-    st.order_date, st.order_no, st.shop = order.date, order.order_no, order.shop
-    st.platform_account, st.platform, st.express_no = order.platform_account, order.platform, order.express_no
-    st.postage_cny, st.fx_rate, st.order_status = order.postage_cny, order.fx_rate, order.status
-    if built_items is not None:
-        st.items = [StagingItem(**d) for d in built_items]
-    st.sync_from_items()
-    st.updated_at = utcnow()
-    st.version = st.version + 1   # 镜像也算一次对暂存行的写：必须自增乐观锁版本，
-    #                              否则暂存页拿旧 version 保存不会 409，会用陈旧表单悄悄覆盖镜像值。
-    session.add(st)
 
 
 @router.get("")
@@ -117,25 +96,10 @@ def list_orders(
 
 @router.post("/ocr")
 async def ocr_order(file: UploadFile = File(...)):
-    """识别订单详情截图，抽取快递公司/快递号/订单号/成交价供前端自动填表。
-    OCR 为 CPU 密集且较慢，放线程池执行 → 不阻塞事件循环，前端可连续上传多张并发识别。"""
-    from fastapi.concurrency import run_in_threadpool
+    """识别订单详情截图，抽取快递公司/快递号/订单号/成交价供前端自动填表。"""
+    from ..services.ocr import recognize_order
 
-    from ..services.ocr import OcrUnavailable, recognize_order
-
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="请上传图片文件")
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="图片为空")
-    if len(data) > _MAX_OCR_BYTES:
-        raise HTTPException(status_code=413, detail="图片过大（上限 10MB）")
-    try:
-        return await run_in_threadpool(recognize_order, data)
-    except OcrUnavailable as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    return await run_ocr(file, recognize_order)
 
 
 @router.post("", response_model=OrderRead)
@@ -197,7 +161,7 @@ def update_order(order_id: int, payload: OrderUpdate, session: Session = Depends
     elif not order.items:                    # 兜底：历史订单可能无物品 → 补占位，守住「≥1 物品」不变量
         order.items = [OrderItem(**d) for d in build_items([], seed_goods, order.shop)]
     order.sync_from_items()                  # 无论是否改物品：价格恒由物品派生，并按新 fx/override 重算日元
-    _mirror_to_staging(session, order, built)  # 若由暂存导入：镜像回暂存行，避免删单后重导丢失编辑
+    mirror_to_staging(session, order, built)  # 若由暂存导入：镜像回暂存行，避免删单后重导丢失编辑
 
     session.add(order)
     session.commit()

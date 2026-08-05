@@ -1,14 +1,19 @@
-// 状态枚举（必须与后端 models.py 的枚举值一致）
-// 淘宝交易状态（对齐淘宝：待付款→待发货→待收货→交易成功 / 退款 / 交易关闭）
-export const ORDER_STATUS = ['待付款', '待发货', '待收货', '交易成功', '退款', '交易关闭']
+// 状态枚举（必须与后端 models/base.py 的枚举值一致）
+// 商品订单生命周期：待付款→待发货→待收货→已签收（国内快递到集运仓）→集运中→已到达；
+// 退款 / 交易关闭是旁支终态。顺序与后端 ORDER_STATUS_RANK 一致（见 Orders 页 STATUS_RANK）。
+export const ORDER_STATUS = ['待付款', '待发货', '待收货', '已签收', '集运中', '已到达', '退款', '交易关闭']
 export const SHIPMENT_STATUS = ['打包中', '已发出', '已签收', '已取消']
 export const STAGING_STATUS = ['待处理', '已导入', '已忽略']   // 暂存导入工作流状态
 export const ORDER_SOURCES = ['闲鱼', '淘宝', '京东', '拼多多', '其他']   // 订单来源平台（OCR 可自动识别）
 
+// 注意：订单的「已签收」与集运的「已签收」是同一个字面量（不同的列、不同的后端白名单），
+// 在这张共用色表里共享一个条目，语义都是「到手/签收成功」，同色即可。
 function statusTagType(s) {   // 内部用：语义色映射，对外走 statusStyle
   return {
-    待付款: 'info', 待发货: 'primary', 待收货: 'warning', 交易成功: 'success', 退款: 'danger', 交易关闭: 'info',
-    打包中: 'warning', 已发出: 'primary', 已签收: 'success', 已取消: 'info',
+    待付款: 'info', 待发货: 'primary', 待收货: 'warning',
+    已签收: 'success', 集运中: 'primary', 已到达: 'success',
+    退款: 'danger', 交易关闭: 'info',
+    打包中: 'warning', 已发出: 'primary', 已取消: 'info',
     闲鱼: 'warning', 淘宝: 'primary', 京东: 'danger',
   }[s] || 'info'
 }

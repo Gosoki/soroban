@@ -1,4 +1,6 @@
-"""截图 OCR：从淘宝/支付宝订单详情图里抽取快递公司、快递号、订单号、成交价。
+"""截图 OCR：从订单详情图里抽字段。两类截图共用同一引擎与解析原语——
+- 商品订单（闲鱼）：快递公司、快递号、订单号、成交价 → recognize_order
+- 集运订单：国际单号、成品包裹号、订单时间、内含快递号 → recognize_shipment
 
 用 RapidOCR（onnxruntime，离线中文模型，pip 装、无系统二进制依赖）。引擎首次加载
 模型较慢，故做进程内单例懒加载。解析靠「标签 + 几何同行关联」：先在同一文字框里
@@ -100,6 +102,27 @@ def _extract_tracking(text: str, min_len: int = 8) -> Optional[str]:
     return max(cands, key=len).upper() if cands else None
 
 
+# OCR 常把 ASCII 连字符识别成各种全角/排版破折号，统一归一后再做正则匹配。
+_DASHES = "–—−‒﹘﹣－"
+_DASH_RE = re.compile(f"[{_DASHES}]")
+_DATE_LIKE_RE = re.compile(r"^\d{4}-\d{1,2}-\d{1,2}$")
+
+
+def _norm_dashes(text: str) -> str:
+    return _DASH_RE.sub("-", text or "")
+
+
+def _extract_package_no(text: str, min_len: int = 6) -> Optional[str]:
+    """成品包裹号：形如 2304513-1，**带连字符**（_extract_tracking 的 [A-Za-z0-9]+ 会把它切成
+    两段，故单独一个提取器）。归一破折号后取「字母数字＋连字符」最长串，要求含 ≥6 位数字。
+    显式排除 YYYY-MM-DD —— 页面上「订单时间」也满足数字条件，不排掉会被同行/下方兜底误取。"""
+    runs = re.findall(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+", _norm_dashes(text))
+    cands = [r for r in runs
+             if len(r) >= min_len and sum(c.isdigit() for c in r) >= 6
+             and not _DATE_LIKE_RE.match(r)]
+    return max(cands, key=len).upper() if cands else None
+
+
 def _to_tokens(ocr_result) -> list[dict]:
     """把 RapidOCR 结果 [[box, text, score], ...] 归一成带几何信息的 token 列表。"""
     tokens = []
@@ -117,6 +140,7 @@ def _to_tokens(ocr_result) -> list[dict]:
             "h": max(ys) - min(ys),
             "digits": _longest_digit_run(text or ""),      # 订单号等纯数字用
             "tracking": _extract_tracking(text or ""),     # 快递单号用（保留字母前缀）
+            "package": _extract_package_no(text or ""),    # 成品包裹号用（带连字符）
         })
     return tokens
 
@@ -233,8 +257,9 @@ def _detect_other_platform(full_text: str) -> Optional[str]:
 def _detect_status(full_text: str, has_express: bool) -> str:
     """判交易状态：终态优先；发货后（头部「卖家已发货/待确认收货」或已有快递单号）→ 待收货；
     「等待卖家发货」→ 待发货；都不明确时以有无快递单号兜底（有单号必已发货）。"""
+    # 「交易成功」是闲鱼页面上的字样（关键词照旧），映射到本系统的「已签收」
     if "交易成功" in full_text or "交易完成" in full_text:
-        return OrderStatus.received.value       # 交易成功
+        return OrderStatus.received.value       # 已签收
     if "交易关闭" in full_text or "已关闭" in full_text:
         return OrderStatus.cancelled.value      # 交易关闭
     if has_express or any(k in full_text for k in ("待确认收货", "卖家已发货", "待收货", "确认收货")):
@@ -379,10 +404,106 @@ def recognize_order(image_bytes: bytes) -> dict:
         fields["reject_reason"] = None
     # 交易状态：有快递单号（已发货）→ 待收货，否则待发货（另按头部状态语细分终态）
     fields["status"] = _detect_status(full, bool(fields.get("express_no")))
-    # 交易成功（已完成）无需物流信息：不回填快递公司/快递号
-    if fields["status"] == OrderStatus.received.value:
-        fields["express_company"] = None
-        fields["express_no"] = None
+    # 注：旧版在「交易成功」时会清空快递公司/快递号（认为已完成的单不需要物流信息）。现在快递号
+    # 是集运「内含快递」联动的匹配键——清掉就再也匹配不上该订单，故保留。误取风险本就很低：
+    # 快递号必须以 COMPANY_MAP 命中的快递公司名为锚点、且同行有「≥8 位含≥6 个数字」的串才会被抓。
     # 附带完整识别文本，便于前端在缺字段时给用户核对/手动补
     fields["raw_text"] = full
+    return fields
+
+
+# --- 集运订单截图 -------------------------------------------------------------
+# 集运平台「支付详情」页有两个 Tab，各自一张截图，需分别识别后合并到同一张集运单：
+#   成品包裹：国际单号 EB861624386CN / 成品包裹号 2304513-1 / 渠道 / 订单时间
+#   内含快递：本包裹装了哪几个国内快递单号（用来联动商品订单）
+# 与商品订单 OCR 复用同一引擎、同一套「标签锚点 + 几何同行关联」原语。
+
+# 「渠道」取国际单号上方最近的中文行；这些是页面固定文案，不是渠道名，需排除。
+_SHIPMENT_CHROME = ("计费详情", "打包成", "客服留言", "支付详情",
+                    "成品包裹", "内含快递", "打包要求", "尺寸查看", "订单时间")
+
+
+def _nearest_cjk_above(anchor: dict, tokens: list[dict], row_tol: float) -> Optional[str]:
+    """取 anchor 上方最近的一行中文文本（跳过页面固定文案），用于抓「渠道」这类无标签的标题行。"""
+    above = [t for t in tokens
+             if t["cy"] < anchor["cy"] - row_tol
+             and _has_cjk(t["text"])
+             and not any(w in t["text"] for w in _SHIPMENT_CHROME)]
+    if not above:
+        return None
+    return max(above, key=lambda t: t["cy"])["text"].strip() or None
+
+
+def parse_shipment_fields(ocr_result) -> dict:
+    """从集运截图的 OCR 结果里抽取集运单字段。两个 Tab 共用本函数，靠 kind 区分识别到的是哪张。"""
+    tokens = _to_tokens(ocr_result)
+    out = {"kind": "unknown", "shipment_no": None, "intl_tracking_no": None,
+           "date": None, "channel": None, "express_nos": []}
+    if not tokens:
+        return out
+
+    heights = [t["h"] for t in tokens if t["h"] > 0]
+    row_tol = (sum(heights) / len(heights) * 0.8) if heights else 12.0
+
+    # 同一个词可能在页面上出现多次（如「订单时间」既是灰色分组标题、又是数据行标签，标题那行
+    # 同行没有值），故逐个锚点尝试直到取到值，而不是在首个锚点上 break。
+    def _first(keyword: str, pick):
+        for t in tokens:
+            if keyword in t["text"] and (v := pick(t)) is not None:
+                return t, v
+        return None, None
+
+    # 国际单号：值为本框或同行的 tracking（EB861624386CN 含 9 位数字，min_len=8 可命中）
+    anchor, value = _first(
+        "国际单号",
+        lambda t: _extract_tracking(t["text"], 8) or _same_row_value(t, tokens, row_tol, 8, key="tracking"),
+    )
+    if anchor is not None:
+        out["intl_tracking_no"] = value
+        out["channel"] = _nearest_cjk_above(anchor, tokens, row_tol)
+
+    # 成品包裹号：值带连字符（2304513-1），走 package 提取器
+    _, out["shipment_no"] = _first(
+        "包裹号",
+        lambda t: _extract_package_no(t["text"]) or _same_row_value(t, tokens, row_tol, 6, key="package"),
+    )
+
+    # 订单时间：只取日期部分（页面是 YYYY-MM-DD HH:MM:SS）
+    _, out["date"] = _first("订单时间", lambda t: _parse_order_date(t, tokens, row_tol))
+
+    # 内含快递：**所有**含「快递单号」的框都是锚点（不是取首个），逐行取号后去重保序
+    seen = set()
+    for t in tokens:
+        if "快递单号" not in t["text"]:
+            continue
+        no = _extract_tracking(t["text"], 8) or _same_row_value(t, tokens, row_tol, 8, key="tracking")
+        if no and no not in seen:
+            seen.add(no)
+            out["express_nos"].append(no)
+
+    # kind：成品包裹页的标识字段优先；只有快递号列表则是内含快递页
+    if out["intl_tracking_no"] or out["shipment_no"]:
+        out["kind"] = "package"
+    elif out["express_nos"]:
+        out["kind"] = "express_list"
+    return out
+
+
+def recognize_shipment(image_bytes: bytes) -> dict:
+    """对上传的集运截图跑 OCR 并解析出集运单字段。抛 OcrUnavailable 表示引擎不可用。
+    不做平台判定/卡车模板匹配——那套是闲鱼商品订单专用的。"""
+    engine = _get_engine()
+    try:
+        from PIL import Image
+        import numpy as np
+
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        arr = np.array(img)
+    except Exception as e:
+        raise ValueError(f"图片无法解析：{e}") from e
+
+    with _infer_lock:                 # 串行化引擎推理（RapidOCR 非保证可重入）
+        result, _ = engine(arr)
+    fields = parse_shipment_fields(result)
+    fields["raw_text"] = "\n".join(item[1] for item in (result or []))
     return fields
