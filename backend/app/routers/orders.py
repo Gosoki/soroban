@@ -23,19 +23,33 @@ router = APIRouter(
 )
 
 
-def _check_shipment(session: Session, shipment_id):
+def _check_shipment(session: Session, shipment_id, *, lock: bool = False):
     """挂靠的集运订单必须存在且未软删（防悬空/无效外链）。
 
     用标量 SELECT 直读 DB，而非 session.get——后者命中身份映射缓存会返回加载时的旧
-    is_delete，同事务里第二次校验（create_order flush 后复核）就形同虚设。标量列查询
-    每次都发 SQL、读事务内最新状态，才能真正闭合「校验通过→集运单被并发软删→仍挂上」。"""
+    is_delete，同事务里第二次校验就形同虚设。
+
+    `lock=True` 时加 `FOR UPDATE`，用于**写入前的最后一次复核**。这一笔是必须的，
+    因为「重发一次普通 SELECT」在两种引擎下根本不是一回事：
+
+    - SQLite：pysqlite 只在 DML 前才发 BEGIN，SELECT 跑在 autocommit 下、没有读快照，
+      所以重读确实能看到别人刚提交的软删 → TOCTOU 被闭合。
+    - MySQL：InnoDB 默认 REPEATABLE READ，读视图在事务内**第一次一致性读**时就钉死了
+      （而且钉住它的往往是更早的鉴权查询 `session.get(User, ...)`——FastAPI 的
+      per-request 依赖缓存让 get_current_user 与本处理器共用同一个 Session）。
+      之后所有普通 SELECT 都读同一份快照，重读结果与第一次**恒等**，等于没写。
+
+    `FOR UPDATE` 是 locking read：读已提交的最新版本，并锁住该行直到本事务结束——
+    对方要么已经软删完（我们读到并 422），要么被挡住直到我们提交。
+    SQLAlchemy 的 sqlite 方言对 `FOR UPDATE` 是 no-op（编译产物里根本不出现），
+    所以 SQLite 侧行为一字未变。"""
     if shipment_id is not None:
-        alive = session.execute(
-            select(ShipmentOrder.id).where(
-                ShipmentOrder.id == shipment_id, ShipmentOrder.is_delete.is_(False)
-            )
-        ).first()
-        if alive is None:
+        stmt = select(ShipmentOrder.id).where(
+            ShipmentOrder.id == shipment_id, ShipmentOrder.is_delete.is_(False)
+        )
+        if lock:
+            stmt = stmt.with_for_update()
+        if session.execute(stmt).first() is None:
             raise HTTPException(status_code=422, detail="所属集运订单不存在或已删除")
 
 
@@ -125,9 +139,10 @@ def create_order(payload: OrderCreate, session: Session = Depends(get_session)):
     order.sync_from_items()                   # price_cny = Σ(单价×数量) + 邮费，并重算日元
     session.add(order)
     session.flush()                           # 写入并占写锁；FK 保证集运单硬存在
-    # flush 后复核集运单仍未软删：_check_shipment 用标量 SELECT 直读 DB（见其注释），与本次
-    # 写入同一事务，闭合「校验通过→集运单被并发软删→订单仍挂上」的 TOCTOU
-    _check_shipment(session, order.shipment_order_id)
+    # flush 后复核集运单仍未软删，闭合「校验通过→集运单被并发软删→订单仍挂上」的 TOCTOU。
+    # lock=True 不是可选项：MySQL 的 REPEATABLE READ 会让普通重读拿到与第一次相同的快照，
+    # 不加锁读这一步在 MySQL 上是死代码（见 _check_shipment 的说明）。
+    _check_shipment(session, order.shipment_order_id, lock=True)
     session.commit()
     session.refresh(order)
     return order
@@ -148,10 +163,11 @@ def update_order(order_id: int, payload: OrderUpdate, session: Session = Depends
         raise_not_found("淘宝订单")
     if not guarded_bump(session, Order, order_id, payload.version):
         raise_conflict()
-    # 集运单存活校验放在 guarded_bump 之后：此时写事务已开启并持写锁，校验与写入同一事务，
-    # 闭合「校验通过 → 集运单被并发软删 → 仍挂上」的 TOCTOU（与 attach_order 的 EXISTS 守卫同效）。
+    # 集运单存活校验放在 guarded_bump 之后：此时写事务已开启并持写锁，校验与写入同一事务。
+    # 同样必须 lock=True——MySQL 下不加锁的 SELECT 读的是事务开头钉住的快照，
+    # 看不见并发提交的软删（与 attach_order 把 EXISTS 塞进 UPDATE 语句是同一个道理）。
     if "shipment_order_id" in payload.model_fields_set:
-        _check_shipment(session, payload.shipment_order_id)
+        _check_shipment(session, payload.shipment_order_id, lock=True)
 
     # price_cny 由物品派生，不接受直接改（订单列表 RMB 只读，改价走物品）
     data = payload.model_dump(exclude_unset=True, exclude={"version", "items", "price_cny"})

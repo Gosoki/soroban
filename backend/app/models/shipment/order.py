@@ -6,6 +6,7 @@ from typing import Optional
 from sqlalchemy import Index, text
 from sqlmodel import Field, Relationship
 
+from ...db.dialect import BinStr
 from ..base import LedgerBase, ShipmentStatus
 
 
@@ -22,12 +23,12 @@ class ShipmentOrder(LedgerBase, table=True):
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    shipment_no: Optional[str] = Field(default=None, max_length=64)   # 集运单号
+    shipment_no: Optional[str] = Field(default=None, max_length=64, sa_type=BinStr(64))   # 集运单号；活跃行唯一键，故逐字节比较
     weight: Optional[Decimal] = Field(default=None, max_digits=8, decimal_places=2)  # 重量kg
     intl_tracking_no: Optional[str] = Field(default=None, max_length=128)  # 国际运单号
     status: str = Field(default=ShipmentStatus.packing.value, max_length=32, index=True)
     special_fee_jpy: Optional[int] = Field(default=None)    # 特殊费（恒日元：关税/消费税等）
-    recipient: Optional[str] = Field(default=None, max_length=128)   # 收货人（标签，从可管理集里选）
+    recipient: Optional[str] = Field(default=None, max_length=128, sa_type=BinStr(128))   # 收货人（标签，被标签改名按值精确匹配）
 
     orders: list["Order"] = Relationship(back_populates="shipment_order")  # noqa: F821
 

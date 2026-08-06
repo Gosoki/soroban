@@ -16,6 +16,7 @@ from sqlmodel import Session, select
 from ..auth import get_current_user
 from ..database import get_session
 from ..db.dialect import insert_or_ignore, upsert
+from ..maintenance import barrier
 from ..models import (
     ShipmentOrder,
     StagingItem,
@@ -80,10 +81,19 @@ def _pick_color(counts: Counter) -> int:
 
 def _sync(session: Session, field: str, used: set[str]) -> list[TagOption]:
     """确保该字段所有标签都在库、都有颜色：补登记数据里出现的新值、回填历史空颜色。
-    used = 该字段在数据里实际用到的值（由调用方算好传入，见 _list：一次扫描两处用）。"""
+    used = 该字段在数据里实际用到的值（由调用方算好传入，见 _list：一次扫描两处用）。
+
+    **这是唯一一条经 GET 请求写库的路径**（GET /api/tags/{field} → _list → 这里 commit）。
+    HTTP 中间件按「GET 是安全方法」直接放行，拦不住它——所以只读屏障必须在这里自己查一次，
+    否则数据库迁移拷贝期间随便打开一个带标签列的列表页，就会往源库写 tagoption，
+    正是 maintenance.py 要杜绝的撕裂拷贝。
+    屏障期间只是**不落库**：已登记的标签照常返回，未登记的新值这次不登记，
+    下一次 GET 自然补上——纯粹是推迟，不丢任何东西。"""
     rows = session.exec(
         select(TagOption).where(TagOption.field == field).order_by(TagOption.id)
     ).all()
+    if barrier.blocked_reason() is not None:
+        return rows
     counts = Counter(r.color for r in rows if r.color is not None)
     existing = {r.value for r in rows}
     changed = False

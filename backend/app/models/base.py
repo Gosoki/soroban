@@ -20,6 +20,7 @@ from sqlalchemy import Text
 from sqlmodel import Field, SQLModel
 
 from ..config import CNY_MAX, JPY_MAX
+from ..db.dialect import UtcDateTime
 
 
 def utcnow() -> dt.datetime:
@@ -89,6 +90,24 @@ EXCLUDED_STATUSES = {
 }
 
 
+def guard_cny(p: Decimal) -> Decimal:
+    """人民币金额的上限卡口，越界抛 ValueError（main 里统一转 422）。
+
+    为什么派生金额也要卡：schemas 的单字段校验只管**直填**的列，而订单/暂存的 price_cny 是
+    Σ(物品单价×数量)+邮费 派生来的，单项都合法、乘出来/加起来照样能越界
+    （数量 100 万 × 单价 1 万，或光靠一个顶格的邮费）。
+    不卡的后果是双引擎发散：SQLite 的 NUMERIC(12,2) 只是亲和性、照单全收，脏行落库后
+    连 GET 列表都会被 response_model 的校验打成 422（整页打不开）；MySQL 的 DECIMAL(12,2)
+    则在 commit 时抛 1264 Out of range（实测 MySQL 9.7，默认 sql_mode 含 STRICT_TRANS_TABLES），
+    经 DataError 冲到 ASGI 层变成裸 500。两边都难看，且都在写入之后才暴露。"""
+    if p is None:
+        return p
+    d = Decimal(p)
+    if not d.is_finite() or abs(d) > CNY_MAX:
+        raise ValueError(f"货款金额超出可接受范围（上限 {CNY_MAX}）")
+    return d
+
+
 def price_from_items(items) -> Decimal:
     """订单/暂存的人民币总价 = Σ(物品单价 × 数量)，量化到分。空价按 0。
 
@@ -112,8 +131,10 @@ class LedgerBase(SQLModel):
     payer_id: Optional[int] = Field(default=None, foreign_key="user.id")
     version: int = Field(default=1)                          # 乐观锁
     is_delete: bool = Field(default=False, index=True)       # 软删标记（True=已删，查询默认过滤）
-    created_at: dt.datetime = Field(default_factory=utcnow)
-    updated_at: dt.datetime = Field(default_factory=utcnow)
+    # UtcDateTime：MySQL 侧显式 DATETIME(6)。不写 fsp 建出来是 DATETIME(0)，
+    # 超精度的值会被**四舍五入**（不是截断、也不报 warning），迁移过去时间戳就变了。
+    created_at: dt.datetime = Field(default_factory=utcnow, sa_type=UtcDateTime())
+    updated_at: dt.datetime = Field(default_factory=utcnow, sa_type=UtcDateTime())
 
     # 金额输入列
     price_cny: Optional[Decimal] = Field(default=None, max_digits=12, decimal_places=2)
@@ -132,9 +153,7 @@ class LedgerBase(SQLModel):
         派生而来、绕过了单字段校验，故这里对**最终**货款与派生日元再卡一次上限：越界抛
         ValueError（main 里统一转 422），防止 Numeric(12,2)/有符号 INT 溢出与双引擎发散。"""
         if self.price_cny is not None:
-            p = Decimal(self.price_cny)
-            if not p.is_finite() or abs(p) > CNY_MAX:
-                raise ValueError(f"货款金额超出可接受范围（上限 {CNY_MAX}）")
+            guard_cny(self.price_cny)               # 与 OrderStaging.sync_from_items 同一把卡口
         if self.price_cny is not None and self.fx_rate is not None:
             cny = Decimal(self.price_cny).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             rate = Decimal(self.fx_rate).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)

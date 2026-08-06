@@ -178,6 +178,17 @@ def migrate(t: Target):
         # 整表覆盖拷贝：当前数据引擎 → 目标。
         # **全程挂只读屏障**：replace_data 逐表读源库，而 SQLite 侧没有读快照，期间的写入会
         # 产生撕裂的拷贝（订单拷了、物品没拷 / 子表引用尚未拷贝的父行）。见 app/maintenance.py。
+        # 拷贝前体检：SQLite 不检查 VARCHAR 长度与 DECIMAL 范围，历史脏行会让 MySQL 侧
+        # 抛 1406/1264；而拷贝是单事务，一行踩雷整批回滚。与其让用户对着一句原始异常发呆，
+        # 不如先把具体是哪张表哪一行、哪个字段超了列出来。
+        problems = db_migrate.preflight(get_engine(), tgt)
+        if problems:
+            raise HTTPException(
+                status_code=400,
+                detail="以下数据超出目标数据库（MySQL）的字段限制，迁移会失败，请先修正：\n"
+                       + "\n".join(problems[:10])
+                       + (f"\n…另有 {len(problems) - 10} 处" if len(problems) > 10 else ""),
+            )
         try:
             with barrier.hold("数据库迁移中"):
                 counts = db_migrate.replace_data(get_engine(), tgt)
@@ -187,6 +198,9 @@ def migrate(t: Target):
             control.save_migrate_fingerprint(control_engine(), _target_key(t), fp)
         except HTTPException:
             raise
+        except db_migrate.CopyFailed as e:                      # 必须在 RuntimeError 之前
+            log.exception("数据拷贝失败")
+            raise HTTPException(status_code=400, detail=str(e))
         except RuntimeError as e:                               # 已有另一项维护操作在进行
             raise HTTPException(status_code=409, detail=str(e))
         except Exception as e:                                  # noqa: BLE001
@@ -204,6 +218,25 @@ def switch(t: Target):
     backend, url, tgt, owns = _resolve_target(t)
     if _is_same_as_active(backend, url):
         raise HTTPException(status_code=400, detail="当前已在使用该数据库")
+
+    # 目标库的 schema 必须先升到 head，否则切过去全站 500（缺列 1054 / 缺表 1146，
+    # 两者都不是 IntegrityError/ValueError，main.py 无对应 handler → 裸 500）。
+    # 场景很平常：迁到 MySQL 用一阵 → 切回本地 SQLite → 升级 soroban → 再切回 MySQL，
+    # 那份 MySQL 的 schema 还停在切走那天。两个方向对称，故对 SQLite 目标也一并执行。
+    #
+    # 选「自动升级」而不是「拒绝并提示先迁移」：进程重启时 create_db_and_tables 本来就会
+    # 对当前后端 run_migrations，拒绝在这里反而不一致；更要紧的是，拒绝会把用户推向
+    # 「迁移到此库」按钮——那个按钮会用源库快照**覆盖**目标库，把「schema 落后」变成
+    # 「数据被旧快照盖掉」，是更难收拾的后果。
+    # 必须在 is_target_empty 之前：它会 select 业务表，缺列时抛出的异常会被下面的兜底
+    # 误报成「尚未建表/迁移」，同样把用户引向那个会覆盖数据的按钮。
+    try:
+        run_migrations(url)
+    except Exception as e:                                     # noqa: BLE001
+        if owns:
+            tgt.dispose()
+        log.exception("目标库 schema 升级失败")
+        raise HTTPException(status_code=400, detail=f"目标数据库的表结构升级失败，未切换：{e}")
 
     # 目标必须已建表且有数据（= 迁移过），否则拒绝
     try:

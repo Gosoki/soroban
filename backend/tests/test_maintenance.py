@@ -152,6 +152,81 @@ def test_scheduler_loop_checks_barrier():
     assert "barrier.blocked_reason()" in body, "scheduler_loop 没查只读屏障"
 
 
+def test_get_tags_does_not_write_while_held(client, session):
+    """第四条写路径：GET /api/tags/{field} 会把数据里的新值自动登记成标签并 commit。
+    中间件按「GET 是安全方法」放行，拦不到——屏障期间必须由 _sync 自己不落库。"""
+    from sqlmodel import select
+
+    from app.models import TagOption
+
+    account = "屏障期才出现的账号"
+    client.post("/api/orders", json={"date": "2029-03-01", "platform_account": account})
+
+    def registered() -> bool:
+        session.expire_all()
+        rows = session.exec(select(TagOption).where(TagOption.field == "platform_account")).all()
+        return any(r.value == account for r in rows)
+
+    with barrier.hold("数据库迁移中", drain=0.1):
+        r = client.get("/api/tags/platform_account")
+        assert r.status_code == 200                                  # 读照常放行
+        assert not registered(), "屏障期间 GET /api/tags 仍往源库写了 tagoption"
+
+    client.get("/api/tags/platform_account")                         # 撤销后下一次 GET 自然补上
+    assert registered(), "屏障撤销后应当恢复自动登记（只是推迟，不是丢弃）"
+
+
+def test_no_get_endpoint_writes_without_checking_barrier():
+    """通用护栏：HTTP 方法推断不出会不会写库。任何 GET 端点只要（传递地）能走到
+    commit/flush，它的调用链上就必须有人查过屏障——否则迁移拷贝期间会被它写脏。"""
+    import ast
+    import collections
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "app"
+    calls: dict[str, set[str]] = collections.defaultdict(set)
+    writes: set[str] = set()
+    guards: set[str] = set()
+    gets: list[tuple[str, str]] = []
+
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in [n for n in ast.walk(tree)
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Call):
+                    continue
+                f = node.func
+                name = f.id if isinstance(f, ast.Name) else getattr(f, "attr", None)
+                if name:
+                    calls[fn.name].add(name)
+                if isinstance(f, ast.Attribute):
+                    if f.attr in ("commit", "flush"):
+                        writes.add(fn.name)
+                    if f.attr == "blocked_reason":
+                        guards.add(fn.name)
+            for d in fn.decorator_list:
+                if (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute)
+                        and d.func.attr == "get"):
+                    gets.append((fn.name, f"{path.name}:{fn.lineno}"))
+
+    def reachable(start: str) -> set[str]:
+        seen, stack = {start}, [start]
+        while stack:
+            for callee in calls.get(stack.pop(), ()):
+                if callee not in seen:
+                    seen.add(callee)
+                    stack.append(callee)
+        return seen
+
+    unguarded = [
+        f"GET {name} ({loc}) 经 {sorted(reachable(name) & writes)} 写库，但链上无人查屏障"
+        for name, loc in gets
+        if (reachable(name) & writes) and not (reachable(name) & guards)
+    ]
+    assert not unguarded, "只读屏障漏了 GET 写路径：\n  " + "\n  ".join(unguarded)
+
+
 # --- 迁移指纹与变更检测 --------------------------------------------------------
 
 def test_fingerprint_changes_on_insert(client, session):

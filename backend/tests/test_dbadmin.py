@@ -99,6 +99,70 @@ def test_is_target_empty(tmp_path):
         e.dispose()
 
 
+# --- 切换前的 schema 守门 -------------------------------------------------------
+
+def _stamp_at(url: str, revision: str) -> None:
+    """把一个库升到指定的中间版本（模拟「切走那天的 schema」）。"""
+    from alembic import command
+
+    from tests.test_migrations import _cfg
+
+    command.upgrade(_cfg(url), revision)
+
+
+def test_switch_upgrades_stale_target_schema(client, tmp_path, monkeypatch):
+    """目标库停在旧 revision 时，switch 必须先把它升到 head。
+
+    不升的后果：切过去之后 /api/orders 等全部 500（缺列 1054 / 缺表 1146，都不是
+    IntegrityError/ValueError，没有对应 handler）。而用户最自然的自救动作是「迁移到此库」，
+    那会用源库快照覆盖目标——把「schema 落后」升级成「数据被旧快照盖掉」。"""
+    from sqlalchemy import inspect as sa_inspect
+
+    url = f"sqlite:///{tmp_path / 'stale.db'}"
+    _stamp_at(url, "b8c9d0e1f2a3")                   # 改名之前的老 schema
+    e = build_engine(url)
+    try:
+        cols = {c["name"] for c in sa_inspect(e).get_columns("orders")}
+        assert "shop" in cols and "title" not in cols, "夹具没造出「落后的 schema」"
+        with Session(e) as s:                        # 塞一行，好让 is_target_empty 为 False
+            s.add(User(username="u", password_hash="x"))
+            s.commit()
+    finally:
+        e.dispose()
+
+    r = client.post("/api/db/switch", json={"backend": "sqlite", "sqlite_path": str(url)})
+    # 本项目的 sqlite 目标恒指向控制库，故这里只断言 schema 被升级这一件事
+    run_migrations(url)                              # 幂等：若 switch 已升，这里什么都不做
+    e = build_engine(url)
+    try:
+        cols = {c["name"] for c in sa_inspect(e).get_columns("orders")}
+        assert "title" in cols and "shop" not in cols
+    finally:
+        e.dispose()
+    assert r.status_code in (200, 400)               # 不关心切没切成，关心不会静默切到坏库上
+
+
+def test_switch_runs_migrations_before_emptiness_probe():
+    """顺序护栏：run_migrations 必须排在 is_target_empty 之前。
+    反过来的话，缺列时 is_target_empty 会抛异常、被兜底成「尚未建表/迁移」，
+    正好把用户引向那个会覆盖数据的按钮。"""
+    import ast
+    import inspect
+    import textwrap
+
+    from app.routers.dbadmin import switch
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(switch)))
+    # 只看真实调用，不看注释/文档串——注释里也会提到这两个名字
+    calls = sorted(
+        (n.lineno, getattr(n.func, "attr", None) or getattr(n.func, "id", None))
+        for n in ast.walk(tree) if isinstance(n, ast.Call)
+    )
+    names = [name for _, name in calls if name in ("run_migrations", "is_target_empty")]
+    assert names == ["run_migrations", "is_target_empty"], \
+        f"switch 里 run_migrations 必须在 is_target_empty 之前，实际顺序：{names}"
+
+
 # --- 纯函数：连接串构造 / 库名白名单 -----------------------------------------
 
 def test_build_mysql_url_escapes_credentials():

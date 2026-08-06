@@ -603,3 +603,31 @@
 - **顺带修出真 bug**：加 `migrate_state` 后测试瞬间全红——`run_migrations` 判「pre-Alembic 旧库」的排除集是**手抄**的三张表名，新控制表没进去 → 全新部署被误判、stamp 到 baseline 而建不出业务表。改为从 `control_metadata.tables` **自动派生**，并加测试锁住。
 - **F（改密码不失效 token）**：拍板维持现状，理由写进 `auth.create_access_token` 文档串。
 - **验证**：501 条 pytest 全绿（新增 `test_maintenance.py` 26 条：写端点全被拦、读放行、`/api/db/*` 与登录放行、异常时屏障必撤、硬超时自愈、并发挂起被拒、等排空、指纹增删改检出、控制表排除集不许手抄）；前端 `npm run build` 通过；真实迁移 + 变更检测端到端复验。
+
+### 第四十九版：SQL 方言专项审计 —— 排序规则根因修复 + 真 MySQL 契约测试
+起因是一句「你再看 SQL 方言有没有明显的问题」。10 维度并行排查 + 双视角对抗证伪，33 条原始发现去重后 18 条全部存活。拿到真 MySQL（9.7）之后把所有推演逐条实测，结论收敛到**一个根因 + 若干独立缺陷**。
+
+**根因：MySQL 侧所有字符串列落在 `utf8mb4_0900_ai_ci`，SQLite 是 BINARY。**
+baseline 建表只给了 `mysql_charset='utf8mb4'` 而没给 COLLATE，MySQL 的规则是「声明了 CHARACTER SET 却没声明 COLLATE 时取**字符集**的默认排序规则」——不是库的，所以 `ensure_database` 里那句 `COLLATE utf8mb4_unicode_ci` 从来没生效过。实测 MySQL 9.7 判为相等的有：`'Alice'='alice'`、`'José'='Jose'`、`'ＡＢＣ'='ABC'`、`'ヤマダ'='やまだ'`、`'ｶﾞ'='ガ'`——对一个日本代购账本，命中面远不止「大小写」。
+
+后果两条，都实测复现过：① SQLite 里合法共存的 `'Alice'/'alice'` 拷进 MySQL 撞 1062，而 `replace_data` 是单事务 → **整次迁移回滚**，且 UI 里无法自救（删标签说「正被使用」、改名说「新名字已被占用」）；② `routers/tags` 的按值批量改名/删除用 `WHERE col = value`，在 MySQL 上命中本不该动的行——实测「改一个收货人，另一个只差大小写的收货人被一起改掉」。
+
+- **修法**：`dialect.BinStr(n)` 给「参与唯一约束」与「被批量精确匹配」的 11 个键列在 MySQL 上显式声明 `utf8mb4_0900_bin`，`emit_active_unique` 的三个生成列同样带上（唯一性是它说了算）。迁移 `f2a3b4c5d6e7`，顺序是**先拆生成列 → 再改基础列 → 最后重建**（生成列依赖基础列，否则 MySQL 拒绝改列）。SQLite 侧零 DDL。
+- **为什么是 `utf8mb4_0900_bin` 而不是 `utf8mb4_bin`**：实测 `SHOW COLLATION` —— 后者是 **PAD SPACE**（`'a '='a'`），只有前者是 NO PAD，才与 SQLite BINARY 真正等价。`_0900_bin` 需 MySQL 8.0+（MariaDB 没有），故 `bin_collation()` 探测后回退。
+
+**其余已修**：
+- **`tools/backfill_item_price.py:38` 把 `unit_price_cny` 拼成 `unit_unit_price_cny`** —— SQLModel(table=True) 关掉了 Pydantic 校验，未知 kwarg 被**静默丢弃** → 单价落 NULL → `sync_from_items` 把总价重算成「只剩邮费」，**历史订单货款被清零**，二次运行还会把 0 固化。与方言无关，但优先级最高。已加事后校验（偏移超过按数量推导的取整容差就中止且不写库）+ AST 护栏扫全仓同类拼错。
+- **只读屏障漏了第四条写路径**（第四十八版的遗留）：`GET /api/tags/{field}` 经 `_list→_sync` 会 INSERT/UPDATE `tagoption` 并 commit，中间件按「GET 是安全方法」放行 → 迁移拷贝期间打开任意带标签列的列表页就会往源库写。已让 `_sync` 自己查屏障（屏障期间只是不落库，下次 GET 自然补上），并加传递闭包扫描守住整类问题。
+- **`OrderStaging.sync_from_items` 缺 `CNY_MAX` 卡口**：账本侧走 `compute_money` 顺带卡，暂存侧不调它。SQLite 静默落脏行并让**整个暂存列表 422 打不开**；MySQL 则 commit 时 1264 → 裸 500。抽出共用的 `guard_cny`。
+- **`switch` 不检查目标库 schema 版本**：`migrate` 有 `run_migrations`，`switch` 没有 → 切到落后 schema 的库全站 500；更糟的是用户最自然的自救动作「迁移到此库」会用源库快照**覆盖**目标。改为切换前自动升级（排在 `is_target_empty` 之前，否则缺列异常会被兜底成「尚未建表」，正好把人引向那个会覆盖数据的按钮）。
+- **时间列 `DATETIME(0)`**：实测存 `14:59:59.700000` 读回 `15:00:00`——MySQL 对小数秒是**四舍五入**且不报 warning，跨分钟跨小时，落在 UTC 日界附近还跨日。改 `UtcDateTime()` → `DATETIME(6)`（迁移 `a3b4c5d6e7f8`），SQLite 侧编译产物不变。
+- **`orders._check_shipment` 的第二次复核在 MySQL 上是死代码**：InnoDB 默认 REPEATABLE READ，读视图在事务内第一次一致性读时就钉死（钉住它的往往是更早的鉴权 `session.get(User,…)`——FastAPI 的 per-request 依赖缓存让二者共用 Session），重读结果与第一次恒等。改成 `with_for_update()` 的 locking read；SQLAlchemy 的 sqlite 方言对 `FOR UPDATE` 是 no-op，SQLite 行为一字未变。
+- **迁移前体检 `preflight`**：SQLite 不检查 VARCHAR 长度与 DECIMAL 范围，历史脏行会让拷贝在 MySQL 侧撞 1406/1264 而整批回滚。改为拷贝前扫出来、说清哪张表哪一行哪个字段，400 返回；拷贝失败也带上表名（`CopyFailed`，与 barrier 的 RuntimeError 分开，否则「拷贝失败」会被报成「有人在同时迁移」）。
+
+**契约测试（本轮最值钱的产出）**：`tests/test_mysql_contract.py`，由 `SOROBAN_TEST_MYSQL_URL` 门控、默认跳过。它把**整个应用**的数据引擎临时切到 MySQL，再照常打 HTTP 端点——同一份路由代码、同一个请求，在另一个引擎上跑一遍比对可观测结果。此前几百条测试**全部跑在 SQLite 上**，本轮这一整类 bug 没有一条能被它们发现。
+
+已验证这些测试不是装饰品：把库降级到修复前的 revision，四项断言（标签变体共存 / 改名不误伤 / 集运单号变体共存 / 微秒保留）**全部失败**，升级后全部通过。
+
+**验证**：517 条 pytest（SQLite）+ 14 条契约测试（真 MySQL 9.7）= 531 全绿；前端 `npm run build` 通过；全部迁移在真 MySQL 上跑通 upgrade→downgrade→upgrade。
+
+**仍需真机复验的**：本轮结论已基本全部实测，唯一未验的是 MariaDB（`dialect.is_mysql` 放行它，但它没有 `utf8mb4_0900_bin`，会走 `utf8mb4_bin` 回退分支——尾空格仍会折叠）。

@@ -64,6 +64,40 @@ def test_cny_overflow_raises():
         m.compute_money()
 
 
+# --- 派生金额的越界卡口（暂存侧没有 compute_money，必须自己卡）---------------------
+# 单字段校验只管直填列：单项都合法、乘出来/加起来照样能越界。SQLite 会静默落库并让整个
+# 暂存列表被 response_model 打成 422；MySQL 则 commit 时 1264 → 裸 500。
+
+@pytest.mark.parametrize("payload", [
+    pytest.param({"items": [{"name": "量大", "quantity": 1_000_000,
+                             "unit_price_cny": "10000.00"}]}, id="数量×单价"),
+    pytest.param({"items": [{"name": "a", "quantity": 1, "unit_price_cny": "9999999999.99"},
+                            {"name": "b", "quantity": 1, "unit_price_cny": "9999999999.99"}]},
+                 id="多物品求和"),
+    pytest.param({"postage_cny": "9999999999.99",
+                  "items": [{"name": "一元", "quantity": 1, "unit_price_cny": "1.00"}]},
+                 id="光靠邮费"),
+])
+def test_staging_derived_price_overflow_rejected(client, session, payload):
+    from sqlmodel import select
+
+    from app.models import OrderStaging
+
+    before = len(session.exec(select(OrderStaging)).all())
+    r = client.post("/api/staging", json={"order_no": f"OVF-{payload!r:.12}", **payload})
+    assert r.status_code == 422, f"越界的派生总价应当被拒绝，实际 {r.status_code}"
+    session.expire_all()
+    assert len(session.exec(select(OrderStaging)).all()) == before, "脏行仍然落库了"
+
+
+def test_staging_list_stays_readable_after_overflow_attempt(client):
+    """越界被拒之后，暂存列表必须照常打得开——脏行一旦落库，整页都会 422。"""
+    client.post("/api/staging", json={
+        "order_no": "OVF-LIST",
+        "items": [{"name": "x", "quantity": 1_000_000, "unit_price_cny": "10000.00"}]})
+    assert client.get("/api/staging").status_code == 200
+
+
 def test_jpy_overflow_raises():
     m = _mk(price_cny=Decimal(JPY_MAX), fx_rate=Decimal("20"))
     with pytest.raises(ValueError):

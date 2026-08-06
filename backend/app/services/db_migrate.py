@@ -11,9 +11,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+from decimal import Decimal
 from urllib.parse import quote_plus
 
 import pymysql
+from sqlalchemy import func as sa_func
 from sqlmodel import Session, delete, select
 
 from ..database import build_engine
@@ -41,6 +43,20 @@ MIGRATION_ORDER = [
 ]
 
 _DB_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+class CopyFailed(RuntimeError):
+    """整表拷贝在某张表上失败。独立成一个类型，是为了跟 barrier.hold 抛的 RuntimeError
+    （「已有另一项维护操作在进行」→ 409）区分开——两者语义完全不同，混在一起会让
+    「拷贝失败」被当成「有人在同时迁移」报给用户。"""
+
+# 表名 → 界面上的说法。指纹差异与迁移体检都要向用户报表名，共用一份免得两处漂移。
+_TABLE_LABELS = {
+    "orders": "商品订单", "orderstaging": "暂存订单", "shipmentorder": "集运订单",
+    "miscexpense": "杂项支出", "orderitem": "订单物品", "stagingitem": "暂存物品",
+    "user": "用户", "fxrate": "汇率", "tagoption": "标签", "pluginconfig": "插件配置",
+    "setting": "系统设置", "columnlayout": "列布局",
+}
 
 
 def build_mysql_url(host: str, port: int, user: str, password: str, database: str) -> str:
@@ -91,8 +107,6 @@ def source_fingerprint(engine) -> str:
 
     刻意不含 Setting/ColumnLayout：前者压根没在用，后者是界面偏好、丢了也无所谓，
     把它们算进来只会让「拖一下列宽」也触发变更告警。"""
-    from sqlalchemy import func as sa_func
-
     noise = {"setting", "columnlayout"}
     out: dict[str, list] = {}
     with Session(engine) as s:
@@ -110,9 +124,7 @@ def source_fingerprint(engine) -> str:
 
 def describe_fingerprint_diff(before: str, after: str) -> list[str]:
     """把两份指纹的差异说成人话，如 ["订单 +3 条", "集运订单 有改动"]。相同则返回空列表。"""
-    labels = {"orders": "商品订单", "orderstaging": "暂存订单", "shipmentorder": "集运订单",
-              "miscexpense": "杂项支出", "orderitem": "订单物品", "stagingitem": "暂存物品",
-              "user": "用户", "fxrate": "汇率", "tagoption": "标签", "pluginconfig": "插件配置"}
+    labels = _TABLE_LABELS
     try:
         a, b = json.loads(before), json.loads(after)
     except (TypeError, ValueError):
@@ -137,6 +149,62 @@ def is_target_empty(engine) -> bool:
     return True
 
 
+def preflight(src_engine, dst_engine) -> list[str]:
+    """拷贝前体检：找出**源库里合法、目标库会拒收**的行，说人话报给用户。
+
+    为什么需要：SQLite 是弱约束——VARCHAR(n) 只是亲和性、不检查长度，NUMERIC(12,2) 照单全收
+    任意大的数；MySQL 在 STRICT_TRANS_TABLES 下则分别抛 1406 Data too long 与
+    1264 Out of range（实测 MySQL 9.7 默认 sql_mode 就含 STRICT_TRANS_TABLES）。
+    而 `replace_data` 是**单事务**，任何一行踩雷都会让整次迁移回滚，用户只看到一句
+    「数据拷贝失败：<SQLAlchemy 原始串>」，既不知道是哪张表哪一行，也不知道该怎么办。
+
+    入口层的校验（schemas 的长度卡口、models.guard_cny 的金额卡口）只保证**今后**写不进脏行，
+    对早已躺在库里的历史数据无能为力——那正是这里要捞出来的。
+
+    注意：排序规则导致的唯一键冲突**不在这里检查**。迁移 f2a3b4c5d6e7 已把键列改成
+    utf8mb4_0900_bin，MySQL 侧的唯一性与 SQLite 的 BINARY 逐字节等价，那类冲突不再可能发生。
+
+    返回人话描述的问题列表；空列表 = 可以拷。目标不是 MySQL 时直接返回空（SQLite 什么都收）。
+    """
+    if dst_engine.dialect.name not in ("mysql", "mariadb"):
+        return []
+
+    src_is_sqlite = src_engine.dialect.name == "sqlite"
+    # SQLite 的 length() 按字符数；MySQL 的 LENGTH() 按字节，得用 CHAR_LENGTH() 才可比
+    # ——VARCHAR(n) 的 n 数的是字符。用错函数会把纯中文的合法值误报成超长。
+    strlen = sa_func.length if src_is_sqlite else sa_func.char_length
+
+    problems: list[str] = []
+    with Session(src_engine) as s:
+        for model in MIGRATION_ORDER:
+            label = _TABLE_LABELS.get(model.__tablename__, model.__tablename__)
+            # 主键不一定叫 id（ColumnLayout 的主键是 table_name），取表自己声明的那个
+            pk = list(model.__table__.primary_key.columns)[0]
+            for col in model.__table__.columns:
+                limit = getattr(col.type, "length", None)
+                if limit:                                   # 定长字符串列
+                    for key, n, val in s.exec(
+                        select(pk, strlen(col), col).where(strlen(col) > limit).limit(3)
+                    ).all():
+                        problems.append(
+                            f"{label} #{key} 的「{col.name}」有 {n} 个字符，"
+                            f"超过上限 {limit}：{str(val)[:40]}…"
+                        )
+                    continue
+                precision = getattr(col.type, "precision", None)
+                scale = getattr(col.type, "scale", None)
+                if precision is not None and scale is not None:   # DECIMAL 列
+                    ceiling = Decimal(10) ** (precision - scale)
+                    for key, val in s.exec(
+                        select(pk, col).where(sa_func.abs(col) >= ceiling).limit(3)
+                    ).all():
+                        problems.append(
+                            f"{label} #{key} 的「{col.name}」= {val}，"
+                            f"超出 DECIMAL({precision},{scale}) 能存的范围"
+                        )
+    return problems
+
+
 def replace_data(src_engine, dst_engine) -> dict:
     """把源库业务数据**整体覆盖**到目标库（支持任意方向：SQLite↔MySQL）。
 
@@ -157,7 +225,13 @@ def replace_data(src_engine, dst_engine) -> dict:
             rows = src.exec(select(model)).all()
             for r in rows:
                 dst.add(model(**{c: getattr(r, c) for c in cols}))
-            dst.flush()
+            # 带上表名再抛：原先失败只有一句 SQLAlchemy 原始串，用户既不知道卡在哪张表，
+            # 也无从判断该去清理什么。preflight 会拦掉绝大多数，这里兜住漏网的。
+            try:
+                dst.flush()
+            except Exception as e:                          # noqa: BLE001
+                label = _TABLE_LABELS.get(model.__tablename__, model.__tablename__)
+                raise CopyFailed(f"拷贝「{label}」表时失败：{e}") from e
             counts[model.__tablename__] = len(rows)
             log.info("迁移 %s：%d 行", model.__tablename__, len(rows))
         dst.commit()                      # 全部成功才一次性提交

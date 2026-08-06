@@ -32,6 +32,16 @@ cd backend
 | `test_ocr_parse.py` | OCR 纯解析层（不跑引擎、不需要 rapidocr） |
 | `test_dbadmin.py` | 迁移表清单完整性、整库拷贝、DSN 加解密、方言助手 |
 | `test_consistency.py` | **跨层一致性**：后端枚举 ↔ 前端常量 ↔ 爬虫映射 ↔ 前端调用的 API 路径 |
+| `test_migrations.py` | Alembic 链路：单 head、线性、从零建全表、幂等、降级往返、历史数据订正 |
+| `test_code_normalization.py` | 单号类列的归一口径（`norm_code` 转大写、`norm_id` 只去空格） |
+| `test_naming.py` | 命名歧义统一后的列名/状态值不许回退 |
+| `test_maintenance.py` | 只读屏障：四条写路径全覆盖、异常必撤、硬超时自愈、迁移变更指纹 |
+| `test_invariants.py` | 模型层不变量（金额派生、软删语义等） |
+| `test_security.py` | 鉴权、登录限流、SECRET_KEY 拒绝不安全默认值 |
+| `test_packaging.py` | 打包脚本与 spec：路径、跳转标签、`_MEIPASS` 契约 |
+| `test_requirements.py` | 依赖清单与实际 import 不许脱节 |
+| `test_tools.py` | `tools/` 下的一次性脚本（回填不得改动金额）+ **模型构造不许传错字段名** |
+| `test_mysql_contract.py` | **双引擎契约**：同一请求在真 MySQL 上跑一遍，比对可观测结果（默认跳过，见下） |
 
 ## 两类值得留意的测试
 
@@ -43,3 +53,21 @@ cd backend
 **`test_edge_cases.py`** 里有几条注释以「⚠️ 已知行为」开头：那不是 bug，是当前刻意/已知的
 取舍（如「清空全部单价会把旧总价折到第一条」）。它们被钉在这里是为了**改动时不会无声漂移**；
 若哪天决定改语义，请连带更新这些断言。
+
+
+## `test_mysql_contract.py`：默认跳过的那一组
+
+上面所有测试都跑在 **SQLite** 上，所以「SQLite 全绿、切到 MySQL 才炸」的整类 bug
+它们天然看不见——排序规则（`_ci` vs BINARY）、`DATETIME` 精度、`DECIMAL` 范围、
+`INSERT IGNORE` 把数据截断降级成 warning……第四十九版审计确认的发散，没有一条
+能被纯 SQLite 的测试发现。
+
+这一组把**整个应用**的数据引擎临时切到 MySQL，再照常打 HTTP 端点：同一份路由代码、
+同一个请求、另一个引擎，比对可观测结果。
+
+```bash
+SOROBAN_TEST_MYSQL_URL='mysql+pymysql://user:pass@host:3306/db?charset=utf8mb4' \
+  .venv/bin/python -m pytest
+```
+
+不给连接串就自动跳过。⚠️ 它会**清空**目标库的业务表，只能指向专用测试库。

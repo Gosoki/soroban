@@ -6,6 +6,7 @@ from typing import Optional
 from sqlalchemy import Column, Index, Text, text
 from sqlmodel import Field, Relationship
 
+from ...db.dialect import BinStr
 from ..base import LedgerBase, OrderStatus, price_from_items
 
 
@@ -32,7 +33,9 @@ class Order(LedgerBase, table=True):
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    order_no: Optional[str] = Field(default=None, max_length=64)   # 淘宝订单号
+    # 逐字节比较（BinStr）的列：要么参与唯一约束，要么被 routers/tags 的批量改名/删除
+    # 用 `WHERE col = value` 精确命中。MySQL 默认的 _ci 会让前者误撞 1062、后者误伤别的行。
+    order_no: Optional[str] = Field(default=None, max_length=64, sa_type=BinStr(64))   # 淘宝订单号；与 platform 共同构成活跃行唯一键
     # 商品标题。用 Text 而非 VARCHAR(255)：一单多件时爬虫会把各件标题拼成「A / B / C」，
     # 轻易超过 255；定长列会逼得入口层截断（悄悄丢字）或 422（打回整批同步）。
     # 本列不参与索引/唯一约束，Text 无代价。
@@ -40,10 +43,10 @@ class Order(LedgerBase, table=True):
     url: Optional[str] = Field(default=None, sa_column=Column(Text))  # 商品链接（可能很长）
     category: Optional[str] = Field(default=None, max_length=64)   # 分类
     status: str = Field(default=OrderStatus.paid.value, max_length=32, index=True)
-    platform: Optional[str] = Field(default=None, max_length=32, index=True)      # 来源平台（闲鱼/淘宝/京东）
+    platform: Optional[str] = Field(default=None, max_length=32, index=True, sa_type=BinStr(32))   # 来源平台（闲鱼/淘宝/京东）
     express_no: Optional[str] = Field(default=None, max_length=64, index=True)    # 快递号（归组用）
     express_company: Optional[str] = Field(default=None, max_length=64)           # 快递公司
-    platform_account: Optional[str] = Field(default=None, max_length=64, index=True)  # 平台账号（各平台的登录号，如淘宝2个）
+    platform_account: Optional[str] = Field(default=None, max_length=64, index=True, sa_type=BinStr(64))  # 平台账号（各平台的登录号，如淘宝2个）
     shipment_order_id: Optional[int] = Field(
         default=None, foreign_key="shipmentorder.id", index=True
     )  # 可空 = 已买未集运

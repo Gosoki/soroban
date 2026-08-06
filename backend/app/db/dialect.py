@@ -15,6 +15,9 @@ from __future__ import annotations
 
 from typing import Optional
 
+import sqlalchemy as sa
+from sqlalchemy import String
+from sqlalchemy.dialects import mysql as _mysql
 from sqlalchemy.dialects.mysql import insert as _mysql_insert
 from sqlalchemy.dialects.sqlite import insert as _sqlite_insert
 from sqlalchemy.engine import Connection, Dialect, Engine
@@ -38,6 +41,63 @@ def is_sqlite(bind=None) -> bool:
 
 def is_mysql(bind=None) -> bool:
     return _name(bind) in ("mysql", "mariadb")
+
+
+# --- 比较语义：让 MySQL 的字符串列与 SQLite 一样逐字节比较 ---------------------------
+# 建表时只给 CHARACTER SET 不给 COLLATE，MySQL 会取**字符集的默认排序规则**（不是库的），
+# 即 utf8mb4_0900_ai_ci —— 大小写不敏感**且**重音不敏感。实测 MySQL 9.7 判为相等的有：
+#     'Alice'='alice'  'José'='Jose'  'ＡＢＣ'='ABC'  'ヤマダ'='やまだ'  'ｶﾞ'='ガ'
+# 对一个日本代购账本，这远不止「大小写」那么窄。而 SQLite 无 COLLATE 即 BINARY 逐字节。
+# 后果：同一份数据，唯一键在 SQLite 上合法共存、拷进 MySQL 撞 1062；`WHERE col = v` 的
+# 批量改名/删除在 MySQL 上会命中本不该动的行。
+#
+# 选 utf8mb4_0900_bin 而不是 utf8mb4_bin：后者是 PAD SPACE（'a ' = 'a'），
+# 只有前者是 NO PAD，才与 SQLite BINARY 真正等价。实测：
+#     SHOW COLLATION LIKE 'utf8mb4%bin' → utf8mb4_0900_bin=NO PAD / utf8mb4_bin=PAD SPACE
+# 代价：utf8mb4_0900_bin 是 MySQL 8.0+ 才有的（MariaDB 没有）。迁移里会探测并回退，
+# 见 alembic/versions/f2a3b4c5d6e7_binary_collation_for_key_columns.py。
+BIN_COLLATION = "utf8mb4_0900_bin"
+BIN_COLLATION_FALLBACK = "utf8mb4_bin"          # 8.0 以前 / MariaDB；PAD SPACE，尾空格仍会折叠
+
+
+def bin_collation(bind=None) -> str:
+    """本服务端可用的二进制排序规则名。8.0+ 用 _0900_bin，老服务端退到 _bin。
+
+    宁可退到 PAD SPACE 的 utf8mb4_bin，也好过因为一个不存在的排序规则让整次升级失败：
+    尾空格折叠的影响面远小于大小写/重音折叠，何况所有入口都 .strip() 过。"""
+    if bind is None:
+        from alembic import op
+        bind = op.get_bind()
+    try:
+        from sqlalchemy import text as _text
+        found = bind.execute(_text("SHOW COLLATION LIKE :c"), {"c": BIN_COLLATION}).first()
+        return BIN_COLLATION if found else BIN_COLLATION_FALLBACK
+    except Exception:                            # noqa: BLE001  探测失败就用保守值
+        return BIN_COLLATION_FALLBACK
+
+
+def UtcDateTime():                              # noqa: N802  —— 当类型用，故用类型的命名风格
+    """保留微秒的时间列：MySQL 显式 DATETIME(6)，SQLite 本来就存全精度 ISO 字符串。
+
+    不写 fsp 的话 MySQL 建出来是 DATETIME(0)，而超出精度的值是**四舍五入**而非截断，也不报
+    warning。实测 MySQL 9.7：存 '2026-08-05 14:59:59.700000' 读回 '2026-08-05 15:00:00'
+    ——跨了分钟和小时，落在 UTC 日界附近时还会跨日（暂存页「入库日期」按 JST 显示，
+    迁移前后会差一天）。
+    影响面确实不大（指纹是同引擎自比、排序都有 id 兜底），但「同一份数据迁过去精度就变了」
+    这件事本身就不该有，何况修它是零代价的。"""
+    return sa.DateTime().with_variant(_mysql.DATETIME(fsp=6), "mysql")
+
+
+def BinStr(length: int):                        # noqa: N802  —— 当类型用，故用类型的命名风格
+    """「逐字节比较」的字符串列：MySQL 显式 utf8mb4_0900_bin，SQLite 本来就是 BINARY。
+
+    用在两类列上，别的列不必动（用户可见文本按 ci 比较反而更自然）：
+      1. 参与唯一约束的（含 emit_active_unique 生成列的组成列）
+      2. 被 `WHERE col = value` 批量改写/删除命中的（见 routers/tags 的改名与按账号清空）
+    """
+    return String(length).with_variant(
+        _mysql.VARCHAR(length, collation=BIN_COLLATION), "mysql"
+    )
 
 
 # --- 跨方言的幂等插入/更新（业务代码在运行期用，传 session.get_bind() 探方言）------------
@@ -86,8 +146,12 @@ def emit_active_unique(
     - sqlite_where  部分索引 WHERE 条件，如 "order_no IS NOT NULL AND is_delete = 0"
     """
     if is_mysql(op.get_bind()):
+        # 生成列必须显式带 COLLATE：不写就继承表默认的 utf8mb4_0900_ai_ci，于是这条
+        # 「活跃行唯一」在 MySQL 上变成大小写/重音不敏感，与 SQLite 部分索引的逐字节比较
+        # 不等价（'jf-2606a' 与 'JF-2606A' 在 SQLite 共存、在 MySQL 撞 1062）。
         op.execute(
             f"ALTER TABLE `{table}` ADD COLUMN `{gen_col}` VARCHAR(512) "
+            f"COLLATE {bin_collation(op.get_bind())} "
             f"GENERATED ALWAYS AS ({mysql_expr}) STORED"
         )
         op.execute(f"CREATE UNIQUE INDEX `{index_name}` ON `{table}` (`{gen_col}`)")

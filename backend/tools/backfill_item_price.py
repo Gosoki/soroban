@@ -35,8 +35,9 @@ def _backfill_row(obj, item_cls) -> dict:
         # price 用 0.00 而非 None（订单价 NULL 时）→ 二次运行时该物品已有价，走 skip，保证幂等
         seed = goods if obj.price_cny is not None else Decimal("0.00")
         obj.items = [item_cls(name=(obj.title or "未命名物品")[:255], quantity=1,
-                              unit_unit_price_cny=seed, auto=True)]
+                              unit_price_cny=seed, auto=True)]
         action = "auto_item"
+        tolerance = Decimal("0")            # 数量=1、单价=货款原值 → 总价应当分毫不差
     elif all(it.unit_price_cny is None for it in items):
         total = goods
         for i, it in enumerate(items):
@@ -47,12 +48,24 @@ def _backfill_row(obj, item_cls) -> dict:
                 it.unit_price_cny = Decimal("0.00")
             it.auto = True
         action = "priced_items"
+        # 只有首件承担折算：单价量化到分的误差 ≤ 半分，乘回数量后 ≤ 0.005×q，取 0.01×q 留余量。
+        tolerance = _Q * (items[0].quantity or 1)
     else:
         return {"action": "skip", "shift": Decimal("0")}   # 已迁移，幂等跳过
 
     old = Decimal(obj.price_cny or 0)
     obj.sync_from_items()                                   # 订单同时重算日元；暂存只重算 price_cny
-    return {"action": action, "shift": Decimal(obj.price_cny or 0) - old}
+    shift = Decimal(obj.price_cny or 0) - old
+    # 事后校验：SQLModel(table=True) 关掉了 Pydantic 校验，构造时传错的字段名会被**静默丢弃**，
+    # 单价落 NULL → sync_from_items 把总价重算成「只剩邮费」。这里曾因 unit_price_cny 拼成
+    # unit_unit_price_cny 而把历史订单的货款整额清零，且二次运行会把 0 固化。
+    # 回填只该产生「取整」级别的分位误差，出现更大的偏移一律视为 bug，立即中止而不是写库。
+    if abs(shift) > tolerance:
+        raise RuntimeError(
+            f"回填 {type(obj).__name__}#{obj.id} 使总价从 {old} 变成 {obj.price_cny}"
+            f"（偏移 {shift}，容差 {tolerance}），远超取整误差。已中止，未写入任何数据。"
+        )
+    return {"action": action, "shift": shift}
 
 
 def backfill(engine) -> dict:

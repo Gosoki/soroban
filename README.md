@@ -234,6 +234,25 @@ cd backend
 列布局白名单、前端写死的 API 路径——这些「三处各写一份、只能靠约定同步」的常量被写成了断言，
 改后端忘了改前端/爬虫就会红。
 
+### 双引擎契约测试（可选，需要一个真 MySQL）
+
+上面那些测试**全部跑在 SQLite 上**，所以「SQLite 全绿、切到 MySQL 才炸」的那一类 bug
+它们天然看不见（排序规则、`DATETIME` 精度、`DECIMAL` 范围、`INSERT IGNORE` 吞截断……）。
+`test_mysql_contract.py` 补这一层：它把**整个应用**的数据引擎临时切到 MySQL，再照常打
+HTTP 端点，比对可观测结果。没给连接串就自动跳过。
+
+```bash
+cd backend
+SOROBAN_TEST_MYSQL_URL='mysql+pymysql://user:pass@host:3306/db?charset=utf8mb4' \
+  .venv/bin/python -m pytest
+```
+
+⚠️ 它会**清空**目标库的业务表，只能指向专用测试库，别指向在用的库。
+
+需要 MySQL 8.0+：键列要用 `utf8mb4_0900_bin` 才能与 SQLite 的逐字节比较等价
+（`utf8mb4_bin` 是 PAD SPACE，尾空格会被折叠）。老服务端/MariaDB 会自动回退到
+`utf8mb4_bin`，其余行为一致。
+
 ## 状态
 
 稳定迭代中（详见 [docs/README.md](docs/README.md) 的版本记录）。已完成：登录、看板、淘宝/集运/杂项三页、双币结算与汇率、全部订单暂存与导入、列布局持久化、淘宝爬虫插件（已可用）。

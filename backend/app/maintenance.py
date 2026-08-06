@@ -7,12 +7,16 @@
 （源库是 MySQL 时反而没这问题：pymysql 的 SELECT 会开事务，InnoDB 给整轮拷贝一致的快照。
  又是一处双引擎发散——所以不能指望「反正 MySQL 没事」。）
 
-**必须覆盖三条写路径**，漏一条锁就是假的：
+**必须覆盖四条写路径**，漏一条锁就是假的：
   1. HTTP 写端点        → main.py 的中间件（POST/PATCH/PUT/DELETE）
   2. services/fx.fx_loop → 它**直接用 Session 写** FxRate，完全绕过 HTTP
   3. routers/plugins.scheduler_loop → 屏障期间别去起爬虫子进程。不是怕它写坏（回灌会被
      中间件拦下），而是白开一次浏览器冲淘宝——并发多开浏览器是风控红线，见插件的
      docs/风控与对策.md。
+  4. routers/tags._sync → **一个 GET 请求会写库**：GET /api/tags/{field} 会把数据里出现过
+     的新值自动登记成标签并 commit。中间件按「GET 是安全方法」放行，拦不到它，
+     所以它自己查屏障。教训：别用 HTTP 方法推断会不会写——只有代码知道。
+     （tests/test_maintenance.py 里有一条传递闭包扫描守着，新出现同类路径会红。）
 
 **绝不能泄漏**：屏障一旦忘了撤，整个应用就永久只读。所以除了 try/finally，还带一道**硬超时**
 自愈：超过 deadline 一律视为已撤销。宁可迁移中途失去保护（那时最坏是拷贝撕裂、可重来），

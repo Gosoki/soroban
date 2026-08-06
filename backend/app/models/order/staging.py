@@ -7,7 +7,8 @@ from typing import Optional
 from sqlalchemy import Column, Index, Text, text
 from sqlmodel import Field, Relationship, SQLModel
 
-from ..base import StagingStatus, price_from_items, utcnow
+from ...db.dialect import BinStr, UtcDateTime
+from ..base import StagingStatus, guard_cny, price_from_items, utcnow
 
 
 class OrderStaging(SQLModel, table=True):
@@ -24,9 +25,10 @@ class OrderStaging(SQLModel, table=True):
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    order_no: Optional[str] = Field(default=None, max_length=64)  # 可空：手动新建空行后再填
-    platform_account: Optional[str] = Field(default=None, max_length=64)
-    platform: Optional[str] = Field(default=None, max_length=32)  # 来源平台（淘宝/闲鱼/京东）；淘宝插件抓取即「淘宝」，导入时随单迁移到账本
+    # BinStr 的理由见 Order 同名列（唯一约束 / 批量精确匹配，必须逐字节）。
+    order_no: Optional[str] = Field(default=None, max_length=64, sa_type=BinStr(64))  # 可空：手动新建空行后再填
+    platform_account: Optional[str] = Field(default=None, max_length=64, sa_type=BinStr(64))
+    platform: Optional[str] = Field(default=None, max_length=32, sa_type=BinStr(32))  # 来源平台（淘宝/闲鱼/京东）；淘宝插件抓取即「淘宝」，导入时随单迁移到账本
     title: Optional[str] = Field(default=None, sa_type=Text)   # 商品标题；Text 的理由见 Order.title
     price_cny: Optional[Decimal] = Field(default=None, max_digits=12, decimal_places=2)
     postage_cny: Optional[Decimal] = Field(default=None, max_digits=12, decimal_places=2)  # 邮费（元）；空=包邮。价 = Σ(单价×数量) + 邮费
@@ -42,8 +44,8 @@ class OrderStaging(SQLModel, table=True):
         default=None, foreign_key="orders.id"
     )
     version: int = Field(default=1)                         # 乐观锁（人工/爬虫并发编辑同一暂存行）
-    scraped_at: dt.datetime = Field(default_factory=utcnow)
-    updated_at: dt.datetime = Field(default_factory=utcnow)
+    scraped_at: dt.datetime = Field(default_factory=utcnow, sa_type=UtcDateTime())
+    updated_at: dt.datetime = Field(default_factory=utcnow, sa_type=UtcDateTime())
 
     items: list["StagingItem"] = Relationship(
         back_populates="staging",
@@ -51,8 +53,12 @@ class OrderStaging(SQLModel, table=True):
     )
 
     def sync_from_items(self) -> None:
-        """暂存价 = Σ(物品单价×数量) + 邮费（与账本同口径）。改动 items/邮费 后调用。"""
-        self.price_cny = price_from_items(self.items) + (self.postage_cny or 0)
+        """暂存价 = Σ(物品单价×数量) + 邮费（与账本同口径）。改动 items/邮费 后调用。
+
+        卡口与账本侧同源（guard_cny）：账本走 compute_money 顺带卡，暂存没有日元派生、
+        不调 compute_money，所以必须在这里显式卡一次——否则「暂存能存、导入成账本才报错」，
+        脏行会一直躺在暂存表里，还会让整个暂存列表被 response_model 打成 422。"""
+        self.price_cny = guard_cny(price_from_items(self.items) + (self.postage_cny or 0))
 
 
 class StagingItem(SQLModel, table=True):
