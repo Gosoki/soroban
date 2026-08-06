@@ -37,27 +37,33 @@ class Source(str, Enum):
 
 
 class OrderStatus(str, Enum):
+    """**只记国内段**：从下单到国内快递签收。
+
+    国际段（集运中/送达）不在这里——它的唯一真相是所挂靠集运单的 `ShipmentStatus`。
+    订单一旦挂上集运单，展示的状态就跟随那张单（见 `Order.effective_status`）；
+    释放出来则回落到本列。这样同一件事只有一处记录，不会像以前那样
+    「订单说集运中、它挂的集运单说已发出」。
+    """
+
     unpaid = "待付款"       # 等待买家付款
     paid = "待发货"         # 买家已付款、待卖家发货
     shipped = "待收货"      # 卖家已发货
-    # 「已入仓」= 国内快递**被集运仓**签收。刻意不叫「已签收」——集运单也有个「已签收」，
-    # 那个是国际包裹**本人**收到；同字面量还被 EXCLUDED_STATUSES 这类跨表集合共用，极易出错。
-    warehoused = "已入仓"   # 国内快递已到集运仓（闲鱼页面显示「交易成功」）
-    consolidating = "集运中"  # 已挂靠集运单，等待打包/发出
-    arrived = "已到达"      # 终态：国际段送达、本人收到货
+    # 「已签收」= **国内**快递签收（淘宝/闲鱼页面上的「交易成功」就是这一刻）。
+    # 曾短暂叫过「已入仓」，因为集运单那边也有个「已签收」、同字面量不同义容易出错；
+    # 现在集运侧已改叫「已送达」，冲突消失，故用回用户口径的「已签收」。
+    signed = "已签收"       # 国内快递签收（淘宝/闲鱼「交易成功」）—— 国内段终态
     refunded = "退款"
     cancelled = "交易关闭"
 
 
-# 交易状态生命周期序：只准前进不回退（挂靠/OCR 合并时据此判定）。
+# 国内段生命周期序：只准前进不回退（OCR 合并 / 爬虫回灌时据此判定）。
 # 退款/交易关闭是旁支终态，不参与推进 → 用 order_status_rank() 取 -1。
+# 国际段不在序里——它由集运单自己的状态表达，订单不复制。
 ORDER_STATUS_RANK = {
     OrderStatus.unpaid.value: 0,
     OrderStatus.paid.value: 1,
     OrderStatus.shipped.value: 2,
-    OrderStatus.warehoused.value: 3,
-    OrderStatus.consolidating.value: 4,
-    OrderStatus.arrived.value: 5,
+    OrderStatus.signed.value: 3,
 }
 
 
@@ -69,8 +75,9 @@ def order_status_rank(status: Optional[str]) -> int:
 class ShipmentStatus(str, Enum):
     packing = "打包中"
     shipped = "已发出"
-    # 属性名与 OrderStatus.arrived("已到达") 刻意区分开：这个是「包裹到我手上、签收了」
-    received = "已签收"
+    # 「已送达」= 国际包裹送到我手上（= 签收）。刻意不叫「已签收」——那是**订单**侧
+    # 国内快递签收的说法，同字面量不同义曾出过事（EXCLUDED_STATUSES 这类集合跨两张表用）。
+    delivered = "已送达"
     cancelled = "已取消"
 
 

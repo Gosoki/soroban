@@ -11,7 +11,7 @@ from sqlmodel import Session, select
 
 from ..auth import get_current_user
 from ..database import get_session
-from ..models import OrderStatus, ShipmentOrder, Order, order_status_rank, utcnow
+from ..models import ShipmentOrder, Order, utcnow
 from ..schemas import (
     ShipmentCreate, ShipmentOcrAttachResult, ShipmentRead, ShipmentUpdate, OrderItemRead, OrderBrief,
 )
@@ -111,7 +111,7 @@ async def ocr_attach_express(
     file: UploadFile = File(...),
     session: Session = Depends(get_session),
 ):
-    """识别「内含快递」截图，把截图里的快递单号对应的商品订单挂到本集运单并置「集运中」。
+    """识别「内含快递」截图，把截图里的快递单号对应的商品订单挂到本集运单。
 
     单号匹配不上商品订单 → 只在 unmatched 里回报（不建占位单）；已挂在别的集运单 → 跳过
     不强改（沿用 attach_order 的防误抢语义）。重复上传同一张截图是幂等的。
@@ -126,8 +126,6 @@ async def ocr_attach_express(
     fields = await run_ocr(file, recognize_shipment)
     express_nos = fields.get("express_nos") or []
 
-    consolidating = OrderStatus.consolidating.value
-    rank_consolidating = order_status_rank(consolidating)
     attached: list[Order] = []
     skipped: list[Order] = []
     unmatched: list[str] = []
@@ -143,11 +141,11 @@ async def ocr_attach_express(
             if od.shipment_order_id is not None and od.shipment_order_id != shipment_id:
                 skipped.append(od)                       # 已挂别的集运单：交给用户手动处理
                 continue
+            # **只挂靠，不动状态**：订单的 status 只记国内段，国际段由所挂集运单表达
+            # （见 Order.effective_status）。这里曾写过 status="集运中"——那会污染国内段状态，
+            # 一旦释放出来，回落到的就是被覆盖过的值而不是真实的「已签收」。
             values = {"shipment_order_id": shipment_id,
                       "version": Order.version + 1, "updated_at": utcnow()}
-            # 状态只前进不回退：已是「已到达」的单不该被拉回「集运中」
-            if order_status_rank(od.status) < rank_consolidating:
-                values["status"] = consolidating
             # 原子挂靠，守卫与 attach_order 同款：仍未挂靠（或已挂本单，幂等）、未软删、
             # 且集运单在极小竞态窗内没被并发软删。靠 rowcount 判定，避免「读-判断-写」双挂。
             res = session.execute(
@@ -226,10 +224,9 @@ def attach_order(shipment_id: int, order_id: int, session: Session = Depends(get
     """把一个商品订单挂到本集运单（点选添加）。同一个外键 shipment_order_id，与商品页共用。
     仅允许「未挂靠」的商品单：已挂在别的集运单 → 422（先移除再加，防误抢）。
 
-    **刻意不改订单状态**（与 /{id}/ocr-express 的自动挂靠不同，那边会推进到「集运中」）：
-    点选挂靠表达的是「我打算把这单放进这个包裹」，货可能还没发出、更没到集运仓；
-    而「内含快递」截图来自集运方的装箱清单，出现在上面就意味着货**确实已在包裹里**，
-    才够格推进到「集运中」。两边的差别是业务语义上的，不是遗漏。"""
+    **不改订单状态**——两条挂靠路径都不改。订单的 status 只记国内段，
+    界面显示的国际段状态由本集运单表达（见 Order.effective_status），
+    挂上就自动跟随、释放就自动回落，没有需要写的东西。"""
     shipment = session.get(ShipmentOrder, shipment_id)
     if not shipment or shipment.is_delete:
         raise_not_found("集运订单")

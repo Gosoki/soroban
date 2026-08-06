@@ -18,8 +18,15 @@
           <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
             <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
           </el-select>
+          <!-- 选项 = 国内段 + 集运段：列表显示的是继承后的状态，只列国内段的话，
+               界面上一堆「已发出」却在筛选框里选不到它 -->
           <el-select v-model="filters.status" placeholder="状态" clearable style="width: 120px" @change="reload">
-            <el-option v-for="s in ORDER_STATUS" :key="s" :label="s" :value="s" />
+            <el-option-group label="国内段（商品订单）">
+              <el-option v-for="s in ORDER_STATUS" :key="s" :label="s" :value="s" />
+            </el-option-group>
+            <el-option-group label="国际段（集运订单）">
+              <el-option v-for="s in SHIPMENT_STATUS" :key="s" :label="s" :value="s" />
+            </el-option-group>
           </el-select>
           <el-select v-model="filters.platform_account" placeholder="账号昵称" clearable filterable style="width: 120px" @change="reload">
             <el-option v-for="a in accountOptions" :key="a" :label="a" :value="a" />
@@ -52,6 +59,17 @@
                 <span class="ship-meta">{{ j.date }} · 运费 {{ j.jpy_settled != null ? fmtJPY(j.jpy_settled) : '待定' }}</span>
               </div>
             </el-option>
+          </el-select>
+        </template>
+        <template #cell-status="{ row }">
+          <el-tooltip v-if="row.shipment_order_id" content="跟随所挂集运订单的状态；从集运单里释放后可改" placement="top">
+            <el-tag size="small" :style="statusStyle(row.effective_status)" class="st-inherit">
+              {{ row.effective_status }}
+            </el-tag>
+          </el-tooltip>
+          <el-select v-else :model-value="row.status" size="small" class="st-pick"
+                     @change="(v) => saveCell(row, 'status', v)">
+            <el-option v-for="o in ORDER_STATUS" :key="o" :label="o" :value="o" />
           </el-select>
         </template>
         <template #cell-items="{ row }">
@@ -93,7 +111,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Camera, Check } from '@element-plus/icons-vue'
 import { shipmentApi, ordersApi, tagsApi } from '@/api'
-import { ORDER_SOURCES, ORDER_STATUS, statusStyle } from '@/constants'
+import { ORDER_SOURCES, ORDER_STATUS, SHIPMENT_STATUS, statusStyle } from '@/constants'
 import { fmtJPY } from '@/utils/money'
 import { queueOrderWrite } from '@/utils/orderWrites'
 import { today } from '@/utils/datetime'
@@ -109,7 +127,9 @@ const columns = [
   { key: 'platform', label: '来源', type: 'tag', field: 'platform', width: COL_W, placeholder: '来源' },
   { key: 'title', label: '商品', type: 'text', long: true, width: COL_W },
   { key: 'items', label: '物品', readonly: true, width: COL_W, expand: true },
-  { key: 'status', label: '状态', type: 'select', options: ORDER_STATUS, width: COL_W, clearable: false },
+  // 状态列走自定义槽：挂着集运单时显示**继承来的**集运状态且不可改（改了也看不见效果，
+  // 实际会改到被遮住的国内段状态）。readonly 只是让 NotionTable 让位给槽，不代表不能编辑。
+  { key: 'status', label: '状态', readonly: true, width: COL_W },
   { key: 'shipment_order_id', label: '集运订单', readonly: true, width: COL_W, placeholder: '选择' },
   { key: 'jpy_settled', label: '结算（円）', format: 'jpy', readonly: true, width: COL_W },
   { key: 'jpy_override', label: '覆盖（円）', type: 'int', format: 'jpy', width: COL_W, placeholder: '实付日元' },
@@ -290,10 +310,10 @@ async function findByOrderNo(orderNo) {
   } catch (_) { return null }
 }
 
-// 交易状态生命周期序：只准前进（待付款→待发货→待收货→已入仓→集运中→已到达），不回退；
+// 国内段生命周期序：只准前进（待付款→待发货→待收货→已签收），不回退；国际段由集运单表达。
 // 退款/交易关闭是旁支终态、未知值同样取 -1。必须与后端 models/base.py 的 ORDER_STATUS_RANK 一致
-// ——集运页「内含快递」自动挂靠也按同一张表判定是否把订单推进到「集运中」。
-const STATUS_RANK = { 待付款: 0, 待发货: 1, 待收货: 2, 已入仓: 3, 集运中: 4, 已到达: 5 }
+// ——只管国内段；挂靠不再改状态（国际段由集运单表达，见后端 Order.effective_status）。
+const STATUS_RANK = { 待付款: 0, 待发货: 1, 待收货: 2, 已签收: 3 }
 function statusRank(s) { return STATUS_RANK[s] ?? -1 }
 
 // 这单还「没有真实价格」吗？= 物品全是系统占位(auto) 且合计为 0。
@@ -463,6 +483,8 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+.st-inherit { cursor: default; }
+.st-pick { width: 100%; }
 .pager { margin-top: 12px; justify-content: flex-end; }
 /* OCR 上传：工具栏里的点选按钮（拖拽走整窗覆盖层，这里只负责点击选图）。 */
 .ocr-up { display: inline-flex; }

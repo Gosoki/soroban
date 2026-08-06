@@ -46,19 +46,29 @@ def test_attach_and_detach(client):
 
 def test_manual_attach_does_not_touch_status(client):
     """点选挂靠 = 「打算放进这个包裹」，货未必已到集运仓 → 不推进状态。
-    与 /ocr-express（来自集运方装箱清单，推进到「集运中」）刻意不同，见 attach_order 文档串。"""
+    两条挂靠路径都不改状态：国际段由集运单表达，挂上自动跟随、释放自动回落。"""
     s = mk_ship(client, shipment_no="JF-ST1")
     o = mk_order(client, status="待收货")
     client.post(f"/api/shipment/{s['id']}/order/{o['id']}")
     assert client.get(f"/api/orders/{o['id']}").json()["status"] == "待收货"
 
 
-def test_detach_does_not_touch_status(client):
-    s = mk_ship(client, shipment_no="JF-ST2")
-    o = mk_order(client, status="集运中")
+def test_attach_inherits_status_and_detach_restores(client):
+    """订单只记国内段；挂上集运单后**显示**跟随那张单，释放后回落到自己的状态。
+
+    关键是挂靠期间 `status` 必须原样保留——曾经自动挂靠会把「集运中」写进 status，
+    那样一释放，回落到的就是被覆盖过的值，而不是真实的国内段状态。"""
+    s = mk_ship(client, shipment_no="JF-ST2")          # 新建集运单默认「打包中」
+    o = mk_order(client, status="已签收")
+
     client.post(f"/api/shipment/{s['id']}/order/{o['id']}")
+    got = client.get(f"/api/orders/{o['id']}").json()
+    assert got["status"] == "已签收", "挂靠不该动订单自己的国内段状态"
+    assert got["effective_status"] == "打包中", "挂靠后显示的应是集运单的状态"
+
     client.delete(f"/api/shipment/{s['id']}/order/{o['id']}")
-    assert client.get(f"/api/orders/{o['id']}").json()["status"] == "集运中"
+    got = client.get(f"/api/orders/{o['id']}").json()
+    assert got["status"] == got["effective_status"] == "已签收", "释放后应回落到自身状态"
 
 
 def test_attach_is_idempotent(client):
@@ -142,3 +152,55 @@ def test_money_recomputed_on_patch(client):
     r = client.patch(f"/api/shipment/{s['id']}", json={"version": s["version"], "fx_rate": "30"})
     assert r.json()["jpy_settled"] == 300
     assert Decimal(r.json()["price_cny"]) == Decimal("10.00")
+
+
+# --- 状态继承：订单只记国内段，国际段跟随所挂集运单 -------------------------------
+
+def test_status_filter_matches_what_is_displayed(client):
+    """筛选口径必须与显示口径一致。曾经的隐患：列表里显示的是集运单状态（继承来的），
+    筛选却按订单自身状态查——于是「界面上一排『已发出』，筛『已发出』一条也搜不到」。"""
+    s = mk_ship(client, shipment_no="JF-FLT1")
+    o = mk_order(client, status="已签收")
+    client.post(f"/api/shipment/{s['id']}/order/{o['id']}")
+    client.patch(f"/api/shipment/{s['id']}", json={
+        "version": client.get(f"/api/shipment/{s['id']}").json()["version"], "status": "已发出"})
+
+    hit = client.get("/api/orders", params={"status": "已发出", "limit": 200}).json()["items"]
+    assert any(x["id"] == o["id"] for x in hit), "按继承来的集运状态筛不到该订单"
+
+    miss = client.get("/api/orders", params={"status": "已签收", "limit": 200}).json()["items"]
+    assert all(x["id"] != o["id"] for x in miss), "挂靠中的订单不该再被自身国内段状态筛出来"
+
+
+def test_effective_status_falls_back_when_shipment_soft_deleted(client):
+    """集运单被软删后界面上已经看不见它了，再拿它的状态显示就是个查无此处的幽灵值。"""
+    s = mk_ship(client, shipment_no="JF-SD1")
+    o = mk_order(client, status="已签收")
+    client.post(f"/api/shipment/{s['id']}/order/{o['id']}")
+    client.delete(f"/api/shipment/{s['id']}")
+    assert client.get(f"/api/orders/{o['id']}").json()["effective_status"] == "已签收"
+
+
+def test_unattached_order_effective_status_equals_own(client):
+    o = mk_order(client, status="待收货")
+    got = client.get(f"/api/orders/{o['id']}").json()
+    assert got["status"] == got["effective_status"] == "待收货"
+
+
+def test_ocr_auto_attach_does_not_write_status():
+    """自动挂靠（「内含快递」截图）曾把「集运中」写进订单 status——那会污染国内段状态，
+    一旦释放，回落到的是被覆盖过的值。现在两条挂靠路径都只写外键、不动状态。"""
+    import inspect
+
+    from app.routers import shipment as mod
+
+    src = inspect.getsource(mod.ocr_attach_express)
+    assert '"status"' not in src and "OrderStatus" not in src, \
+        "自动挂靠又开始写订单状态了"
+
+
+def test_order_status_enum_is_domestic_only():
+    from app.models import OrderStatus
+
+    assert {s.value for s in OrderStatus} == {
+        "待付款", "待发货", "待收货", "已签收", "退款", "交易关闭"}

@@ -82,7 +82,17 @@ def list_orders(
     if date_to:
         conds.append(Order.date <= date_to)
     if status:
-        conds.append(Order.status == status)
+        # 筛选口径必须与**显示**口径一致（effective_status）：显示的是集运单状态、
+        # 筛选却按订单自身状态，就会出现「列表里明明显示着一堆『已发出』，
+        # 筛『已发出』却一条都搜不到」。用相关子查询而非 JOIN——不改变结果行的形状，
+        # 也就不会影响上面那句 count 与下面的分页。
+        ship_status = (
+            select(ShipmentOrder.status)
+            .where(ShipmentOrder.id == Order.shipment_order_id,
+                   ShipmentOrder.is_delete.is_(False))
+            .scalar_subquery()
+        )
+        conds.append(func.coalesce(ship_status, Order.status) == status)
     if platform:
         conds.append(Order.platform == platform)
     if platform_account:
@@ -107,7 +117,9 @@ def list_orders(
     rows = session.exec(
         select(Order)
         .where(*conds)
-        .options(selectinload(Order.items))   # OrderRead 带 items：一次取回整页，避免每单懒加载(N+1)
+        # 两个关系都预加载：items 供 OrderRead 展开，shipment_order 供 effective_status。
+        # 少一个都会变成整页逐行发 SQL（N+1）——tests/test_queries.py 钉着查询条数。
+        .options(selectinload(Order.items), selectinload(Order.shipment_order))
         .order_by(Order.date.desc(), Order.id.desc())
         .offset(offset)
         .limit(limit)

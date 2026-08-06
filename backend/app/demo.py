@@ -52,7 +52,7 @@ def main() -> None:
 
         # —— 集运订单 ——
         jf1 = ShipmentOrder(date=D(2026, 6, 5), shipment_no="JF-2606A", weight=Decimal("4.5"),
-                           intl_tracking_no="LP00612345678", status="已入仓",
+                           intl_tracking_no="LP00612345678", status="已签收",
                            price_cny=Decimal("180"), fx_rate=Decimal("20.5"), special_fee_jpy=1200,
                            note="含关税消费税", recipient="本人")
         jf2 = ShipmentOrder(date=D(2026, 6, 20), shipment_no="JF-2606B", weight=Decimal("2.1"),
@@ -69,13 +69,13 @@ def main() -> None:
         # —— 商品订单（date, order_no, title, account, express, price, rate, status, jf, items, override）——
         orders = [
             dict(date=D(2026, 5, 28), order_no="TB250528001", title="谷子屋", platform_account="acctA",
-                 express_no="SF1001", price_cny="320", fx_rate="20.5", status="已入仓", jf=jf1.id,
+                 express_no="SF1001", price_cny="320", fx_rate="20.5", status="已签收", jf=jf1.id,
                  items=[("初音未来 手办", 1)]),
             dict(date=D(2026, 5, 30), order_no="TB250530007", title="万代官方旗舰店", platform_account="acctA",
-                 express_no="SF1002", price_cny="460", fx_rate="20.5", status="已入仓", jf=jf1.id,
+                 express_no="SF1002", price_cny="460", fx_rate="20.5", status="已签收", jf=jf1.id,
                  items=[("MG 高达模型", 2)]),
             dict(date=D(2026, 6, 2), order_no="TB250602013", title="痛包周边专营", platform_account="acctA",
-                 express_no="YT2003", price_cny="88", fx_rate="20.8", status="已入仓", jf=jf1.id,
+                 express_no="YT2003", price_cny="88", fx_rate="20.8", status="已签收", jf=jf1.id,
                  items=[("亚克力立牌", 3), ("金属徽章", 5)]),
             dict(date=D(2026, 6, 18), order_no="TB250618022", title="二次元周边店", platform_account="acctB",
                  express_no="ZT3004", price_cny="55", fx_rate="21", status="待收货", jf=jf2.id,
@@ -131,7 +131,7 @@ def main() -> None:
                  price_cny="45", order_date=D(2026, 7, 8), items=[("色纸", 2), ("明信片套装", 1)]),
             dict(order_no="TB250708090", platform_account="acctA", title="手办工房", trade_status="待收货",
                  price_cny="150", order_date=D(2026, 7, 8), items=[("景品公仔", 1)]),
-            dict(order_no="TB250707100", platform_account="acctB", title="日用百货", trade_status="已入仓",
+            dict(order_no="TB250707100", platform_account="acctB", title="日用百货", trade_status="已签收",
                  price_cny="39", order_date=D(2026, 7, 7), items=[("洗发水(非集运)", 1)]),
             dict(order_no="TB250709110", platform_account="acctA", title="画集屋", trade_status="待付款",
                  price_cny="78", order_date=D(2026, 7, 9), items=[("设定集", 1), ("A3 海报", 2)]),

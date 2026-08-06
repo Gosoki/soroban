@@ -78,19 +78,25 @@ def test_order_and_shipment_status_literals_are_disjoint():
     assert not (order & shipment), f"两个状态枚举又有了同名值：{sorted(order & shipment)}"
 
 
-def test_order_status_uses_warehoused_not_received():
-    """订单的这一步是「国内快递**被集运仓**签收」，叫「已入仓」比「已签收」准确，
-    也避开与集运单「已签收」（国际包裹**本人**收到）的碰撞。"""
-    assert OrderStatus.warehoused.value == "已入仓"
-    assert "已签收" not in {s.value for s in OrderStatus}
-    assert ShipmentStatus.received.value == "已签收"
+def test_two_legs_use_distinct_words():
+    """两段各用各的词，且不重名：
+      · 订单（国内段）：快递签收 = 「已签收」，就是淘宝/闲鱼页面的「交易成功」
+      · 集运单（国际段）：包裹到本人手上 = 「已送达」
+    曾经两边都叫「已签收」，而 EXCLUDED_STATUSES 这类集合同时作用于两张表——
+    同字面量意味着「改一个枚举会静默影响另一张表的过滤」。"""
+    assert OrderStatus.signed.value == "已签收"
+    assert ShipmentStatus.delivered.value == "已送达"
+    assert "已入仓" not in {s.value for s in OrderStatus}, "已入仓 已取消，别再冒出来"
+    assert "已签收" not in {s.value for s in ShipmentStatus}
 
 
 def test_status_enum_attribute_names_do_not_collide_confusingly():
-    """`OrderStatus.arrived`（已到达）与旧的 `ShipmentStatus.arrived`（已签收）同名不同义，
-    写 `Status.arrived` 时得先想清楚是哪个枚举。现在集运侧叫 received。"""
+    """属性名也不许跨枚举撞：曾经两边都有 `arrived`，写 `Status.arrived` 得先想清楚是哪个枚举。
+    现在订单侧只到 signed（已签收，国内段终点），集运侧 delivered（已送达）。"""
     assert not hasattr(ShipmentStatus, "arrived")
-    assert OrderStatus.arrived.value == "已到达"
+    assert not hasattr(ShipmentStatus, "signed")
+    assert not hasattr(OrderStatus, "delivered")
+    assert not hasattr(OrderStatus, "consolidating"), "国际段状态不该回到订单枚举里"
 
 
 def test_staging_status_enum_untouched():
@@ -142,9 +148,10 @@ def test_scraper_pushes_current_field_names():
     assert '"shop"' not in text and '"order_status"' not in text
 
 
-def test_frontend_order_status_matches_backend_after_rename():
-    """改状态字面量最容易漏前端。test_consistency.py 已全面比对，这里只钉住「已入仓」这一条。"""
+def test_frontend_status_words_match_backend():
+    """改状态字面量最容易漏前端。test_consistency.py 已全面比对，这里钉住这两个词。"""
     js = (_REPO / "frontend" / "src" / "constants.js").read_text(encoding="utf-8")
-    assert "'已入仓'" in js
+    assert "'已签收'" in js and "'已送达'" in js
+    assert "'已入仓'" not in js, "前端还留着已取消的「已入仓」"
     orders_vue = (_REPO / "frontend" / "src" / "views" / "Orders" / "index.vue").read_text(encoding="utf-8")
-    assert "已入仓: 3" in orders_vue, "Orders 页的 STATUS_RANK 没跟着改"
+    assert "已签收: 3" in orders_vue, "Orders 页的 STATUS_RANK 没跟着改"

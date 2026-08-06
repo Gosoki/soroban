@@ -1,18 +1,20 @@
 // 状态枚举（必须与后端 models/base.py 的枚举值一致）
-// 商品订单生命周期：待付款→待发货→待收货→已入仓（国内快递到集运仓）→集运中→已到达；
+// 商品订单只记**国内段**：待付款→待发货→待收货→已签收（国内快递签收）。
+// 国际段（集运中/送达）不在这里——挂上集运单后界面显示的是那张单的状态（后端算好的 effective_status），
+// 释放出来则回落到订单自己的状态。同一件事只有一处记录，不会两边打架。
 // 退款 / 交易关闭是旁支终态。顺序与后端 ORDER_STATUS_RANK 一致（见 Orders 页 STATUS_RANK）。
-export const ORDER_STATUS = ['待付款', '待发货', '待收货', '已入仓', '集运中', '已到达', '退款', '交易关闭']
-export const SHIPMENT_STATUS = ['打包中', '已发出', '已签收', '已取消']
+export const ORDER_STATUS = ['待付款', '待发货', '待收货', '已签收', '退款', '交易关闭']
+export const SHIPMENT_STATUS = ['打包中', '已发出', '已送达', '已取消']
 export const STAGING_STATUS = ['待处理', '已导入', '已忽略']   // 暂存导入工作流状态
 export const ORDER_SOURCES = ['闲鱼', '淘宝', '京东', '拼多多', '其他']   // 订单来源平台（OCR 可自动识别）
 
-// 订单的「已入仓」= 国内快递被集运仓签收；集运单的「已签收」= 国际包裹本人收到。
+// 订单的「已签收」= 国内快递签收（淘宝「交易成功」）；集运单的「已送达」= 国际包裹到本人手上。
 // 两者曾是同一个字面量（跨表集合共用时是实打实的坑），现已拆开，各占一个条目。
 function statusTagType(s) {   // 内部用：语义色映射，对外走 statusStyle
   return {
     待付款: 'info', 待发货: 'primary', 待收货: 'warning',
-    已入仓: 'success', 集运中: 'primary', 已到达: 'success',
-    已签收: 'success',   // 集运单：国际包裹本人签收
+    已签收: 'success',
+    已送达: 'success',   // 集运单：国际包裹送到本人手上
     退款: 'danger', 交易关闭: 'info',
     打包中: 'warning', 已发出: 'primary', 已取消: 'info',
     闲鱼: 'warning', 淘宝: 'primary', 京东: 'danger',

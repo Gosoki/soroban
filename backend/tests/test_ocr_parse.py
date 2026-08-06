@@ -100,7 +100,7 @@ def test_parse_order_fields_empty():
 
 
 def test_detect_status_lifecycle():
-    assert ocr._detect_status("交易成功", False) == "已入仓"
+    assert ocr._detect_status("交易成功", False) == "已签收"   # 闲鱼「交易成功」= 国内快递签收
     assert ocr._detect_status("交易关闭", False) == "交易关闭"
     assert ocr._detect_status("等待卖家发货", False) == "待发货"
     assert ocr._detect_status("卖家已发货", False) == "待收货"

@@ -331,7 +331,10 @@ class OrderRead(MoneyOut):
     title: Optional[str] = None
     url: Optional[str] = None
     category: Optional[str] = None
-    status: str
+    status: str                     # 订单自己的**国内段**状态（挂靠期间也原样保留）
+    # 界面该显示的状态：挂着集运单就是那张单的状态，否则等于 status。
+    # 由后端算而不是前端拼：筛选、排序、导出都要用同一个口径，算两遍必然对不上。
+    effective_status: str
     platform: Optional[str] = None
     express_no: Optional[str] = None
     express_company: Optional[str] = None

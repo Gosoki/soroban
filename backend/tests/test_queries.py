@@ -81,7 +81,10 @@ def test_orders_list_is_not_n_plus_1(client):
         client.get("/api/orders", params={"limit": 1})
     with count_queries() as b:
         client.get("/api/orders", params={"limit": 100})
-    assert b["n"] <= a["n"], (
+    # 判据是「**不随行数增长**」，不是「一条都不能多」：selectinload 每个关系最多多发
+    # **一条**批量查询（items 一条、shipment_order 一条），且只在该页真有相关行时才发——
+    # 所以 1 行页与 100 行页之间存在最多 2 条的常数差。真的 N+1 会是 ~100 条，不会混淆。
+    assert b["n"] <= a["n"] + 2, (
         f"订单列表查询数随行数增长（1 行 {a['n']} 条 → 100 行 {b['n']} 条）\n"
         + "\n".join(b["sql"])
     )

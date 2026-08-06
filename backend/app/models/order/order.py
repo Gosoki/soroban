@@ -58,6 +58,28 @@ class Order(LedgerBase, table=True):
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
 
+    @property
+    def effective_status(self) -> str:
+        """界面上该显示的状态：**挂着集运单就跟随集运单，否则用自己的**。
+
+        `status` 只记国内段（下单→国内快递签收），国际段的唯一真相是集运单的 `status`。
+        订单不复制它——复制就会漂移，本项目就漂过：7 条订单标「集运中」，它们挂的那张
+        集运单标「已发出」，同一件事两处记录对不上。
+
+        释放（解除挂靠）后自动回落到 `status`，因为国内段状态一直原样留在库里、从没被覆盖。
+        正因如此，**挂靠时绝不能把集运状态写进 `status`**（旧的 OCR 自动挂靠干过这事，已改）。
+
+        集运单被软删时也回落到自身状态：那张单在界面上已经看不见了，
+        再拿它的状态显示会是个查无此处的幽灵值。
+
+        ⚠️ 读它会触碰 `shipment_order` 关系。列表接口必须 `selectinload(Order.shipment_order)`，
+        否则整页逐行懒加载 = N+1（tests/test_queries.py 钉着这条）。
+        """
+        ship = self.shipment_order
+        if ship is not None and not ship.is_delete:
+            return ship.status
+        return self.status
+
     def sync_from_items(self) -> None:
         """订单价 = Σ(物品单价×数量) + 邮费，再重算日元。改动 items/邮费 后必须调用。"""
         self.price_cny = price_from_items(self.items) + (self.postage_cny or 0)
