@@ -78,7 +78,7 @@ import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Plus } from '@element-plus/icons-vue'
 import { stagingApi, tagsApi } from '@/api'
-import { ORDER_SOURCES, STAGING_STATUS, ORDER_STATUS, stagingStyle } from '@/constants'
+import { ORDER_SOURCES, PRICE_HELP, STAGING_STATUS, ORDER_STATUS, stagingStyle } from '@/constants'
 import { fmtDate } from '@/utils/datetime'
 import NotionTable from '@/components/NotionTable.vue'
 
@@ -89,7 +89,7 @@ const columns = [
   { key: 'platform_account', label: '账号昵称', type: 'tag', field: 'platform_account', width: COL_W },
   { key: 'platform', label: '来源', type: 'tag', field: 'platform', width: COL_W, placeholder: '来源' },
   { key: 'title', label: '商品', type: 'text', long: true, width: COL_W },   // 标题长：点开弹宽框看全
-  { key: 'price_cny', label: '人民币（元）', format: 'cny', readonly: true, width: COL_W },   // 由物品单价×数量派生
+  { key: 'price_cny', label: '人民币（元）', format: 'cny', readonly: true, width: COL_W, help: PRICE_HELP },   // 由物品单价×数量派生
   { key: 'trade_status', label: '交易状态', type: 'select', options: ORDER_STATUS, width: COL_W },
   { key: 'items', label: '物品', readonly: true, width: COL_W, expand: true },
   { key: 'order_no', label: '订单号', type: 'text', width: COL_W, placeholder: '订单号' },

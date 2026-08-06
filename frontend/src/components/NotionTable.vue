@@ -23,6 +23,18 @@
                 @dragleave="onDragLeave(col)" @drop="onDrop(col)" @dragend="onDragEnd">
               <div class="gtn-th-inner">
                 <span class="gtn-col-name">{{ col.label }}</span>
+                <!-- 列级说明：任何列声明 help 就长出一个「?」，点开显示。给「口径不直观」的列用
+                     （如派生金额为什么和平台显示差几分），免得靠用户去翻文档或猜。 -->
+                <el-popover v-if="col.help" trigger="click" :width="340" placement="bottom-start">
+                  <template #reference>
+                    <el-icon class="gtn-help" title="说明" @click.stop @mousedown.stop
+                             @dragstart.prevent.stop><QuestionFilled /></el-icon>
+                  </template>
+                  <div class="gtn-help-body" @mousedown.stop @click.stop>
+                    <div class="gtn-help-title">{{ col.label }}</div>
+                    <div class="gtn-help-text">{{ col.help }}</div>
+                  </div>
+                </el-popover>
                 <el-popover v-if="col.type === 'tag'" trigger="click" :width="260" placement="bottom-start" @show="onTagShow(col.field)">
                   <template #reference>
                     <el-icon class="gtn-tagcfg" title="管理标签" @click.stop @mousedown.stop @dragstart.prevent.stop><Setting /></el-icon>
@@ -113,7 +125,7 @@
 <script setup>
 import { computed, onMounted, reactive, ref, useSlots, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowRight, Brush, Check, Delete, Edit, Plus, Setting } from '@element-plus/icons-vue'
+import { ArrowRight, Brush, Check, Delete, Edit, Plus, QuestionFilled, Setting } from '@element-plus/icons-vue'
 import GotionCell from './GotionCell.vue'
 import { layoutApi, tagsApi } from '@/api'
 import { TAG_PALETTE, tagStyleAt } from '@/constants'
@@ -375,6 +387,10 @@ function stopResize() {
 .gtn-new-ph { height: 36px; padding: 0 8px; display: flex; align-items: center; color: #5b6880; font-size: 13px; }
 
 .gtn-tagcfg { margin-left: 4px; color: #6b7a93; cursor: pointer; font-size: 13px; }
+.gtn-help { margin-left: 4px; color: #909399; cursor: help; font-size: 13px; }
+.gtn-help:hover { color: var(--el-color-primary); }
+.gtn-help-title { font-weight: 600; margin-bottom: 6px; }
+.gtn-help-text { font-size: 12px; line-height: 1.75; color: var(--el-text-color-regular); white-space: pre-line; }
 .gtn-tagcfg:hover { color: #67c23a; }
 .gtn-tagmgr-title { color: #9ba8bf; font-size: 12px; margin-bottom: 8px; }
 .gtn-tag-list { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }

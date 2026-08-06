@@ -110,3 +110,31 @@ def test_frontend_api_paths_exist_in_backend():
         if not any(m == method.upper() and rx.match(path) for m, rx in routes):
             missing.append(f"{method.upper()} {path}")
     assert not missing, f"前端调用了后端没有的接口：{missing}"
+
+
+# --- 列头说明（NotionTable 的 col.help）---------------------------------------
+
+def test_price_help_is_shared_not_duplicated():
+    """「人民币（元）」的口径说明同时出现在订单页与暂存页。必须共用 constants.js 的
+    PRICE_HELP，不许各页抄一份——同一个解释抄两遍，改一处忘一处就会自相矛盾。"""
+    root = _REPO / "frontend" / "src"
+    assert "export const PRICE_HELP" in (root / "constants.js").read_text(encoding="utf-8")
+    for page in ("Orders", "Staging"):
+        src = (root / "views" / page / "index.vue").read_text(encoding="utf-8")
+        assert "help: PRICE_HELP" in src, f"{page} 页的人民币列没挂说明"
+        assert "PRICE_HELP" in src.split("from '@/constants'")[0], f"{page} 页没 import PRICE_HELP"
+
+
+def test_price_help_explains_the_known_rounding_gap():
+    """这条说明的存在意义就是解释「为什么和淘宝实付差几分」。
+    真把内容改没了，用户点开「?」会看到一段答非所问的话。"""
+    js = (_REPO / "frontend" / "src" / "constants.js").read_text(encoding="utf-8")
+    body = js.split("export const PRICE_HELP")[1]
+    for kw in ("单价", "数量", "邮费", "四舍五入", "误差"):
+        assert kw in body, f"人民币列说明里缺少「{kw}」"
+
+
+def test_notion_table_supports_column_help():
+    """col.help 是通用能力（任何口径不直观的列都能用），不是给某一列写死的。"""
+    src = (_REPO / "frontend" / "src" / "components" / "NotionTable.vue").read_text(encoding="utf-8")
+    assert 'v-if="col.help"' in src and "QuestionFilled" in src

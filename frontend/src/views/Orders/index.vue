@@ -111,7 +111,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Camera, Check } from '@element-plus/icons-vue'
 import { shipmentApi, ordersApi, tagsApi } from '@/api'
-import { ORDER_SOURCES, ORDER_STATUS, SHIPMENT_STATUS, statusStyle } from '@/constants'
+import { ORDER_SOURCES, ORDER_STATUS, PRICE_HELP, SHIPMENT_STATUS, statusStyle } from '@/constants'
 import { fmtJPY } from '@/utils/money'
 import { queueOrderWrite } from '@/utils/orderWrites'
 import { today } from '@/utils/datetime'
@@ -133,7 +133,8 @@ const columns = [
   { key: 'shipment_order_id', label: '集运订单', readonly: true, width: COL_W, placeholder: '选择' },
   { key: 'jpy_settled', label: '结算（円）', format: 'jpy', readonly: true, width: COL_W },
   { key: 'jpy_override', label: '覆盖（円）', type: 'int', format: 'jpy', width: COL_W, placeholder: '实付日元' },
-  { key: 'price_cny', label: '人民币（元）', format: 'cny', readonly: true, width: COL_W },   // 由物品单价×数量派生，改价走展开面板
+  // help：口径 + 「为什么和淘宝实付差几分」，表头点「?」可见（见 docs/README.md 第五十三版）
+  { key: 'price_cny', label: '人民币（元）', format: 'cny', readonly: true, width: COL_W, help: PRICE_HELP },   // 由物品单价×数量派生，改价走展开面板
   { key: 'fx_rate', label: '汇率', type: 'decimal', width: COL_W, placeholder: '当天汇率' },
   { key: 'express_company', label: '快递公司', type: 'text', width: COL_W, placeholder: '快递公司' },
   { key: 'express_no', label: '快递号', type: 'text', width: COL_W, placeholder: '快递号' },
