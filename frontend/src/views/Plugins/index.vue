@@ -12,14 +12,35 @@
         <div class="head">
           <span class="pname">{{ p.name }}</span>
           <span class="pver">v{{ p.version || '?' }}</span>
-          <el-tag size="small" :style="typeStyle(p.installed ? 'success' : 'danger')">
-            {{ p.installed ? '已安装' : '未安装(缺 venv)' }}
+          <el-tag size="small" :style="typeStyle(installTagType(p))">
+            {{ installTagText(p) }}
           </el-tag>
           <div class="grow" />
           <span class="sw-label">启用定时</span>
           <el-switch v-model="p._form.enabled" :disabled="!p.installed" @change="saveConfig(p)" />
         </div>
       </template>
+
+      <!-- 缺依赖：说清缺什么 + 一键补齐。不列出来的话，用户只看到一片灰按钮而无从下手 -->
+      <el-alert v-if="p.needs && p.needs.length" type="warning" :closable="false" class="needs">
+        <template #title>
+          <span v-if="p.install && p.install.running">正在安装：{{ p.install.step }}…</span>
+          <span v-else>插件还缺以下依赖，装好后才能添加账号与抓取</span>
+        </template>
+        <ul class="needlist">
+          <li v-for="n in p.needs" :key="n.key"><b>{{ n.label }}</b> —— {{ n.hint }}</li>
+        </ul>
+        <div class="needact">
+          <el-button type="primary" size="small" :loading="!!(p.install && p.install.running)"
+                     @click="doInstall(p)">
+            {{ p.install && p.install.running ? '安装中…' : '一键安装' }}
+          </el-button>
+          <el-checkbox v-model="p._withBrowser" :disabled="!!(p.install && p.install.running)" size="small">
+            一并下载浏览器内核（约 150MB，仅首次）
+          </el-checkbox>
+        </div>
+        <div v-if="p.install && p.install.error" class="neederr">{{ p.install.error }}</div>
+      </el-alert>
 
       <!-- 插件设置：定时抓取 -->
       <div class="field">
@@ -86,7 +107,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Download } from '@element-plus/icons-vue'
 import { pluginsApi, tagsApi } from '@/api'
@@ -108,15 +129,70 @@ async function load() {
   loading.value = true
   try {
     const list = await pluginsApi.list()
+    const prev = Object.fromEntries(plugins.value.map((x) => [x.id, x]))
     plugins.value = list.map((p) => ({
       ...p, _busy: false,
+      // 刷新时保留用户勾过的选项，别让轮询把复选框弹回默认
+      _withBrowser: prev[p.id]?._withBrowser ?? true,
       _form: { enabled: p.config.enabled, schedule_minutes: p.config.schedule_minutes || 0 },
       _add: { name: '', platform: '淘宝' },
     }))
+    // 有安装在跑就继续盯着，装完自动刷新（按钮解禁、缺依赖提示消失）
+    if (list.some((p) => p.install && p.install.running)) scheduleInstallPoll()
     try { platformTags.value = await tagsApi.list('platform') } catch (_) { /* 无所谓，下拉可自建 */ }
   } catch (_) { /* 拦截器已提示 */ } finally {
     loading.value = false
   }
+}
+
+// --- 依赖安装 ---------------------------------------------------------------
+
+function installTagType(p) {
+  if (p.install && p.install.running) return 'warning'
+  return p.installed ? 'success' : 'danger'
+}
+function installTagText(p) {
+  if (p.install && p.install.running) return '安装中…'
+  if (p.installed) return '已就绪'
+  const n = (p.needs || []).length
+  return n ? `缺 ${n} 项依赖` : '未就绪'
+}
+
+let installTimer = null
+function scheduleInstallPoll() {
+  if (installTimer) return                    // 单例：多张卡同时装也只有一个轮询
+  installTimer = setInterval(async () => {
+    try {
+      const list = await pluginsApi.list()
+      if (!list.some((p) => p.install && p.install.running)) {
+        clearInterval(installTimer); installTimer = null
+        await load()                          // 装完整体刷新一次，状态与按钮一起就位
+        return
+      }
+      // 安装中只更新进度字段，不整体替换 —— 否则用户正在输入的账号名会被冲掉
+      for (const fresh of list) {
+        const cur = plugins.value.find((x) => x.id === fresh.id)
+        if (cur) { cur.install = fresh.install; cur.needs = fresh.needs; cur.installed = fresh.installed }
+      }
+    } catch (_) { clearInterval(installTimer); installTimer = null }
+  }, 2000)
+}
+onBeforeUnmount(() => { if (installTimer) { clearInterval(installTimer); installTimer = null } })
+
+async function doInstall(p) {
+  const browserPart = p._withBrowser ? '，并下载 Playwright 浏览器内核（约 150MB）' : ''
+  try {
+    await ElMessageBox.confirm(
+      `将为插件【${p.name}】建立独立 Python 环境并从 PyPI 安装依赖${browserPart}。`
+      + '这一步需要联网，可能持续几分钟。确认继续？',
+      '安装插件依赖', { type: 'warning', confirmButtonText: '开始安装', cancelButtonText: '取消' },
+    )
+  } catch (_) { return }
+  try {
+    await pluginsApi.install(p.id, p._withBrowser)
+    p.install = { running: true, step: '准备', error: null }
+    scheduleInstallPoll()
+  } catch (_) { /* 拦截器已提示 */ }
 }
 
 async function saveConfig(p) {
@@ -261,6 +337,10 @@ onMounted(load)
 </script>
 
 <style scoped>
+.needs { margin-bottom: 12px; }
+.needlist { margin: 6px 0 0; padding-left: 18px; font-size: 12px; line-height: 1.7; }
+.needact { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+.neederr { margin-top: 8px; font-size: 12px; color: var(--el-color-danger); white-space: pre-wrap; word-break: break-all; }
 .bar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
 .hint { color: #7d8aa3; font-size: 12px; flex: 1; }
 .plugin { margin-bottom: 16px; }

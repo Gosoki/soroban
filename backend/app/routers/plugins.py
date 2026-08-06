@@ -10,10 +10,12 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
 import threading
+import time
 import tomllib
 from pathlib import Path
 from typing import Optional
@@ -208,7 +210,115 @@ def _rename_state(manifest: dict, old: str, new: str) -> bool:
 
 
 def _python(manifest: dict) -> Path:
-    return manifest["_dir"] / manifest.get("python", ".venv/bin/python")
+    p = manifest["_dir"] / manifest.get("python", ".venv/bin/python")
+    if not p.exists() and os.name == "nt":          # Windows 的 venv 是 Scripts/python.exe
+        alt = manifest["_dir"] / ".venv" / "Scripts" / "python.exe"
+        if alt.exists():
+            return alt
+    return p
+
+
+_needs_cache: dict[str, tuple[float, list[dict]]] = {}
+_NEEDS_TTL = 60.0                                    # 秒
+
+
+def needs(manifest: dict) -> list[dict]:
+    """`_needs` 的带缓存版本。
+
+    必须缓存：探测依赖要在**插件自己的解释器**里 `import`（每个模块一次子进程）再问一次
+    Playwright 浏览器路径。而 GET /api/plugins 是前端**轮询**的接口——不缓存的话，每次轮询
+    都要 spawn 三四个进程，装依赖时前端还在秒级轮询，直接把机器拖垮。
+    安装结束会显式失效（见 _install_worker），所以不会拿着过期结论不放。"""
+    key = manifest["id"]
+    hit = _needs_cache.get(key)
+    now = time.monotonic()
+    if hit and now - hit[0] < _NEEDS_TTL:
+        return hit[1]
+    val = _needs(manifest)
+    _needs_cache[key] = (now, val)
+    return val
+
+
+def _needs(manifest: dict) -> list[dict]:
+    """插件还缺哪些依赖。返回 [{key, label, hint}]；空列表 = 可以用了。
+
+    分三档而不是笼统一句「未安装」：三者的补法完全不同（建 venv / 装 pip 包 / 下浏览器），
+    用户看到「缺什么」才知道点下去会发生什么，也才看得懂失败在哪一步。
+    """
+    d, out = manifest["_dir"], []
+    py = _python(manifest)
+    # 判据是「解释器能跑」而不是「文件存在」：venv 建到一半失败（例如系统缺 ensurepip）时，
+    # bin/python 这个符号链接**已经在了**，只看存在与否会把半成品当成装好了，
+    # 于是前端不提示重建 venv，却在下一步莫名其妙地报缺依赖。
+    if not py.exists() or not _runs(py):
+        out.append({"key": "venv", "label": "Python 环境（venv）",
+                    "hint": "插件用独立 venv 隔离重依赖；现在没有或已损坏，需要（重新）建立"})
+        return out                                   # venv 都不能用，后两项无从谈起
+    req = d / "requirements.txt"
+    if req.exists():
+        missing = [m for m in _declared_modules(req) if not _importable(py, m)]
+        if missing:
+            out.append({"key": "deps", "label": "Python 依赖",
+                        "hint": "缺少：" + "、".join(missing)})
+    if _wants_browser(d) and not _browser_ready(py):
+        out.append({"key": "browser", "label": "浏览器内核（Chromium）",
+                    "hint": "Playwright 需要一份自带的 Chromium（约 150MB），系统装的浏览器不算"})
+    return out
+
+
+def _declared_modules(req: Path) -> list[str]:
+    """requirements.txt 的行 → 可 import 的模块名。只做最直白的解析，够本项目用。"""
+    mods = []
+    for line in req.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", "-")):
+            continue
+        name = re.split(r"[<>=!~\[; ]", line, maxsplit=1)[0].strip()
+        if name:
+            mods.append(name.replace("-", "_"))
+    return mods
+
+
+def _runs(py: Path) -> bool:
+    """这个解释器能不能真跑起来（区分「文件在」与「venv 可用」）。"""
+    try:
+        return subprocess.run([str(py), "-c", "pass"], capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _has_pip(py: Path) -> bool:
+    try:
+        return subprocess.run([str(py), "-m", "pip", "--version"],
+                              capture_output=True, timeout=60).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _importable(py: Path, module: str) -> bool:
+    """在**插件自己的解释器**里试 import。不能用 soroban 的解释器判断——两个环境是隔离的。"""
+    try:
+        return subprocess.run([str(py), "-c", f"import {module}"],
+                              capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _wants_browser(d: Path) -> bool:
+    req = d / "requirements.txt"
+    return req.exists() and "playwright" in req.read_text(encoding="utf-8").lower()
+
+
+def _browser_ready(py: Path) -> bool:
+    """Playwright 的 Chromium 是否已下载。问 playwright 自己要路径，别猜缓存目录
+    （它随 PLAYWRIGHT_BROWSERS_PATH / 平台 / 版本变）。"""
+    code = ("from playwright.sync_api import sync_playwright\n"
+            "import os,sys\n"
+            "with sync_playwright() as p: sys.exit(0 if os.path.exists(p.chromium.executable_path) else 1)")
+    try:
+        return subprocess.run([str(py), "-c", code], capture_output=True, timeout=60).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _reap(proc: subprocess.Popen, label: str) -> None:
@@ -258,14 +368,119 @@ def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str]
     return proc.pid
 
 
+# --- 安装（建 venv / 装依赖 / 下浏览器）-------------------------------------------
+# 为什么要有：插件自带独立 venv（plugin.toml 的 python 字段），但建它一直得用户自己开终端。
+# 结果就是「把插件放进目录 → 面板上全是灰按钮 → 只写着『未安装(缺 venv)』」，没有下一步。
+# 安装是**长任务且要联网**（pip 拉包、playwright 下 ~150MB 浏览器），所以后台跑 + 轮询状态，
+# 绝不能卡住 HTTP 请求。
+
+_install_state: dict[str, dict] = {}                 # plugin_id → {running, step, log, error, done_at}
+_install_lock = threading.Lock()
+
+
+def _venv_cmd(d: Path) -> list[str]:
+    """建插件 venv 的命令。用 soroban 自己的解释器建——它一定存在、且与插件同机同 Python 系列。
+
+    先试标准方式，让 venv 自带 pip（用户后续想手工 pip install 什么也方便）。
+    只有当这台机器的 ensurepip 不可用时才退到 `--without-pip`——Debian/Ubuntu 上
+    「装了 python3 却没装 python3-venv」很常见，标准 venv 会建到一半失败并留下半成品。
+    没有 pip 也不影响安装：_pip_cmd 会借 soroban 的 pip 用 `--python` 装进去（pip 23.1+）。
+    """
+    base = [sys.executable, "-m", "venv", str(d / ".venv")]
+    try:
+        if subprocess.run([sys.executable, "-c", "import ensurepip"],
+                          capture_output=True, timeout=30).returncode == 0:
+            return base
+    except (OSError, subprocess.SubprocessError):
+        pass
+    log.info("本机 ensurepip 不可用，插件 venv 改用 --without-pip 建立")
+    return [*base[:-1], "--without-pip", base[-1]]
+
+
+def _pip_cmd(target_py: Path, args: list[str]) -> list[str]:
+    """往目标 venv 装包的命令。
+
+    优先用它**自己的** pip；没有（我们刻意用 --without-pip 建的）就借 soroban 的 pip、
+    用 `--python` 指过去（pip 23.1+ 支持，实测装进去后目标 venv 能正常 import）。
+    这样即便系统 python3-venv 不完整，安装依然能走完，不必要求用户先 apt install。"""
+    if _has_pip(target_py):
+        return [str(target_py), "-m", "pip", "install", *args]
+    return [sys.executable, "-m", "pip", "--python", str(target_py), "install", *args]
+
+
+def _install_worker(manifest: dict, with_browser: bool) -> None:
+    """按 venv → pip → 浏览器 的顺序装，每步失败即停并把 stderr 尾巴留给前端。"""
+    pid, d = manifest["id"], manifest["_dir"]
+    req = d / "requirements.txt"
+    # 每步的命令**延迟到执行时才拼**：建完 venv 之后解释器路径才存在，而它在 Windows 上是
+    # Scripts/python.exe、在 POSIX 上是 bin/python——提前拼好会在 Windows 上指向不存在的路径。
+    steps: list[tuple[str, callable]] = []
+    py0 = _python(manifest)
+    if not py0.exists() or not _runs(py0):
+        steps.append(("建立 Python 环境", lambda: _venv_cmd(d)))
+    if req.exists():
+        steps.append(("安装 Python 依赖", lambda: _pip_cmd(_python(manifest), ["-q", "-r", str(req)])))
+    if with_browser and _wants_browser(d):
+        steps.append(("下载浏览器内核",
+                      lambda: [str(_python(manifest)), "-m", "playwright", "install", "chromium"]))
+
+    def fail(msg: str) -> None:
+        with _install_lock:
+            _install_state[pid].update(running=False, error=msg)
+        _needs_cache.pop(pid, None)
+        log.warning("插件 %s 安装失败：%s", pid, msg)
+
+    for label, build in steps:
+        with _install_lock:
+            _install_state[pid]["step"] = label
+        log.info("插件 %s 安装：%s", pid, label)
+        try:
+            r = subprocess.run(build(), cwd=str(d), capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=1800)
+        except Exception as e:                       # noqa: BLE001
+            return fail(f"{label}失败：{e}")
+        if r.returncode != 0:
+            tail = (r.stderr or r.stdout or "").strip()[-500:]
+            return fail(f"{label}失败：{tail or '未知错误'}")
+    _needs_cache.pop(pid, None)                      # 装完立刻失效缓存，别让前端看着旧结论
+    remaining = _needs(manifest)
+    with _install_lock:
+        _install_state[pid].update(
+            running=False, step="完成", done_at=utcnow().isoformat(),
+            error=None if not remaining else "装完仍缺：" + "、".join(x["label"] for x in remaining))
+    log.info("插件 %s 安装完成，仍缺 %s", pid, [x["key"] for x in remaining] or "无")
+
+
+@router.post("/{plugin_id}/install")
+def install_plugin(
+    plugin_id: str,
+    with_browser: bool = Query(True, description="是否一并下载 Playwright 浏览器内核（约 150MB）"),
+):
+    """补齐插件依赖。后台执行，用 GET /api/plugins 轮询 install 字段看进度。"""
+    m = _find_manifest(plugin_id)
+    with _install_lock:
+        st = _install_state.get(plugin_id)
+        if st and st.get("running"):
+            raise HTTPException(status_code=409, detail="该插件正在安装中，请稍候")
+        _install_state[plugin_id] = {"running": True, "step": "准备", "error": None, "done_at": None}
+    threading.Thread(target=_install_worker, args=(m, with_browser), daemon=True).start()
+    return {"ok": True}
+
+
 @router.get("")
 def list_plugins(session: Session = Depends(get_session)):
     out = []
     for m in discover():
         cfg = session.get(PluginConfig, m["id"])
+        need = needs(m)
+        with _install_lock:
+            st = dict(_install_state.get(m["id"]) or {})
         out.append({
             "id": m["id"], "name": m.get("name", m["id"]), "version": m.get("version"),
-            "installed": _python(m).exists(),
+            "installed": not need,                  # 「装好了」= 一样不缺，而非只看 venv 在不在
+            "needs": need,                          # 缺什么，逐项给前端说清
+            "install": st,                           # 安装进度（running/step/error）
+            "python": str(_python(m)),
             "config": {
                 "enabled": bool(cfg.enabled) if cfg else False,
                 "schedule_minutes": cfg.schedule_minutes if cfg else 0,

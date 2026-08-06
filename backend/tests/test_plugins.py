@@ -216,3 +216,99 @@ def test_broken_plugin_toml_is_skipped(tmp_path, monkeypatch, client):
 def test_missing_scraper_dir_is_empty(tmp_path, monkeypatch, client):
     monkeypatch.setattr(settings, "SCRAPER_DIR", str(tmp_path / "does-not-exist"))
     assert client.get("/api/plugins").json() == []
+
+
+# --- 依赖安装（缺什么 → 一键补齐）------------------------------------------------
+# 背景：插件本体跑在**独立 venv** 里（plugin.toml 的 python 字段），而建这个 venv 一直得用户
+# 自己开终端。结果是「把插件丢进目录 → 面板上一片灰按钮 → 只写着『未安装』」，没有下一步。
+
+@pytest.fixture(autouse=True)
+def _clear_needs_cache():
+    """needs() 带 60s 缓存（它要 spawn 子进程探测，而 GET /api/plugins 是被轮询的）。
+    测试间必须清掉，否则前一条用例的结论会串味。"""
+    plug._needs_cache.clear()
+    plug._install_state.clear()
+    yield
+    plug._needs_cache.clear()
+    plug._install_state.clear()
+
+
+def test_missing_venv_is_reported_as_a_need(client, fake_plugin):
+    """没建 venv 时要说清「缺什么」，而不是笼统一句未安装——三档依赖的补法完全不同。"""
+    p = client.get("/api/plugins").json()[0]
+    assert p["installed"] is False
+    assert [n["key"] for n in p["needs"]] == ["venv"]
+    assert p["needs"][0]["label"] and p["needs"][0]["hint"]      # 前端要拿去显示
+
+
+def test_half_built_venv_still_counts_as_missing(client, fake_plugin):
+    """venv 建到一半失败（系统缺 ensurepip 时很常见）会留下 bin/python 这个符号链接。
+    只看「文件在不在」会把半成品当成装好了 → 前端不提示重建，却在下一步莫名报缺依赖。
+    判据必须是「解释器能不能跑」。"""
+    py = fake_plugin / ".venv" / "bin" / "python"
+    py.parent.mkdir(parents=True)
+    py.write_text("not a real interpreter")                      # 存在但跑不起来
+    py.chmod(0o755)
+    p = client.get("/api/plugins").json()[0]
+    assert p["installed"] is False
+    assert [n["key"] for n in p["needs"]] == ["venv"]
+
+
+def test_install_is_rejected_while_running(client, fake_plugin):
+    """安装是长任务，重复点不能并发跑两遍（pip 同时写一个 venv 会互相踩）。"""
+    plug._install_state[PLUGIN_ID] = {"running": True, "step": "安装 Python 依赖", "error": None}
+    assert client.post(f"/api/plugins/{PLUGIN_ID}/install").status_code == 409
+
+
+def test_install_progress_is_exposed(client, fake_plugin):
+    """前端靠轮询 GET /api/plugins 的 install 字段显示进度与失败原因。"""
+    plug._install_state[PLUGIN_ID] = {"running": True, "step": "下载浏览器内核", "error": None}
+    p = client.get("/api/plugins").json()[0]
+    assert p["install"]["running"] is True and p["install"]["step"] == "下载浏览器内核"
+
+
+def test_install_unknown_plugin_404(client, fake_plugin):
+    assert client.post("/api/plugins/nope/install").status_code == 404
+
+
+def test_venv_cmd_falls_back_when_ensurepip_missing(monkeypatch, tmp_path):
+    """Debian/Ubuntu 上「装了 python3 却没装 python3-venv」很常见：ensurepip 缺失，
+    标准 `python -m venv` 会建到一半失败。此时必须退到 --without-pip，
+    否则用户被堵在「请先 apt install python3-venv」——而那一步他可能没有 sudo。"""
+    import subprocess
+
+    real = subprocess.run
+
+    def fake(cmd, *a, **kw):
+        if isinstance(cmd, list) and cmd[-1] == "import ensurepip":
+            return subprocess.CompletedProcess(cmd, 1)           # 假装本机没有 ensurepip
+        return real(cmd, *a, **kw)
+
+    monkeypatch.setattr(plug.subprocess, "run", fake)
+    assert "--without-pip" in plug._venv_cmd(tmp_path)
+
+
+def test_pip_cmd_borrows_soroban_pip_when_venv_has_none(monkeypatch, tmp_path):
+    """用 --without-pip 建出来的 venv 自己没有 pip。这时借 soroban 的 pip、
+    用 `--python` 指过去装（pip 23.1+），而不是要求用户自己 bootstrap。"""
+    monkeypatch.setattr(plug, "_has_pip", lambda py: False)
+    cmd = plug._pip_cmd(tmp_path / "python", ["-r", "req.txt"])
+    assert "--python" in cmd and cmd[0] == plug.sys.executable
+
+
+def test_pip_cmd_prefers_own_pip(monkeypatch, tmp_path):
+    monkeypatch.setattr(plug, "_has_pip", lambda py: True)
+    cmd = plug._pip_cmd(tmp_path / "python", ["-r", "req.txt"])
+    assert "--python" not in cmd and cmd[0] == str(tmp_path / "python")
+
+
+def test_needs_is_cached(client, fake_plugin, monkeypatch):
+    """GET /api/plugins 是前端轮询的接口，而探测依赖要 spawn 好几个子进程。
+    不缓存的话，装依赖时前端秒级轮询会把机器拖垮。"""
+    calls = []
+    real = plug._needs
+    monkeypatch.setattr(plug, "_needs", lambda m: (calls.append(1), real(m))[1])
+    client.get("/api/plugins")
+    client.get("/api/plugins")
+    client.get("/api/plugins")
+    assert len(calls) == 1, f"探测跑了 {len(calls)} 次，缓存没生效"

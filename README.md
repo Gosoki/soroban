@@ -102,13 +102,24 @@ SOROBAN_ADMIN_PASS='你的强密码' ./start.sh     # 首次即设定管理员�
 `start.sh` 会自动：建 venv、装依赖、生成含随机 SECRET_KEY 的 `.env`、建 admin、装前端依赖、起服务。浏览器开 http://localhost:8621 。
 
 - **局域网从别的设备访问**：`start.sh` 默认后端只绑 `127.0.0.1`。要开放：后端起用 `--host 0.0.0.0`、前端 `npm run dev -- --host`（已含 `--host`），并把本机 IP 加进 `.env` 的 `CORS_ORIGINS`。⚠️ 开放前**务必改掉默认密码**（见下）。
-- **爬虫插件（可选）**：soroban 只发现插件、不含其代码。要用淘宝爬虫，进各插件目录各自安装：
+- **爬虫插件（可选）**：soroban 只发现插件、不含其代码。把插件目录放进 `scraper/` 之后，
+  打开「插件管理」页——缺依赖会直接列出缺什么（Python 环境 / Python 依赖 / 浏览器内核），
+  点**「一键安装」**即可，装完按钮自动解禁，不用开终端。
+
+  soroban 会用自己的解释器建插件的 `.venv`、装 `requirements.txt`、按需下载 Chromium。
+  本机 `ensurepip` 不可用时（Debian/Ubuntu 上「装了 python3 却没装 python3-venv」很常见）
+  会自动改用 `--without-pip` 建，再借 soroban 的 pip 装进去——不需要 sudo、不需要先 apt。
+
+  也可以手动装（想脱离面板单独用命令行时）：
   ```bash
   cd scraper/soroban-scraper-taobao
   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
   .venv/bin/python -m playwright install chromium
   ```
-  装好后在 soroban「插件管理」页即显示「已安装」，在那里扫码授权、设账号/定时。详见 `scraper/soroban-scraper-taobao/README.md`。
+  装好后在「插件管理」页扫码授权、设账号/定时。详见 `scraper/soroban-scraper-taobao/README.md`。
+
+  > ⚠️ **扫码登录必须有图形界面**（`session.py` 硬编码有头浏览器）。无头服务器上装得了、抓得了，
+  > 但授权那一步得在有屏幕的机器上做，再把 `.state/<账号>.json` 拷过去。
 
 ### 生产 / 长期运行（单进程、同源，无需 vite）
 

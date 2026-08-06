@@ -74,6 +74,8 @@ export const layoutApi = {
 // 爬虫插件（soroban 扫 scraper/soroban-scraper-* 作为插件；管理层在插件管理页）
 export const pluginsApi = {
   list: () => http.get('/plugins'),
+  install: (id, withBrowser = true) =>
+    http.post(`/plugins/${id}/install`, null, { params: { with_browser: withBrowser } }),
   saveConfig: (id, cfg) => http.put(`/plugins/${id}/config`, cfg),
   login: (id, account) => http.post(`/plugins/${id}/login`, null, { params: { account } }),
   fetch: (id, account) => http.post(`/plugins/${id}/fetch`, null, { params: account ? { account } : {} }),
