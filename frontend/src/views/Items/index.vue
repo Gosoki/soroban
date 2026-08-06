@@ -52,7 +52,7 @@
     <el-dialog v-model="editVisible" :title="editTitle" width="640px" top="6vh" append-to-body @closed="onEditClosed">
       <div v-if="editingOrder">
         <div class="edit-ctx">
-          <span class="ec-shop">{{ editingOrder.shop || '（无标题）' }}</span>
+          <span class="ec-shop">{{ editingOrder.title || '（无标题）' }}</span>
           <el-tag size="small" :style="statusStyle(editingOrder.status)">{{ editingOrder.status }}</el-tag>
           <span v-if="editingOrder.platform_account" class="ec-dim">账号 {{ editingOrder.platform_account }}</span>
           <span class="ec-dim">下单 {{ editingOrder.date }}</span>
@@ -77,10 +77,10 @@ const columns = [
   { key: 'date', label: '下单日期', readonly: true, width: 100 },
   { key: 'platform_account', label: '账号', readonly: true, width: 100 },
   { key: 'platform', label: '来源', readonly: true, width: 80 },
-  { key: 'shop', label: '商品', readonly: true, width: 130 },
+  { key: 'title', label: '商品', readonly: true, width: 130 },
   { key: 'name', label: '物品名', readonly: true, width: 180 },
   { key: 'quantity', label: '数量', readonly: true, width: 64 },
-  { key: 'price_cny', label: '单价（元）', format: 'cny', readonly: true, width: 100 },
+  { key: 'unit_price_cny', label: '单价（元）', format: 'cny', readonly: true, width: 100 },
   { key: 'amount_cny', label: '金额（元）', format: 'cny', readonly: true, width: 100 },
   { key: 'status', label: '状态', readonly: true, width: 84 },
   { key: 'order_no', label: '订单号', readonly: true, width: 130 },
@@ -105,7 +105,11 @@ async function loadAcctColors() {
   } catch (_) { /* 拦截器已提示 */ }
 }
 
+// 请求序号：筛选/翻页可以在上一次响应回来前再发一次，慢的那次后到会把新数据整个覆盖掉
+// （表现为「清了筛选却只剩一部分」「内容是第2页、页码高亮第3页」）。只认最后一次发出的请求。
+let loadSeq = 0
 async function load() {
+  const my = ++loadSeq
   loading.value = true
   try {
     const params = { limit: pageSize, offset: (page.value - 1) * pageSize }
@@ -115,10 +119,11 @@ async function load() {
     if (filters.platform_account) params.platform_account = filters.platform_account
     if (filters.range) { params.date_from = filters.range[0]; params.date_to = filters.range[1] }
     const res = await itemsApi.list(params)
+    if (my !== loadSeq) return          // 已有更新的请求发出，丢弃这次的结果
     rows.value = res.items
     total.value = res.total
   } finally {
-    loading.value = false
+    if (my === loadSeq) loading.value = false
   }
 }
 function reload() { page.value = 1; load() }
@@ -126,7 +131,7 @@ function onPage(p) { page.value = p; load() }
 
 // 灰显 = 物品名与商品标题相同（无独立物品详情）
 function isTitleItem(row) {
-  return !!row.name && (row.name || '').trim() === (row.shop || '').trim()
+  return !!row.name && (row.name || '').trim() === (row.title || '').trim()
 }
 
 // —— 编辑：打开该物品所属订单，复用 OrderItemsEditor（同一写入链）——

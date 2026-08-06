@@ -34,17 +34,17 @@ def _backfill_row(obj, item_cls) -> dict:
     if not items:
         # price 用 0.00 而非 None（订单价 NULL 时）→ 二次运行时该物品已有价，走 skip，保证幂等
         seed = goods if obj.price_cny is not None else Decimal("0.00")
-        obj.items = [item_cls(name=(obj.shop or "未命名物品")[:255], quantity=1,
-                              price_cny=seed, auto=True)]
+        obj.items = [item_cls(name=(obj.title or "未命名物品")[:255], quantity=1,
+                              unit_unit_price_cny=seed, auto=True)]
         action = "auto_item"
-    elif all(it.price_cny is None for it in items):
+    elif all(it.unit_price_cny is None for it in items):
         total = goods
         for i, it in enumerate(items):
             if i == 0:
                 q = it.quantity or 1
-                it.price_cny = (total / q).quantize(_Q, rounding=ROUND_HALF_UP)
+                it.unit_price_cny = (total / q).quantize(_Q, rounding=ROUND_HALF_UP)
             else:
-                it.price_cny = Decimal("0.00")
+                it.unit_price_cny = Decimal("0.00")
             it.auto = True
         action = "priced_items"
     else:

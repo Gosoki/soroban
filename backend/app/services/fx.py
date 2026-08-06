@@ -80,11 +80,21 @@ def rate_for_date(session: Session, d: Optional[dt.date]) -> Optional[Decimal]:
 
 
 async def fx_loop() -> None:
-    """Background refresh; keeps last-good on any error (hiyori pattern)."""
+    """Background refresh; keeps last-good on any error (hiyori pattern)。
+
+    只读屏障期间跳过：本循环**直接用 Session 写** FxRate，绕过 HTTP 中间件，
+    不自己检查就会在数据库迁移的拷贝过程中往源库插行（见 app/maintenance.py）。
+    跳过没有代价——汇率下一轮再抓即可，抓不到还有历史兜底。"""
+    from ..maintenance import barrier
+
     while True:
         try:
-            with Session(get_engine()) as session:
-                await refresh_and_store(session)
+            reason = barrier.blocked_reason()
+            if reason:
+                log.info("汇率刷新跳过：%s", reason)
+            else:
+                with Session(get_engine()) as session:
+                    await refresh_and_store(session)
         except Exception as e:
             log.warning("汇率刷新循环异常: %s", e)
         await asyncio.sleep(settings.FX_REFRESH)

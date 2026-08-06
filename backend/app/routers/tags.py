@@ -63,7 +63,7 @@ def _data_values(session: Session, field: str) -> set[str]:
             stmt = stmt.where(model.is_delete.is_(False))
         if model is OrderStaging:
             # 已忽略的暂存行是「看过后丢弃」的抓取结果，不算真在用（否则其账号会被误锁、误自动登记）
-            stmt = stmt.where(OrderStaging.status != StagingStatus.ignored.value)
+            stmt = stmt.where(OrderStaging.import_status != StagingStatus.ignored.value)
         for v in session.exec(stmt).all():
             if v:
                 out.add(v)
@@ -130,6 +130,9 @@ def add_tag(field: str, payload: TagIn, session: Session = Depends(get_session))
     value = payload.value.strip()
     if not value:
         raise HTTPException(status_code=422, detail="标签不能为空")
+    # 在**登记时**就按目标数据列限长：TagOption.value 能存 128，但选进 Order.platform(32) 会炸。
+    # 不在这里挡，用户会建出一个「选一次报一次错」的标签。
+    check_value_fits(field, value)
     rows = session.exec(select(TagOption).where(TagOption.field == field)).all()
     if not any(r.value == value for r in rows):     # 新值才分配颜色（前 N 个不撞色）
         counts = Counter(r.color for r in rows if r.color is not None)
@@ -153,6 +156,7 @@ def set_tag_color(
     """手动给某标签改颜色（调色盘 10 色之一）。颜色本是建标签时自动分配、之后不变，这里开手动改的口子。
     用 upsert：标签已在库则改色；只在数据里出现、还没登记的值则顺带登记为该色。"""
     _check_field(field)
+    check_value_fits(field, value)      # 它会顺带登记该值，同样得先确认装得进数据列
     session.execute(upsert(
         session.get_bind(), TagOption,
         {"field": field, "value": value, "color": color},
@@ -174,7 +178,7 @@ def tag_value_in_use(session: Session, field: str, name: str) -> bool:
         if hasattr(model, "is_delete"):
             stmt = stmt.where(model.is_delete.is_(False))
         if model is OrderStaging:
-            stmt = stmt.where(OrderStaging.status != StagingStatus.ignored.value)
+            stmt = stmt.where(OrderStaging.import_status != StagingStatus.ignored.value)
         if session.exec(stmt.limit(1)).first() is not None:
             return True
     return session.exec(
@@ -182,11 +186,29 @@ def tag_value_in_use(session: Session, field: str, name: str) -> bool:
     ).first() is not None
 
 
+def check_value_fits(field: str, value: str) -> None:
+    """标签值必须能装进它会被写入的**每一个**数据列，否则 422。
+
+    请求体 schema 那套 max_length（见 schemas._len）只覆盖 body 字段；标签的增加/改名走的是
+    **Query 参数**，绕开了那层。而 TagOption.value 是 VARCHAR(128)、目标数据列却可能只有
+    VARCHAR(32)（如 Order.platform）——超长时 MySQL 抛 DataError（不是 IntegrityError，
+    逃过全局 409 处理器 → 500），SQLite 则静默存下，之后迁到 MySQL 时整次 replace_data 被这条
+    脏数据卡死。所以按**最小的那个列**限长。"""
+    for model, col in _FIELD_SOURCES.get(field, ()):
+        limit = model.__table__.columns[col.key].type.length
+        if limit and len(value) > limit:
+            raise HTTPException(
+                status_code=422,
+                detail=f"「{field}」的值最长 {limit} 个字符（当前 {len(value)}）",
+            )
+
+
 def rename_tag_value(session: Session, field: str, old: str, new: str) -> dict:
     """把标签字段 field 的值从 old 改成 new，跨表迁移（**不提交**，由调用方在同一事务里 commit）：
       · 该字段对应的数据表（见 _FIELD_SOURCES）的列值，version/updated_at 自增（守住乐观锁纪律）；
       · 标签 TagOption 直接改值以**保住原颜色**（new 已有标签则合并、弃 old）。
     返回各数据表改动行数（键为模型名）。"""
+    check_value_fits(field, new)
     now = utcnow()
     counts = {}
     for model, col in _FIELD_SOURCES.get(field, ()):
@@ -213,16 +235,29 @@ def rename_tag_value(session: Session, field: str, old: str, new: str) -> dict:
     return counts
 
 
-def delete_account_staging(session: Session, account: str) -> int:
-    """硬删某淘宝账号名下的全部暂存行（OrderStaging）连同其物品（StagingItem）。
-    先删子表再删父表以满足外键；**不提交**，由调用方在同一事务里 commit。返回删除的暂存行数。"""
-    ids = session.exec(
-        select(OrderStaging.id).where(OrderStaging.platform_account == account)
+def delete_account_staging(session: Session, account: str) -> tuple[int, int]:
+    """硬删某账号名下的暂存行（OrderStaging）连同其物品（StagingItem）。返回 (删除数, 跳过数)。
+    先删子表再删父表以满足外键；**不提交**，由调用方在同一事务里 commit。
+
+    **跳过「已导入且账本单仍在」的行**——与单条删除（routers/staging.delete_staging 的 409）
+    同一条不变量：暂存行是账本单的镜像，把镜像删了会留下一张没人认领的账本单，它继续占着
+    (order_no, platform) 唯一号；爬虫下次重抓时暂存唯一索引已空出、会新建一条待处理行，
+    用户点「导入」就撞唯一约束、再也导不进来。要真删得先在「商品订单」页删掉账本单。"""
+    rows = session.exec(
+        select(OrderStaging.id, OrderStaging.imported_order_id)
+        .where(OrderStaging.platform_account == account)
     ).all()
+    linked_ids = [r[1] for r in rows if r[1] is not None]
+    alive = set()
+    if linked_ids:
+        alive = set(session.exec(
+            select(Order.id).where(Order.id.in_(linked_ids), Order.is_delete.is_(False))
+        ).all())
+    ids = [r[0] for r in rows if r[1] not in alive]      # None not in alive → 未导入的照删
     if ids:
         session.execute(sa_delete(StagingItem).where(StagingItem.staging_id.in_(ids)))
         session.execute(sa_delete(OrderStaging).where(OrderStaging.id.in_(ids)))
-    return len(ids)
+    return len(ids), len(rows) - len(ids)
 
 
 def soft_delete_account_orders(session: Session, account: str) -> int:
@@ -245,7 +280,7 @@ def soft_delete_account_orders(session: Session, account: str) -> int:
     )
     session.execute(
         sa_update(OrderStaging).where(OrderStaging.imported_order_id.in_(ids))
-        .values(imported_order_id=None, status=StagingStatus.pending.value,
+        .values(imported_order_id=None, import_status=StagingStatus.pending.value,
                 version=OrderStaging.version + 1, updated_at=now)
     )
     return len(ids)

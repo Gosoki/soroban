@@ -174,6 +174,46 @@ async function doSwitch(target, name) {
     await dbApi.switch(target)
     ElMessage.success(`已切换到 ${name}`)
     await loadStatus()
+  } catch (e) {
+    // 409 = 后端发现「迁移之后当前库又被改过」。这些改动不在目标库里，切过去就静默没了。
+    // 409 被 http 拦截器刻意跳过（留给页面处理），所以这里必须自己弹，否则用户什么都看不到。
+    if (e.response?.status === 409) {
+      await onSourceChanged(target, name, e.response?.data?.detail)
+    }
+    // 其余错误拦截器已提示
+  } finally { busy.value = null }
+}
+
+// 源库在迁移后又有改动：让用户在「重新迁移」与「放弃这些改动」之间明确选一个，
+// 而不是替他决定。默认按钮是「重新迁移」——那才是不丢数据的那条路。
+async function onSourceChanged(target, name, detail) {
+  let choice
+  try {
+    choice = await ElMessageBox.confirm(
+      detail || '迁移之后当前库又有改动，直接切换会丢失。',
+      '当前库有未迁移的改动',
+      {
+        type: 'warning',
+        distinguishCancelAndClose: true,
+        confirmButtonText: '重新迁移再切换',
+        cancelButtonText: '仍然切换（放弃这些改动）',
+      },
+    )
+  } catch (action) {
+    if (action !== 'cancel') return          // 点 × 或按 Esc = 什么都不做
+    choice = 'discard'
+  }
+  busy.value = 'switch'
+  try {
+    if (choice === 'discard') {
+      await dbApi.switch({ ...target, confirm_changed: true })
+      ElMessage.warning(`已切换到 ${name}（放弃了未迁移的改动）`)
+    } else {
+      await dbApi.migrate(target)            // 先补一次迁移，把新改动带过去
+      await dbApi.switch(target)
+      ElMessage.success(`已重新迁移并切换到 ${name}`)
+    }
+    await loadStatus()
   } catch (_) { /* 拦截器已提示 */ } finally { busy.value = null }
 }
 

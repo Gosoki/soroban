@@ -113,7 +113,9 @@ def test_migration_normalizes_existing_codes(fresh_url):
 
 
 def test_migration_preserves_long_titles(fresh_url):
-    """标题列放宽后，既有长标题原样保留（SQLite 本就不限长，这里守住不被误截）。"""
+    """标题列放宽为 TEXT + 随后改名 shop→title：既有长标题一路原样保留，不被截断也不丢。
+
+    注意插入语句用的是**当时那一版**的列名（shop）——这正是「从旧库升上来」要验的场景。"""
     cfg = _cfg(fresh_url)
     command.upgrade(cfg, "c9d0e1f2a3b4")
     title = "很长的商品标题 / " * 50
@@ -126,7 +128,8 @@ def test_migration_preserves_long_titles(fresh_url):
                 {"d": dt.date(2028, 1, 1), "t": dt.datetime(2028, 1, 1), "s": title})
         command.upgrade(cfg, "head")
         with e.connect() as c:
-            assert c.execute(text("SELECT shop FROM orders")).scalar() == title
+            # 升到 head 后列已改名 shop→title（迁移 e1f2a3b4c5d6）
+            assert c.execute(text("SELECT title FROM orders")).scalar() == title
     finally:
         e.dispose()
 

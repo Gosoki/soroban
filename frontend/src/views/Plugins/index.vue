@@ -91,6 +91,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Download } from '@element-plus/icons-vue'
 import { pluginsApi, tagsApi } from '@/api'
 import { tagStyleAt, typeStyle } from '@/constants'
+import { fmtDateTime } from '@/utils/datetime'
 
 const plugins = ref([])
 const loading = ref(false)
@@ -100,10 +101,7 @@ const platformOpts = computed(() => platformTags.value.map((t) => t.value))
 const platformColor = computed(() => Object.fromEntries(platformTags.value.map((t) => [t.value, t.color])))
 function platformStyle(v) { return tagStyleAt(platformColor.value[v] ?? -1, v) }
 
-function fmtTime(s) {
-  const d = new Date(s)
-  return isNaN(d) ? s : d.toLocaleString('ja-JP')
-}
+const fmtTime = fmtDateTime   // 后端存 naive UTC，必须补 Z 再解析，见 utils/datetime.js
 function enabledCount(p) { return p.accounts.filter((a) => a.configured && a.enabled).length }
 
 async function load() {
@@ -229,7 +227,15 @@ async function doDeleteAccountStaging(p, account) {
   p._busy = true
   try {
     const r = await pluginsApi.deleteAccountStaging(p.id, account)
-    ElMessage.success(`已删除 ${account} 的暂存单 ${r.deleted} 条`)
+    if (r.skipped) {
+      ElMessage({
+        type: 'warning', duration: 8000,
+        message: `已删除 ${account} 的暂存单 ${r.deleted} 条；跳过 ${r.skipped} 条已导入的`
+          + `（删了会在账本里留下导不回来的孤儿单，请先到「商品订单」页删掉对应订单）`,
+      })
+    } else {
+      ElMessage.success(`已删除 ${account} 的暂存单 ${r.deleted} 条`)
+    }
   } catch (_) { /* 拦截器已提示 */ } finally {
     p._busy = false
   }

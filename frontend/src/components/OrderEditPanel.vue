@@ -45,7 +45,7 @@
       <label class="f"><span>分类</span>
         <el-input v-model="order.category" size="small" placeholder="分类" @change="saveField('category', order.category)" /></label>
       <label class="f"><span>商品标题</span>
-        <el-input v-model="order.shop" size="small" placeholder="商品标题" @change="saveField('shop', order.shop)" /></label>
+        <el-input v-model="order.title" size="small" placeholder="商品标题" @change="saveField('title', order.title)" /></label>
       <label class="f f-wide"><span>商品链接</span>
         <el-input v-model="order.url" size="small" placeholder="商品链接" @change="saveField('url', order.url)" /></label>
       <label class="f f-wide"><span>备注</span>

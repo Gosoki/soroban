@@ -27,15 +27,17 @@ class OrderStaging(SQLModel, table=True):
     order_no: Optional[str] = Field(default=None, max_length=64)  # 可空：手动新建空行后再填
     platform_account: Optional[str] = Field(default=None, max_length=64)
     platform: Optional[str] = Field(default=None, max_length=32)  # 来源平台（淘宝/闲鱼/京东）；淘宝插件抓取即「淘宝」，导入时随单迁移到账本
-    shop: Optional[str] = Field(default=None, sa_type=Text)   # 商品标题；Text 的理由见 Order.shop
+    title: Optional[str] = Field(default=None, sa_type=Text)   # 商品标题；Text 的理由见 Order.title
     price_cny: Optional[Decimal] = Field(default=None, max_digits=12, decimal_places=2)
     postage_cny: Optional[Decimal] = Field(default=None, max_digits=12, decimal_places=2)  # 邮费（元）；空=包邮。价 = Σ(单价×数量) + 邮费
     fx_rate: Optional[Decimal] = Field(default=None, max_digits=10, decimal_places=4)  # 新建/抓取时记当天汇率，导入一同迁移
     order_date: Optional[dt.date] = None
     express_no: Optional[str] = Field(default=None, max_length=64)
     raw_json: Optional[str] = Field(default=None, sa_column=Column(Text))  # 原始留底
-    status: str = Field(default=StagingStatus.pending.value, max_length=32, index=True)  # 导入工作流状态：待处理/已导入/已忽略
-    order_status: Optional[str] = Field(default=None, max_length=32)  # 淘宝订单真实状态(已付/已发/…)；导入后与账本 status 联动
+    # 一行上有两个「状态」，务必分清：import_status = 导入工作流（待处理/已导入/已忽略），
+    # trade_status = 淘宝那边的真实交易状态。旧名 status / order_status 看不出区别。
+    import_status: str = Field(default=StagingStatus.pending.value, max_length=32, index=True)
+    trade_status: Optional[str] = Field(default=None, max_length=32)  # 淘宝订单真实状态(待发货/待收货/…)；导入后与账本 status 联动
     imported_order_id: Optional[int] = Field(
         default=None, foreign_key="orders.id"
     )
@@ -60,7 +62,7 @@ class StagingItem(SQLModel, table=True):
     staging_id: int = Field(foreign_key="orderstaging.id", index=True)
     name: str = Field(max_length=255)
     quantity: int = Field(default=1)
-    price_cny: Optional[Decimal] = Field(default=None, max_digits=12, decimal_places=2)  # 单价（元）
+    unit_price_cny: Optional[Decimal] = Field(default=None, max_digits=12, decimal_places=2)  # **单价**（元）；与订单的 price_cny(总价) 区分
     auto: bool = Field(default=False)                       # True=系统自动生成/自动定价（前端灰显）
 
     staging: Optional[OrderStaging] = Relationship(back_populates="items")

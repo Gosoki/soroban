@@ -49,7 +49,7 @@ def list_items(
         conds.append(
             OrderItem.name.contains(q, autoescape=True)
             | Order.order_no.contains(q, autoescape=True)
-            | Order.shop.contains(q, autoescape=True)
+            | Order.title.contains(q, autoescape=True)
             | Order.express_no.contains(q, autoescape=True)
         )
 
@@ -69,12 +69,12 @@ def list_items(
     items = []
     for it, o in rows:
         amount = None
-        if it.price_cny is not None:
-            amount = (Decimal(it.price_cny) * (it.quantity or 1)).quantize(_Q, rounding=ROUND_HALF_UP)
+        if it.unit_price_cny is not None:
+            amount = (Decimal(it.unit_price_cny) * (it.quantity or 1)).quantize(_Q, rounding=ROUND_HALF_UP)
         items.append(ItemListRead(
-            id=it.id, name=it.name, quantity=it.quantity, price_cny=it.price_cny,
+            id=it.id, name=it.name, quantity=it.quantity, unit_price_cny=it.unit_price_cny,
             amount_cny=amount, auto=it.auto,
-            order_id=o.id, date=o.date, order_no=o.order_no, shop=o.shop,
+            order_id=o.id, date=o.date, order_no=o.order_no, title=o.title,
             platform_account=o.platform_account, platform=o.platform, status=o.status,
             express_no=o.express_no,
         ))

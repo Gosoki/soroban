@@ -26,6 +26,13 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 
 def create_access_token(user: User, expires_delta: Optional[dt.timedelta] = None) -> str:
+    """签发登录令牌。
+
+    **设计取舍（已拍板，勿再当 bug「修」）**：改密码**不会**让已签发的令牌失效。令牌里没有
+    版本号、服务端也没有黑名单——这是刻意的：本系统是自用账本，共用者就两个人，为「把某人
+    踢下线」这个几乎用不到的能力去加一列 + 迁移 + 每次请求多查一次，不划算。
+    真需要强制全体下线时：改 .env 的 SECRET_KEY 并重启即可（代价是所有人重新登录，
+    且已保存的 MySQL 连接串会解不开、退回本地 SQLite——见 db/control.py）。"""
     now = dt.datetime.now(dt.timezone.utc)
     payload = {
         "sub": str(user.id),

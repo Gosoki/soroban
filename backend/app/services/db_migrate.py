@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from urllib.parse import quote_plus
@@ -81,6 +82,52 @@ def ensure_database(host: str, port: int, user: str, password: str, database: st
         conn.close()
 
 
+def source_fingerprint(engine) -> str:
+    """源库的「变更指纹」：各业务表的行数 + 最大 updated_at，序列化成 JSON。
+
+    用途：`migrate` 拷完记一份，`switch` 前再算一次做对比——两者不同就说明**迁移之后源库又被
+    改过**，那些改动不会跟着过去，切换后就静默消失了。指纹只需要「能发现变了」，不需要精确
+    到哪一行，所以行数 + 最新时间戳足够便宜也足够灵敏（增/删看行数，改看时间戳）。
+
+    刻意不含 Setting/ColumnLayout：前者压根没在用，后者是界面偏好、丢了也无所谓，
+    把它们算进来只会让「拖一下列宽」也触发变更告警。"""
+    from sqlalchemy import func as sa_func
+
+    noise = {"setting", "columnlayout"}
+    out: dict[str, list] = {}
+    with Session(engine) as s:
+        for model in MIGRATION_ORDER:
+            name = model.__tablename__
+            if name in noise:
+                continue
+            count = s.exec(select(sa_func.count()).select_from(model)).one()
+            newest = None
+            if "updated_at" in model.__table__.columns:
+                newest = s.exec(select(sa_func.max(model.updated_at))).one()
+            out[name] = [int(count), str(newest) if newest is not None else None]
+    return json.dumps(out, sort_keys=True)
+
+
+def describe_fingerprint_diff(before: str, after: str) -> list[str]:
+    """把两份指纹的差异说成人话，如 ["订单 +3 条", "集运订单 有改动"]。相同则返回空列表。"""
+    labels = {"orders": "商品订单", "orderstaging": "暂存订单", "shipmentorder": "集运订单",
+              "miscexpense": "杂项支出", "orderitem": "订单物品", "stagingitem": "暂存物品",
+              "user": "用户", "fxrate": "汇率", "tagoption": "标签", "pluginconfig": "插件配置"}
+    try:
+        a, b = json.loads(before), json.loads(after)
+    except (TypeError, ValueError):
+        return ["无法比对（指纹损坏）"]
+    out = []
+    for table in sorted(set(a) | set(b)):
+        (ca, ta), (cb, tb) = a.get(table, [0, None]), b.get(table, [0, None])
+        label = labels.get(table, table)
+        if cb != ca:
+            out.append(f"{label} {cb - ca:+d} 条")
+        elif tb != ta:
+            out.append(f"{label} 有改动")
+    return out
+
+
 def is_target_empty(engine) -> bool:
     """目标业务表是否全空（防止对已有数据的库重复导入）。"""
     with Session(engine) as s:
@@ -90,7 +137,7 @@ def is_target_empty(engine) -> bool:
     return True
 
 
-def copy_data(src_engine, dst_engine) -> dict:
+def replace_data(src_engine, dst_engine) -> dict:
     """把源库业务数据**整体覆盖**到目标库（支持任意方向：SQLite↔MySQL）。
 
     先按逆外键序清空目标各表，再按正序整表拷贝——故切换可逆、可反复迁移。保留自增主键；

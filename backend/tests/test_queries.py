@@ -34,7 +34,7 @@ def _seed_shipments(client, n, tag):
         for j in range(2):
             o = client.post("/api/orders", json={
                 "date": "2026-12-01", "order_no": f"{tag}-{i}-{j}", "platform": "淘宝",
-                "items": [{"name": f"物{j}", "quantity": 1, "price_cny": "1"}]}).json()
+                "items": [{"name": f"物{j}", "quantity": 1, "unit_price_cny": "1"}]}).json()
             client.post(f"/api/shipment/{s['id']}/order/{o['id']}")
 
 
@@ -55,14 +55,14 @@ def test_staging_list_is_not_n_plus_1(client):
     for i in range(2):
         s = client.post("/api/staging", json={
             "order_no": f"QS-A-{i}",
-            "items": [{"name": "x", "quantity": 1, "price_cny": "1"}]}).json()
+            "items": [{"name": "x", "quantity": 1, "unit_price_cny": "1"}]}).json()
         client.post(f"/api/staging/{s['id']}/import")
     with count_queries() as a:
         client.get("/api/staging", params={"status": "已导入", "limit": 100})
     for i in range(6):
         s = client.post("/api/staging", json={
             "order_no": f"QS-B-{i}",
-            "items": [{"name": "x", "quantity": 1, "price_cny": "1"}]}).json()
+            "items": [{"name": "x", "quantity": 1, "unit_price_cny": "1"}]}).json()
         client.post(f"/api/staging/{s['id']}/import")
     with count_queries() as b:
         client.get("/api/staging", params={"status": "已导入", "limit": 100})
@@ -75,8 +75,8 @@ def test_orders_list_is_not_n_plus_1(client):
     for i in range(8):
         client.post("/api/orders", json={
             "date": "2026-12-05", "order_no": f"QO-{i}", "platform": "淘宝",
-            "items": [{"name": "a", "quantity": 1, "price_cny": "1"},
-                      {"name": "b", "quantity": 1, "price_cny": "1"}]})
+            "items": [{"name": "a", "quantity": 1, "unit_price_cny": "1"},
+                      {"name": "b", "quantity": 1, "unit_price_cny": "1"}]})
     with count_queries() as a:
         client.get("/api/orders", params={"limit": 1})
     with count_queries() as b:

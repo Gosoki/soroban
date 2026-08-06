@@ -133,10 +133,13 @@ def run_migrations(url: str) -> None:
     finally:
         check_engine.dispose()
 
-    # 判 pre-Alembic 旧库时要排除控制表（app_db_config / db_connection）——它们由 control.ensure_schema
-    # 常驻创建，否则「全新业务库 + 已存在控制表」会被误判为旧库、错误 stamp 到 baseline 而不建表
-    # （全新部署会因此建不出业务表而崩溃）。
-    business_tables = tables - {"app_db_config", "db_connection", "alembic_version"}
+    # 判 pre-Alembic 旧库时要排除控制表——它们由 control.ensure_schema 常驻创建，
+    # 否则「全新业务库 + 已存在控制表」会被误判为旧库、错误 stamp 到 baseline 而不建业务表
+    # （全新部署会因此崩溃）。
+    # 排除集**从 control_metadata 自动派生**，不再手写：这里曾是一份手抄清单，
+    # 每加一张控制表就得记得同步——加 migrate_state 时就漏了，全部部署路径当场瘫痪。
+    control_tables = set(control.control_metadata.tables) | {"alembic_version"}
+    business_tables = tables - control_tables
     if business_tables and "alembic_version" not in tables:
         base_rev = ScriptDirectory.from_config(cfg).get_base()
         command.stamp(cfg, base_rev)
@@ -144,10 +147,33 @@ def run_migrations(url: str) -> None:
     command.upgrade(cfg, "head")
 
 
+def switch_to_local() -> None:
+    """把「当前后端」改回本地 SQLite 并立即生效。供离线自救用（见 tools/use_local_db.py）。"""
+    control.write_config(_control_engine, "sqlite", None)
+    set_data_engine(_control_engine, _control_url())
+
+
 def create_db_and_tables() -> None:
-    """启动/seed/demo 调用：保证控制表存在，并把**当前数据后端**迁移到最新。"""
+    """启动/seed/demo 调用：保证控制表存在，并把**当前数据后端**迁移到最新。
+
+    数据后端连不上时（MySQL 关机/换网/容器没起）**不自动降级回 SQLite**：切换是非破坏性的，
+    本地 SQLite 里还留着切换那天的旧业务表；悄悄退回去会让用户对着一份陈旧数据继续记账，
+    等 MySQL 回来就是两边各有一半——比起不开机，那才是真正难收拾的。
+    这里只把报错换成**能照做的指引**，然后照样让启动失败（不写坏任何东西）。"""
     control.ensure_schema(_control_engine)
-    run_migrations(_data_url)
+    try:
+        run_migrations(_data_url)
+    except Exception as e:
+        if current_backend() == "mysql":
+            log.error(
+                "连接当前数据库（MySQL）失败：%s\n"
+                "  soroban 不会自动退回本地 SQLite——那份数据停在切换当天，"
+                "对着它继续记账会造成两边各有一半。\n"
+                "  请先确认 MySQL 已启动、网络可达；确实要暂时切回本地账本，执行：\n"
+                "    cd backend && .venv/bin/python -m tools.use_local_db",
+                e,
+            )
+        raise
 
 
 def _wal_truncate() -> None:

@@ -17,7 +17,7 @@ def mk_order(client, **kw):
 # --- 基础：物品为最小单位，订单价由物品派生 ---------------------------------
 
 def test_create_seeds_one_item_when_none_given(client):
-    o = mk_order(client, shop="某商品", price_cny="100.00")
+    o = mk_order(client, title="某商品", price_cny="100.00")
     assert len(o["items"]) == 1
     assert o["items"][0]["auto"] is True
     assert o["items"][0]["name"] == "某商品"
@@ -25,22 +25,22 @@ def test_create_seeds_one_item_when_none_given(client):
 
 
 def test_create_with_items_derives_price(client):
-    o = mk_order(client, items=[{"name": "a", "quantity": 3, "price_cny": "10.00"},
-                                {"name": "b", "quantity": 1, "price_cny": "5.50"}])
+    o = mk_order(client, items=[{"name": "a", "quantity": 3, "unit_price_cny": "10.00"},
+                                {"name": "b", "quantity": 1, "unit_price_cny": "5.50"}])
     assert Decimal(o["price_cny"]) == Decimal("35.50")
 
 
 def test_postage_added_on_top_of_items(client):
     o = mk_order(client, postage_cny="8.00",
-                 items=[{"name": "a", "quantity": 2, "price_cny": "10.00"}])
+                 items=[{"name": "a", "quantity": 2, "unit_price_cny": "10.00"}])
     assert Decimal(o["price_cny"]) == Decimal("28.00")
 
 
 def test_seed_price_excludes_postage_no_double_count(client):
     """只给总价+邮费（无物品明细）：货款 = 总价-邮费，sync 再加邮费 → 总价不变。"""
-    o = mk_order(client, shop="x", price_cny="100.00", postage_cny="10.00")
+    o = mk_order(client, title="x", price_cny="100.00", postage_cny="10.00")
     assert Decimal(o["price_cny"]) == Decimal("100.00")
-    assert Decimal(o["items"][0]["price_cny"]) == Decimal("90.00")
+    assert Decimal(o["items"][0]["unit_price_cny"]) == Decimal("90.00")
 
 
 def test_postage_greater_than_total_rejected(client):
@@ -49,14 +49,14 @@ def test_postage_greater_than_total_rejected(client):
 
 
 def test_price_cny_not_directly_writable(client):
-    o = mk_order(client, items=[{"name": "a", "quantity": 1, "price_cny": "10.00"}])
+    o = mk_order(client, items=[{"name": "a", "quantity": 1, "unit_price_cny": "10.00"}])
     r = client.patch(f"/api/orders/{o['id']}", json={"version": o["version"], "price_cny": "9999"})
     assert r.status_code == 200
     assert Decimal(r.json()["price_cny"]) == Decimal("10.00")   # 仍由物品派生
 
 
 def test_empty_items_list_backfills_placeholder(client):
-    o = mk_order(client, shop="s", items=[{"name": "a", "quantity": 1, "price_cny": "10.00"}])
+    o = mk_order(client, title="s", items=[{"name": "a", "quantity": 1, "unit_price_cny": "10.00"}])
     r = client.patch(f"/api/orders/{o['id']}", json={"version": o["version"], "items": []})
     assert r.status_code == 200
     assert len(r.json()["items"]) == 1       # ≥1 物品的不变量
@@ -65,28 +65,28 @@ def test_empty_items_list_backfills_placeholder(client):
 # --- 乐观锁 -----------------------------------------------------------------
 
 def test_optimistic_lock_conflict(client):
-    o = mk_order(client, shop="a")
+    o = mk_order(client, title="a")
     v = o["version"]
-    assert client.patch(f"/api/orders/{o['id']}", json={"version": v, "shop": "b"}).status_code == 200
-    r = client.patch(f"/api/orders/{o['id']}", json={"version": v, "shop": "c"})
+    assert client.patch(f"/api/orders/{o['id']}", json={"version": v, "title": "b"}).status_code == 200
+    r = client.patch(f"/api/orders/{o['id']}", json={"version": v, "title": "c"})
     assert r.status_code == 409
 
 
 def test_version_increments_on_patch(client):
-    o = mk_order(client, shop="a")
-    r = client.patch(f"/api/orders/{o['id']}", json={"version": o["version"], "shop": "b"})
+    o = mk_order(client, title="a")
+    r = client.patch(f"/api/orders/{o['id']}", json={"version": o["version"], "title": "b"})
     assert r.json()["version"] == o["version"] + 1
 
 
 def test_patch_missing_version_is_422(client):
     o = mk_order(client)
-    assert client.patch(f"/api/orders/{o['id']}", json={"shop": "x"}).status_code == 422
+    assert client.patch(f"/api/orders/{o['id']}", json={"title": "x"}).status_code == 422
 
 
 # --- 软删 -------------------------------------------------------------------
 
 def test_soft_delete_hides_from_list_and_get(client):
-    o = mk_order(client, shop="tobedeleted")
+    o = mk_order(client, title="tobedeleted")
     assert client.delete(f"/api/orders/{o['id']}").status_code == 200
     assert client.get(f"/api/orders/{o['id']}").status_code == 404
     ids = [x["id"] for x in client.get("/api/orders", params={"limit": 200}).json()["items"]]
@@ -157,24 +157,24 @@ def test_attach_soft_deleted_shipment_rejected(client):
 # --- 筛选 / 搜索 ---------------------------------------------------------------
 
 def test_search_matches_item_name(client):
-    mk_order(client, shop="店A", items=[{"name": "独特物品名XYZ", "quantity": 1, "price_cny": "1"}])
+    mk_order(client, title="店A", items=[{"name": "独特物品名XYZ", "quantity": 1, "unit_price_cny": "1"}])
     r = client.get("/api/orders", params={"q": "独特物品名XYZ"})
     assert r.json()["total"] >= 1
 
 
 def test_search_like_wildcards_are_escaped(client):
     """搜索串里的 % 和 _ 必须当字面量（autoescape），否则 '%' 会匹配所有行。"""
-    mk_order(client, shop="含百分号%的商品")
+    mk_order(client, title="含百分号%的商品")
     all_total = client.get("/api/orders", params={"limit": 1}).json()["total"]
     r = client.get("/api/orders", params={"q": "%"})
     assert r.json()["total"] < all_total, "LIKE 通配符未被转义，'%' 匹配到了全部行"
 
 
 def test_search_underscore_escaped(client):
-    mk_order(client, shop="a_b_c 测试下划线")
+    mk_order(client, title="a_b_c 测试下划线")
     r = client.get("/api/orders", params={"q": "a_b"})
     for it in r.json()["items"]:
-        assert "a_b" in (it["shop"] or "")
+        assert "a_b" in (it["title"] or "")
 
 
 def test_exact_order_no_filter(client):

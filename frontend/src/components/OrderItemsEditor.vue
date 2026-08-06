@@ -15,7 +15,7 @@
             :title="isTitleItem(it) ? '物品名与商品标题相同（无独立物品详情）；改成真实物品名即变正常色' : ''">
           <td><el-input v-model="it.name" size="small" placeholder="物品名" @change="onItemEdit(it)" /></td>
           <td><el-input-number v-model="it.quantity" :min="1" :controls="false" size="small" @change="onItemEdit(it)" /></td>
-          <td><el-input-number v-model="it.price_cny" :min="0" :precision="2" :controls="false" size="small"
+          <td><el-input-number v-model="it.unit_price_cny" :min="0" :precision="2" :controls="false" size="small"
                                placeholder="单价" @change="onItemEdit(it)" /></td>
           <td class="c-act"><el-button link type="danger" :icon="Delete" tabindex="-1" @click="removeItem(i)" /></td>
         </tr>
@@ -46,7 +46,7 @@ import { Delete } from '@element-plus/icons-vue'
 import { ordersApi } from '@/api'
 import { queueOrderWrite } from '@/utils/orderWrites'
 
-// order 必须含 id / version / items / postage_cny / shop（订单页的行 或 ordersApi.get 的结果都满足）
+// order 必须含 id / version / items / postage_cny / title（订单页的行 或 ordersApi.get 的结果都满足）
 const props = defineProps({ order: { type: Object, required: true } })
 const emit = defineEmits(['saved', 'conflict'])
 
@@ -54,13 +54,13 @@ const draft = reactive({ name: '', quantity: 1, price: null })
 
 function itemPrice(v) { return (v === '' || v === null || v === undefined) ? null : Number(v) }
 // 灰显 = 物品名与商品标题相同（无独立物品详情，多为自动占位）；有真实物品名即正常
-function isTitleItem(it) { return !!it.name && (it.name || '').trim() === (props.order.shop || '').trim() }
+function isTitleItem(it) { return !!it.name && (it.name || '').trim() === (props.order.title || '').trim() }
 function ensureItems() { if (!props.order.items) props.order.items = []; return props.order.items }
 
 async function saveItems() {
   const items = (props.order.items || []).filter((it) => it.name && it.name.trim())
     .map((it) => ({ name: it.name.trim(), quantity: Number(it.quantity) || 1,
-                    price_cny: itemPrice(it.price_cny), auto: !!it.auto }))
+                    unit_price_cny: itemPrice(it.unit_price_cny), auto: !!it.auto }))
   try {
     // 整个「读 version→PATCH→回写」入队串行，避免与同订单的其它保存并发撞 version 互相 409
     await queueOrderWrite(props.order.id, async () => {
@@ -74,7 +74,14 @@ async function saveItems() {
 }
 
 // 编辑任一物品字段 → 该物品转为「已确认」(auto=false，去灰) 并写库
-function onItemEdit(it) { it.auto = false; saveItems() }
+function onItemEdit(it) {
+  it.auto = false
+  // 名字被清空时**不落库**：saveItems 会把无名物品整条剔掉（连同它的单价），订单金额随之缩水。
+  // 而「Ctrl+A 删掉名字准备重打」是最常见的改名姿势，失焦即触发 change —— 用户以为只是清了个
+  // 输入框，实际是一次无确认、无撤销的删除。真正的删除只走 removeItem（有二次确认）。
+  if (!it.name || !it.name.trim()) return
+  saveItems()
+}
 
 // 邮费改动：写库并让订单价随之重算（不填=包邮）。不覆盖未保存的物品编辑
 async function savePostage() {
@@ -104,7 +111,7 @@ async function removeItem(i) {
 async function commitDraft() {
   if (!draft.name || !draft.name.trim()) return
   ensureItems().push({ name: draft.name.trim(), quantity: Number(draft.quantity) || 1,
-                       price_cny: itemPrice(draft.price), auto: false })
+                       unit_price_cny: itemPrice(draft.price), auto: false })
   draft.name = ''; draft.quantity = 1; draft.price = null
   await saveItems()
 }

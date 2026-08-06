@@ -28,8 +28,8 @@
         <template #cell-items="{ row }">
           <span :class="{ ph: !(row.items && row.items.length), 'auto-txt': allTitleItems(row) }">{{ itemSummary(row) }}</span>
         </template>
-        <template #cell-status="{ row }">
-          <el-tag :style="stagingStyle(row.status)" size="small">{{ row.status }}</el-tag>
+        <template #cell-import_status="{ row }">
+          <el-tag :style="stagingStyle(row.import_status)" size="small">{{ row.import_status }}</el-tag>
         </template>
 
         <template #expand="{ row }">
@@ -39,12 +39,12 @@
                  :title="isTitleItem(row, it) ? '物品名与商品标题相同（无独立物品详情）；改成真实物品名即正常' : ''">
               <el-input v-model="it.name" size="small" placeholder="物品名" style="width: 180px" @change="it.auto = false" />
               <el-input-number v-model="it.quantity" :min="1" :controls="false" size="small" style="width: 80px" @change="it.auto = false" />
-              <el-input-number v-model="it.price_cny" :min="0" :precision="2" :controls="false" size="small"
+              <el-input-number v-model="it.unit_price_cny" :min="0" :precision="2" :controls="false" size="small"
                                style="width: 110px" placeholder="单价" @change="it.auto = false" />
               <el-button link type="danger" :icon="Delete" @click="row.items.splice(i, 1)" />
             </div>
             <div>
-              <el-button size="small" :icon="Plus" @click="ensureItems(row).push({ name: '', quantity: 1, price_cny: null, auto: false })">加物品</el-button>
+              <el-button size="small" :icon="Plus" @click="ensureItems(row).push({ name: '', quantity: 1, unit_price_cny: null, auto: false })">加物品</el-button>
               <el-button size="small" type="primary" @click="saveItems(row)">保存物品</el-button>
             </div>
             <div class="postage-row">
@@ -62,7 +62,7 @@
           </template>
           <template v-else>
             <el-button size="small" type="primary" @click="doImport(row)">导入</el-button>
-            <el-button v-if="row.status !== '已忽略'" size="small" link @click="doIgnore(row)">忽略</el-button>
+            <el-button v-if="row.import_status !== '已忽略'" size="small" link @click="doIgnore(row)">忽略</el-button>
           </template>
         </template>
       </NotionTable>
@@ -79,6 +79,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Plus } from '@element-plus/icons-vue'
 import { stagingApi, tagsApi } from '@/api'
 import { ORDER_SOURCES, STAGING_STATUS, ORDER_STATUS, stagingStyle } from '@/constants'
+import { fmtDate } from '@/utils/datetime'
 import NotionTable from '@/components/NotionTable.vue'
 
 // 默认列顺序 + 统一列宽（≈ 刚好显示日期，取整多留一点 = 110）；用户可拖动改序/改宽，改动持久化
@@ -87,15 +88,15 @@ const columns = [
   { key: 'order_date', label: '下单日期', type: 'date', width: COL_W },
   { key: 'platform_account', label: '账号昵称', type: 'tag', field: 'platform_account', width: COL_W },
   { key: 'platform', label: '来源', type: 'tag', field: 'platform', width: COL_W, placeholder: '来源' },
-  { key: 'shop', label: '商品', type: 'text', long: true, width: COL_W },   // 标题长：点开弹宽框看全
+  { key: 'title', label: '商品', type: 'text', long: true, width: COL_W },   // 标题长：点开弹宽框看全
   { key: 'price_cny', label: '人民币（元）', format: 'cny', readonly: true, width: COL_W },   // 由物品单价×数量派生
-  { key: 'order_status', label: '订单状态', type: 'select', options: ORDER_STATUS, width: COL_W },
+  { key: 'trade_status', label: '交易状态', type: 'select', options: ORDER_STATUS, width: COL_W },
   { key: 'items', label: '物品', readonly: true, width: COL_W, expand: true },
   { key: 'order_no', label: '订单号', type: 'text', width: COL_W, placeholder: '订单号' },
   { key: 'express_no', label: '快递号', type: 'text', width: COL_W, placeholder: '快递号' },
   { key: 'scraped_at', label: '入库日期', readonly: true, width: COL_W },   // 写进库的日期，方便按批次筛选
   { key: 'fx_rate', label: '汇率', type: 'decimal', width: COL_W, placeholder: '当天汇率' },
-  { key: 'status', label: '导入状态', readonly: true, width: COL_W },
+  { key: 'import_status', label: '导入状态', readonly: true, width: COL_W },
 ]
 
 const rows = ref([])
@@ -116,23 +117,22 @@ function itemSummary(row) {
 }
 // 灰显 = 物品名与商品标题相同（无独立物品详情）；有真实物品名即正常
 function isTitleItem(row, it) {
-  return !!it.name && (it.name || '').trim() === (row.shop || '').trim()
+  return !!it.name && (it.name || '').trim() === (row.title || '').trim()
 }
 // 列表「物品」格：全是标题占位（自动生成）时整格灰显
 function allTitleItems(row) {
   return !!(row.items && row.items.length) && row.items.every((it) => isTitleItem(row, it))
-}
-function fmtDate(s) {                         // 入库日期：后端存 UTC(naive)，补 Z 后按本地(JST)显示为 YYYY-MM-DD
-  if (!s) return '—'
-  const d = new Date(/[Z+]/.test(s) ? s : s + 'Z')
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 function ensureItems(row) {
   if (!row.items) row.items = []
   return row.items
 }
 
+// 请求序号：筛选/翻页可以在上一次响应回来前再发一次，慢的那次后到会把新数据整个覆盖掉
+// （表现为「清了筛选却只剩一部分」「内容是第2页、页码高亮第3页」）。只认最后一次发出的请求。
+let loadSeq = 0
 async function load() {
+  const my = ++loadSeq
   loading.value = true
   try {
     const params = { limit: pageSize, offset: (page.value - 1) * pageSize }
@@ -142,10 +142,11 @@ async function load() {
     if (filters.platform_account) params.platform_account = filters.platform_account
     if (filters.range) { params.date_from = filters.range[0]; params.date_to = filters.range[1] }
     const res = await stagingApi.list(params)
+    if (my !== loadSeq) return          // 已有更新的请求发出，丢弃这次的结果
     rows.value = res.items
     total.value = res.total
   } finally {
-    loading.value = false
+    if (my === loadSeq) loading.value = false
   }
 }
 function reload() { page.value = 1; load() }
@@ -168,7 +169,8 @@ async function saveCell(row, key, value) {
 async function saveItems(row) {
   const items = (row.items || []).filter((it) => it.name && it.name.trim())
     .map((it) => ({ name: it.name.trim(), quantity: Number(it.quantity) || 1,
-                    price_cny: (it.price_cny === '' || it.price_cny == null) ? null : Number(it.price_cny),
+                    unit_price_cny: (it.unit_price_cny === '' || it.unit_price_cny == null)
+                      ? null : Number(it.unit_price_cny),
                     auto: !!it.auto }))
   try {
     const updated = await stagingApi.update(row.id, { version: row.version, items })
@@ -192,12 +194,21 @@ async function savePostage(row) {
   }
 }
 
-async function addRow(data = {}) {
+async function addRow(data = {}, done) {
   try {
     const created = await stagingApi.create({ ...data })
     rows.value.unshift(created)
     total.value++
-  } catch (_) { /* 拦截器已提示 */ }
+    done?.(true)
+  } catch (e) {
+    done?.(false)   // 失败时保留幽灵行里的草稿，让用户就地改
+    // 409 被 http 拦截器刻意跳过（留给页面处理）。撞订单号唯一约束时若这里也不提示，
+    // 页面就是「什么都没发生」——连幽灵行里刚敲的单号都被 commitNew 清空了。
+    if (e.response?.status === 409) {
+      const who = data.order_no ? `订单号「${data.order_no}」` : '该记录'
+      ElMessage.warning(`${who} 已存在，未添加`)
+    }
+  }
 }
 
 async function doImport(row) {

@@ -77,8 +77,8 @@ def test_nan_price_raises():
 
 
 def test_price_from_items():
-    items = [OrderItem(name="a", quantity=3, price_cny=Decimal("1.11")),
-             OrderItem(name="b", quantity=1, price_cny=Decimal("2.00"))]
+    items = [OrderItem(name="a", quantity=3, unit_price_cny=Decimal("1.11")),
+             OrderItem(name="b", quantity=1, unit_price_cny=Decimal("2.00"))]
     assert price_from_items(items) == Decimal("5.33")
 
 
@@ -89,7 +89,7 @@ def test_price_from_items_empty_and_null_prices():
 
 def test_order_sync_adds_postage():
     o = Order(date="2026-01-01", postage_cny=Decimal("8.00"), fx_rate=Decimal("20"))
-    o.items = [OrderItem(name="a", quantity=2, price_cny=Decimal("10.00"))]
+    o.items = [OrderItem(name="a", quantity=2, unit_price_cny=Decimal("10.00"))]
     o.sync_from_items()
     assert o.price_cny == Decimal("28.00")
     assert o.jpy_auto == 560

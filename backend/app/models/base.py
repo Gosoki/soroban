@@ -39,7 +39,9 @@ class OrderStatus(str, Enum):
     unpaid = "待付款"       # 等待买家付款
     paid = "待发货"         # 买家已付款、待卖家发货
     shipped = "待收货"      # 卖家已发货
-    received = "已签收"     # 国内快递被集运仓签收（闲鱼页面显示「交易成功」）
+    # 「已入仓」= 国内快递**被集运仓**签收。刻意不叫「已签收」——集运单也有个「已签收」，
+    # 那个是国际包裹**本人**收到；同字面量还被 EXCLUDED_STATUSES 这类跨表集合共用，极易出错。
+    warehoused = "已入仓"   # 国内快递已到集运仓（闲鱼页面显示「交易成功」）
     consolidating = "集运中"  # 已挂靠集运单，等待打包/发出
     arrived = "已到达"      # 终态：国际段送达、本人收到货
     refunded = "退款"
@@ -52,7 +54,7 @@ ORDER_STATUS_RANK = {
     OrderStatus.unpaid.value: 0,
     OrderStatus.paid.value: 1,
     OrderStatus.shipped.value: 2,
-    OrderStatus.received.value: 3,
+    OrderStatus.warehoused.value: 3,
     OrderStatus.consolidating.value: 4,
     OrderStatus.arrived.value: 5,
 }
@@ -66,7 +68,8 @@ def order_status_rank(status: Optional[str]) -> int:
 class ShipmentStatus(str, Enum):
     packing = "打包中"
     shipped = "已发出"
-    arrived = "已签收"
+    # 属性名与 OrderStatus.arrived("已到达") 刻意区分开：这个是「包裹到我手上、签收了」
+    received = "已签收"
     cancelled = "已取消"
 
 
@@ -92,7 +95,7 @@ def price_from_items(items) -> Decimal:
     系统的最小单位是「物品(OrderItem/StagingItem)」：物品带单价(price_cny)与数量(quantity)，
     订单价由此派生、不再直接编辑（见各 model 的 sync_from_items 与 README「物品为最小单位」）。"""
     total = sum(
-        (Decimal(it.price_cny or 0) * (it.quantity or 1) for it in items),
+        (Decimal(it.unit_price_cny or 0) * (it.quantity or 1) for it in items),
         Decimal("0"),
     )
     return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -103,7 +106,9 @@ def price_from_items(items) -> Decimal:
 class LedgerBase(SQLModel):
     date: dt.date = Field(index=True)                       # 记录日期
     note: Optional[str] = Field(default=None, sa_type=Text)  # sa_type（非 sa_column）→ 每个子表各建一份，避免共享 Column 报错
-    source: str = Field(default=Source.manual.value, max_length=32, index=True)
+    # created_via = 这行**怎么进来的**（手填/从暂存导入/机器人）。刻意不叫 source——
+    # 那会和 platform（UI 标签就叫「来源」，值是 淘宝/闲鱼/京东）撞义。
+    created_via: str = Field(default=Source.manual.value, max_length=32, index=True)
     payer_id: Optional[int] = Field(default=None, foreign_key="user.id")
     version: int = Field(default=1)                          # 乐观锁
     is_delete: bool = Field(default=False, index=True)       # 软删标记（True=已删，查询默认过滤）

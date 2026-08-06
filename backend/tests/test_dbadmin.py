@@ -1,6 +1,6 @@
 """数据库管理层：迁移表清单完整性、整库拷贝、方言助手、端点守卫。
 
-不需要真 MySQL——拷贝走 SQLite→SQLite（copy_data 与方向无关），MySQL 专属逻辑只做纯函数校验。
+不需要真 MySQL——拷贝走 SQLite→SQLite（replace_data 与方向无关），MySQL 专属逻辑只做纯函数校验。
 """
 import datetime as dt
 import re
@@ -62,13 +62,13 @@ def test_copy_data_roundtrip(client, dst_engine):
     from app.database import get_engine
 
     client.post("/api/orders", json={
-        "date": "2027-01-01", "order_no": "CP-1", "platform": "淘宝", "shop": "拷贝测试",
-        "items": [{"name": "甲", "quantity": 2, "price_cny": "3.00"}]})
-    counts = db_migrate.copy_data(get_engine(), dst_engine)
+        "date": "2027-01-01", "order_no": "CP-1", "platform": "淘宝", "title": "拷贝测试",
+        "items": [{"name": "甲", "quantity": 2, "unit_price_cny": "3.00"}]})
+    counts = db_migrate.replace_data(get_engine(), dst_engine)
     assert counts["orders"] > 0 and counts["orderitem"] > 0
     with Session(dst_engine) as d:
         o = d.exec(select(Order).where(Order.order_no == "CP-1")).one()
-        assert o.shop == "拷贝测试"
+        assert o.title == "拷贝测试"
         assert [i.name for i in d.exec(select(OrderItem).where(OrderItem.order_id == o.id)).all()] == ["甲"]
         assert d.exec(select(User)).first() is not None      # 用户表也搬（含密码哈希）
 
@@ -77,8 +77,8 @@ def test_copy_data_is_idempotent_overwrite(client, dst_engine):
     """整表覆盖：连拷两次，目标不该翻倍。"""
     from app.database import get_engine
 
-    first = db_migrate.copy_data(get_engine(), dst_engine)
-    second = db_migrate.copy_data(get_engine(), dst_engine)
+    first = db_migrate.replace_data(get_engine(), dst_engine)
+    second = db_migrate.replace_data(get_engine(), dst_engine)
     assert first == second
     with Session(dst_engine) as d:
         assert len(d.exec(select(Order)).all()) == second["orders"]

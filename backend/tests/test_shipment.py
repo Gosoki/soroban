@@ -36,7 +36,7 @@ def test_soft_deleted_frees_shipment_no(client):
 
 def test_attach_and_detach(client):
     s = mk_ship(client, shipment_no="JF-A1")
-    o = mk_order(client, shop="待挂靠")
+    o = mk_order(client, title="待挂靠")
     r = client.post(f"/api/shipment/{s['id']}/order/{o['id']}")
     assert r.status_code == 200
     assert [c["id"] for c in r.json()["orders"]] == [o["id"]]
@@ -129,7 +129,7 @@ def test_ocr_express_missing_shipment_404(client):
 
 def test_shipment_orders_expose_items(client):
     s = mk_ship(client, shipment_no="JF-IT")
-    o = mk_order(client, items=[{"name": "内含物", "quantity": 3, "price_cny": "5.00"}])
+    o = mk_order(client, items=[{"name": "内含物", "quantity": 3, "unit_price_cny": "5.00"}])
     r = client.post(f"/api/shipment/{s['id']}/order/{o['id']}")
     brief = r.json()["orders"][0]
     assert brief["items"][0]["name"] == "内含物"

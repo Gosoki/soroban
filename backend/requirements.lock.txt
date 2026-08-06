@@ -1,3 +1,13 @@
+# 锁定版本（可复现安装）：pip install -r requirements.lock.txt
+#
+# ⚠️ 这份文件必须覆盖 requirements.txt 里的**每一个**直接依赖。曾经漏过 PyMySQL /
+#    rapidocr_onnxruntime / pillow 三个——而 app/services/db_migrate.py 在模块顶层 import
+#    pymysql、又被 routers/dbadmin.py 导入，于是按 README「可复现安装」这条路装出来的环境
+#    连 `uvicorn app.main:app` 都起不来（ModuleNotFoundError，且报错点在跟记账毫不相干的模块里）。
+#    tests/test_requirements.py 会在漏包时变红。
+#
+# 刷新方式：在装齐 requirements.txt 的**干净** venv 里跑 `pip freeze > requirements.lock.txt`。
+
 alembic==1.18.5
 annotated-doc==0.0.4
 annotated-types==0.7.0
@@ -37,3 +47,15 @@ uvicorn==0.51.0
 uvloop==0.22.1
 watchfiles==1.2.0
 websockets==16.0
+flatbuffers==25.12.19
+numpy==2.5.1
+onnxruntime==1.28.0
+opencv-python==5.0.0.93
+packaging==26.3
+pillow==12.3.0
+protobuf==7.35.1
+pyclipper==1.4.0
+PyMySQL==1.2.0
+rapidocr-onnxruntime==1.4.4
+shapely==2.1.2
+tqdm==4.70.0

@@ -61,7 +61,7 @@ def test_derived_price_overflow_is_422_not_500(client):
     """物品数量×单价绕过单字段校验 → compute_money 必须兜住，返回 422。"""
     r = client.post("/api/orders", json={
         "date": "2026-04-01",
-        "items": [{"name": "a", "quantity": 1_000_000, "price_cny": "9999999.99"}],
+        "items": [{"name": "a", "quantity": 1_000_000, "unit_price_cny": "9999999.99"}],
     })
     assert r.status_code == 422, r.text
 
@@ -85,11 +85,11 @@ SQLISH = [
 
 @pytest.mark.parametrize("s", SQLISH)
 def test_hostile_strings_in_shop_roundtrip(client, s):
-    r = client.post("/api/orders", json={"date": "2026-04-01", "shop": s})
+    r = client.post("/api/orders", json={"date": "2026-04-01", "title": s})
     # NUL 字节被 SQLite/驱动拒绝是可接受的（4xx/409），但不能 500
     assert r.status_code in (200, 409, 422), f"{s!r} → {r.status_code} {r.text[:200]}"
     if r.status_code == 200:
-        assert r.json()["shop"] == s
+        assert r.json()["title"] == s
 
 
 @pytest.mark.parametrize("s", SQLISH)
@@ -99,8 +99,8 @@ def test_hostile_strings_in_search_never_500(client, s):
 
 
 def test_overlong_shop_rejected_or_stored(client):
-    """shop 列是 VARCHAR(255)：SQLite 不强制，MySQL 会报错。当前应至少不 500。"""
-    r = client.post("/api/orders", json={"date": "2026-04-01", "shop": "x" * 5000})
+    """title 列是 VARCHAR(255)：SQLite 不强制，MySQL 会报错。当前应至少不 500。"""
+    r = client.post("/api/orders", json={"date": "2026-04-01", "title": "x" * 5000})
     assert r.status_code in (200, 409, 422), r.status_code
 
 
@@ -126,7 +126,7 @@ def test_unknown_layout_table_rejected(client):
 
 
 def test_layout_roundtrip(client):
-    cols = [{"key": "date", "width": 120}, {"key": "shop", "width": 200}]
+    cols = [{"key": "date", "width": 120}, {"key": "title", "width": 200}]
     assert client.put("/api/layout/orders", json={"columns": cols}).status_code == 200
     got = client.get("/api/layout/orders").json()["columns"]
     assert got == cols

@@ -15,7 +15,9 @@ from ..models import OrderStatus, ShipmentOrder, Order, order_status_rank, utcno
 from ..schemas import (
     ShipmentCreate, ShipmentOcrAttachResult, ShipmentRead, ShipmentUpdate, OrderItemRead, OrderBrief,
 )
-from .common import conflict, guarded_bump, mirror_to_staging, not_found, run_ocr, soft_delete
+from .common import (
+    guarded_bump, mirror_to_staging, raise_conflict, raise_not_found, run_ocr, soft_delete,
+)
 
 router = APIRouter(
     prefix="/api/shipment", tags=["shipment"], dependencies=[Depends(get_current_user)]
@@ -24,7 +26,7 @@ router = APIRouter(
 
 def _brief(order: Order) -> OrderBrief:
     return OrderBrief(
-        id=order.id, order_no=order.order_no, date=order.date, shop=order.shop,
+        id=order.id, order_no=order.order_no, date=order.date, title=order.title,
         status=order.status, jpy_settled=order.jpy_settled,
         items=[OrderItemRead(id=it.id, name=it.name, quantity=it.quantity) for it in order.items],
     )
@@ -119,7 +121,7 @@ async def ocr_attach_express(
 
     shipment = session.get(ShipmentOrder, shipment_id)
     if not shipment or shipment.is_delete:
-        not_found("集运订单")
+        raise_not_found("集运订单")
 
     fields = await run_ocr(file, recognize_shipment)
     express_nos = fields.get("express_nos") or []
@@ -196,7 +198,7 @@ def create_order(payload: ShipmentCreate, session: Session = Depends(get_session
 def get_order(order_id: int, session: Session = Depends(get_session)):
     order = session.get(ShipmentOrder, order_id)
     if not order or order.is_delete:
-        not_found("集运订单")
+        raise_not_found("集运订单")
     return _read(session, order)
 
 
@@ -204,9 +206,9 @@ def get_order(order_id: int, session: Session = Depends(get_session)):
 def update_order(order_id: int, payload: ShipmentUpdate, session: Session = Depends(get_session)):
     order = session.get(ShipmentOrder, order_id)
     if not order or order.is_delete:
-        not_found("集运订单")
+        raise_not_found("集运订单")
     if not guarded_bump(session, ShipmentOrder, order_id, payload.version):
-        conflict()
+        raise_conflict()
 
     data = payload.model_dump(exclude_unset=True, exclude={"version"})
     for key, value in data.items():
@@ -230,10 +232,10 @@ def attach_order(shipment_id: int, order_id: int, session: Session = Depends(get
     才够格推进到「集运中」。两边的差别是业务语义上的，不是遗漏。"""
     shipment = session.get(ShipmentOrder, shipment_id)
     if not shipment or shipment.is_delete:
-        not_found("集运订单")
+        raise_not_found("集运订单")
     od = session.get(Order, order_id)
     if not od or od.is_delete:
-        not_found("商品订单")
+        raise_not_found("商品订单")
     if od.shipment_order_id == shipment_id:
         return _read(session, shipment)               # 已挂本单，幂等
     # 原子挂载：仅当商品单在 DB 里仍未挂靠（且未软删）、且集运单当前仍存活时才成功，靠 rowcount 判定。
@@ -262,10 +264,10 @@ def detach_order(shipment_id: int, order_id: int, session: Session = Depends(get
     """从本集运单移除一个商品订单（解除外键）。仅当它确实挂在本单才动（幂等）。"""
     shipment = session.get(ShipmentOrder, shipment_id)
     if not shipment or shipment.is_delete:
-        not_found("集运订单")
+        raise_not_found("集运订单")
     od = session.get(Order, order_id)
     if not od or od.is_delete:
-        not_found("商品订单")
+        raise_not_found("商品订单")
     # 原子解除：仅当它确实挂在本单才动（幂等）；version 在 DB 层自增，不丢并发自增。
     session.execute(
         sa_update(Order)
@@ -280,7 +282,7 @@ def detach_order(shipment_id: int, order_id: int, session: Session = Depends(get
 def delete_order(order_id: int, session: Session = Depends(get_session)):
     order = session.get(ShipmentOrder, order_id)
     if not order or order.is_delete:
-        not_found("集运订单")
+        raise_not_found("集运订单")
     # 解除关联淘宝订单的挂靠，避免留下指向已删集运单的悬空外键
     session.execute(
         sa_update(Order)

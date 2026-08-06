@@ -96,14 +96,10 @@ import { shipmentApi, ordersApi, tagsApi } from '@/api'
 import { ORDER_SOURCES, ORDER_STATUS, statusStyle } from '@/constants'
 import { fmtJPY } from '@/utils/money'
 import { queueOrderWrite } from '@/utils/orderWrites'
+import { today } from '@/utils/datetime'
 import NotionTable from '@/components/NotionTable.vue'
 import OrderItemsEditor from '@/components/OrderItemsEditor.vue'
 
-// 用本地时区（用户在日本=JST）的当天，而非 UTC；否则 JST 0~9 点新建会记成前一天
-const today = () => {
-  const d = new Date()
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-}
 
 // 默认列顺序 + 统一列宽（≈ 刚好显示日期，取整多留一点 = 110）；用户可拖动改序/改宽，改动持久化
 const COL_W = 110
@@ -111,7 +107,7 @@ const columns = [
   { key: 'date', label: '下单日期', type: 'date', width: COL_W },
   { key: 'platform_account', label: '账号昵称', type: 'tag', field: 'platform_account', width: COL_W },
   { key: 'platform', label: '来源', type: 'tag', field: 'platform', width: COL_W, placeholder: '来源' },
-  { key: 'shop', label: '商品', type: 'text', long: true, width: COL_W },
+  { key: 'title', label: '商品', type: 'text', long: true, width: COL_W },
   { key: 'items', label: '物品', readonly: true, width: COL_W, expand: true },
   { key: 'status', label: '状态', type: 'select', options: ORDER_STATUS, width: COL_W, clearable: false },
   { key: 'shipment_order_id', label: '集运订单', readonly: true, width: COL_W, placeholder: '选择' },
@@ -153,14 +149,18 @@ function itemSummary(row) {
 }
 // 灰显 = 物品名与商品标题相同（无独立物品详情，多为自动占位）；有真实物品名即正常
 function isTitleItem(row, it) {
-  return !!it.name && (it.name || '').trim() === (row.shop || '').trim()
+  return !!it.name && (it.name || '').trim() === (row.title || '').trim()
 }
 // 列表「物品」格：全是标题占位（自动生成）时整格灰显
 function allTitleItems(row) {
   return !!(row.items && row.items.length) && row.items.every((it) => isTitleItem(row, it))
 }
 
+// 请求序号：筛选/翻页可以在上一次响应回来前再发一次，慢的那次后到会把新数据整个覆盖掉
+// （表现为「清了筛选却只剩一部分」「内容是第2页、页码高亮第3页」）。只认最后一次发出的请求。
+let loadSeq = 0
 async function load() {
+  const my = ++loadSeq
   loading.value = true
   try {
     const params = { limit: pageSize, offset: (page.value - 1) * pageSize }
@@ -171,10 +171,11 @@ async function load() {
     if (filters.range) { params.date_from = filters.range[0]; params.date_to = filters.range[1] }
     if (focusId.value) params.id = focusId.value          // 跳转定位：隔离显示该单
     const res = await ordersApi.list(params)
+    if (my !== loadSeq) return          // 已有更新的请求发出，丢弃这次的结果
     rows.value = res.items
     total.value = res.total
   } finally {
-    loading.value = false
+    if (my === loadSeq) loading.value = false
   }
 }
 function reload() { page.value = 1; load() }
@@ -253,7 +254,7 @@ async function processOcr(file) {
     const data = {}
     if (res.order_date) data.date = res.order_date          // 下单时间 → 下单日期
     if (res.platform) data.platform = res.platform
-    if (res.product) data.shop = res.product                // 商品名称 →「商品」列(shop)
+    if (res.product) data.title = res.product               // 商品名称 →「商品」列(title)
     if (res.express_company) data.express_company = res.express_company
     if (res.express_no) data.express_no = res.express_no
     if (res.order_no) data.order_no = res.order_no
@@ -289,10 +290,10 @@ async function findByOrderNo(orderNo) {
   } catch (_) { return null }
 }
 
-// 交易状态生命周期序：只准前进（待付款→待发货→待收货→已签收→集运中→已到达），不回退；
+// 交易状态生命周期序：只准前进（待付款→待发货→待收货→已入仓→集运中→已到达），不回退；
 // 退款/交易关闭是旁支终态、未知值同样取 -1。必须与后端 models/base.py 的 ORDER_STATUS_RANK 一致
 // ——集运页「内含快递」自动挂靠也按同一张表判定是否把订单推进到「集运中」。
-const STATUS_RANK = { 待付款: 0, 待发货: 1, 待收货: 2, 已签收: 3, 集运中: 4, 已到达: 5 }
+const STATUS_RANK = { 待付款: 0, 待发货: 1, 待收货: 2, 已入仓: 3, 集运中: 4, 已到达: 5 }
 function statusRank(s) { return STATUS_RANK[s] ?? -1 }
 
 // 这单还「没有真实价格」吗？= 物品全是系统占位(auto) 且合计为 0。
@@ -301,7 +302,7 @@ function hasNoRealPrice(base) {
   const items = base.items || []
   if (!items.length) return true
   if (!items.every((it) => it.auto)) return false
-  const sum = items.reduce((s, it) => s + Number(it.price_cny || 0) * (Number(it.quantity) || 1), 0)
+  const sum = items.reduce((s, it) => s + Number(it.unit_price_cny || 0) * (Number(it.quantity) || 1), 0)
   return sum === 0 && Number(base.postage_cny || 0) === 0
 }
 
@@ -311,7 +312,7 @@ function buildMergePatch(base, data) {
   const patch = { version: base.version }
   if (data.date) patch.date = data.date
   if (data.status && statusRank(data.status) > statusRank(base.status)) patch.status = data.status
-  for (const k of ['platform', 'shop', 'express_company', 'express_no']) {
+  for (const k of ['platform', 'title', 'express_company', 'express_no']) {
     const cur = base[k]
     if (data[k] != null && data[k] !== '' && (cur == null || cur === '')) patch[k] = data[k]
   }
@@ -322,8 +323,8 @@ function buildMergePatch(base, data) {
   if (data.price_cny != null && data.price_cny !== '' && hasNoRealPrice(base)) {
     patch.price_cny = data.price_cny
     patch.items = (base.items || []).length
-      ? base.items.map((it) => ({ name: it.name, quantity: it.quantity, price_cny: null, auto: true }))
-      : [{ name: patch.shop || base.shop || '未命名物品', quantity: 1, price_cny: null, auto: true }]
+      ? base.items.map((it) => ({ name: it.name, quantity: it.quantity, unit_price_cny: null, auto: true }))
+      : [{ name: patch.title || base.title || '未命名物品', quantity: 1, unit_price_cny: null, auto: true }]
   }
   return patch
 }
@@ -338,7 +339,10 @@ async function mergeByOrderNo(existing, data) {
   // 若这单正被用户在别处编辑而 version 变了，OCR 补的字段不该直接丢：拉最新版本、按新状态重算 patch，再试一次。
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const updated = await ordersApi.update(base.id, patch)
+      // 必须进 queueOrderWrite：本页所有对同一订单的写都排在一条链上（见 utils/orderWrites.js）。
+      // OCR 队列是后台跑的，用户很可能正在展开面板里改物品；不排队的话两边各读一份 version、
+      // 谁先落地谁赢——本函数自己有重试所以受损的总是**用户那笔**，正是那条串行链要消灭的场景。
+      const updated = await queueOrderWrite(base.id, () => ordersApi.update(base.id, patch))
       const idx = rows.value.findIndex((r) => r.id === base.id)   // 在当前页则就地刷新
       if (idx >= 0) { const { items, ...rest } = updated; Object.assign(rows.value[idx], rest); sortRows() }
       ElMessage.success(`已按订单号匹配更新 · 订单号 ${data.order_no}${patch.date ? ' · 下单时间 ' + patch.date : ''}`)
@@ -360,7 +364,7 @@ function ocrSummary(data) {
   if (data.date) parts.push(`下单 ${data.date}`)
   if (data.status) parts.push(`状态 ${data.status}`)
   if (data.platform) parts.push(`来源 ${data.platform}`)
-  if (data.shop) parts.push(`商品 ${data.shop}`)
+  if (data.title) parts.push(`商品 ${data.title}`)
   if (data.express_company) parts.push(`快递 ${data.express_company}`)
   if (data.express_no) parts.push(`快递号 ${data.express_no}`)
   if (data.order_no) parts.push(`订单号 ${data.order_no}`)
@@ -397,15 +401,17 @@ function sortRows() {
   rows.value.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : b.id - a.id))
 }
 
-async function addRow(data = {}) {
+async function addRow(data = {}, done) {
   try {
     // status 不写死：后端 OrderBase 默认「待发货」，避免枚举改名后前端残留非法值（曾用'已付'→422）
     const created = await ordersApi.create({ date: today(), ...data })
     rows.value.unshift(created)
     sortRows()                 // 按下单日期归位（OCR 可能录入历史日期，勿留在顶部）
     total.value++
+    done?.(true)
     return created
   } catch (e) {
+    done?.(false)   // 失败时保留幽灵行里的草稿，让用户就地改
     // 409 被 http 拦截器刻意跳过（留给页面处理）→ 这里对「订单号+来源」重复给明确提示
     if (e.response?.status === 409) {
       const who = data.order_no

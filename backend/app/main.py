@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from . import models  # noqa: F401  确保建表前所有模型已注册
 from .config import settings
 from .database import checkpoint_and_dispose, create_db_and_tables, wal_checkpoint_loop
+from .maintenance import barrier
 from .routers import auth, dashboard, dbadmin, fx, items, shipment, layout, misc, orders, plugins, staging, tags
 from .routers.plugins import scheduler_loop
 from .services.fx import fx_loop
@@ -23,13 +24,29 @@ log = logging.getLogger("soroban")
 _INSECURE_KEYS = {"", "dev-insecure-key-change-me", "change-me-to-a-long-random-string"}
 
 
+def _check_secret_key() -> None:
+    """SECRET_KEY 是默认值/过短 → **拒绝启动**，而不是打个警告继续跑。
+
+    为什么必须 fail-closed：这个 key 同时用来签发登录 JWT 与加密数据库连接串，而默认值就写在
+    公开仓库里。只要它还是默认值，任何人都能自己签一个 `{"sub":"1"}` 的令牌拿到管理员权限
+    ——auth.get_current_user 只验签名，没有服务端会话状态可兜底。
+    这类问题也**没法登录进来再修**（令牌本身就不可信），所以不适合像「默认密码」那样只告警。
+
+    正常路径都不会踩到：start.sh / start.bat / run.py 首启都会生成含随机 key 的 .env。
+    """
+    key = settings.SECRET_KEY
+    if key in _INSECURE_KEYS or len(key) < 16:
+        raise RuntimeError(
+            "SECRET_KEY 是不安全的默认值或过短，拒绝启动。\n"
+            "  它用于签发登录令牌与加密数据库连接串——保持默认值等于任何人都能伪造管理员身份。\n"
+            "  解决：删掉 .env 让程序重新生成，或手动在 .env 里写一行\n"
+            "    SECRET_KEY=<python -c \"import secrets;print(secrets.token_hex(32))\" 的输出>"
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if settings.SECRET_KEY in _INSECURE_KEYS or len(settings.SECRET_KEY) < 16:
-        log.warning(
-            "⚠️ SECRET_KEY 是不安全的默认值或过短，仅可用于本地开发。"
-            "上公网前务必在 .env 设置强随机 SECRET_KEY，否则登录 token 可被伪造！"
-        )
+    _check_secret_key()
     create_db_and_tables()          # Alembic upgrade head（幂等；旧库自动接管，见 database.py）
     tasks = [
         asyncio.create_task(fx_loop()),
@@ -46,6 +63,35 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="soroban", version="0.1.0", lifespan=lifespan)
+
+# 数据库迁移期间只读：拷贝没有读快照，期间写入会产生撕裂的拷贝（详见 app/maintenance.py）。
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+# 迁移/切换端点自己不能被自己拦住；登录也放行，否则屏障期间连进来看一眼状态都做不到
+# （登录只读 user 表 + 进程内计数，不写业务数据）。
+_ALLOWED_WHILE_READONLY = ("/api/db/", "/api/auth/login")
+
+
+@app.middleware("http")
+async def _readonly_barrier(request: Request, call_next):
+    """写请求在只读屏障期间一律 503。
+
+    用中间件而不是给每个端点挂依赖：将来新增的写端点**自动**被覆盖，不会有人忘了加。
+    """
+    path = request.url.path
+    if request.method in _SAFE_METHODS or path.startswith(_ALLOWED_WHILE_READONLY):
+        return await call_next(request)
+    reason = barrier.begin_write()          # 原子：查屏障 + 登记在飞写
+    if reason is not None:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": f"{reason}，此期间暂停写入，请稍后重试"},
+            headers={"Retry-After": "10"},
+        )
+    try:
+        return await call_next(request)
+    finally:
+        barrier.end_write()
+
 
 # 令牌走 Authorization 头、不使用 cookie，故 allow_credentials=False（更安全）
 app.add_middleware(

@@ -24,7 +24,7 @@ from sqlmodel import Session, select
 from ..auth import create_access_token, get_current_user
 from ..config import settings
 from ..database import get_engine, get_session
-from ..models import PluginConfig, User, utcnow
+from ..models import Order, PluginConfig, User, utcnow
 from ..schemas import PluginConfigIn
 from .tags import (
     delete_account_staging,
@@ -46,6 +46,8 @@ _SOROBAN_ROOT = (
     else Path(__file__).resolve().parents[3]        # 源码：…/soroban
 )
 _SELF_URL = f"http://127.0.0.1:{os.environ.get('BACKEND_PORT', '8620')}"   # soroban 自身地址（插件同机回灌用）
+# 账号名最终落进 Order/OrderStaging.platform_account，长度以那一列为准（超长在 MySQL 是 500）
+_ACCOUNT_MAX = Order.__table__.columns["platform_account"].type.length
 
 
 def scraper_dir() -> Path:
@@ -72,7 +74,8 @@ def discover() -> list[dict]:
     return out
 
 
-def _find(plugin_id: str) -> dict:
+def _find_manifest(plugin_id: str) -> dict:
+    """按 id 找插件清单（plugin.toml 解析结果）。找不到 → 404。"""
     for m in discover():
         if m.get("id") == plugin_id:
             return m
@@ -276,7 +279,7 @@ def list_plugins(session: Session = Depends(get_session)):
 @router.put("/{plugin_id}/config")
 def save_config(plugin_id: str, payload: PluginConfigIn, session: Session = Depends(get_session)):
     """只存插件级设置：启用定时 + 定时间隔。账号（昵称/平台/启用）走专用增删改端点，这里不碰。"""
-    _find(plugin_id)                                    # 确认插件存在
+    _find_manifest(plugin_id)                                    # 确认插件存在
     cfg = session.get(PluginConfig, plugin_id) or PluginConfig(plugin_id=plugin_id)
     cfg.enabled = payload.enabled
     cfg.schedule_minutes = max(0, payload.schedule_minutes)
@@ -289,12 +292,13 @@ def save_config(plugin_id: str, payload: PluginConfigIn, session: Session = Depe
 @router.post("/{plugin_id}/account")
 def add_account(
     plugin_id: str,
-    name: str = Query(..., description="账号昵称"),
+    # 账号名会写进 Order/OrderStaging.platform_account，按该列长度限长（见 tags.check_value_fits）
+    name: str = Query(..., max_length=_ACCOUNT_MAX, description="账号昵称"),
     platform: str = Query("淘宝", description="导入平台（加时定，之后不可改）"),
     session: Session = Depends(get_session),
 ):
     """添加一个账号：绑定昵称 + 平台（写一次即锁定），默认启用。之后在下面列表登录授权。"""
-    m = _find(plugin_id)
+    m = _find_manifest(plugin_id)
     name = name.strip()
     _check_account_name(m, name)                        # 非空+无逗号+合法文件名（会话文件按此名存）
     cfg = session.get(PluginConfig, plugin_id) or PluginConfig(plugin_id=plugin_id)
@@ -315,7 +319,7 @@ def set_account_enabled(
     session: Session = Depends(get_session),
 ):
     """启用/停用某账号。停用后定时与「抓取全部账号」都跳过它（仍可单独「抓这个号」）。"""
-    _find(plugin_id)
+    _find_manifest(plugin_id)
     cfg = session.get(PluginConfig, plugin_id)
     accs = _account_list(cfg)
     if not any(a["name"] == account for a in accs):
@@ -330,7 +334,7 @@ def set_account_enabled(
 
 @router.post("/{plugin_id}/login")
 def login(plugin_id: str, account: str = Query(..., description="要授权登录的账号")):
-    m = _find(plugin_id)
+    m = _find_manifest(plugin_id)
     _check_account_name(m, account)   # 非空+无逗号+目录穿越校验——与 add 同一把尺子，别让 login 收下非法名产生孤儿会话
     return {"started": True, "pid": _launch(m, "login", ["--account", account])}
 
@@ -342,7 +346,7 @@ def fetch(
     current: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
-    m = _find(plugin_id)
+    m = _find_manifest(plugin_id)
     cfg = session.get(PluginConfig, plugin_id)
     by_name = {a["name"]: a for a in _account_list(cfg)}
     if account:                                          # 单账号：手动抓，忽略「启用」；孤儿(磁盘授权未配置)按缺省淘宝
@@ -366,7 +370,7 @@ def delete_account(
     session: Session = Depends(get_session),
 ):
     """注销某账号：删掉磁盘登录会话，并从插件配置的账号列表里移除。"""
-    m = _find(plugin_id)
+    m = _find_manifest(plugin_id)
     cfg = session.get(PluginConfig, plugin_id)
     if account not in _known_names(cfg, m):
         raise HTTPException(status_code=404, detail=f"该插件下没有账号：{account}")
@@ -382,12 +386,12 @@ def delete_account(
 def rename_account(
     plugin_id: str,
     old: str = Query(..., description="原账号名"),
-    new: str = Query(..., description="新账号名（须全新、不含逗号）"),
+    new: str = Query(..., max_length=_ACCOUNT_MAX, description="新账号名（须全新、不含逗号）"),
     session: Session = Depends(get_session),
 ):
     """账号改名：一次性迁移它名下的暂存/账本订单（保留标签颜色）、重命名磁盘登录会话、更新插件配置。
     只做纯改名——new 若已被占用（已有账号/数据/授权）则拒绝，不与「合并」语义混淆。"""
-    m = _find(plugin_id)
+    m = _find_manifest(plugin_id)
     if m.get("platform") != "taobao":                       # 账号↔platform_account 的耦合是淘宝专属；别的插件先不支持
         raise HTTPException(status_code=400, detail="该插件不支持账号改名。")
     new = new.strip()
@@ -439,12 +443,15 @@ def delete_account_staging_ep(
     account: str = Query(..., description="要清空暂存的账号"),
     session: Session = Depends(get_session),
 ):
-    """删除该账号在「全部订单」暂存表里的所有行（含物品明细）。不动账本正式订单。"""
-    m = _find(plugin_id)
+    """删除该账号在「暂存订单」表里的所有行（含物品明细）。不动账本正式订单。
+
+    已导入且账本单仍在的行会被**跳过**（删了会留下无法再导入的孤儿账本单，见
+    tags.delete_account_staging），跳过数在 skipped 里回报，供前端提示用户先去删账本单。"""
+    m = _find_manifest(plugin_id)
     _require_platform_account(m, session, account)
-    n = delete_account_staging(session, account)
+    deleted, skipped = delete_account_staging(session, account)
     session.commit()
-    return {"ok": True, "deleted": n}
+    return {"ok": True, "deleted": deleted, "skipped": skipped}
 
 
 @router.delete("/{plugin_id}/account/orders")
@@ -454,7 +461,7 @@ def delete_account_orders_ep(
     session: Session = Depends(get_session),
 ):
     """软删该账号名下的所有账本正式淘宝订单（从账本移除、可在数据库层恢复）。不动暂存。"""
-    m = _find(plugin_id)
+    m = _find_manifest(plugin_id)
     _require_platform_account(m, session, account)
     n = soft_delete_account_orders(session, account)
     session.commit()
@@ -502,11 +509,21 @@ def _run_due(session: Session) -> None:
 
 
 async def scheduler_loop(interval: int = 60) -> None:
-    """后台循环：每 interval 秒检查一次到点的插件并触发抓取（放进 lifespan）。"""
+    """后台循环：每 interval 秒检查一次到点的插件并触发抓取（放进 lifespan）。
+
+    只读屏障期间跳过。不是怕它写坏（回灌走 HTTP，会被中间件拦下），而是**白开一次浏览器
+    冲淘宝**——并发多开浏览器是风控红线（见插件 docs/风控与对策.md）。
+    跳过也不会漏抓：last_run_at 没被推进，下一轮到点自然重来。"""
+    from ..maintenance import barrier
+
     while True:
         try:
-            with Session(get_engine()) as session:
-                _run_due(session)
+            reason = barrier.blocked_reason()
+            if reason:
+                log.info("定时抓取跳过：%s", reason)
+            else:
+                with Session(get_engine()) as session:
+                    _run_due(session)
         except Exception as e:                          # 单轮异常不结束循环
             log.warning("插件定时循环异常：%s", e)
         await asyncio.sleep(interval)

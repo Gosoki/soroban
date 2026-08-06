@@ -40,7 +40,7 @@ def _clip(v: Optional[str], limit: int) -> Optional[str]:
 
     只用于「物品名 / 杂项名」这类**显示标签**：255 字远超实际所需，超长多半是误粘贴，
     截尾比 422 打断整批同步划算，且与 routers/common.build_items 里既有的 [:255] 同口径。
-    真正会天然超长的商品标题（`shop`）已经放宽成 TEXT 列、不再截断（见迁移 d0e1f2a3b4c5）。
+    真正会天然超长的商品标题（`title`）已经放宽成 TEXT 列、不再截断（见迁移 d0e1f2a3b4c5）。
     标识类列（订单号/快递号/账号…）不走这里——那种超长是脏输入，宁可 422。"""
     return v if v is None else v[:limit]
 
@@ -214,10 +214,10 @@ class ItemInBase(SQLModel):
     auto 由客户端回传：未改动的「系统自动」项保持 True（前端灰显），用户一编辑即传 False。"""
     name: str
     quantity: int = Field(default=1, ge=1, le=1_000_000)   # ≥1 防负/零算出负订单价；≤1e6 防离谱数量把总价撑爆列上限
-    price_cny: Optional[Decimal] = None
+    unit_price_cny: Optional[Decimal] = None               # **单价**；订单的 price_cny 是总价
     auto: bool = False
 
-    @field_validator("price_cny")
+    @field_validator("unit_price_cny")
     @classmethod
     def _q_item_price(cls, v: Optional[Decimal]) -> Optional[Decimal]:
         return _q_money(v, "物品单价")
@@ -236,7 +236,7 @@ class OrderItemRead(SQLModel):
     id: int
     name: str
     quantity: int
-    price_cny: Optional[Decimal] = None
+    unit_price_cny: Optional[Decimal] = None
     auto: bool = False
 
 
@@ -245,13 +245,13 @@ class ItemListRead(SQLModel):
     id: int
     name: str
     quantity: int
-    price_cny: Optional[Decimal] = None
-    amount_cny: Optional[Decimal] = None
+    unit_price_cny: Optional[Decimal] = None   # 单价
+    amount_cny: Optional[Decimal] = None       # 单价 × 数量
     auto: bool = False
     order_id: int
     date: dt.date
     order_no: Optional[str] = None
-    shop: Optional[str] = None
+    title: Optional[str] = None
     platform_account: Optional[str] = None
     platform: Optional[str] = None
     status: str
@@ -261,9 +261,9 @@ class ItemListRead(SQLModel):
 class OrderFieldsIn(SQLModel):
     """订单可写字段的长度/归一约束（Create/Update 共用；两边字段一致，别再各写一份而漂移）。
     标识类列超长 → 422；单号类列写入即归一（见 norm_code / norm_id）；
-    商品标题 shop 是 Text 列，不限长也不截断。"""
+    商品标题 title 是 Text 列，不限长也不截断。"""
     order_no: Optional[str] = Field(default=None, max_length=_len(Order, "order_no"))
-    shop: Optional[str] = None                     # Text 列，无长度上限
+    title: Optional[str] = None                     # Text 列，无长度上限
     url: Optional[str] = None                      # Text 列，无长度上限
     category: Optional[str] = Field(default=None, max_length=_len(Order, "category"))
     platform: Optional[str] = Field(default=None, max_length=_len(Order, "platform"))
@@ -328,7 +328,7 @@ class OrderRead(MoneyOut):
     date: dt.date
     postage_cny: Optional[Decimal] = None
     order_no: Optional[str] = None
-    shop: Optional[str] = None
+    title: Optional[str] = None
     url: Optional[str] = None
     category: Optional[str] = None
     status: str
@@ -339,7 +339,7 @@ class OrderRead(MoneyOut):
     shipment_order_id: Optional[int] = None
     payer_id: Optional[int] = None
     note: Optional[str] = None
-    source: str
+    created_via: str
     version: int
     created_at: dt.datetime
     updated_at: dt.datetime
@@ -410,7 +410,7 @@ class OrderBrief(SQLModel):
     id: int
     order_no: Optional[str] = None
     date: dt.date
-    shop: Optional[str] = None
+    title: Optional[str] = None
     status: str
     jpy_settled: Optional[int] = None
     items: list[OrderItemRead] = []
@@ -427,7 +427,7 @@ class ShipmentRead(MoneyOut):
     recipient: Optional[str] = None
     payer_id: Optional[int] = None
     note: Optional[str] = None
-    source: str
+    created_via: str
     version: int
     created_at: dt.datetime
     updated_at: dt.datetime
@@ -479,7 +479,7 @@ class MiscRead(MoneyOut):
     category: Optional[str] = None
     payer_id: Optional[int] = None
     note: Optional[str] = None
-    source: str
+    created_via: str
     version: int
     created_at: dt.datetime
     updated_at: dt.datetime
@@ -530,7 +530,7 @@ class StagingItemRead(SQLModel):
     id: int
     name: str
     quantity: int
-    price_cny: Optional[Decimal] = None
+    unit_price_cny: Optional[Decimal] = None
     auto: bool = False
 
 
@@ -540,12 +540,12 @@ class StagingBase(PostageIn):
     platform_account: Optional[str] = Field(
         default=None, max_length=_len(OrderStaging, "platform_account"))
     platform: Optional[str] = Field(default=None, max_length=_len(OrderStaging, "platform"))
-    shop: Optional[str] = None               # 商品标题，Text 列，无长度上限
+    title: Optional[str] = None               # 商品标题，Text 列，无长度上限
     price_cny: Optional[Decimal] = None
     fx_rate: Optional[Decimal] = None
     order_date: Optional[dt.date] = None
     express_no: Optional[str] = Field(default=None, max_length=_len(OrderStaging, "express_no"))
-    order_status: Optional[str] = None       # 淘宝订单真实状态（已付/已发/…），导入后与账本联动
+    trade_status: Optional[str] = None       # 交易状态（待发货/待收货/…），导入后与账本联动
 
     @field_validator("price_cny")
     @classmethod
@@ -567,14 +567,14 @@ class StagingBase(PostageIn):
     def _norm_order_no(cls, v: Optional[str]) -> Optional[str]:
         return norm_id(v)
 
-    @field_validator("order_status")
+    @field_validator("trade_status")
     @classmethod
     def _order_status(cls, v: Optional[str]) -> Optional[str]:
         return v if v is None else _check(v, _ORDER_STATUS, "订单状态")
 
 
 class StagingCreate(StagingBase):
-    status: str = StagingStatus.pending.value
+    import_status: str = StagingStatus.pending.value
     items: list[StagingItemIn] = []
 
     @model_validator(mode="after")
@@ -585,19 +585,19 @@ class StagingCreate(StagingBase):
 
 class StagingUpdate(StagingBase):
     version: int                                       # 乐观锁必填
-    status: Optional[str] = None
+    import_status: Optional[str] = None
     items: Optional[list[StagingItemIn]] = None       # 给了就整体替换
 
-    @field_validator("status")
+    @field_validator("import_status")
     @classmethod
-    def _status(cls, v: Optional[str]) -> Optional[str]:
-        return v if v is None else _check(v, _STAGING_STATUS, "暂存状态")
+    def _import_status(cls, v: Optional[str]) -> Optional[str]:
+        return v if v is None else _check(v, _STAGING_STATUS, "导入状态")
 
 
 class StagingRead(StagingBase):
     id: int
     version: int
-    status: str
+    import_status: str
     imported_order_id: Optional[int] = None
     scraped_at: dt.datetime
     items: list[StagingItemRead] = []

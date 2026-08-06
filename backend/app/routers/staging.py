@@ -25,7 +25,7 @@ from ..models import (
     utcnow,
 )
 from ..schemas import StagingCreate, StagingItemRead, StagingRead, StagingUpdate, OrderRead
-from .common import build_items, conflict, goods_seed, guarded_bump, not_found
+from .common import build_items, goods_seed, guarded_bump, raise_conflict, raise_not_found
 
 router = APIRouter(
     prefix="/api/staging", tags=["staging"], dependencies=[Depends(get_current_user)]
@@ -36,13 +36,13 @@ router = APIRouter(
 _SHARED_TO_ORDER = {
     "order_date": "date",
     "order_no": "order_no",
-    "shop": "shop",
+    "title": "title",
     "platform_account": "platform_account",
     "platform": "platform",
     "express_no": "express_no",
     "postage_cny": "postage_cny",
     "fx_rate": "fx_rate",
-    "order_status": "status",
+    "trade_status": "status",
 }
 
 
@@ -60,16 +60,16 @@ def _overlay(row: OrderStaging, order: Optional[Order]) -> StagingRead:
     if order is not None:
         data.order_date = order.date
         data.order_no = order.order_no
-        data.shop = order.shop
+        data.title = order.title
         data.platform_account = order.platform_account
         data.express_no = order.express_no
         data.price_cny = order.price_cny
         data.postage_cny = order.postage_cny
         data.fx_rate = order.fx_rate
-        data.order_status = order.status
+        data.trade_status = order.status
         data.items = [
             StagingItemRead(id=it.id, name=it.name, quantity=it.quantity,
-                            price_cny=it.price_cny, auto=it.auto)
+                            unit_price_cny=it.unit_price_cny, auto=it.auto)
             for it in order.items
         ]
     return data
@@ -97,7 +97,8 @@ def _read(session: Session, row: OrderStaging) -> StagingRead:
 @router.get("")
 def list_staging(
     session: Session = Depends(get_session),
-    status: Optional[str] = None,
+    import_status: Optional[str] = Query(None, alias="status",
+                                         description="导入状态（待处理/已导入/已忽略）"),
     platform: Optional[str] = None,
     platform_account: Optional[str] = None,
     date_from: Optional[dt.date] = None,
@@ -107,8 +108,8 @@ def list_staging(
     offset: int = Query(0, ge=0),
 ):
     conds = []
-    if status:
-        conds.append(OrderStaging.status == status)
+    if import_status:
+        conds.append(OrderStaging.import_status == import_status)
     if platform:
         conds.append(OrderStaging.platform == platform)
     if platform_account:
@@ -120,7 +121,7 @@ def list_staging(
     if q:   # 统一模糊搜：物品名 / 商品标题 / 订单号 / 快递号（物品名用 EXISTS 子查询，不重复行）
         conds.append(
             OrderStaging.order_no.contains(q, autoescape=True)
-            | OrderStaging.shop.contains(q, autoescape=True)
+            | OrderStaging.title.contains(q, autoescape=True)
             | OrderStaging.express_no.contains(q, autoescape=True)
             | OrderStaging.items.any(StagingItem.name.contains(q, autoescape=True))
         )
@@ -145,7 +146,7 @@ def create_staging(payload: StagingCreate, session: Session = Depends(get_sessio
         row.fx_rate = rate_for_date(session, row.order_date)
     # 最小单位是物品：至少 1 条。播种用「货款」= 种子价 - 邮费，避免邮费摊进单价再被 sync 重复计
     seed_goods = goods_seed(payload.price_cny, payload.postage_cny)
-    row.items = [StagingItem(**d) for d in build_items(payload.items, seed_goods, payload.shop)]
+    row.items = [StagingItem(**d) for d in build_items(payload.items, seed_goods, payload.title)]
     row.sync_from_items()                    # price_cny = Σ(单价×数量) + 邮费
     session.add(row)
     session.commit()
@@ -157,10 +158,10 @@ def create_staging(payload: StagingCreate, session: Session = Depends(get_sessio
 def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depends(get_session)):
     row = session.get(OrderStaging, row_id)
     if not row:
-        not_found("暂存记录")
+        raise_not_found("暂存记录")
     # 暂存行乐观锁：加载后被爬虫/他人改过 → 409，前端刷新（version 原子自增 + 刷新 updated_at）
     if not guarded_bump(session, OrderStaging, row_id, payload.version):
-        conflict()
+        raise_conflict()
     data = payload.model_dump(exclude_unset=True, exclude={"items", "version", "price_cny"})  # 价由物品派生
     order = _linked_order(session, row)
 
@@ -168,17 +169,27 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
         # 已导入：共享字段写穿到账本（唯一真源），仅「导入状态」留在暂存自身。
         # 账本侧再走一次乐观锁：原子自增账本 version，让淘宝页也能察觉此次改动。
         if not guarded_bump(session, Order, order.id, order.version):
-            conflict()
+            raise_conflict()
         for key, value in data.items():
             if key in _SHARED_TO_ORDER:
                 setattr(order, _SHARED_TO_ORDER[key], value)
                 setattr(row, key, value)   # 暂存行自身原始列也同步，避免 tags._data_values / 列表筛选读到陈旧值
-            elif key == "status":
-                row.status = value
+            elif key == "import_status":
+                # 已导入行的**导入状态**不接受直接改：/ignore 端点特意用 `imported_order_id IS NULL`
+                # 挡住「已导入 → 已忽略」，PATCH 若能改就是同一个动作两个入口给相反结论，
+                # 且会留下「状态=已忽略、却还挂着活账本单」的发散行（_overlay 仍按账本覆盖显示，
+                # tags._data_values 又会把它当已丢弃而跳过 → 账号占用凭空消失）。
+                # 工作流状态只由 /import、/ignore、删除来推进。
+                if value != row.import_status:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="该记录已导入账本，导入状态不能直接修改"
+                               "（要撤销请先在「商品订单」页删除对应订单）",
+                    )
         if payload.items is not None:                   # 物品写穿账本（单一真源）+ 暂存镜像，两页一致
             # 种子只认本次显式传来的 price_cny，不回退到当前价——理由同 orders.update_order
             seed_goods = goods_seed(payload.price_cny, order.postage_cny)
-            built = build_items(payload.items, seed_goods, order.shop)
+            built = build_items(payload.items, seed_goods, order.title)
             order.items = [OrderItem(**d) for d in built]
             row.items = [StagingItem(**d) for d in built]
         order.sync_from_items()                         # 账本价+日元由物品派生（fx 变也重算）
@@ -195,7 +206,7 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
     if payload.items is not None:                       # 给了 items 就整体替换（[] → 自动补 1 条占位）
         # 种子只认本次显式传来的 price_cny，不回退到当前价——理由同 orders.update_order
         seed_goods = goods_seed(payload.price_cny, row.postage_cny)
-        row.items = [StagingItem(**d) for d in build_items(payload.items, seed_goods, row.shop)]
+        row.items = [StagingItem(**d) for d in build_items(payload.items, seed_goods, row.title)]
     row.sync_from_items()
     session.add(row)
     session.commit()
@@ -207,7 +218,7 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
 def delete_staging(row_id: int, session: Session = Depends(get_session)):
     row = session.get(OrderStaging, row_id)
     if not row:
-        not_found("暂存记录")
+        raise_not_found("暂存记录")
     if _linked_order(session, row) is not None:
         # 已导入且账本单仍在：直接删暂存会孤立账本 Order（永远占死 order_no 唯一号、无法再导入）。
         # 要求先在「商品订单」页删掉对应订单，再删此暂存，保持暂存↔账本一致。
@@ -229,13 +240,13 @@ def ignore_staging(row_id: int, session: Session = Depends(get_session)):
     res = session.execute(
         sa_update(OrderStaging)
         .where(OrderStaging.id == row_id, OrderStaging.imported_order_id.is_(None))
-        .values(status=StagingStatus.ignored.value,
+        .values(import_status=StagingStatus.ignored.value,
                 version=OrderStaging.version + 1, updated_at=utcnow())
     )
     if res.rowcount != 1:
         row = session.get(OrderStaging, row_id)     # 区分「不存在」与「已导入」
         if row is None:
-            not_found("暂存记录")
+            raise_not_found("暂存记录")
         raise HTTPException(status_code=409, detail="该记录已导入账本，不能忽略")
     session.commit()
     row = session.get(OrderStaging, row_id)
@@ -249,30 +260,31 @@ def import_staging(row_id: int, session: Session = Depends(get_session)):
 
     row = session.get(OrderStaging, row_id)
     if not row:
-        not_found("暂存记录")
+        raise_not_found("暂存记录")
     if row.imported_order_id is not None:
         raise HTTPException(status_code=409, detail="该记录已导入")
 
     order = Order(
         date=row.order_date or dt.date.today(),
         order_no=row.order_no,
-        shop=row.shop,
+        title=row.title,
         platform_account=row.platform_account,
         platform=row.platform,               # 来源随单迁移到账本
         express_no=row.express_no,
         postage_cny=row.postage_cny,         # 邮费随单迁移
         fx_rate=row.fx_rate or rate_for_date(session, row.order_date),  # 优先暂存记录的汇率；否则按下单日期匹配
-        status=row.order_status or OrderStatus.paid.value,   # 订单状态一同迁移
-        source=Source.imported.value,
+        status=row.trade_status or OrderStatus.paid.value,   # 订单状态一同迁移
+        created_via=Source.imported.value,
     )
     # 物品（含单价/auto）随单迁移；订单价由物品派生（= 暂存价，一致）。暂存无物品时兜底自动生成 1 条。
     if row.items:
-        order.items = [OrderItem(name=it.name, quantity=it.quantity, price_cny=it.price_cny, auto=it.auto)
+        order.items = [OrderItem(name=it.name, quantity=it.quantity,
+                                 unit_price_cny=it.unit_price_cny, auto=it.auto)
                        for it in row.items]
     else:
         # 0 物品兜底：种子用货款(总价-邮费)，避免 sync 再加邮费重复计（对齐其它 build_items 站点）
         seed_goods = goods_seed(row.price_cny, row.postage_cny)
-        order.items = [OrderItem(**d) for d in build_items([], seed_goods, row.shop)]
+        order.items = [OrderItem(**d) for d in build_items([], seed_goods, row.title)]
     order.sync_from_items()
     session.add(order)
     session.flush()                             # 拿到 order.id
@@ -282,8 +294,8 @@ def import_staging(row_id: int, session: Session = Depends(get_session)):
         sa_update(OrderStaging)
         .where(OrderStaging.id == row_id, OrderStaging.imported_order_id.is_(None))
         .values(
-            status=StagingStatus.imported.value,
-            order_status=order.status,          # 快照对齐账本（此后以账本为准，读时覆盖）
+            import_status=StagingStatus.imported.value,
+            trade_status=order.status,          # 快照对齐账本（此后以账本为准，读时覆盖）
             imported_order_id=order.id,
             version=OrderStaging.version + 1,
             updated_at=utcnow(),

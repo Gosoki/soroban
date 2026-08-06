@@ -69,7 +69,13 @@ class OcrUnavailable(RuntimeError):
 
 
 def _get_engine():
-    """懒加载并缓存 RapidOCR 引擎（首次约数百 ms 加载模型）。"""
+    """懒加载并缓存 RapidOCR 引擎（首次约数百 ms 加载模型）。
+
+    构造失败与「依赖没装」同等对待、一律转 OcrUnavailable（路由映射成 503 + 可读文案）。
+    RapidOCR() 会按路径加载 ONNX 模型与 config.yaml——打包版尤其容易缺文件（spec 漏收、
+    upx 压坏、杀软隔离），抛的是 FileNotFoundError / onnxruntime.Fail / yaml 错误。
+    这些原先落在 try 之外，用户点一下「识别截图」只会得到一个裸 500。
+    失败后保持 _engine 为 None，下次请求可以重试（装好依赖/补上文件即恢复，无需重启）。"""
     global _engine
     if _engine is not None:
         return _engine
@@ -81,7 +87,10 @@ def _get_engine():
                 raise OcrUnavailable(
                     "OCR 依赖未安装，请在 backend 下执行：pip install rapidocr_onnxruntime"
                 ) from e
-            _engine = RapidOCR()
+            try:
+                _engine = RapidOCR()
+            except Exception as e:    # noqa: BLE001  模型文件缺失/损坏/onnxruntime 初始化失败
+                raise OcrUnavailable(f"OCR 引擎加载失败（模型文件缺失或损坏）：{e}") from e
     return _engine
 
 
@@ -257,9 +266,10 @@ def _detect_other_platform(full_text: str) -> Optional[str]:
 def _detect_status(full_text: str, has_express: bool) -> str:
     """判交易状态：终态优先；发货后（头部「卖家已发货/待确认收货」或已有快递单号）→ 待收货；
     「等待卖家发货」→ 待发货；都不明确时以有无快递单号兜底（有单号必已发货）。"""
-    # 「交易成功」是闲鱼页面上的字样（关键词照旧），映射到本系统的「已签收」
+    # 「交易成功」是闲鱼页面上的字样（关键词照旧），映射到本系统的「已入仓」
+    # ——本系统的「已签收」是**集运单**的状态（国际包裹本人收到），两者刻意不同名。
     if "交易成功" in full_text or "交易完成" in full_text:
-        return OrderStatus.received.value       # 已签收
+        return OrderStatus.warehoused.value     # 已入仓
     if "交易关闭" in full_text or "已关闭" in full_text:
         return OrderStatus.cancelled.value      # 交易关闭
     if has_express or any(k in full_text for k in ("待确认收货", "卖家已发货", "待收货", "确认收货")):
@@ -388,7 +398,11 @@ def recognize_order(image_bytes: bytes) -> dict:
         raise ValueError(f"图片无法解析：{e}") from e
 
     with _infer_lock:                 # 串行化引擎推理（RapidOCR 非保证可重入）
-        result, _ = engine(arr)
+        try:
+            result, _ = engine(arr)
+        except Exception as e:        # noqa: BLE001  极端尺寸/畸形图让引擎前处理内部报错
+            # 转成 ValueError → 路由映射为 400「图片无法识别」，而不是裸 500。
+            raise ValueError(f"图片无法识别（OCR 引擎处理失败）：{e}") from e
     fields = parse_order_fields(result)
 
     # OCR 只产出闲鱼数据：来源恒为「闲鱼」。仅当截图有明确淘宝/京东强标记、且无任何闲鱼信号
@@ -503,7 +517,11 @@ def recognize_shipment(image_bytes: bytes) -> dict:
         raise ValueError(f"图片无法解析：{e}") from e
 
     with _infer_lock:                 # 串行化引擎推理（RapidOCR 非保证可重入）
-        result, _ = engine(arr)
+        try:
+            result, _ = engine(arr)
+        except Exception as e:        # noqa: BLE001  极端尺寸/畸形图让引擎前处理内部报错
+            # 转成 ValueError → 路由映射为 400「图片无法识别」，而不是裸 500。
+            raise ValueError(f"图片无法识别（OCR 引擎处理失败）：{e}") from e
     fields = parse_shipment_fields(result)
     fields["raw_text"] = "\n".join(item[1] for item in (result or []))
     return fields

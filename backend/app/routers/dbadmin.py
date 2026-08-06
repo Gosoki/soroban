@@ -30,6 +30,7 @@ from ..database import (
     set_data_engine,
 )
 from ..db import control
+from ..maintenance import barrier
 from ..services import db_migrate
 
 log = logging.getLogger("soroban.db.admin")
@@ -46,6 +47,8 @@ class Target(BaseModel):
     user: Optional[str] = None
     password: str = ""
     database: Optional[str] = None
+    # 切换时若发现「迁移之后源库又被改过」会 409 拦下；用户明确表示放弃那些改动时置 True 再来一次。
+    confirm_changed: bool = False
 
 
 # --- 解析目标 ------------------------------------------------------------------
@@ -98,6 +101,14 @@ def _is_same_as_active(backend: str, url: str) -> bool:
     return (a.host, a.port, a.username, a.database) == (b.host, b.port, b.username, b.database)
 
 
+def _target_key(t: Target) -> str:
+    """目标库的稳定标识（不含密码），作 migrate_state 的主键。"""
+    if t.connection_id is None and t.backend == "sqlite":
+        return "sqlite"
+    host, port, user, _pw, db = _mysql_conn_fields(t)
+    return f"{user}@{host}:{port}/{db}"
+
+
 def _remember(host, port, user, pw, db) -> int:
     """把 MySQL 连接记入「连接过的库」（加密 DSN）。返回连接 id。"""
     url = db_migrate.build_mysql_url(host, port, user, pw, db)
@@ -148,8 +159,15 @@ def migrate(t: Target):
                 raise HTTPException(status_code=400, detail=f"MySQL 连接失败：{msg}")
             try:
                 db_migrate.ensure_database(host, port, user, pw, db)
-            except ValueError as e:
+            except ValueError as e:                             # 库名不合白名单
                 raise HTTPException(status_code=400, detail=str(e))
+            except Exception as e:                              # noqa: BLE001
+                # 最常见的是 1044/1045「Access denied … CREATE DATABASE」：账号能连服务器
+                # （上面的 test_connection 只跑 SELECT VERSION()，权限完全够）却没有建库权。
+                # 原先这类异常直接冲到 ASGI 层 → 裸 500，前端只显示 axios 的通用文案，
+                # 用户看不到唯一有用的那句诊断。
+                log.exception("目标库创建失败")
+                raise HTTPException(status_code=400, detail=f"目标库创建失败：{e}")
             _remember(host, port, user, pw, db)
         # 目标建/更新 schema（Alembic，含方言生成列）；本地 SQLite 目标同样确保升到 head
         try:
@@ -157,11 +175,20 @@ def migrate(t: Target):
         except Exception as e:                                  # noqa: BLE001
             log.exception("目标建表失败")
             raise HTTPException(status_code=500, detail=f"目标建表失败：{e}")
-        # 整表覆盖拷贝：当前数据引擎 → 目标
+        # 整表覆盖拷贝：当前数据引擎 → 目标。
+        # **全程挂只读屏障**：replace_data 逐表读源库，而 SQLite 侧没有读快照，期间的写入会
+        # 产生撕裂的拷贝（订单拷了、物品没拷 / 子表引用尚未拷贝的父行）。见 app/maintenance.py。
         try:
-            counts = db_migrate.copy_data(get_engine(), tgt)
+            with barrier.hold("数据库迁移中"):
+                counts = db_migrate.replace_data(get_engine(), tgt)
+                # 拷完立刻记下源库指纹：switch 时再算一次做对比，就能发现
+                # 「迁移之后源库又被改过」——那些改动不会跟着过去。
+                fp = db_migrate.source_fingerprint(get_engine())
+            control.save_migrate_fingerprint(control_engine(), _target_key(t), fp)
         except HTTPException:
             raise
+        except RuntimeError as e:                               # 已有另一项维护操作在进行
+            raise HTTPException(status_code=409, detail=str(e))
         except Exception as e:                                  # noqa: BLE001
             log.exception("数据拷贝失败")
             raise HTTPException(status_code=500, detail=f"数据拷贝失败：{e}")
@@ -189,6 +216,22 @@ def switch(t: Target):
         if owns:
             tgt.dispose()
         raise HTTPException(status_code=400, detail="目标数据库无数据，请先点「迁移到此库」")
+
+    # 「迁移之后源库又被改过没有」——改过的那些**不会**跟着切换过去，切完就静默消失了。
+    # 拿不到指纹（老版本迁的 / 换过机器）时不拦，只是没法给出这层保护。
+    recorded = control.read_migrate_fingerprint(control_engine(), _target_key(t))
+    if recorded is not None and not t.confirm_changed:
+        changes = db_migrate.describe_fingerprint_diff(
+            recorded, db_migrate.source_fingerprint(get_engine()))
+        if changes:
+            if owns:
+                tgt.dispose()
+            raise HTTPException(
+                status_code=409,
+                detail="迁移之后当前库又有改动（" + "、".join(changes) + "）。"
+                       "这些改动不在目标库里，直接切换会丢失。"
+                       "建议先重新点「迁移到此库」；确认要放弃这些改动请再确认一次。",
+            )
 
     if backend == "mysql":
         host, port, user, pw, db = _mysql_conn_fields(t)

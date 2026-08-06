@@ -66,6 +66,18 @@ db_connection = Table(
 )
 
 
+# 「上一次迁移到某目标时，源库长什么样」——供 switch 判断「迁移之后源库又被改过没有」。
+# 放控制库（而非业务库）：它描述的是**迁移过程**，且必须独立于「当前用哪个数据引擎」。
+# 按目标标识分行，故先后迁到两个不同目标不会互相覆盖。
+migrate_state = Table(
+    "migrate_state",
+    control_metadata,
+    Column("target", String(255), primary_key=True),   # 目标库标识，如 u@h:3306/db 或 sqlite
+    Column("fingerprint", Text, nullable=False),        # JSON：各表行数 + 最大 updated_at
+    Column("migrated_at", DateTime, nullable=False),
+)
+
+
 def _fernet() -> Fernet:
     # 由 SECRET_KEY 派生 32 字节 → urlsafe base64 → Fernet 密钥
     key = base64.urlsafe_b64encode(hashlib.sha256(settings.SECRET_KEY.encode()).digest())
@@ -190,3 +202,27 @@ def touch_connection(engine: Engine, cid: int) -> None:
 def delete_connection(engine: Engine, cid: int) -> None:
     with engine.begin() as conn:
         conn.execute(delete(db_connection).where(db_connection.c.id == cid))
+
+
+# --- 迁移快照指纹 --------------------------------------------------------------
+
+def save_migrate_fingerprint(engine: Engine, target: str, fingerprint: str) -> None:
+    """记下「迁移到 target 时，源库的样子」。同一目标重复迁移则覆盖。"""
+    now = dt.datetime.now(dt.timezone.utc)
+    with engine.begin() as conn:
+        exists = conn.execute(
+            select(migrate_state.c.target).where(migrate_state.c.target == target)).first()
+        if exists:
+            conn.execute(update(migrate_state).where(migrate_state.c.target == target)
+                         .values(fingerprint=fingerprint, migrated_at=now))
+        else:
+            conn.execute(insert(migrate_state)
+                         .values(target=target, fingerprint=fingerprint, migrated_at=now))
+
+
+def read_migrate_fingerprint(engine: Engine, target: str) -> Optional[str]:
+    """取上次迁移到 target 时记录的源库指纹；没记过返回 None（如服务重启前迁的旧版本）。"""
+    with engine.connect() as conn:
+        row = conn.execute(
+            select(migrate_state.c.fingerprint).where(migrate_state.c.target == target)).first()
+    return row[0] if row else None

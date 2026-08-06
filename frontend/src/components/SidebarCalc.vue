@@ -58,11 +58,25 @@ function isEditable(el) {
   const tag = el.tagName
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable
 }
+// 焦点是否落在「按 Enter/空格会触发默认行为」的控件上（按钮、链接、可 Tab 到的自定义控件）。
+// 这类元素上的 Enter 必须放行：preventDefault 会连带取消浏览器为它合成的 click。
+function isActivatable(el) {
+  if (!el || el === document.body) return false
+  const tag = el.tagName
+  if (tag === 'BUTTON' || tag === 'A' || tag === 'SUMMARY' || tag === 'LABEL') return true
+  const role = el.getAttribute?.('role')
+  if (role && ['button', 'link', 'menuitem', 'option', 'tab', 'switch', 'checkbox'].includes(role)) return true
+  return el.hasAttribute?.('tabindex')          // 自定义可聚焦控件（Element Plus 大量使用）
+}
 function onGlobalKey(e) {
   if (e.ctrlKey || e.metaKey || e.altKey) return          // 别劫持快捷键
   if (isEditable(document.activeElement)) return           // 正在真输入框里打字 → 不抢
   if (document.body.classList.contains('el-popup-parent--hidden')) return   // 有弹窗/抽屉打开 → 不抢焦点
   const k = e.key
+  // Enter / = / Backspace 在按钮、链接等可激活元素上有各自的默认行为，一律放行。
+  // 否则：算式一旦非空（equals() 会把结果留在框里，且本组件挂在 Layout 内、切页不卸载），
+  // 整个应用里的 Enter 就被永久吞掉——键盘用户点不动任何按钮，还会被把焦点抢到侧栏。
+  if ((k === 'Enter' || k === '=' || k === 'Backspace') && isActivatable(document.activeElement)) return
   if (/^[0-9]$/.test(k) || k === '.' || k === '+' || k === '-' || k === '(' || k === ')') ins(k)
   else if (k === '*') ins('×')
   else if (k === '/') ins('÷')

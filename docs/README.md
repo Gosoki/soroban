@@ -549,3 +549,57 @@
 - **前端杂项**：`bcrypt` 新密码限 72 字节（防静默截断）；`NotionTable` 仅 `minWidth` 的列拖动排序/拖宽不再被写成 160；杂项/集运删末行改 `load()`（原留空页）；`Shipment.loadUnassigned` 加 try/catch；`Plugins` 加/改账号 409 显式弹后端 detail（拦截器刻意跳过 409）；数据库表单按钮 busy 期间禁用；侧栏计算器空算式下不吞全局 Enter/Backspace；`fmtCNY/JPY` 非数字降级为「—」不显 NaN。
 - **暂缓（记录待议，非本版改）**：改密码不失效历史 JWT（需给 User 加列+迁移，单用户低危）；登录计时枚举（单用户无实际价值）；爬虫 offset 翻页在并发插入下可能跳行（>500 行才触发，自愈）。
 - **验证**：后端 `import`+mapper 全绿；TestClient E2E（溢出→422、杂项补汇率→结算 2400、删/忽略已导入→409）、`compute_money`/OCR 正则/密码 72 字节/backfill 不重复计邮费 单测全过；前端 `npm run build` 通过。⚠️ 需**重启后端 + 重建前端**才生效。
+
+### 第四十五版：状态改名收尾 + 双引擎发散清零 + 列表接口去 N+1
+承接第四十四版之后的一轮系统审计（详见 [审计报告-2026-08.md](审计报告-2026-08.md)）。新增 **372 条 pytest** 常驻回归（`backend/tests/`，跑临时库、不碰 `soroban.db`）。
+- **⚠️ 最高危（数据静默丢失）**：`ceee9b7` 把 `交易成功` 改名 `已签收`，但爬虫 `normalize.STATUS_MAP` 仍映射旧值 → 淘宝上「交易成功/待评价」的订单回灌时撞枚举白名单 422，被 `upsert_orders` 计入 `skipped` **静默跳过**，日志只有数字变化。已修，并新增 `test_consistency.py` 把「后端枚举 ↔ 前端常量 ↔ 爬虫映射 ↔ 前端调用的 API 路径」这些**三处各写一份**的约定变成断言——这个 bug 就是它抓出来的。
+- **OCR 补价失效且反馈失真**：`price_cny` 是派生列，`buildMergePatch` 直接 PATCH 它会被后端忽略，界面却报「已更新」。改为把成交价当**种子价** + 一份无单价物品一起发，由后端 `build_items` 折算；并加 `hasNoRealPrice()` 守卫，用户手填过价的单绝不覆盖。
+- **31 个 VARCHAR 列无长度校验**（SQLite 静默存 / MySQL `Data too long` → 500）：新增 `schemas._len()` 以建表定义为唯一真相补齐校验，`weight`(Numeric(8,2)) 同理；`Create`/`Update` 里重复的字段声明收敛成 `OrderFieldsIn`/`ShipmentFieldsIn`/`MiscFieldsIn`。`test_lengths.py` 有元测试，加列漏加校验即红。
+- **三个列表接口 N+1**：`ShipmentRead.model_validate()` 为填 `orders` 字段去懒加载关系（连已软删的子订单一起拉），随后又被过滤过的列表整个覆盖。改为 `_read_many()` 批量化 + `_shipment_read()` 只用本表列构造。`test_queries.py` 用 `before_cursor_execute` 数 SQL，守住「查询数不随行数增长」。
+- **软删统一推进 version/updated_at**（原先只有批量路径推进）；`import_staging` 并发门闸补显式 `rollback`；`/api/tags/{field}` 的全表 DISTINCT 由两遍改一遍；`run_migrations` 的连接池泄漏。
+- **`.requirements.sha256` 被误提交**：这是「本机装了哪版依赖」的指纹，一旦碰巧等于 `requirements.txt` 的哈希，新 clone 会**跳过 pip install**。已移除并 gitignore，`start.bat` 改把指纹放进 conda env 内（跟着它描述的环境走）。
+
+### 第四十六版：拍板项落地 + 多智能体全项目审计（21 条确认 / 9 条证伪）
+- **A. 商品标题列放宽为 TEXT**（迁移 `d0e1f2a3b4c5`）：`orders.shop`/`orderstaging.shop` 存的是商品标题，一单多件时爬虫拼成「A / B / C」天然超 255，而两列既不索引也不参与唯一约束——定长毫无意义。改 TEXT 后既不截断也不 500。SQLite 侧刻意不做 DDL（不强制长度，batch ALTER 反而要重建表、有搞坏部分唯一索引的风险）。
+- **B+C. 种子价只认显式传来的 `price_cny`**，不再回退当前价。两条反直觉行为同源、一起消失：清空全部单价现在记 0+auto（**与只清空部分单价同口径**，旧行为是同一动作两种结果）；改邮费不再用「旧总价 − 新邮费」倒推货款。散在 6 处的换算收敛成 `common.goods_seed()`。
+- **D. 单号写入即归一**：`express_no`/`intl_tracking_no` TRIM+UPPER（匹配键，且 SQLite 区分大小写而 MySQL 默认不区分 → 双引擎发散）；`order_no`/`shipment_no` 只 TRIM 不改大小写（有唯一索引，批量改可能撞约束让升级失败）。迁移一并归一历史数据。
+- **⚠️ 最高危（认证绕过）**：打包出的 `soroban.exe` **从不生成 .env** → 用仓库里公开的默认 SECRET_KEY 签 JWT，叠加默认 `HOST=0.0.0.0`、自动播种 admin/admin123 并打印口令、登录无限速。同网段任何人自签一个令牌就是管理员。四层修复：`run.py` 首启生成随机 SECRET_KEY（**在 import app 之前**）、HOST 默认改环回、`main.py` 对不安全密钥 **fail-closed**（这类问题没法「登录进来再修」）、新增 `app/ratelimit.py` 登录失败指数退避。
+- **打包链在任何新 clone 上都是断的**：`pyinstaller.bat` 调 `soroban.spec`，而标准 `.gitignore` 的 `*.spec` 把它整个忽略、从未进过版本库（与 `.requirements.sha256` 同类模板副作用）。已加 `!soroban.spec` 反排除并按代码里的 `sys._MEIPASS` 期望补写 spec。另修批处理 `%errorlevel%` 在括号块内**解析期展开**的陷阱——pip/npm 安装失败的三处检查从来不生效。
+- **其余 13 条**：清空物品名会静默删物品（HIGH）；README 数据库整章过期，照做会以为切了 MySQL 其实还写 SQLite（HIGH）；按账号清空暂存硬删已导入行→孤儿账本单；Query 参数改名绕开长度校验；爬虫单价解析失效会把已有暂存价覆盖成 0；`requirements.lock.txt` 漏 3 个直接依赖导致「可复现安装」起不来；`backup.sh` 在 MySQL 模式静默备份过期 SQLite；MySQL 连不上时无自救出口（新增 `tools/use_local_db.py`）；集运/暂存新建 409 被吞；插件页时间早 9 小时；计算器全局吞 Enter 导致键盘点不动按钮；幽灵新建行每格建一条；列表页无请求序号防护。详见审计报告。
+- **验证**：459 条 pytest 全绿；前端 `npm run build` 通过；真实起服务端到端复验（.env 生成、fail-closed、登录退避实测第 6 次起退避/第 7 次 429/换用户名不牵连）。⚠️ `soroban.spec` 与 `requirements.lock.txt` 未经真实构建/安装验证，需在 Windows 与干净 venv 上各跑一次。
+
+### 第四十七版：命名歧义全部统一（列名/状态值/函数名）+ E/F 拍板
+用户拍板「有歧义的都统一」。迁移 `e1f2a3b4c5d6` 一次性落地，含**三处数据迁移**（列改名、状态值改写、`columnlayout.columns_json` 里存的列键按表重映射），upgrade→downgrade→upgrade 往返实测通过。
+
+| 旧 | 新 | 为什么 |
+|---|---|---|
+| `orders/orderstaging.shop` | `title` | 存的是**商品标题**（爬虫 normalize、UI 列头都叫「商品」），不是店铺名 |
+| `orderitem/stagingitem.price_cny` | `unit_price_cny` | 与订单的 `price_cny`（**总价**）一名两义，且两者有 Σ单价×数量=总价 的关系，最易看串 |
+| `orderstaging.status` | `import_status` | 一行两个 status：这个是**导入工作流**（待处理/已导入/已忽略） |
+| `orderstaging.order_status` | `trade_status` | ……这个是**真实交易**状态，对齐上面 |
+| `orders/shipmentorder/miscexpense.source` | `created_via` | 与 `platform`（UI 标签就叫「来源」）撞义；它其实是「这行怎么进来的」 |
+| `OrderStatus.received = "已签收"` | `warehoused = "已入仓"` | 与集运单的「已签收」**同字面量不同义**（订单=国内快递被集运仓签收；集运=国际包裹本人收到），而 `EXCLUDED_STATUSES` 这类集合同时作用于两张表 |
+| `ShipmentStatus.arrived` | `received` | 与 `OrderStatus.arrived("已到达")` 同属性名不同义 |
+| `db_migrate.copy_data` | `replace_data` | 它会**先清空**目标库；`copy` 读不出破坏性 |
+| `common.not_found/conflict` | `raise_not_found/raise_conflict` | 是 raise 而非 return，原名像构造器 |
+| `plugins._find` | `_find_manifest` | 返回的是 plugin.toml 的解析结果 |
+
+- **保留未改**：`OrderCreate/Update.price_cny`（在 create 上它就是「订单价」这个自然名；物品改成 `unit_price_cny` 后一名两义已消失，剩下的「输入是种子、输出是派生」有文档串说明）；`platform`（对 淘宝/闲鱼/京东 而言本就准确，歧义在 `source` 那一侧，已改）。
+- **新增 `tests/test_naming.py`（16 条）**把每条约定写成断言：不许再出现 `shop` 列、物品价必须是 `unit_price_cny`、两个状态枚举的字面量必须**完全不相交**、前端无残留旧字段名、爬虫推送字段名跟得上。改回去就红。
+- **F（改密码不失效 token）**：用户拍板**维持现状**，理由已写进 `auth.create_access_token` 的文档串（自用账本、共用者两人，为几乎用不到的「踢下线」加列+迁移+每请求多查一次不划算；真要强制下线改 SECRET_KEY 重启）。
+- **E′（迁移/切换之间无写屏障）**：待定，方案见审计报告「二」。
+- **验证**：475 条 pytest 全绿；前端 `npm run build` 通过；爬虫产出形状实测；真实起服务端到端复验（新字段名建单/暂存导入/看板/物品列表、单号归一、集运「已签收」与订单「已入仓」并存）。⚠️ 生产升级前请先 `./backup.sh`——本次迁移会改列名与状态值。
+
+### 第四十八版：数据库迁移只读屏障 + 切换前变更检测（E′ 拍板落地）
+用户定的方向：拷贝时锁库停一切写入；拷完解锁，之后改写就写旧库；切换那刻来不及的少量数据可接受。实施时补强了两点：
+
+- **锁库是必需而非保险**：`replace_data` 逐表读源库，而 SQLite 侧**没有读快照**（pysqlite 只在写语句前发 BEGIN，SELECT 跑 autocommit）→ 拷贝中途的写入会产生**撕裂的拷贝**（订单拷了物品没拷、子表引用未拷贝的父行）。MySQL 源库反而一致（InnoDB 快照）——又一处双引擎发散。
+- **「丢的只是爬虫能爬回来的」不成立**：还会丢 OCR 建的闲鱼订单、集运单、杂项、**所有编辑**（改价/改状态/挂靠/导入）、标签，而且**静默**。→ 加变更检测把静默丢失变成知情选择。
+
+落地：
+- **`app/maintenance.py` 只读屏障**，覆盖**三条写路径**（只拦 HTTP 不够）：① HTTP 写端点（`main.py` 中间件，`/api/db/*` 与登录放行——用中间件而非逐端点挂依赖，将来新增写端点自动覆盖）；② `fx_loop`（直接用 Session 写 FxRate，绕过 HTTP）；③ `scheduler_loop`（屏障期间别起爬虫子进程——白开一次浏览器冲淘宝，并发多开是风控红线）。
+- **绝不泄漏**：try/finally + **硬超时自愈**（15min）。宁可迁移中途失去保护（最坏拷贝撕裂、可重来），也不能让账本永久只读。挂起时先等在飞写请求排空。
+- **变更检测**：`migrate` 拷完记源库指纹（各表行数 + 最大 `updated_at`，存控制库新表 `migrate_state`，按目标分行）；`switch` 前重算比对，不同则 409 说人话「迁移之后当前库又有改动（商品订单 +3 条、集运订单 有改动）」。前端二选一：**重新迁移再切换**（默认）／仍然切换（放弃改动）。指纹刻意不含 `columnlayout`，拖列宽不该告警。
+- **顺带修出真 bug**：加 `migrate_state` 后测试瞬间全红——`run_migrations` 判「pre-Alembic 旧库」的排除集是**手抄**的三张表名，新控制表没进去 → 全新部署被误判、stamp 到 baseline 而建不出业务表。改为从 `control_metadata.tables` **自动派生**，并加测试锁住。
+- **F（改密码不失效 token）**：拍板维持现状，理由写进 `auth.create_access_token` 文档串。
+- **验证**：501 条 pytest 全绿（新增 `test_maintenance.py` 26 条：写端点全被拦、读放行、`/api/db/*` 与登录放行、异常时屏障必撤、硬超时自愈、并发挂起被拒、等排空、指纹增删改检出、控制表排除集不许手抄）；前端 `npm run build` 通过；真实迁移 + 变更检测端到端复验。

@@ -20,9 +20,9 @@ from .models import (
 # 列布局默认：顺序 + 统一列宽（≈ 刚好显示日期，取整多留一点 = 110）。demo 注入库，reset 后即此默认序。
 COL_W = 110
 COL_LAYOUTS = {
-    "staging": ["order_date", "platform_account", "shop", "price_cny", "order_status",
-                "items", "order_no", "express_no", "scraped_at", "fx_rate", "status"],
-    "orders": ["date", "platform_account", "shop", "items", "status", "shipment_order_id",
+    "staging": ["order_date", "platform_account", "title", "price_cny", "trade_status",
+                "items", "order_no", "express_no", "scraped_at", "fx_rate", "import_status"],
+    "orders": ["date", "platform_account", "title", "items", "status", "shipment_order_id",
                "jpy_settled", "jpy_override", "price_cny", "fx_rate", "express_no", "order_no"],
 }
 
@@ -52,7 +52,7 @@ def main() -> None:
 
         # —— 集运订单 ——
         jf1 = ShipmentOrder(date=D(2026, 6, 5), shipment_no="JF-2606A", weight=Decimal("4.5"),
-                           intl_tracking_no="LP00612345678", status="已签收",
+                           intl_tracking_no="LP00612345678", status="已入仓",
                            price_cny=Decimal("180"), fx_rate=Decimal("20.5"), special_fee_jpy=1200,
                            note="含关税消费税", recipient="本人")
         jf2 = ShipmentOrder(date=D(2026, 6, 20), shipment_no="JF-2606B", weight=Decimal("2.1"),
@@ -66,39 +66,39 @@ def main() -> None:
         for j in (jf1, jf2, jf3):
             s.refresh(j)
 
-        # —— 商品订单（date, order_no, shop, account, express, price, rate, status, jf, items, override）——
+        # —— 商品订单（date, order_no, title, account, express, price, rate, status, jf, items, override）——
         orders = [
-            dict(date=D(2026, 5, 28), order_no="TB250528001", shop="谷子屋", platform_account="acctA",
-                 express_no="SF1001", price_cny="320", fx_rate="20.5", status="已签收", jf=jf1.id,
+            dict(date=D(2026, 5, 28), order_no="TB250528001", title="谷子屋", platform_account="acctA",
+                 express_no="SF1001", price_cny="320", fx_rate="20.5", status="已入仓", jf=jf1.id,
                  items=[("初音未来 手办", 1)]),
-            dict(date=D(2026, 5, 30), order_no="TB250530007", shop="万代官方旗舰店", platform_account="acctA",
-                 express_no="SF1002", price_cny="460", fx_rate="20.5", status="已签收", jf=jf1.id,
+            dict(date=D(2026, 5, 30), order_no="TB250530007", title="万代官方旗舰店", platform_account="acctA",
+                 express_no="SF1002", price_cny="460", fx_rate="20.5", status="已入仓", jf=jf1.id,
                  items=[("MG 高达模型", 2)]),
-            dict(date=D(2026, 6, 2), order_no="TB250602013", shop="痛包周边专营", platform_account="acctA",
-                 express_no="YT2003", price_cny="88", fx_rate="20.8", status="已签收", jf=jf1.id,
+            dict(date=D(2026, 6, 2), order_no="TB250602013", title="痛包周边专营", platform_account="acctA",
+                 express_no="YT2003", price_cny="88", fx_rate="20.8", status="已入仓", jf=jf1.id,
                  items=[("亚克力立牌", 3), ("金属徽章", 5)]),
-            dict(date=D(2026, 6, 18), order_no="TB250618022", shop="二次元周边店", platform_account="acctB",
+            dict(date=D(2026, 6, 18), order_no="TB250618022", title="二次元周边店", platform_account="acctB",
                  express_no="ZT3004", price_cny="55", fx_rate="21", status="待收货", jf=jf2.id,
                  items=[("角色抱枕套", 1)]),
-            dict(date=D(2026, 6, 19), order_no="TB250619031", shop="手办工房", platform_account="acctB",
+            dict(date=D(2026, 6, 19), order_no="TB250619031", title="手办工房", platform_account="acctB",
                  express_no="ZT3005", price_cny="130", fx_rate="21", status="待收货", jf=jf2.id,
                  items=[("景品手办", 1)]),
-            dict(date=D(2026, 7, 3), order_no="TB250703044", shop="谷子屋", platform_account="acctA",
+            dict(date=D(2026, 7, 3), order_no="TB250703044", title="谷子屋", platform_account="acctA",
                  express_no="SF1006", price_cny="60", fx_rate="23.86", status="待发货", jf=jf3.id,
                  items=[("吧唧/徽章", 10)]),
             # 退款：打退款标记，金额/物品照显，但不计入合计（不再用负数冲抵）
-            dict(date=D(2026, 7, 4), order_no="TB250704050", shop="挂件小铺", platform_account="acctA",
+            dict(date=D(2026, 7, 4), order_no="TB250704050", title="挂件小铺", platform_account="acctA",
                  price_cny="25", fx_rate="23.86", status="退款", items=[("亚克力挂件", 1)]),
             # 日元直付（只填覆盖日元）
-            dict(date=D(2026, 7, 6), order_no="TB250706061", shop="日亚代付", platform_account="acctB",
+            dict(date=D(2026, 7, 6), order_no="TB250706061", title="日亚代付", platform_account="acctB",
                  override=3500, status="待发货", items=[("日亚补款", 1)]),
             # 交易关闭（不计入看板）
-            dict(date=D(2026, 7, 7), order_no="TB250707070", shop="测试店", platform_account="acctA",
+            dict(date=D(2026, 7, 7), order_no="TB250707070", title="测试店", platform_account="acctA",
                  price_cny="200", fx_rate="23", status="交易关闭", items=[("已关闭的订单", 1)]),
         ]
         for t in orders:
             o = Order(
-                date=t["date"], order_no=t["order_no"], shop=t["shop"], platform_account=t["platform_account"],
+                date=t["date"], order_no=t["order_no"], title=t["title"], platform_account=t["platform_account"],
                 express_no=t.get("express_no"), status=t["status"], shipment_order_id=t.get("jf"),
                 price_cny=Decimal(t["price_cny"]) if "price_cny" in t else None,
                 fx_rate=Decimal(t["fx_rate"]) if "fx_rate" in t else None,
@@ -127,13 +127,13 @@ def main() -> None:
 
         # —— 暂存（待处理，演示「导入 / 忽略」；含一单多物）——
         staging = [
-            dict(order_no="TB250708081", platform_account="acctA", shop="谷子屋", order_status="待发货",
+            dict(order_no="TB250708081", platform_account="acctA", title="谷子屋", trade_status="待发货",
                  price_cny="45", order_date=D(2026, 7, 8), items=[("色纸", 2), ("明信片套装", 1)]),
-            dict(order_no="TB250708090", platform_account="acctA", shop="手办工房", order_status="待收货",
+            dict(order_no="TB250708090", platform_account="acctA", title="手办工房", trade_status="待收货",
                  price_cny="150", order_date=D(2026, 7, 8), items=[("景品公仔", 1)]),
-            dict(order_no="TB250707100", platform_account="acctB", shop="日用百货", order_status="已签收",
+            dict(order_no="TB250707100", platform_account="acctB", title="日用百货", trade_status="已入仓",
                  price_cny="39", order_date=D(2026, 7, 7), items=[("洗发水(非集运)", 1)]),
-            dict(order_no="TB250709110", platform_account="acctA", shop="画集屋", order_status="待付款",
+            dict(order_no="TB250709110", platform_account="acctA", title="画集屋", trade_status="待付款",
                  price_cny="78", order_date=D(2026, 7, 9), items=[("设定集", 1), ("A3 海报", 2)]),
         ]
         for st in staging:

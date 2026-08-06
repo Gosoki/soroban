@@ -165,8 +165,8 @@ def test_excluded_statuses_are_all_real_enum_values(client):
 def test_items_list_amount_and_context(client):
     _clear_ledger()
     o = client.post("/api/orders", json={
-        "date": "2026-10-01", "shop": "店", "order_no": "IT-1", "platform": "淘宝",
-        "items": [{"name": "甲", "quantity": 3, "price_cny": "2.50"}],
+        "date": "2026-10-01", "title": "店", "order_no": "IT-1", "platform": "淘宝",
+        "items": [{"name": "甲", "quantity": 3, "unit_price_cny": "2.50"}],
     }).json()
     res = client.get("/api/items", params={"q": "甲"}).json()
     it = next(x for x in res["items"] if x["name"] == "甲")
@@ -177,7 +177,7 @@ def test_items_list_amount_and_context(client):
 def test_items_list_hides_deleted_orders(client):
     _clear_ledger()
     o = client.post("/api/orders", json={"date": "2026-10-02",
-                                         "items": [{"name": "乙", "quantity": 1, "price_cny": "1"}]}).json()
+                                         "items": [{"name": "乙", "quantity": 1, "unit_price_cny": "1"}]}).json()
     assert client.get("/api/items", params={"q": "乙"}).json()["total"] == 1
     client.delete(f"/api/orders/{o['id']}")
     assert client.get("/api/items", params={"q": "乙"}).json()["total"] == 0
@@ -186,9 +186,9 @@ def test_items_list_hides_deleted_orders(client):
 def test_items_total_matches_rows(client):
     _clear_ledger()
     client.post("/api/orders", json={"date": "2026-10-03", "items": [
-        {"name": "p1", "quantity": 1, "price_cny": "1"},
-        {"name": "p2", "quantity": 1, "price_cny": "1"},
-        {"name": "p3", "quantity": 1, "price_cny": "1"},
+        {"name": "p1", "quantity": 1, "unit_price_cny": "1"},
+        {"name": "p2", "quantity": 1, "unit_price_cny": "1"},
+        {"name": "p3", "quantity": 1, "unit_price_cny": "1"},
     ]})
     res = client.get("/api/items", params={"limit": 500}).json()
     assert res["total"] == len(res["items"]) == 3

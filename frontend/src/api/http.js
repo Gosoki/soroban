@@ -52,12 +52,16 @@ http.interceptors.response.use(
       localStorage.removeItem('auth_user')
       if (window.location.hash !== '#/login') window.location.hash = '#/login'
     }
-    // 409（乐观锁冲突）交给页面处理，不在这里弹通用错误
+    // 409（乐观锁冲突 / 迁移前的变更确认）交给页面处理，不在这里弹通用错误
     if (err.response?.status !== 409) {
       let detail = err.response?.data?.detail
       // FastAPI 校验错误的 detail 是数组（[{msg,loc}...]）——展平成可读文案，别把具体原因丢成通用提示
       if (Array.isArray(detail)) detail = detail.map((e) => e?.msg || String(e)).join('；')
-      ElMessage.error((typeof detail === 'string' && detail) ? detail : (err.message || '请求失败'))
+      const text = (typeof detail === 'string' && detail) ? detail : (err.message || '请求失败')
+      // 503 = 数据库迁移期间的只读屏障：是暂时状态、稍后重试即可，用 warning 而非 error，
+      // 别让用户以为账本坏了。
+      if (err.response?.status === 503) ElMessage.warning(text)
+      else ElMessage.error(text)
     }
     return Promise.reject(err)
   }

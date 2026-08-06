@@ -11,10 +11,10 @@ from app import schemas as S
 from app.models import MiscExpense, Order, OrderItem, OrderStaging, ShipmentOrder, TagOption
 
 # 短文本列：超长截断而非拒绝（见 schemas._clip）。
-# `shop`（商品标题）不在此列——它已放宽成 TEXT 列，不限长也不截断。
+# `title`（商品标题）不在此列——它已放宽成 TEXT 列，不限长也不截断。
 CLIPPED = {"name"}
 # 服务端决定或已有枚举白名单的列，不接受任意客户端字符串，无需长度校验
-SERVER_OWNED = {"source", "status", "order_status"}
+SERVER_OWNED = {"created_via", "status", "import_status", "trade_status"}
 
 # (输入 schema, 对应模型)
 PAIRS = [
@@ -87,45 +87,45 @@ def test_order_at_limit_accepted(client):
 def test_shop_is_a_text_column_on_both_models():
     """商品标题必须是无长度上限的 TEXT：一单多件时爬虫会把各件标题拼起来，轻易超 255。"""
     for model in (Order, OrderStaging):
-        assert model.__table__.columns["shop"].type.length is None, \
-            f"{model.__tablename__}.shop 又变回定长列了，超长标题会被截断/500"
+        assert model.__table__.columns["title"].type.length is None, \
+            f"{model.__tablename__}.title 又变回定长列了，超长标题会被截断/500"
 
 
 def test_shop_is_not_indexed():
     """TEXT 能用的前提：该列不参与任何索引/唯一约束——MySQL 给 TEXT 建索引必须写前缀长度，
-    一旦有人给 shop 加了 index，迁移 d0e1f2a3b4c5 的 MODIFY ... TEXT 会直接失败。"""
+    一旦有人给 title 加了 index，迁移 d0e1f2a3b4c5 的 MODIFY ... TEXT 会直接失败。"""
     for model in (Order, OrderStaging):
         indexed = {c.name for idx in model.__table__.indexes for c in idx.columns}
-        assert "shop" not in indexed, f"{model.__tablename__}.shop 被加了索引，与 TEXT 列冲突"
-        assert model.__table__.columns["shop"].index is not True
+        assert "title" not in indexed, f"{model.__tablename__}.title 被加了索引，与 TEXT 列冲突"
+        assert model.__table__.columns["title"].index is not True
 
 
 def test_order_overlong_shop_is_kept_whole(client):
     """长标题原样保存，一个字都不丢。"""
     title = "商" * 400
-    r = client.post("/api/orders", json={"date": "2026-04-01", "shop": title})
+    r = client.post("/api/orders", json={"date": "2026-04-01", "title": title})
     assert r.status_code == 200, r.text
-    assert r.json()["shop"] == title
+    assert r.json()["title"] == title
 
 
 def test_staging_overlong_shop_is_kept_whole(client):
     title = "标" * 600
-    r = client.post("/api/staging", json={"order_no": "LONGTITLE-1", "shop": title})
+    r = client.post("/api/staging", json={"order_no": "LONGTITLE-1", "title": title})
     assert r.status_code == 200, r.text
-    assert r.json()["shop"] == title
+    assert r.json()["title"] == title
 
 
 def test_long_title_survives_import_to_ledger(client):
     """导入账本时标题原样搬过去（两边都是 TEXT）。"""
     title = "超长商品标题 / " * 60
-    s = client.post("/api/staging", json={"order_no": "LONGTITLE-2", "shop": title}).json()
+    s = client.post("/api/staging", json={"order_no": "LONGTITLE-2", "title": title}).json()
     o = client.post(f"/api/staging/{s['id']}/import").json()
-    assert o["shop"] == title
+    assert o["title"] == title
 
 
 def test_overlong_item_name_is_clipped(client):
     r = client.post("/api/orders", json={
-        "date": "2026-04-01", "items": [{"name": "物" * 400, "quantity": 1, "price_cny": "1"}]})
+        "date": "2026-04-01", "items": [{"name": "物" * 400, "quantity": 1, "unit_price_cny": "1"}]})
     assert r.status_code == 200, r.text
     assert len(r.json()["items"][0]["name"]) == 255
 
@@ -213,8 +213,8 @@ def test_order_update_validates_length(client):
 def test_order_update_keeps_long_shop_whole(client):
     o = client.post("/api/orders", json={"date": "2026-04-01"}).json()
     title = "商" * 400
-    r = client.patch(f"/api/orders/{o['id']}", json={"version": o["version"], "shop": title})
-    assert r.status_code == 200 and r.json()["shop"] == title
+    r = client.patch(f"/api/orders/{o['id']}", json={"version": o["version"], "title": title})
+    assert r.status_code == 200 and r.json()["title"] == title
 
 
 def test_misc_update_validates_length(client):

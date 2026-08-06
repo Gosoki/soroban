@@ -11,7 +11,7 @@ def _row(model, oid):
 
 
 def test_order_soft_delete_bumps_version(client):
-    o = client.post("/api/orders", json={"date": "2026-12-20", "shop": "sd1"}).json()
+    o = client.post("/api/orders", json={"date": "2026-12-20", "title": "sd1"}).json()
     client.delete(f"/api/orders/{o['id']}")
     row = _row(Order, o["id"])
     assert row.is_delete is True

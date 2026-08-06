@@ -165,7 +165,7 @@ def test_delete_account_orders_resets_imported_staging(client, fake_plugin):
     client.delete(f"/api/plugins/{PLUGIN_ID}/account/orders", params={"account": "purge3"})
     row = next(x for x in client.get("/api/staging", params={"limit": 500}).json()["items"]
                if x["id"] == s["id"])
-    assert row["imported_order_id"] is None and row["status"] == "待处理"
+    assert row["imported_order_id"] is None and row["import_status"] == "待处理"
 
 
 def test_fetch_without_venv_is_400(client, fake_plugin):

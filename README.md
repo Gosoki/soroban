@@ -19,7 +19,7 @@
 |---|---|
 | 前端 | Vue 3 + Element Plus + Vite + Axios |
 | 后端 | FastAPI + SQLModel |
-| 数据库 | **SQLite（WAL 模式）/ MySQL 可切换**——同一套代码按 `DATABASE_URL` 自动适配方言（见「数据库」章） |
+| 数据库 | **SQLite（WAL 模式）/ MySQL 可运行期热切换**——同一套代码自动适配方言；切换入口在应用内「数据库」页，**不是** `.env`（见「数据库」章） |
 | 迁移 | **Alembic**（启动自动 `upgrade head`；旧库首启自动接管；改 model 后 `alembic revision --autogenerate`，见「更新」章） |
 | 汇率 | open.er-api.com（CNY→JPY，免费无 key） |
 
@@ -44,15 +44,20 @@ soroban/
 │   │   └── services/       汇率等
 │   ├── alembic/            数据库迁移脚本（versions/ 里每个改动一个版本，需提交；迁移方言无关）
 │   ├── alembic.ini         Alembic 配置
-│   ├── scripts/            一次性脚本（migrate_sqlite_to_mysql.py：SQLite→MySQL 整库搬运）
+│   ├── scripts/            历史脚本（migrate_sqlite_to_mysql.py：已被「数据库」页取代）
+│   ├── tools/              一次性/自救脚本（use_local_db.py：MySQL 连不上时切回本地）
+│   ├── tests/              pytest（跑临时库，不碰 soroban.db；见 tests/README.md）
+│   ├── run.py              打包入口（首启生成含随机 SECRET_KEY 的 .env）
 │   ├── requirements.txt        直接依赖（宽松版本）
 │   └── requirements.lock.txt   锁定版本（可复现安装）
 ├── frontend/               Vue 3 + Element Plus + Vite
 ├── scraper/                爬虫插件（各自成库/venv，soroban git 排除，仅留 README）
 │   └── soroban-scraper-taobao/   淘宝订单爬虫（Playwright + H5/桌面 mtop 抓包）
-├── docs/                   开发记录、设计决策、抓包实测记录
+├── docs/                   开发记录、设计决策、抓包实测记录、审计报告
 ├── start.sh                一键启动（开发）
-└── backup.sh               数据库备份（WAL 安全）
+├── pyinstaller.bat         打包 soroban.exe
+├── soroban.spec            PyInstaller 清单（手写，**必须提交**——标准 .gitignore 的 *.spec 会误伤）
+└── backup.sh               数据库备份（WAL 安全；MySQL 模式下会拒绝执行）
 ```
 
 ## 本地运行
@@ -135,43 +140,56 @@ git pull               # 2) 拉最新（在 master 分支）
 
 ## 数据库（SQLite / MySQL）
 
-同一套代码同时支持 **SQLite**（默认，零配置，适合单机）和 **MySQL**（多人/生产），由 `.env` 里的
-`DATABASE_URL` 一个开关决定，无需改代码：
+同一套代码同时支持 **SQLite**（默认，零配置，适合单机）和 **MySQL**（多人/生产）。
 
-```bash
-# 默认：SQLite 文件
-DATABASE_URL=sqlite:///./soroban.db
-# 切 MySQL（务必带 charset=utf8mb4；密码里的特殊字符要 URL 编码，如 @ → %40）
-DATABASE_URL=mysql+pymysql://user:pass@127.0.0.1:3306/soroban?charset=utf8mb4
-```
+> ⚠️ **切换入口是应用内的「数据库」页，不是 `.env`。**
+> 早期版本靠改 `.env` 的 `DATABASE_URL` 切库，现在**不是了**：`DATABASE_URL` 只用来定位那个
+> 恒为 SQLite 的**控制库**（`backend/app/database.py::_control_url`——填 MySQL 串会被直接忽略、
+> 回退到 `sqlite:///./soroban.db`）。往里填 MySQL 串不会报错、也不会生效，
+> 你以为切过去了，实际所有新数据仍然写在本地 SQLite 里。
 
-- **模型解耦**：表按页面功能拆在 `app/models/` 子目录（user/taobao/shipment/misc/fx/config），
+**两个库，各司其职**：
+
+| | 存什么 | 在哪 |
+|---|---|---|
+| **控制库** | 「当前用哪个后端」+ 加密的 MySQL 连接串（表 `app_db_config` / `db_connection`） | 恒为本地 SQLite（`DATABASE_URL` 指的就是它） |
+| **数据库** | 全部业务数据（订单/集运/杂项/暂存…） | SQLite 或 MySQL，由控制库里的配置决定，可**运行期热切换**、无需重启 |
+
+- **模型解耦**：表按页面功能拆在 `app/models/` 子目录（user/order/shipment/misc/fx/config），
   对外仍是 `from app.models import X` 扁平导入，业务代码无感。
 - **方言差异集中翻译**：`app/db/dialect.py` 负责把 SQLite 与 MySQL 的语法差异统一。最典型的是
   「软删/空值感知的唯一约束」（订单号非空且未软删时才唯一）——SQLite 用**部分唯一索引**，
   MySQL 用**生成列 + 唯一键**等价实现，语义完全一致。
 - **迁移方言无关**：`alembic upgrade head` 在两种库上都能建出正确 schema（启动时自动执行）。
 
-### 从 SQLite 迁到 MySQL
+### 迁到 MySQL（全程在网页上点）
 
-```bash
-# 1) MySQL 建库（utf8mb4）
-mysql> CREATE DATABASE soroban CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+打开左侧「**数据库**」页：
 
-# 2) 装驱动（已在 requirements.txt）
-pip install PyMySQL
+1. **连接新的 MySQL**：填主机/端口/用户名/密码/库名 → 点「测试连接并记住」。
+   库还不存在也没关系，迁移时会自动建（utf8mb4）——但账号需要 `CREATE DATABASE` 权限。
+2. 点「**迁移到此库**」：建库 → 建表（Alembic）→ 把**当前库**的数据整表覆盖过去。此步**不切换**、不动当前库。
+   > 拷贝期间**全站只读**：所有写操作返回 503，汇率刷新与定时抓取一并暂停。
+   > 这不是保险而是必需——拷贝逐表读源库、SQLite 侧没有读快照，期间的写入会产生
+   > 「订单拷了、物品没拷」这种撕裂的副本。通常一两秒就结束。
+3. 抽查 MySQL 里的数据无误后，点「**切换**」：热切换，无需重启。
+   > 若这中间你又录过数据，切换会被**拦下来**并告诉你差了什么（如「商品订单 +3 条」）——
+   > 那些改动不在目标库里，切过去就没了。可以选「重新迁移再切换」（推荐）或明确放弃它们。
 
-# 3) 目标库建表：把 .env 的 DATABASE_URL 指向 MySQL，跑一次迁移
-cd backend && python -m alembic upgrade head
+连接串（含密码）用 `SECRET_KEY` 派生的 Fernet 密钥加密后存在控制库里，**永不回传前端**。
 
-# 4) 搬数据（按外键顺序整库拷贝；MySQL 生成列自动计算，不手写）
-python -m scripts.migrate_sqlite_to_mysql --src sqlite:///./soroban.db
-#   --dst 省略时用 .env 的 DATABASE_URL；目标表非空会中止（幂等保护）
+**回退**：同一页选「本地 SQLite」那一行点「切换」即可。切换是非破坏性的（不清空任何库），
+所以可以来回切；但本地那份数据停在你当初迁走的那一刻——**要拿它当最新账本，得先「迁移到此库」**。
 
-# 5) 抽查 MySQL 数据无误后，保持 .env 指向 MySQL、重启后端即完成切换
-```
+> ⚠️ **服务起不来时怎么切回本地**：数据在 MySQL 上而 MySQL 连不上时，soroban 会**拒绝启动**
+> （刻意不自动降级——本地那份是旧数据，对着它记账会造成两边各有一半）。此时网页点不到，用命令行：
+> ```bash
+> cd backend && .venv/bin/python -m tools.use_local_db
+> ```
+> 它只改「当前用哪个后端」这一个标记，不动任何数据。
 
-要回退 SQLite，把 `DATABASE_URL` 改回 `sqlite:///./soroban.db` 重启即可（双方言并存）。
+> `backend/scripts/migrate_sqlite_to_mysql.py` 是「数据库」页出现之前的一次性脚本，
+> 功能已被上面的流程取代，保留仅供命令行批处理场景。
 
 > 已在 MySQL 9.7 上实测：迁移、生成列、四种「软删唯一」语义、整库 ETL、应用启动路径全部通过。
 
@@ -180,7 +198,12 @@ python -m scripts.migrate_sqlite_to_mysql --src sqlite:///./soroban.db
 ```bash
 ./backup.sh            # 用 sqlite3 .backup，WAL 安全；自动保留最近 30 份到 backups/
 ```
-> `backup.sh` 仅针对 SQLite。用 MySQL 时改用 `mysqldump soroban > soroban_$(date +%F).sql`（或数据库自带的定时备份）。
+> `backup.sh` 仅针对 SQLite。它会**先读控制库确认当前后端**：若已切到 MySQL 就直接报错退出
+> （不再静默备出一份「体积正常、表齐全、却停在迁移当天」的旧快照——那种备份挂 cron 天天成功、
+> 真出事去恢复才发现丢了几个月）。用 MySQL 时请改用：
+> ```bash
+> mysqldump --single-transaction --default-character-set=utf8mb4 soroban > soroban_$(date +%F).sql
+> ```
 
 建议挂定时（macOS 用 `launchd`，或 `crontab -e`）：
 ```

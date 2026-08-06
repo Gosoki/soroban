@@ -51,7 +51,7 @@
                 </template>
               </el-table-column>
               <el-table-column label="商品" min-width="160" show-overflow-tooltip>
-                <template #default="{ row: t }"><span :class="t.shop ? '' : 'ph'">{{ t.shop || '—' }}</span></template>
+                <template #default="{ row: t }"><span :class="t.title ? '' : 'ph'">{{ t.title || '—' }}</span></template>
               </el-table-column>
               <el-table-column label="物品" min-width="180">
                 <template #default="{ row: t }">
@@ -113,17 +113,13 @@ import { Camera, Loading, Upload } from '@element-plus/icons-vue'
 import { shipmentApi, ordersApi } from '@/api'
 import { SHIPMENT_STATUS } from '@/constants'
 import { fmtJPY } from '@/utils/money'
+import { today } from '@/utils/datetime'
 import NotionTable from '@/components/NotionTable.vue'
 
 const router = useRouter()
 // 点关联订单的订单号 → 跳到商品页、隔离显示该单并自动展开（用 id，兼容无订单号的单）
 function gotoOrder(t) { router.push({ path: '/orders', query: { focus: t.id } }) }
 
-// 用本地时区（用户在日本=JST）的当天，而非 UTC；否则 JST 0~9 点新建会记成前一天
-const today = () => {
-  const d = new Date()
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-}
 
 const columns = [
   { key: 'date', label: '日期', type: 'date', width: 130 },
@@ -150,7 +146,11 @@ const pageSize = 30
 const filters = reactive({ range: null, status: '', q: '' })
 const unassignedOptions = ref([])
 
+// 请求序号：筛选/翻页可以在上一次响应回来前再发一次，慢的那次后到会把新数据整个覆盖掉
+// （表现为「清了筛选却只剩一部分」「内容是第2页、页码高亮第3页」）。只认最后一次发出的请求。
+let loadSeq = 0
 async function load() {
+  const my = ++loadSeq
   loading.value = true
   try {
     const params = { limit: pageSize, offset: (page.value - 1) * pageSize }
@@ -158,10 +158,11 @@ async function load() {
     if (filters.status) params.status = filters.status
     if (filters.q) params.q = filters.q
     const res = await shipmentApi.list(params)
+    if (my !== loadSeq) return          // 已有更新的请求发出，丢弃这次的结果
     rows.value = res.items
     total.value = res.total
   } finally {
-    loading.value = false
+    if (my === loadSeq) loading.value = false
   }
 }
 function reload() { page.value = 1; load() }
@@ -176,13 +177,23 @@ async function saveCell(row, key, value) {
   }
 }
 
-async function addRow(data = {}) {
+async function addRow(data = {}, done) {
   try {
     const created = await shipmentApi.create({ date: today(), status: '打包中', ...data })
     rows.value.unshift(created)
     total.value++
+    done?.(true)
     return created                    // OCR 建单据此判断是否真的建成（失败时拦截器已提示）
-  } catch (_) { return null }
+  } catch (e) {
+    done?.(false)   // 失败时保留幽灵行里的草稿，让用户就地改
+    // 409 被 http 拦截器刻意跳过（留给页面处理）。不在这里提示的话，撞集运单号唯一约束时
+    // 页面「什么都没发生」：没有 toast、没有新行、幽灵行里刚敲的单号也被 commitNew 清掉了。
+    if (e.response?.status === 409) {
+      const who = data.shipment_no ? `集运单号「${data.shipment_no}」` : '该记录'
+      ElMessage.warning(`${who} 已存在，未添加`)
+    }
+    return null
+  }
 }
 
 async function delRow(row) {

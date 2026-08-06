@@ -11,7 +11,7 @@ from ..auth import get_current_user
 from ..database import get_session
 from ..models import MiscExpense
 from ..schemas import MiscCreate, MiscRead, MiscUpdate
-from .common import conflict, guarded_bump, not_found, soft_delete
+from .common import guarded_bump, raise_conflict, raise_not_found, soft_delete
 
 router = APIRouter(
     prefix="/api/misc", tags=["misc"], dependencies=[Depends(get_current_user)]
@@ -69,7 +69,7 @@ def create_item(payload: MiscCreate, session: Session = Depends(get_session)):
 def get_item(item_id: int, session: Session = Depends(get_session)):
     item = session.get(MiscExpense, item_id)
     if not item or item.is_delete:
-        not_found("杂项")
+        raise_not_found("杂项")
     return item
 
 
@@ -77,9 +77,9 @@ def get_item(item_id: int, session: Session = Depends(get_session)):
 def update_item(item_id: int, payload: MiscUpdate, session: Session = Depends(get_session)):
     item = session.get(MiscExpense, item_id)
     if not item or item.is_delete:
-        not_found("杂项")
+        raise_not_found("杂项")
     if not guarded_bump(session, MiscExpense, item_id, payload.version):
-        conflict()
+        raise_conflict()
 
     data = payload.model_dump(exclude_unset=True, exclude={"version"})
     for key, value in data.items():
@@ -96,7 +96,7 @@ def update_item(item_id: int, payload: MiscUpdate, session: Session = Depends(ge
 def delete_item(item_id: int, session: Session = Depends(get_session)):
     item = session.get(MiscExpense, item_id)
     if not item or item.is_delete:
-        not_found("杂项")
+        raise_not_found("杂项")
     soft_delete(item)
     session.add(item)
     session.commit()

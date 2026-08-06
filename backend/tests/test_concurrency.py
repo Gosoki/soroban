@@ -14,7 +14,7 @@ from app.routers.common import guarded_bump
 
 
 def test_guarded_bump_only_one_winner(client):
-    o = client.post("/api/orders", json={"date": "2027-04-01", "shop": "cc1"}).json()
+    o = client.post("/api/orders", json={"date": "2027-04-01", "title": "cc1"}).json()
     with Session(get_engine()) as a, Session(get_engine()) as b:
         assert guarded_bump(a, Order, o["id"], o["version"]) is True
         a.commit()
@@ -24,7 +24,7 @@ def test_guarded_bump_only_one_winner(client):
 
 
 def test_guarded_bump_refuses_soft_deleted(client):
-    o = client.post("/api/orders", json={"date": "2027-04-01", "shop": "cc2"}).json()
+    o = client.post("/api/orders", json={"date": "2027-04-01", "title": "cc2"}).json()
     client.delete(f"/api/orders/{o['id']}")
     with Session(get_engine()) as s:
         assert guarded_bump(s, Order, o["id"], o["version"]) is False
@@ -41,7 +41,7 @@ def test_import_gate_claims_only_once(client):
             return sess.execute(
                 sa_update(OrderStaging)
                 .where(OrderStaging.id == s["id"], OrderStaging.imported_order_id.is_(None))
-                .values(status=StagingStatus.imported.value, imported_order_id=fake_order_id,
+                .values(import_status=StagingStatus.imported.value, imported_order_id=fake_order_id,
                         version=OrderStaging.version + 1, updated_at=utcnow())
             ).rowcount
 
@@ -88,23 +88,23 @@ def test_attach_after_shipment_deleted_is_rejected(client):
 
 def test_stale_patch_after_someone_else_wrote_is_409(client):
     """两个页面各持一份表单：先提交的赢，后提交的必须 409 而不是覆盖。"""
-    o = client.post("/api/orders", json={"date": "2027-04-01", "shop": "初始"}).json()
+    o = client.post("/api/orders", json={"date": "2027-04-01", "title": "初始"}).json()
     tab_a = dict(o)
     tab_b = dict(o)
     assert client.patch(f"/api/orders/{o['id']}",
-                        json={"version": tab_a["version"], "shop": "A 改的"}).status_code == 200
-    r = client.patch(f"/api/orders/{o['id']}", json={"version": tab_b["version"], "shop": "B 改的"})
+                        json={"version": tab_a["version"], "title": "A 改的"}).status_code == 200
+    r = client.patch(f"/api/orders/{o['id']}", json={"version": tab_b["version"], "title": "B 改的"})
     assert r.status_code == 409
-    assert client.get(f"/api/orders/{o['id']}").json()["shop"] == "A 改的"
+    assert client.get(f"/api/orders/{o['id']}").json()["title"] == "A 改的"
 
 
 def test_staging_write_through_bumps_both_versions(client):
     """暂存写穿账本：两边 version 都要推进，否则另一页拿旧版本能悄悄覆盖。"""
-    s = client.post("/api/staging", json={"order_no": "CC-WT", "shop": "a"}).json()
+    s = client.post("/api/staging", json={"order_no": "CC-WT", "title": "a"}).json()
     o = client.post(f"/api/staging/{s['id']}/import").json()
     row = next(x for x in client.get("/api/staging", params={"limit": 500}).json()["items"]
                if x["id"] == s["id"])
-    client.patch(f"/api/staging/{s['id']}", json={"version": row["version"], "shop": "b"})
+    client.patch(f"/api/staging/{s['id']}", json={"version": row["version"], "title": "b"})
     assert client.get(f"/api/orders/{o['id']}").json()["version"] > o["version"]
     row2 = next(x for x in client.get("/api/staging", params={"limit": 500}).json()["items"]
                 if x["id"] == s["id"])
@@ -113,11 +113,11 @@ def test_staging_write_through_bumps_both_versions(client):
 
 def test_order_edit_bumps_mirrored_staging_version(client):
     """账本改动镜像回暂存时也必须推进暂存 version（否则暂存页旧表单不会 409）。"""
-    s = client.post("/api/staging", json={"order_no": "CC-MIR", "shop": "a"}).json()
+    s = client.post("/api/staging", json={"order_no": "CC-MIR", "title": "a"}).json()
     o = client.post(f"/api/staging/{s['id']}/import").json()
     before = next(x for x in client.get("/api/staging", params={"limit": 500}).json()["items"]
                   if x["id"] == s["id"])["version"]
-    client.patch(f"/api/orders/{o['id']}", json={"version": o["version"], "shop": "改"})
+    client.patch(f"/api/orders/{o['id']}", json={"version": o["version"], "title": "改"})
     after = next(x for x in client.get("/api/staging", params={"limit": 500}).json()["items"]
                  if x["id"] == s["id"])["version"]
     assert after > before

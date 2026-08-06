@@ -24,11 +24,11 @@ def goods_seed(price_cny, postage_cny):
 
 
 def build_items(items_in, seed_goods, fallback_name):
-    """把「物品输入 + 货款种子价 + 兜底物品名」规整成 ≥1 条物品 dict(name/quantity/price_cny/auto)。
+    """把「物品输入 + 货款种子价 + 兜底物品名」规整成 ≥1 条物品 dict(name/quantity/unit_price_cny/auto)。
 
     - seed_goods 是**货款**（已扣掉邮费），不是订单总价：订单价 = Σ(单价×数量) + 邮费，
       种子若含邮费，sync_from_items 会把邮费再加一遍。所有调用点都传 `订单价 - 邮费`。
-    - fallback_name 是没有物品明细时拿来当物品名的商品标题（即 Order.shop 列，见其命名说明）。
+    - fallback_name 是没有物品明细时拿来当物品名的商品标题（即 Order.title 列，见其命名说明）。
 
     系统最小单位是物品，订单必须有 ≥1 物品（见 README「物品为最小单位」）：
     - 没给物品 → 自动生成 1 条（name=兜底名、数量 1、单价=货款种子、auto=True 灰显可改）。
@@ -40,30 +40,33 @@ def build_items(items_in, seed_goods, fallback_name):
         seed_goods = Decimal("0.00")
     if not items_in:
         return [{"name": (fallback_name or "未命名物品")[:255], "quantity": 1,
-                 "price_cny": seed_goods if seed_goods is not None else Decimal("0.00"), "auto": True}]
-    any_priced = any(it.price_cny is not None for it in items_in)
+                 "unit_price_cny": seed_goods if seed_goods is not None else Decimal("0.00"),
+                 "auto": True}]
+    any_priced = any(it.unit_price_cny is not None for it in items_in)
     if not any_priced and seed_goods is not None:
         out = []
         for i, it in enumerate(items_in):
             if i == 0:
                 q = it.quantity or 1
                 unit = (Decimal(seed_goods) / q).quantize(_CNY_Q, rounding=ROUND_HALF_UP)
-                out.append({"name": it.name, "quantity": it.quantity, "price_cny": unit, "auto": True})
+                out.append({"name": it.name, "quantity": it.quantity,
+                            "unit_price_cny": unit, "auto": True})
             else:
-                out.append({"name": it.name, "quantity": it.quantity, "price_cny": Decimal("0.00"), "auto": True})
+                out.append({"name": it.name, "quantity": it.quantity,
+                            "unit_price_cny": Decimal("0.00"), "auto": True})
         return out
     # 有单价的原样用；没单价的记 0 并标 auto（灰显=待补价），避免误当作真实 ¥0
     return [{"name": it.name, "quantity": it.quantity,
-             "price_cny": (it.price_cny if it.price_cny is not None else Decimal("0.00")),
-             "auto": (True if it.price_cny is None else bool(getattr(it, "auto", False)))}
+             "unit_price_cny": (it.unit_price_cny if it.unit_price_cny is not None else Decimal("0.00")),
+             "auto": (True if it.unit_price_cny is None else bool(getattr(it, "auto", False)))}
             for it in items_in]
 
 
-def not_found(name: str = "记录"):
+def raise_not_found(name: str = "记录"):
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"{name}不存在")
 
 
-def conflict():
+def raise_conflict():
     """P5：乐观锁冲突 → 409，前端提示刷新。"""
     raise HTTPException(
         status_code=status.HTTP_409_CONFLICT,
@@ -110,9 +113,9 @@ def mirror_to_staging(session: Session, order, built_items) -> None:
     ).first()
     if st is None:
         return
-    st.order_date, st.order_no, st.shop = order.date, order.order_no, order.shop
+    st.order_date, st.order_no, st.title = order.date, order.order_no, order.title
     st.platform_account, st.platform, st.express_no = order.platform_account, order.platform, order.express_no
-    st.postage_cny, st.fx_rate, st.order_status = order.postage_cny, order.fx_rate, order.status
+    st.postage_cny, st.fx_rate, st.trade_status = order.postage_cny, order.fx_rate, order.status
     if built_items is not None:
         st.items = [StagingItem(**d) for d in built_items]
     st.sync_from_items()

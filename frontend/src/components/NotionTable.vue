@@ -66,8 +66,11 @@
 
         <tbody>
           <!-- 幽灵新建行：放最上，与「最新在上」一致；任意格输入即建行 -->
-          <tr v-if="addable" class="gtn-new">
-            <td class="gtn-td-id gtn-new-num" title="新建一行" @click="commitNew">
+          <!-- 幽灵新建行：填格子只攒草稿，按回车或点左侧 ✓ 才落库（见 commitNew） -->
+          <tr v-if="addable" class="gtn-new" @keyup.enter="commitNew">
+            <td class="gtn-td-id gtn-new-num" :class="{ ready: hasNew }"
+                :title="hasNew ? '提交新建这一行（或在格子里按回车）' : '在右侧格子里填内容即可新建一行'"
+                @click="commitNew">
               <el-icon><component :is="hasNew ? Check : Plus" /></el-icon>
             </td>
             <td v-if="hasActions"></td>
@@ -255,18 +258,26 @@ watch(() => props.openId, (id, prev) => {
   if (id !== null && id !== undefined) open.add(id)
 }, { immediate: true })
 
+// 幽灵新建行：填格子只是攒草稿，**不落库**。落库要么点左侧的 ✓、要么在格子里按回车。
+//
+// 原先是「任意一格 change 就立刻 emit('add') 并清空 newRow」，有两个后果：
+// ① 横着填三格 = 连建三条各只有一个字段的记录（每条还带今天日期+默认状态），得逐条确认删掉；
+// ② 表头那颗 hasNew ? Check : Plus 图标永远停在 Plus——为「多格填完再提交」设计的路径是死代码。
 function onNew(col, value) {
   newRow[col.key] = value
-  if (hasNew.value) commitNew()
 }
 function commitNew() {
   if (!hasNew.value) return
   const data = {}
   Object.keys(newRow).forEach((k) => {
     if (newRow[k] !== null && newRow[k] !== '') data[k] = newRow[k]
-    delete newRow[k]
   })
-  emit('add', data)
+  // 成功才清空草稿：失败（如订单号撞唯一约束）时把用户刚敲的内容留在格子里让他改，
+  // 而不是连人带字一起吞掉。父页的 addRow 收到第二个参数就回调它。
+  emit('add', data, (ok) => {
+    if (ok === false) return
+    Object.keys(newRow).forEach((k) => delete newRow[k])
+  })
 }
 
 // —— 列拖拽换位 ——
@@ -359,6 +370,8 @@ function stopResize() {
 .gtn-new td { background: #10192c; border-bottom: 1px solid #202c44; border-right: 1px solid #28354a; }
 .gtn-new-num { color: #5c6b85; cursor: pointer; }
 .gtn-new-num:hover { color: #67c23a; background: rgba(103, 194, 58, 0.1); }
+/* 草稿已有内容 → ✓ 亮起，提示「可以提交了」 */
+.gtn-new-num.ready { color: #67c23a; background: rgba(103, 194, 58, 0.12); }
 .gtn-new-ph { height: 36px; padding: 0 8px; display: flex; align-items: center; color: #5b6880; font-size: 13px; }
 
 .gtn-tagcfg { margin-left: 4px; color: #6b7a93; cursor: pointer; font-size: 13px; }

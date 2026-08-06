@@ -1,5 +1,13 @@
 """一次性数据迁移：把 SQLite（soroban.db）整库搬到 MySQL。
 
+⚠️ **本脚本已被应用内「数据库」页取代**（见 README「数据库」章 / app/services/db_migrate.py），
+   保留仅供命令行批处理场景。两点差异务必注意：
+   1. 它**不会**切换 soroban 实际使用的后端——那由控制库里的 app_db_config 决定，只能在
+      「数据库」页切（或 `python -m tools.use_local_db` 切回本地）。改 .env 的 DATABASE_URL
+      **不再有任何切换效果**，那个值现在只用来定位恒为 SQLite 的控制库。
+   2. 因此下面第 2 步「把 .env 指向 MySQL」只是借 alembic 的配置通道给目标库建表，
+      建完记得改回去，否则控制库位置也会跟着变。
+
 前置：
 1. MySQL 已建库（utf8mb4）：CREATE DATABASE soroban CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 2. 目标库已建好 schema：先把 .env 的 DATABASE_URL 指向 MySQL，跑一次
@@ -93,7 +101,8 @@ def main() -> None:
             total += n
             print(f"  {model.__tablename__:<16} {n:>6} 行")
         dst.commit()
-    print(f"完成，共迁移 {total} 行。请抽查 MySQL 数据后再切换生产 DATABASE_URL。")
+    print(f"完成，共迁移 {total} 行。请抽查 MySQL 数据，然后在应用内「数据库」页点「切换」生效")
+    print("（改 .env 的 DATABASE_URL 不会切换后端——见本文件顶部说明）")
 
 
 if __name__ == "__main__":
