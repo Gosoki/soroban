@@ -2,7 +2,7 @@
   <div class="set-page" v-loading="loading">
     <h2 class="title">设置</h2>
     <p class="lead">
-      这里改的是**业务偏好**，存在数据库里、即时生效。密钥、监听地址、数据库连接串那些属于部署配置，
+      这里改的是<b>业务偏好</b>，存在数据库里、即时生效。密钥、监听地址、数据库连接串那些属于部署配置，
       在 <code>backend/.env</code> 里改、要重启，不在这一页。
     </p>
 
@@ -30,16 +30,16 @@
           </el-tooltip>
         </label>
         <div class="chain">
-          <div v-for="(s, i) in draft['fx.sources']" :key="s" class="chain-row">
+          <div v-for="(s, i) in chain" :key="s" class="chain-row">
             <span class="ord">{{ i + 1 }}</span>
             <span class="sname">{{ SOURCE_NAMES[s] || s }}</span>
             <el-tag v-if="i === 0" size="small" :style="typeStyle('success')">首选</el-tag>
             <span class="sdesc">{{ SOURCE_DESC[s] }}</span>
             <div class="grow" />
             <el-button link :icon="Top" :disabled="i === 0" title="上移" @click="move(i, -1)" />
-            <el-button link :icon="Bottom" :disabled="i === draft['fx.sources'].length - 1"
+            <el-button link :icon="Bottom" :disabled="i === chain.length - 1"
                        title="下移" @click="move(i, 1)" />
-            <el-button link type="danger" :icon="Delete" :disabled="draft['fx.sources'].length <= 1"
+            <el-button link type="danger" :icon="Delete" :disabled="chain.length <= 1"
                        title="不使用这个源" @click="drop(i)" />
           </div>
           <div v-if="unused.length" class="chain-add">
@@ -52,7 +52,8 @@
       </div>
 
       <!-- 数值项 -->
-      <div v-for="k in ['fx.attempts', 'fx.fallback_hours', 'fx.refresh_seconds']" :key="k" class="field">
+      <div v-for="k in loaded ? ['fx.attempts', 'fx.fallback_hours', 'fx.refresh_seconds'] : []"
+           :key="k" class="field">
         <label class="flabel">
           {{ spec(k).label }}
           <el-tooltip :content="spec(k).hint" placement="top">
@@ -73,7 +74,7 @@
           </el-tooltip>
         </label>
         <el-select v-model="draft['fx.boc_column']" size="small" style="width: 160px"
-                   :disabled="!draft['fx.sources'].includes('boc')">
+                   :disabled="!chain.includes('boc')">
           <el-option v-for="c in spec('fx.boc_column').choices || []" :key="c"
                      :label="BOC_COLS[c] || c" :value="c" />
         </el-select>
@@ -110,6 +111,7 @@ const BOC_COLS = {
 }
 
 const loading = ref(false)
+const loaded = ref(false)   // 数据到位前不渲染依赖它的表单项
 const saving = ref(false)
 const refreshing = ref(false)
 const specs = ref([])
@@ -119,7 +121,11 @@ const fx = ref({})
 
 function spec(key) { return specs.value.find((s) => s.key === key) || {} }
 const allSources = computed(() => spec('fx.sources').choices || [])
-const unused = computed(() => allSources.value.filter((s) => !(draft.value['fx.sources'] || []).includes(s)))
+// 数据回来之前 draft 是空对象。模板里**任何**地方都不该直接摸 draft['fx.sources']——
+// 对 undefined 调 .includes 会在渲染时抛 TypeError，整页当场卡死（本页就这么白过）。
+// 统一从这里取，兜底成空数组。
+const chain = computed(() => draft.value['fx.sources'] || [])
+const unused = computed(() => allSources.value.filter((s) => !chain.value.includes(s)))
 // 深比较：源顺序是数组，`!==` 恒为真会让「保存」按钮一直亮着
 const dirty = computed(() => JSON.stringify(draft.value) !== JSON.stringify(saved.value))
 
@@ -142,17 +148,18 @@ async function load() {
     saved.value = r.values
     draft.value = JSON.parse(JSON.stringify(r.values))
     fx.value = await fxApi.get()
+    loaded.value = true
   } catch (_) { /* 拦截器已提示 */ } finally { loading.value = false }
 }
 
 function move(i, d) {
   const arr = draft.value['fx.sources']
   const j = i + d
-  if (j < 0 || j >= arr.length) return
+  if (!arr || j < 0 || j >= arr.length) return
   ;[arr[i], arr[j]] = [arr[j], arr[i]]
 }
-function drop(i) { draft.value['fx.sources'].splice(i, 1) }
-function add(s) { draft.value['fx.sources'].push(s) }
+function drop(i) { draft.value['fx.sources']?.splice(i, 1) }
+function add(s) { draft.value['fx.sources']?.push(s) }
 function reset() { draft.value = JSON.parse(JSON.stringify(saved.value)) }
 
 async function save() {

@@ -192,3 +192,30 @@ def test_panel_allows_typing_goods_amount():
     assert "async function applyGoods" in src
     assert "quantity: 1" in src and "props.order.title" in src, "手填货款没绑成「订单名称×1」"
     assert ':disabled="!isSingleUnitItem"' in src, "拆过明细后仍允许从这里覆盖，会冲掉明细"
+
+
+def test_settings_page_never_touches_raw_draft_array():
+    """设置页的源列表在数据回来之前是 undefined。模板里直接 `draft['fx.sources'].xxx`
+    会在渲染时抛 TypeError → **整页卡死白屏**（本页真这么炸过一次）。
+    统一走带兜底的 `chain` computed，模板里不许再出现裸的 draft['fx.sources']。"""
+    src = (_REPO / "frontend" / "src" / "views" / "Settings" / "index.vue").read_text(encoding="utf-8")
+    tpl = src.split("</template>")[0]
+    assert "draft['fx.sources']" not in tpl, "模板里又直接摸 draft['fx.sources'] 了"
+    assert "const chain = computed(" in src, "缺少带兜底的 chain computed"
+
+
+def test_settings_source_keys_match_backend():
+    """页面上那份「源 key → 中文名」必须与后端 SOURCE_LABELS 对齐，
+    否则用户看到的是 `erapi` 这种原始 key。"""
+    from app.services.fx import SOURCE_LABELS
+
+    src = (_REPO / "frontend" / "src" / "views" / "Settings" / "index.vue").read_text(encoding="utf-8")
+    for key in SOURCE_LABELS:
+        assert f"{key}:" in src, f"设置页缺少源 {key} 的展示名"
+
+
+def test_nav_is_generated_from_routes():
+    """侧栏菜单曾是手写数组，与路由表两份——加了路由忘了加它，页面就进不去。
+    必须从路由表生成。"""
+    layout = (_REPO / "frontend" / "src" / "components" / "Layout.vue").read_text(encoding="utf-8")
+    assert "router.getRoutes()" in layout, "侧栏又变回手写数组了"

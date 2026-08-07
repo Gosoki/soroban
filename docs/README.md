@@ -806,3 +806,15 @@ baseline 建表只给了 `mysql_charset='utf8mb4'` 而没给 COLLATE，MySQL 的
 **顺带一条流程教训**：我此前每轮收尾都 `rm -rf frontend/dist` 保持工作区干净。但生产模式下后端托管的正是 `dist`，删掉就等于用户那边完全没更新——本轮「怎么没看见设置」就是这么来的。**以后不再删它**（它本来就在 `.gitignore` 里，留着不进版本库）。
 
 **验证**：577 条 pytest（新增 2 条：`index.html` 必须 no-cache 且 assets 必须长缓存、静态挂载必须用带策略的子类）；真浏览器实测响应头 `no-cache` / `immutable` 正确，带 etag 重放返回 304。
+
+**补记（同版收尾）**：设置页首次进入必然白屏——`draft` 在数据回来之前是空对象，而模板里
+`draft['fx.sources'].includes('boc')` 对 `undefined` 调 `.includes`，渲染当场抛 TypeError。
+别处都写了 `|| []` 兜底，唯独这一处漏了。改为统一走带兜底的 `chain` computed，
+并加测试禁止模板里再出现裸的 `draft['fx.sources']`。
+定位同样靠 Playwright：真浏览器打开 `#/settings`，控制台一行
+`TypeError: Cannot read properties of undefined (reading 'includes')` 直接指到位置。
+顺带修掉 `<p>` 里误写的 Markdown 星号（HTML 里不会渲染，会原样显示成 `**业务偏好**`）。
+
+**验证补充**：580 条 pytest（再加 3 条：模板不许裸取 draft 数组、设置页源名必须与后端
+`SOURCE_LABELS` 对齐、侧栏必须从路由表生成）；真浏览器实测设置页渲染正常、
+上移/撤销交互生效、零报错。
