@@ -82,7 +82,15 @@ const columns = [
   { key: 'quantity', label: '数量', readonly: true, width: 64 },
   { key: 'unit_price_cny', label: '单价（元）', format: 'cny', readonly: true, width: 100 },
   { key: 'amount_cny', label: '金额（元）', format: 'cny', readonly: true, width: 100 },
-  { key: 'status', label: '状态', readonly: true, width: 84 },
+  // 与商品订单页同一口径：挂了集运单就显示继承来的集运状态、整格置灰（标签仍是原色）。
+  // 本页所有列都是只读的（物品要改去订单页展开面板），这里的 lock 纯粹是**视觉提示**：
+  // 让人一眼看出这行的状态不是订单自己的，而是跟着集运单走的。
+  {
+    key: 'status', label: '状态', readonly: true, width: 84,
+    display: (row) => row.effective_status || row.status,
+    lock: (row) => !!row.shipment_order_id,
+    lockHint: '该订单已挂靠集运订单，状态跟随那张单',
+  },
   { key: 'order_no', label: '订单号', readonly: true, width: 130 },
   { key: 'express_no', label: '快递号', readonly: true, width: 110 },
 ]

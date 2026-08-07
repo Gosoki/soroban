@@ -8,6 +8,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func
+from sqlalchemy.orm import selectinload
 from sqlmodel import Session, select
 
 from ..auth import get_current_user
@@ -60,6 +61,8 @@ def list_items(
     rows = session.exec(
         select(OrderItem, Order)
         .join(Order, Order.id == OrderItem.order_id)
+        # effective_status 会触碰 shipment_order 关系；不预加载就是整页逐行发 SQL（N+1）
+        .options(selectinload(Order.shipment_order))
         .where(*conds)
         .order_by(Order.date.desc(), Order.id.desc(), OrderItem.id.asc())
         .offset(offset)
@@ -76,6 +79,7 @@ def list_items(
             amount_cny=amount, auto=it.auto,
             order_id=o.id, date=o.date, order_no=o.order_no, title=o.title,
             platform_account=o.platform_account, platform=o.platform, status=o.status,
+            effective_status=o.effective_status, shipment_order_id=o.shipment_order_id,
             express_no=o.express_no,
         ))
     return {"items": items, "total": total}

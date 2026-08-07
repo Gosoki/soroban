@@ -88,8 +88,11 @@
             <td v-if="hasActions"></td>
             <td v-if="expandable"></td>
             <td v-for="col in cols" :key="'n-' + col.key" class="gtn-td">
-              <GotionCell v-if="!col.readonly && !$slots['cell-' + col.key]" new-row
-                          :model-value="newRow[col.key]" :col="cellCol(col)" @change="(v) => onNew(col, v)" />
+              <!-- newEditable：数据行只读、**新建行可填**。用于「派生值，但新建时需要一个种子」
+                   的列——如订单的人民币：平时由物品单价×数量派生、不许直接改，
+                   但新建一单时总得有个地方把金额填进去。 -->
+              <GotionCell v-if="(!col.readonly || col.newEditable) && !$slots['cell-' + col.key]" new-row
+                          :model-value="newRow[col.key]" :col="newCol(col)" @change="(v) => onNew(col, v)" />
               <!-- 只读/自定义列在新建行显其占位提示（如「集运订单」显「选择」）；无占位则留空 -->
               <div v-else-if="col.placeholder" class="gtn-new-ph">{{ col.placeholder }}</div>
             </td>
@@ -215,6 +218,11 @@ function saveLayout() {
 }
 
 // —— 标签列：渲染成 select，选项 + 每标签颜色/是否在用 来自可管理的标签集 ——
+// 新建行用的列配置：把 readonly 摘掉（否则 GotionCell 直接渲染成只读展示）
+function newCol(col) {
+  const c = cellCol(col)
+  return col.newEditable ? { ...c, readonly: false } : c
+}
 function cellCol(col) {
   return col.type === 'tag'
     ? { ...col, type: 'select', options: tagOptions[col.field] || [], tagMeta: tagMeta[col.field] || {}, tagColored: true }

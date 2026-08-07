@@ -115,13 +115,7 @@ const columns = [
   { key: 'platform_account', label: '账号昵称', type: 'tag', field: 'platform_account', width: COL_W },
   { key: 'platform', label: '来源', type: 'tag', field: 'platform', width: COL_W, placeholder: '来源' },
   { key: 'title', label: '商品', type: 'text', long: true, width: COL_W },
-  // 物品列同理：挂靠期间整格置灰（这批货已经进包裹了，不该在列表上随手改）。
-  // 仍可点开展开面板查看；真要改先从集运单里释放。
-  {
-    key: 'items', label: '物品', readonly: true, width: COL_W, expand: true,
-    lock: (row) => !!row.shipment_order_id,
-    lockHint: '已挂靠集运订单；要改物品请先从集运单里释放',
-  },
+  { key: 'items', label: '物品', readonly: true, width: COL_W, expand: true },
   // 状态：点标签就能选（和其它标签列一致）。挂着集运单时**按行锁定**——显示继承来的集运状态、
   // 整格置灰不可点，但标签本身保持原色；释放后自动恢复可选。
   // display 只影响显示，写回仍走 key='status'（订单自己的国内段状态）。
@@ -135,7 +129,12 @@ const columns = [
   { key: 'jpy_settled', label: '结算（円）', format: 'jpy', readonly: true, width: COL_W },
   { key: 'jpy_override', label: '覆盖（円）', type: 'int', format: 'jpy', width: COL_W, placeholder: '实付日元' },
   // help：口径 + 「为什么和淘宝实付差几分」，表头点「?」可见（见 docs/README.md 第五十三版）
-  { key: 'price_cny', label: '人民币（元）', format: 'cny', readonly: true, width: COL_W, help: PRICE_HELP },   // 由物品单价×数量派生，改价走展开面板
+  // 数据行只读（金额由物品单价×数量派生，改价走展开面板）；
+  // **新建行可填**——新建一单时总得有个地方把金额填进去，后端会把它折成一条物品（见 build_items）。
+  {
+    key: 'price_cny', label: '人民币（元）', format: 'cny', readonly: true, newEditable: true,
+    type: 'decimal', placeholder: '货款', width: COL_W, help: PRICE_HELP,
+  },
   { key: 'fx_rate', label: '汇率', type: 'decimal', width: COL_W, placeholder: '当天汇率' },
   { key: 'express_company', label: '快递公司', type: 'text', width: COL_W, placeholder: '快递公司' },
   { key: 'express_no', label: '快递号', type: 'text', width: COL_W, placeholder: '快递号' },

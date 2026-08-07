@@ -254,7 +254,11 @@ class ItemListRead(SQLModel):
     title: Optional[str] = None
     platform_account: Optional[str] = None
     platform: Optional[str] = None
-    status: str
+    status: str                                # 订单自己的**国内段**状态
+    # 界面该显示的状态：订单挂了集运单就跟随那张单，否则等于 status。
+    # 与商品订单页同一口径（见 models/order/order.py 的 Order.effective_status）。
+    effective_status: str = ""
+    shipment_order_id: Optional[int] = None    # 有值 = 已挂靠 → 该格锁定
     express_no: Optional[str] = None
 
 
