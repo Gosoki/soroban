@@ -40,7 +40,10 @@ import { ArrowRight } from '@element-plus/icons-vue'
 
 const expr = ref('')
 const inp = ref(null)
-const open = ref(localStorage.getItem('calc_open') !== '0')   // 折叠状态记忆
+// 默认**收起**：算一笔账才偶尔用一次，常驻展开白占侧栏高度。
+// 仍然记忆——手动展开过就一直展开，直到你再收起来（判据用 === '1' 而非 !== '0'，
+// 这样「从没点过」和「点过又收起」都是收起，只有明确展开过才展开）。
+const open = ref(localStorage.getItem('calc_open') === '1')
 function toggle() { open.value = !open.value; localStorage.setItem('calc_open', open.value ? '1' : '0') }
 function ins(ch) { expr.value += ch }
 function back() { expr.value = expr.value.slice(0, -1) }

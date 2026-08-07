@@ -106,10 +106,12 @@
                 <el-icon class="chev" :class="{ open: open.has(row.id) }"><ArrowRight /></el-icon>
               </td>
               <td v-for="col in cols" :key="col.key" class="gtn-td"
-                  :class="{ 'gtn-td-clickexp': col.expand && expandable }"
+                  :class="{ 'gtn-td-clickexp': col.expand && expandable, 'gtn-td-locked': isLocked(col, row) }"
+                  :title="isLocked(col, row) ? (col.lockHint || '') : null"
                   @click="col.expand && expandable ? toggle(row.id) : null">
                 <div v-if="$slots['cell-' + col.key]" class="gtn-slot"><slot :name="'cell-' + col.key" :row="row" /></div>
-                <GotionCell v-else :model-value="row[col.key]" :col="cellCol(col)" @change="(v) => $emit('save', row, col.key, v)" />
+                <GotionCell v-else :model-value="cellValue(col, row)" :col="cellCol(col)"
+                            :locked="isLocked(col, row)" @change="(v) => $emit('save', row, col.key, v)" />
               </td>
             </tr>
             <tr v-if="expandable && open.has(row.id)" class="gtn-exp-row">
@@ -169,6 +171,15 @@ const totalWidth = computed(() =>
 const hasNew = computed(() =>
   Object.keys(newRow).some((k) => { const v = newRow[k]; return v !== null && v !== undefined && v !== '' }),
 )
+
+// 按**行**锁定某一格：col.lock(row) 返回真即锁。列级只读仍用 col.readonly。
+// 用于「这格的值由别处决定」——如订单挂上集运单后状态跟随那张单，本格不该再能改。
+function isLocked(col, row) { return typeof col.lock === 'function' && !!col.lock(row) }
+// 展示值可以不等于 row[col.key]：col.display(row) 给一个派生值（如状态显示继承来的集运状态），
+// 但**写回仍走 col.key**——显示与存储各归各的，别把派生值写进原字段。
+function cellValue(col, row) {
+  return typeof col.display === 'function' ? col.display(row) : row[col.key]
+}
 
 // —— 用后端保存的顺序/宽度重排代码里定义的列 ——
 function buildCols() {
@@ -387,6 +398,10 @@ function stopResize() {
 .gtn-new-ph { height: 36px; padding: 0 8px; display: flex; align-items: center; color: #5b6880; font-size: 13px; }
 
 .gtn-tagcfg { margin-left: 4px; color: #6b7a93; cursor: pointer; font-size: 13px; }
+/* 锁定格：整格发灰、点不动；内部标签仍是原色（见 GotionCell 注释） */
+.gtn-td-locked { background: var(--el-fill-color-light); cursor: not-allowed; }
+.gtn-td-locked .gtn-disp, .gtn-td-locked .gtn-slot { opacity: .72; pointer-events: none; }
+.gtn-td-locked .el-tag { opacity: 1; }
 .gtn-help { margin-left: 4px; color: #909399; cursor: help; font-size: 13px; }
 .gtn-help:hover { color: var(--el-color-primary); }
 .gtn-help-title { font-weight: 600; margin-bottom: 6px; }

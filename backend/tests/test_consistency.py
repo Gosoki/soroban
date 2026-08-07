@@ -138,3 +138,57 @@ def test_notion_table_supports_column_help():
     """col.help 是通用能力（任何口径不直观的列都能用），不是给某一列写死的。"""
     src = (_REPO / "frontend" / "src" / "components" / "NotionTable.vue").read_text(encoding="utf-8")
     assert 'v-if="col.help"' in src and "QuestionFilled" in src
+
+
+# --- 表格单元格的「按行锁定」与面板手填货款 -------------------------------------
+
+def _orders_vue() -> str:
+    return (_REPO / "frontend" / "src" / "views" / "Orders" / "index.vue").read_text(encoding="utf-8")
+
+
+def test_status_column_is_still_a_click_to_pick_tag():
+    """状态必须保持「点标签就能选」——和其它标签列一致的交互。
+    曾经为了显示继承来的集运状态，把它换成过 el-select 下拉，交互就和别的列不一样了。"""
+    src = _orders_vue()
+    assert "key: 'status', label: '状态', type: 'select'" in src, "状态列不再是 select 单元格（点标签选）"
+    assert "#cell-status" not in src, "状态列又被自定义槽接管了，交互会和其它标签列不一致"
+
+
+def test_status_and_items_lock_when_attached():
+    """挂靠集运单后这两格锁定：值由别处决定，能点开改只会让人困惑
+    （改的是被遮住的国内段状态，改完看不出变化）。"""
+    src = _orders_vue()
+    for key in ("'status'", "'items'"):
+        blk = src.split(f"key: {key}")[1][:400]
+        assert "lock: (row) => !!row.shipment_order_id" in blk, f"{key} 列没有按挂靠状态锁定"
+        assert "lockHint" in blk, f"{key} 列锁定了却没给提示，用户不知道为什么点不动"
+
+
+def test_status_cell_displays_inherited_value():
+    """锁定期间要显示**继承来的**集运状态，而不是订单自己的国内段状态。"""
+    blk = _orders_vue().split("key: 'status'")[1][:400]
+    assert "display: (row) => row.effective_status" in blk
+
+
+def test_locked_cell_greys_the_cell_not_the_tag():
+    """置灰的是格子，标签保持原色——否则一眼看不出是什么状态。"""
+    css = (_REPO / "frontend" / "src" / "components" / "NotionTable.vue").read_text(encoding="utf-8")
+    assert ".gtn-td-locked" in css
+    assert ".gtn-td-locked .el-tag { opacity: 1; }" in css, "标签跟着格子一起变灰了"
+
+
+def test_notion_table_supports_row_level_lock():
+    """按行锁定是通用能力（col.lock(row)），不是给某一列写死的。"""
+    src = (_REPO / "frontend" / "src" / "components" / "NotionTable.vue").read_text(encoding="utf-8")
+    assert "function isLocked(col, row)" in src and "col.lock === 'function'" in src
+    cell = (_REPO / "frontend" / "src" / "components" / "GotionCell.vue").read_text(encoding="utf-8")
+    assert "locked: { type: Boolean" in cell
+    assert "props.col.readonly || props.locked" in cell, "锁定没挡住 date/text 等类型的编辑入口"
+
+
+def test_panel_allows_typing_goods_amount():
+    """面板要能直接填货款（不想拆明细时的懒人入口）：折成「订单标题 × 1」的单条物品。"""
+    src = (_REPO / "frontend" / "src" / "components" / "OrderItemsEditor.vue").read_text(encoding="utf-8")
+    assert "async function applyGoods" in src
+    assert "quantity: 1" in src and "props.order.title" in src, "手填货款没绑成「订单名称×1」"
+    assert ':disabled="!isSingleUnitItem"' in src, "拆过明细后仍允许从这里覆盖，会冲掉明细"

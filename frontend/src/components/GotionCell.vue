@@ -5,11 +5,12 @@
     <span v-else class="ph">{{ emptyText }}</span>
   </div>
 
-  <!-- select：tag + 弹出选项 -->
-  <el-popover v-else-if="col.type === 'select'" :visible="editing" :width="180" :offset="4"
+  <!-- select：tag + 弹出选项。locked 时只展示不可选——但**标签本身照常上色**：
+       置灰的是格子（表示这格现在由别处决定），不是标签，否则一眼看不出是什么状态。 -->
+  <el-popover v-else-if="col.type === 'select'" :visible="editing && !locked" :width="180" :offset="4"
               placement="bottom-start" @update:visible="(v) => !v && (editing = false)">
     <template #reference>
-      <div class="gtn-disp sel" @click="editing = !editing">
+      <div class="gtn-disp sel" :class="{ locked }" @click="!locked && (editing = !editing)">
         <el-tag v-if="modelValue" v-bind="tagAttrs(modelValue)" size="small">{{ modelValue }}</el-tag>
         <span v-else class="ph">{{ emptyText }}</span>
       </div>
@@ -72,6 +73,9 @@ const props = defineProps({
   modelValue: { default: null },
   col: { type: Object, required: true },
   newRow: { type: Boolean, default: false },   // 幽灵新建行：空值显占位提示引导填写
+  // 按**行**锁定（列级只读用 col.readonly）。用于「这一格的值由别处决定」的情形：
+  // 例如订单挂上集运单后，状态跟随那张单，本格不该再能改。
+  locked: { type: Boolean, default: false },
 })
 const emit = defineEmits(['change'])
 
@@ -108,7 +112,7 @@ const emptyText = computed(() =>
 )
 
 function start() {
-  if (props.col.readonly) return
+  if (props.col.readonly || props.locked) return
   editVal.value = props.modelValue ?? null
   editing.value = true
   nextTick(() => inp.value?.focus?.())
@@ -139,6 +143,8 @@ function choose(o) {
 </script>
 
 <style scoped>
+/* 锁定：格子发灰 + 不可点，但内部标签保持原色（见模板注释） */
+.gtn-disp.sel.locked { cursor: not-allowed; opacity: .85; }
 .gtn-disp { height: 36px; padding: 0 8px; display: flex; align-items: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gtn-disp.sel { cursor: pointer; }
 .gtn-disp:hover { background: rgba(24, 144, 255, 0.06); }

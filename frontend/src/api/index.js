@@ -114,3 +114,10 @@ export const tagsApi = {
       ? http.post(`/plugins/taobao/account/rename`, null, { params: { old: oldVal, new: newVal } })
       : http.post(`/tags/${field}/rename`, null, { params: { old: oldVal, new: newVal } }),
 }
+
+// 运行期设置（存库、「设置」页上改）。与 backend/.env 的部署配置是两回事。
+export const settingsApi = {
+  get: () => http.get('/settings'),
+  // 只传要改的键：整包提交会把别人刚在另一个标签页改过的项一起盖回去
+  save: (values) => http.put('/settings', { values }),
+}

@@ -61,17 +61,6 @@
             </el-option>
           </el-select>
         </template>
-        <template #cell-status="{ row }">
-          <el-tooltip v-if="row.shipment_order_id" content="跟随所挂集运订单的状态；从集运单里释放后可改" placement="top">
-            <el-tag size="small" :style="statusStyle(row.effective_status)" class="st-inherit">
-              {{ row.effective_status }}
-            </el-tag>
-          </el-tooltip>
-          <el-select v-else :model-value="row.status" size="small" class="st-pick"
-                     @change="(v) => saveCell(row, 'status', v)">
-            <el-option v-for="o in ORDER_STATUS" :key="o" :label="o" :value="o" />
-          </el-select>
-        </template>
         <template #cell-items="{ row }">
           <span :class="{ ph: !(row.items && row.items.length), 'auto-txt': allTitleItems(row) }">{{ itemSummary(row) }}</span>
         </template>
@@ -126,10 +115,22 @@ const columns = [
   { key: 'platform_account', label: '账号昵称', type: 'tag', field: 'platform_account', width: COL_W },
   { key: 'platform', label: '来源', type: 'tag', field: 'platform', width: COL_W, placeholder: '来源' },
   { key: 'title', label: '商品', type: 'text', long: true, width: COL_W },
-  { key: 'items', label: '物品', readonly: true, width: COL_W, expand: true },
-  // 状态列走自定义槽：挂着集运单时显示**继承来的**集运状态且不可改（改了也看不见效果，
-  // 实际会改到被遮住的国内段状态）。readonly 只是让 NotionTable 让位给槽，不代表不能编辑。
-  { key: 'status', label: '状态', readonly: true, width: COL_W },
+  // 物品列同理：挂靠期间整格置灰（这批货已经进包裹了，不该在列表上随手改）。
+  // 仍可点开展开面板查看；真要改先从集运单里释放。
+  {
+    key: 'items', label: '物品', readonly: true, width: COL_W, expand: true,
+    lock: (row) => !!row.shipment_order_id,
+    lockHint: '已挂靠集运订单；要改物品请先从集运单里释放',
+  },
+  // 状态：点标签就能选（和其它标签列一致）。挂着集运单时**按行锁定**——显示继承来的集运状态、
+  // 整格置灰不可点，但标签本身保持原色；释放后自动恢复可选。
+  // display 只影响显示，写回仍走 key='status'（订单自己的国内段状态）。
+  {
+    key: 'status', label: '状态', type: 'select', options: ORDER_STATUS, width: COL_W, clearable: false,
+    display: (row) => row.effective_status ?? row.status,
+    lock: (row) => !!row.shipment_order_id,
+    lockHint: '跟随所挂集运订单的状态；从集运单里释放后可改',
+  },
   { key: 'shipment_order_id', label: '集运订单', readonly: true, width: COL_W, placeholder: '选择' },
   { key: 'jpy_settled', label: '结算（円）', format: 'jpy', readonly: true, width: COL_W },
   { key: 'jpy_override', label: '覆盖（円）', type: 'int', format: 'jpy', width: COL_W, placeholder: '实付日元' },
@@ -484,8 +485,6 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
-.st-inherit { cursor: default; }
-.st-pick { width: 100%; }
 .pager { margin-top: 12px; justify-content: flex-end; }
 /* OCR 上传：工具栏里的点选按钮（拖拽走整窗覆盖层，这里只负责点击选图）。 */
 .ocr-up { display: inline-flex; }

@@ -39,6 +39,10 @@
           <div class="fx" v-if="fx.rate">
             1元 = {{ fx.rate }}円
             <el-tag v-if="fx.stale" size="small" :style="typeStyle('warning')">旧</el-tag>
+            <!-- 备用源：中国银行牌价连续 72h 取不到才会切过来（见 backend/app/services/fx.py）。
+                 标出来是因为口径变了——中行折算价 vs 通用中间价，数值会有差别。 -->
+            <el-tag v-if="fx.fallback" size="small" :style="typeStyle('info')"
+                    title="中国银行牌价暂时取不到，当前用的是备用汇率源；恢复后自动切回">备用</el-tag>
           </div>
           <div class="user">
             <el-icon><User /></el-icon><span>{{ userName }}</span>
@@ -108,7 +112,7 @@ try {
   userName.value = u.display_name || u.username || '用户'
 } catch (_) { /* ignore */ }
 
-const fx = reactive({ rate: null, stale: false })
+const fx = reactive({ rate: null, stale: false, fallback: false })
 onMounted(async () => {
   mq = window.matchMedia('(max-width: 768px)')
   syncMobile()
@@ -117,6 +121,7 @@ onMounted(async () => {
     const r = await fxApi.get()
     fx.rate = r.rate
     fx.stale = r.stale
+    fx.fallback = !!r.fallback
   } catch (_) { /* ignore */ }
 })
 onUnmounted(() => { mq?.removeEventListener('change', syncMobile) })

@@ -521,6 +521,9 @@ class FxRead(SQLModel):
     rate: Optional[Decimal] = None
     date: Optional[dt.date] = None
     stale: bool = False                     # True = 用的是历史兜底值
+    source: str = "boc"                     # boc=中国银行 / google=谷歌财经 / erapi=通用汇率 API
+    source_label: str = ""                  # 上面那个的中文名，供前端提示显示
+    fallback: bool = False                  # True = 不是优先级链上的首选源（前端显示「备用」）
 
 
 # --- 淘宝抓取暂存（全部淘宝订单 → 确认导入）---------------------------------
@@ -640,3 +643,11 @@ class TagOut(SQLModel):
     value: str
     color: int                      # 调色盘序号（0..N-1），前端映射到 TAG_PALETTE
     in_use: bool = False            # 是否被数据（订单/暂存/集运）使用中——使用中不可删除
+
+
+# --- 运行期设置 ------------------------------------------------------------------
+
+class SettingsUpdate(SQLModel):
+    """只带要改的键（部分更新）。取值校验在 services/prefs 里做，那里是唯一真相。"""
+
+    values: dict

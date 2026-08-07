@@ -31,7 +31,14 @@
       </tbody>
     </table>
     <div class="postage-row">
-      <span class="postage-lb">邮费（元）</span>
+      <span class="postage-lb">货款（元）</span>
+      <el-input-number v-model="goodsInput" :min="0" :precision="2" :controls="false" size="small"
+                       :disabled="!isSingleUnitItem" :placeholder="isSingleUnitItem ? '直接填金额' : '由明细算出'"
+                       style="width: 130px" @change="applyGoods" />
+      <el-tooltip placement="top" :content="GOODS_HINT">
+        <el-icon class="lb-help"><QuestionFilled /></el-icon>
+      </el-tooltip>
+      <span class="postage-lb pl">邮费（元）</span>
       <el-input-number v-model="order.postage_cny" :min="0" :precision="2" :controls="false" size="small"
                        placeholder="包邮" style="width: 130px" @change="savePostage" />
       <span class="postage-hint">不填 = 包邮</span>
@@ -40,9 +47,9 @@
 </template>
 
 <script setup>
-import { reactive } from 'vue'
+import { computed, reactive, ref, watchEffect } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete } from '@element-plus/icons-vue'
+import { Delete, QuestionFilled } from '@element-plus/icons-vue'
 import { ordersApi } from '@/api'
 import { queueOrderWrite } from '@/utils/orderWrites'
 
@@ -51,6 +58,40 @@ const props = defineProps({ order: { type: Object, required: true } })
 const emit = defineEmits(['saved', 'conflict'])
 
 const draft = reactive({ name: '', quantity: 1, price: null })
+
+const GOODS_HINT =
+  '懒人入口：不想拆物品明细时，直接填这一单的货款（不含邮费）。'
+  + '会折成一条物品：名称取商品标题、数量 1、单价 = 该金额。\n'
+  + '拆过明细（多条物品，或数量不为 1）之后这里就只读了——'
+  + '那时候金额由明细算出来，反过来改它会把你拆好的明细冲掉。'
+
+// 已经拆过明细就不许再从这里覆盖：多于一条、或唯一那条数量不是 1，都算拆过。
+const isSingleUnitItem = computed(() => {
+  const its = props.order.items || []
+  return its.length <= 1 && (its.length === 0 || (Number(its[0].quantity) || 1) === 1)
+})
+// 显示值 = 货款 = 订单价 − 邮费（订单价本身是派生的，见列头「?」）
+const goodsInput = ref(null)
+watchEffect(() => {
+  const its = props.order.items || []
+  if (isSingleUnitItem.value) {           // 可编辑：就是那条物品的单价
+    const v = its.length ? its[0].unit_price_cny : null
+    goodsInput.value = (v === null || v === undefined) ? null : Number(v)
+    return
+  }
+  // 拆过明细：只读显示派生出来的货款 Σ(单价×数量)，让人看得见总数、但改不了
+  goodsInput.value = its.reduce(
+    (sum, it) => sum + (Number(it.unit_price_cny) || 0) * (Number(it.quantity) || 1), 0)
+})
+
+// 手填货款 → 绑成「订单名称 × 1」的单条物品。auto=true 保持灰显，提示这是自动折算的、待复核。
+async function applyGoods(v) {
+  if (!isSingleUnitItem.value) return               // 拆过明细的不该走到这（输入框已禁用），双保险
+  const price = itemPrice(v)
+  const name = (props.order.title || '').trim() || '未命名物品'
+  props.order.items = [{ name, quantity: 1, unit_price_cny: price, auto: true }]
+  await saveItems()
+}
 
 function itemPrice(v) { return (v === '' || v === null || v === undefined) ? null : Number(v) }
 // 灰显 = 物品名与商品标题相同（无独立物品详情，多为自动占位）；有真实物品名即正常
@@ -118,6 +159,8 @@ async function commitDraft() {
 </script>
 
 <style scoped>
+.lb-help { color: #909399; cursor: help; font-size: 13px; margin-left: 2px; }
+.postage-lb.pl { margin-left: 16px; }
 .oie { padding: 12px 20px; }
 /* 二级子表格：视觉与一级列表(NotionTable)一致——同样的边框、行高与悬停；无表头填充 */
 .item-tbl { border-collapse: collapse; font-size: 13px; color: #d6deea; table-layout: fixed; }
