@@ -115,3 +115,34 @@ def test_pyinstaller_bat_has_no_errorlevel_in_block():
             pytest.fail(f"括号块内用了 %errorlevel%（解析期展开，读到的是旧值）：{line}")
         depth += line.count("(") - line.count(")")
         depth = max(0, depth)
+
+
+# --- 静态托管的缓存策略 ---------------------------------------------------------
+
+def test_index_html_is_not_cached_but_assets_are():
+    """前端每次 `npm run build`，资源文件名的哈希都会变。若 `index.html` 被浏览器缓存，
+    老用户拿到的还是旧的那份，它引用的旧哈希文件已经不存在 → 一连串 404 → **整站白屏**，
+    普通刷新还不一定能好（要硬刷新才绕过缓存）。本项目真白过一次。
+
+    StaticFiles 默认只给 etag/last-modified、**不给 Cache-Control**，浏览器会启发式缓存——
+    所以必须显式声明。反过来 assets 带内容哈希，内容变了名字就变，缓存一年也安全。
+    """
+    import inspect
+
+    from app import main
+
+    src = inspect.getsource(main._SpaStatic)
+    assert 'resp.headers["Cache-Control"] = "no-cache"' in src, "index.html 没设 no-cache"
+    assert "immutable" in src and "max-age=31536000" in src, "assets 没设长缓存"
+    assert 'path.startswith("assets/")' in src, "两类资源没有分开设策略"
+
+
+def test_static_mount_uses_the_cache_aware_class():
+    """挂载时用回裸 StaticFiles 就等于把上面那条策略整个绕过去了。"""
+    import inspect
+
+    from app import main
+
+    src = inspect.getsource(main)
+    tail = src[src.index("if _DIST.is_dir():"):]
+    assert "_SpaStatic(directory=" in tail, "静态挂载没用带缓存策略的子类"

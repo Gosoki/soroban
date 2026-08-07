@@ -150,6 +150,31 @@ _DIST = (
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parents[2] / "frontend" / "dist"
 )
+class _SpaStatic(StaticFiles):
+    """带正确缓存策略的静态托管。
+
+    **为什么必须自己设 Cache-Control**：StaticFiles 只给 etag/last-modified，不给
+    Cache-Control。浏览器对这种响应会**启发式缓存**——于是前端每次 `npm run build`，
+    资源文件名的哈希都变了，而老用户拿到的还是缓存里的旧 `index.html`，
+    它引用的旧哈希文件已经不存在 → 一连串 404 → **整站白屏**，且刷新也不一定好
+    （得硬刷新才绕过缓存）。这不是理论风险，本项目就这么白过一次。
+
+    策略：
+      · `index.html` —— `no-cache`：每次都回源校验（有 etag，没变就 304，不费流量）。
+        它是**唯一**记录着「当前该加载哪些哈希文件」的地方，必须永远最新。
+      · `/assets/*` —— 一年 + `immutable`：文件名里带内容哈希，内容变了名字就变，
+        所以旧文件永远不会被复用，缓存多久都安全。
+    """
+
+    async def get_response(self, path: str, scope):
+        resp = await super().get_response(path, scope)
+        if path.startswith("assets/"):
+            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
 if _DIST.is_dir():
-    app.mount("/", StaticFiles(directory=str(_DIST), html=True), name="frontend")
+    app.mount("/", _SpaStatic(directory=str(_DIST), html=True), name="frontend")
     log.info("已挂载前端静态文件（生产同源托管）：%s", _DIST)
