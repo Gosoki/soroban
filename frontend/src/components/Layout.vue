@@ -83,16 +83,20 @@ import SidebarCalc from '@/components/SidebarCalc.vue'
 
 const router = useRouter()
 const route = useRoute()
-const nav = [
-  { path: '/dashboard', title: '看板', icon: 'Odometer' },
-  { path: '/orders', title: '商品订单', icon: 'ShoppingCart' },
-  { path: '/items', title: '物品列表', icon: 'Grid' },
-  { path: '/shipment', title: '集运订单', icon: 'Ship' },
-  { path: '/misc', title: '杂项支出', icon: 'Money' },
-  { path: '/staging', title: '暂存订单', icon: 'Tickets' },
-  { path: '/plugins', title: '插件管理', icon: 'Connection' },
-  { path: '/database', title: '数据库', icon: 'Coin' },
-]
+// 侧栏菜单**从路由表生成**，不再手写一份。
+// 这里曾经是一个硬编码数组：加了新路由却忘了往这加一行，页面就进不去——
+// 而路由 meta 里本来就写着 title/icon，抄第二遍纯属自找漏。
+// 顺序按 ORDER 排（业务上的先后≠路由声明顺序）；没列进 ORDER 的新页面自动排在最后，
+// 也就是说以后加页面只要写路由，菜单自己会长出来。
+const ORDER = ['/dashboard', '/orders', '/items', '/shipment', '/misc',
+               '/staging', '/plugins', '/database', '/settings']
+const nav = router.getRoutes()
+  .filter((r) => r.meta?.title && r.path.startsWith('/') && r.path !== '/login')
+  .map((r) => ({ path: r.path, title: r.meta.title, icon: r.meta.icon || 'Document' }))
+  .sort((a, b) => {
+    const ia = ORDER.indexOf(a.path); const ib = ORDER.indexOf(b.path)
+    return (ia < 0 ? 999 : ia) - (ib < 0 ? 999 : ib)
+  })
 
 // —— 响应式：≤768px 视为手机，侧栏收成抽屉 ——
 const isMobile = ref(false)
