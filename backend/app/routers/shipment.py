@@ -42,11 +42,19 @@ def _shipment_read(s: ShipmentOrder, children: list[Order]) -> ShipmentRead:
     return ShipmentRead(**scalars, orders=[_brief(c) for c in children])
 
 
-def _read_many(session: Session, shipments: list[ShipmentOrder]) -> list[ShipmentRead]:
+def _read_many(session: Session, shipments: list[ShipmentOrder],
+               brief: bool = False) -> list[ShipmentRead]:
     """批量构造响应，其中 orders 只含未软删的关联商品订单（不泄露已删数据）。
 
     一次 IN 查询取回**整页**的子订单（再用 selectinload 一次取回它们的物品），而不是每行
-    各查一次——列表页一屏 50 行时，这是 1+1 条 SQL 与 50+50 条的差别。"""
+    各查一次——列表页一屏 50 行时，这是 1+1 条 SQL 与 50+50 条的差别。
+
+    `brief=True` 时**完全跳过**子订单与物品：订单页/物品页拉这个接口只是为了填一个
+    「选哪张集运单」的下拉，全仓没有一处读 `j.orders`。实测 200 张集运单展开后
+    响应 1.1MB / 1073ms，而消费方只用 4 个标量字段——纯浪费。
+    查询条数测试（tests/test_queries.py）钉的是条数、钉不住体积，1.1MB 它照样绿。"""
+    if brief:
+        return [_shipment_read(s, []) for s in shipments]
     ids = [s.id for s in shipments]
     by_parent: dict[int, list[Order]] = {}
     if ids:
@@ -72,6 +80,7 @@ def list_orders(
     date_to: Optional[dt.date] = None,
     status: Optional[str] = None,
     q: Optional[str] = Query(None, description="按集运单号搜索"),
+    brief: bool = Query(False, description="只要集运单本身，不展开子订单与物品（供下拉选项用）"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
@@ -93,7 +102,7 @@ def list_orders(
         .offset(offset)
         .limit(limit)
     ).all()
-    return {"items": _read_many(session, rows), "total": total}
+    return {"items": _read_many(session, rows, brief=brief), "total": total}
 
 
 @router.post("/ocr")

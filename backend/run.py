@@ -58,6 +58,15 @@ def ensure_env(rt: Path) -> bool:
 
 
 def main() -> None:
+    # 本入口不接受任何命令行参数。加这道保险是因为：打包成 exe 后 sys.executable 就是
+    # exe 自己，任何「拿它当 python 跑」的误用（如 `soroban.exe -m venv …`）都会静默地
+    # **把 soroban 再启动一遍**——建 .env、连库跑迁移，最后卡在端口占用。
+    # 直接报错退出，能把这类误用从「莫名其妙的影子实例」变成一眼可见的错误。
+    if sys.argv[1:]:
+        print(f"soroban 不接受命令行参数（收到 {sys.argv[1:]}）。"
+              "如果你想用它当 Python 解释器跑模块，那是用错了——请用系统的 python。",
+              file=sys.stderr)
+        raise SystemExit(2)
     rt = _runtime_dir()
     os.chdir(rt)  # 让 .env / soroban.db（默认 sqlite:///./soroban.db）落在 exe 同级
 

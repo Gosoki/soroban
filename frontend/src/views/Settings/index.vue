@@ -182,7 +182,11 @@ async function doRefresh() {
   try {
     fx.value = await fxApi.refresh()
     ElMessage.success(`已按当前设置取到：1元 = ${fx.value.rate}円（${fx.value.source_label}）`)
-  } catch (_) { /* 拦截器已提示 */ } finally { refreshing.value = false }
+  } catch (e) {
+    // 「拦截器已提示」只对 axios 抛的错成立。这里曾因 fxApi.refresh 压根没导出而抛
+    // TypeError，被空 catch 吞掉 → 点了完全静默、按钮像坏的。留一行痕。
+    console.error('[fx refresh]', e)
+  } finally { refreshing.value = false }
 }
 
 onMounted(load)

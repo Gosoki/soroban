@@ -98,3 +98,37 @@ def test_tags_list_scans_data_once(client):
     # platform_account 有 2 个数据来源表 → 一轮 = 2 条 DISTINCT；再加 1 条取标签
     distinct = [q for q in s["sql"] if "DISTINCT" in q.upper()]
     assert len(distinct) == 2, f"DISTINCT 扫描了 {len(distinct)} 次（应为 2）：\n" + "\n".join(distinct)
+
+
+def test_shipment_brief_skips_children(client):
+    """订单页/物品页拉这个接口只是为了填「选哪张集运单」的下拉，全仓无一处读 j.orders。
+    不加 brief 时 200 张集运单会展开出全部子订单+物品（实测 1.1MB / 1073ms）。
+    查询条数测试钉不住体积——所以这里直接断言形状。"""
+    full = client.get("/api/shipment", params={"limit": 200}).json()["items"]
+    brief = client.get("/api/shipment", params={"limit": 200, "brief": True}).json()["items"]
+    assert len(full) == len(brief), "brief 不该改变返回的集运单条数"
+    assert all(x["orders"] == [] for x in brief), "brief 应当完全不展开子订单"
+    if full and any(x["orders"] for x in full):
+        assert any(x["orders"] for x in full), "非 brief 仍应展开（集运页自己的面板要用）"
+
+
+def test_scheduler_loop_does_not_block_event_loop():
+    """协程里做同步 DB I/O，MySQL 运行中掉线会阻塞整个事件循环——
+    实测单次卡 384 秒（pymysql read_timeout 默认 None），期间 /api/health 都一起卡死。"""
+    import inspect
+
+    from app.routers import plugins as mod
+
+    src = inspect.getsource(mod.scheduler_loop)
+    assert "run_in_threadpool" in src, "定时循环又在事件循环里直接做同步 DB I/O 了"
+
+
+def test_mysql_engine_has_read_and_write_timeouts():
+    """connect_timeout 只管 TCP 建连，**不管握手之后的读**。三个都要设，否则最坏是无界阻塞。"""
+    import inspect
+
+    from app import database
+
+    src = inspect.getsource(database.build_engine)
+    for k in ("connect_timeout", "read_timeout", "write_timeout"):
+        assert k in src, f"MySQL engine 缺 {k}"

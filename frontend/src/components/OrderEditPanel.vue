@@ -26,7 +26,7 @@
           <el-option v-for="a in accounts" :key="a" :label="a" :value="a" />
         </el-select></label>
       <label class="f"><span>所属集运</span>
-        <el-select v-model="order.shipment_order_id" size="small" clearable filterable placeholder="未集运"
+        <el-select :persistent="false" v-model="order.shipment_order_id" size="small" clearable filterable placeholder="未集运"
                    @change="saveField('shipment_order_id', order.shipment_order_id)">
           <el-option v-for="j in sortedShipments" :key="j.id"
                      :label="(j.shipment_no || ('#' + j.id)) + ' · ' + j.status" :value="j.id" />

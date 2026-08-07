@@ -12,8 +12,15 @@
           <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
             <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
           </el-select>
+          <!-- 选项 = 国内段 + 集运段：列表显示的是继承后的状态，只列国内段的话，
+               界面上一堆「已发出」却在筛选框里选不到（与订单页同款） -->
           <el-select v-model="filters.status" placeholder="状态" clearable style="width: 120px" @change="reload">
-            <el-option v-for="s in ORDER_STATUS" :key="s" :label="s" :value="s" />
+            <el-option-group label="国内段（商品订单）">
+              <el-option v-for="s in ORDER_STATUS" :key="s" :label="s" :value="s" />
+            </el-option-group>
+            <el-option-group label="国际段（集运订单）">
+              <el-option v-for="s in SHIPMENT_STATUS" :key="s" :label="s" :value="s" />
+            </el-option-group>
           </el-select>
           <el-select v-model="filters.platform_account" placeholder="账号昵称" clearable filterable style="width: 120px" @change="reload">
             <el-option v-for="a in accountOptions" :key="a" :label="a" :value="a" />
@@ -31,8 +38,14 @@
           <el-tag v-if="row.platform" size="small" :style="statusStyle(row.platform)">{{ row.platform }}</el-tag>
           <span v-else class="ph">—</span>
         </template>
+        <!-- 与商品订单页同一口径：挂了集运单就显示继承来的集运状态。
+             ⚠️ 这里必须自己取 effective_status —— 列配置里的 col.display 对**有插槽的列无效**
+             （NotionTable 的插槽分支优先于 GotionCell，而 display 只在 GotionCell 里被调用），
+             曾因此让两个页面对同一张单显示不同状态、tooltip 还说着反话。 -->
         <template #cell-status="{ row }">
-          <el-tag size="small" :style="statusStyle(row.status)">{{ row.status }}</el-tag>
+          <el-tag size="small" :style="statusStyle(row.effective_status || row.status)">
+            {{ row.effective_status || row.status }}
+          </el-tag>
         </template>
         <!-- 灰显=物品名与商品标题相同（无独立物品详情） -->
         <template #cell-name="{ row }">
@@ -68,7 +81,7 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
 import { itemsApi, ordersApi, shipmentApi, tagsApi } from '@/api'
-import { ORDER_SOURCES, ORDER_STATUS, statusStyle, tagStyleAt } from '@/constants'
+import { ORDER_SOURCES, ORDER_STATUS, SHIPMENT_STATUS, statusStyle, tagStyleAt } from '@/constants'
 import NotionTable from '@/components/NotionTable.vue'
 import OrderEditPanel from '@/components/OrderEditPanel.vue'
 
@@ -85,9 +98,11 @@ const columns = [
   // 与商品订单页同一口径：挂了集运单就显示继承来的集运状态、整格置灰（标签仍是原色）。
   // 本页所有列都是只读的（物品要改去订单页展开面板），这里的 lock 纯粹是**视觉提示**：
   // 让人一眼看出这行的状态不是订单自己的，而是跟着集运单走的。
+  // 状态：值由 #cell-status 插槽自己取（插槽优先于 GotionCell，col.display 在这里是**死代码**，
+  // 所以不写 display —— 写了只会误导下一个人以为它在起作用）。
+  // lock 仍然有效：它作用在 <td> 上，与插槽无关，负责把整格置灰做视觉提示。
   {
     key: 'status', label: '状态', readonly: true, width: 84,
-    display: (row) => row.effective_status || row.status,
     lock: (row) => !!row.shipment_order_id,
     lockHint: '该订单已挂靠集运订单，状态跟随那张单',
   },
@@ -149,7 +164,7 @@ const editingId = ref(null)
 const editDirty = ref(false)     // 本次弹窗内是否发生过保存（关窗时据此决定要不要重载列表）
 const shipmentOptions = ref([])  // 供「所属集运」下拉；进页时拉一次
 async function loadShipment() {
-  try { shipmentOptions.value = (await shipmentApi.list({ limit: 200 })).items } catch (_) { /* 已提示 */ }
+  try { shipmentOptions.value = (await shipmentApi.list({ limit: 200, brief: true })).items } catch (_) { /* 已提示 */ }
 }
 const editTitle = computed(() => '编辑物品所属订单' + (editingOrder.value?.order_no ? ' · ' + editingOrder.value.order_no : ''))
 

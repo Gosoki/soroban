@@ -15,7 +15,7 @@ from .config import settings
 from .database import checkpoint_and_dispose, create_db_and_tables, wal_checkpoint_loop
 from .maintenance import barrier
 from .routers import (
-    auth, dashboard, dbadmin, fx, items, layout, misc, orders, plugins,
+    auth, dashboard, dbadmin, fx, items, layout, meta, misc, orders, plugins,
     settings as settings_router, shipment, staging, tags,
 )
 from .routers.plugins import scheduler_loop
@@ -108,7 +108,7 @@ app.add_middleware(
 for r in (
     auth.router, orders.router, shipment.router, misc.router, items.router,
     staging.router, dashboard.router, fx.router, layout.router, tags.router, plugins.router,
-    dbadmin.router, settings_router.router,
+    dbadmin.router, settings_router.router, meta.router,
 ):
     app.include_router(r)
 

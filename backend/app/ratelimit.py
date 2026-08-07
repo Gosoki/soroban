@@ -32,13 +32,27 @@ class LoginThrottle:
         return ((username or "").strip().lower(), client_ip or "?")
 
     def _prune(self, now: float) -> None:
-        """调用方必须持锁。清掉过期项；仍然超量则丢最旧的（攻击者刷用户名时的兜底）。"""
+        """调用方必须持锁。清掉过期项；仍然超量则按「谁最该被丢」淘汰。
+
+        ⚠️ 淘汰顺序不能只按「最旧」：**正在退避中的那条恰恰就是最旧的**——它一直被
+        429 挡回去，时间戳不再刷新。于是攻击者只要用几千个不存在的用户名打一遍登录
+        （`auth.py` 对不存在的用户名短路、不跑 bcrypt，几乎零成本），就能把真正在
+        退避的条目挤出表、计数归零，白拿一轮免罚尝试，可无限重复。实测把 900s 的
+        惩罚压成 27s（约 20 倍提速）。
+
+        所以排序键改成 `(count, 最后失败时刻)`：**优先丢没有惩罚的条目**
+        （count ≤ FREE_TRIES），它们被丢了也不损失任何保护。
+
+        这里刻意 **fail-open**（表满也照样为新 key 建条目，只是换个淘汰顺序）。
+        反过来「表满就拒绝建新条目」是 fail-closed：攻击者把表填满高 count 条目
+        就能把你自己稳定锁在门外——用 20 倍提速换一个可靠的 DoS，对个人账本更糟。
+        """
         expired = [k for k, (_, ts) in self._fails.items() if now - ts > FORGET_AFTER]
         for k in expired:
             del self._fails[k]
         if len(self._fails) > MAX_ENTRIES:
-            for k, _ in sorted(self._fails.items(), key=lambda kv: kv[1][1])[
-                    : len(self._fails) - MAX_ENTRIES]:
+            victims = sorted(self._fails.items(), key=lambda kv: (kv[1][0], kv[1][1]))
+            for k, _ in victims[: len(self._fails) - MAX_ENTRIES]:
                 del self._fails[k]
 
     def retry_after(self, key: tuple[str, str]) -> int:

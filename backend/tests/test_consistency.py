@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import pathlib
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,16 @@ from app.models import ORDER_STATUS_RANK, OrderStatus, ShipmentStatus, StagingSt
 
 _REPO = Path(__file__).resolve().parents[2]
 _CONSTANTS_JS = _REPO / "frontend" / "src" / "constants.js"
+
+
+def _template_of(path) -> str:
+    """取 SFC 的整个 <template> 段。
+
+    ⚠️ 别用 `src.split("</template>")[0]` —— 具名插槽自己就是 `<template #xxx>…</template>`，
+    第一个 `</template>` 是**内层插槽**的收尾，那样切会把模板砍掉大半，
+    于是「找不到插槽」被误判成「没有插槽」，测试假绿。按 <script 切才对。"""
+    src = pathlib.Path(path).read_text(encoding="utf-8")
+    return src.split("<script", 1)[0]
 _ORDERS_VUE = _REPO / "frontend" / "src" / "views" / "Orders" / "index.vue"
 _SCRAPER_NORMALIZE = _REPO / "scraper" / "soroban-scraper-taobao" / "taobao_scraper" / "normalize.py"
 
@@ -60,14 +71,63 @@ def test_scraper_status_map_targets_are_valid(constants_js):
 
 
 def test_status_rank_covers_all_forward_statuses():
-    """生命周期里「会前进」的状态都要有 rank；退款/交易关闭刻意不在表里（取 -1）。"""
-    from app.models import order_status_rank
-    side = {OrderStatus.refunded.value, OrderStatus.cancelled.value}
+    """生命周期里「会前进」的状态都要有 rank；终态刻意不在表里（取 -1）。
+
+    ⚠️ 但 -1 **不能**单独用来判「能不能覆盖」——见下面那条。"""
+    from app.models import is_terminal, order_status_rank
     for s in OrderStatus:
-        if s.value in side:
+        if is_terminal(s.value):
             assert order_status_rank(s.value) == -1
         else:
             assert order_status_rank(s.value) >= 0, f"{s.value} 缺 rank"
+
+
+def test_terminal_status_is_never_overwritten_by_automation():
+    """本项目栽过的坑：终态 rank 为 -1，而 -1 的效果是「**任何**推进态都 > 它」，
+    于是一张已标「退款」的单被 OCR 再识别一次就被抹成「待发货」——
+    退款本不计入看板合计，抹掉后**看板金额凭空变大**（实测 188606→211975）。"""
+    from app.models import can_advance
+
+    for terminal in ("退款", "交易关闭"):
+        for incoming in ("待付款", "待发货", "待收货", "已签收"):
+            assert not can_advance(terminal, incoming), \
+                f"终态「{terminal}」被「{incoming}」盖掉了"
+
+
+def test_automation_may_still_set_terminal_status():
+    """反向：平台把单关了/退款了，账本该跟上。"""
+    from app.models import can_advance
+
+    assert can_advance("待收货", "退款")
+    assert can_advance("已签收", "交易关闭")
+
+
+def test_can_advance_only_moves_forward():
+    from app.models import can_advance
+
+    assert can_advance("待发货", "待收货")
+    assert not can_advance("已签收", "待发货"), "不该回退"
+    assert not can_advance("待收货", "待收货"), "相同值不该触发写入"
+    assert not can_advance("待收货", None)
+
+
+def test_frontend_merge_uses_the_same_terminal_rule():
+    """前端 OCR 合并有自己一份 rank（跨语言没法直接共用）。至少钉住：
+    它必须有终态保护、且不能再退回到「只比 rank」。"""
+    src = (_REPO / "frontend" / "src" / "views" / "Orders" / "index.vue").read_text(encoding="utf-8")
+    assert "function canAdvance(" in src, "前端合并没有终态保护"
+    assert "const TERMINAL = ['退款', '交易关闭']" in src
+    assert "canAdvance(base.status, data.status)" in src, "合并判定没走 canAdvance"
+    assert "statusRank(data.status) > statusRank(base.status)" not in src, "又退回只比 rank 了"
+
+
+def test_ocr_recognises_refund_before_express():
+    """退款单同样带快递号。先判快递就会把退款单识别成「待收货」——之前正是这么错的。"""
+    from app.services import ocr
+
+    assert ocr._detect_status("退款成功 买家已收到退款", False) == "退款"
+    assert ocr._detect_status("退款成功 买家已收到退款", True) == "退款", "有快递号也该判退款"
+    assert ocr._detect_status("交易关闭", True) == "交易关闭"
 
 
 def test_layout_table_whitelist_covers_frontend_tables():
@@ -154,14 +214,77 @@ def test_status_column_is_still_a_click_to_pick_tag():
     assert "#cell-status" not in src, "状态列又被自定义槽接管了，交互会和其它标签列不一致"
 
 
-def test_status_and_items_lock_when_attached():
-    """挂靠集运单后这两格锁定：值由别处决定，能点开改只会让人困惑
-    （改的是被遮住的国内段状态，改完看不出变化）。"""
+def test_status_locks_when_attached_but_items_does_not():
+    """**只有状态列**锁定：它的值由所挂集运单决定，能点开改只会让人困惑
+    （改的是被遮住的国内段状态，改完看不出变化）。
+
+    物品列**不锁**——挂靠不改变「这单买了什么」，物品该照常能改（走展开面板）。
+    曾误把它一起锁上，是把「物品列表页同理」错读成了「物品这一列同理」。"""
     src = _orders_vue()
-    for key in ("'status'", "'items'"):
-        blk = src.split(f"key: {key}")[1][:400]
-        assert "lock: (row) => !!row.shipment_order_id" in blk, f"{key} 列没有按挂靠状态锁定"
-        assert "lockHint" in blk, f"{key} 列锁定了却没给提示，用户不知道为什么点不动"
+    st = src.split("key: 'status'")[1][:400]
+    assert "lock: (row) => !!row.shipment_order_id" in st, "状态列没有按挂靠锁定"
+    assert "lockHint" in st, "状态列锁定了却没给提示"
+
+    it = src.split("key: 'items'")[1][:300]
+    assert "lock:" not in it, "物品列又被锁上了——挂靠不该影响改物品"
+
+
+def test_items_page_status_follows_shipment_too():
+    """「物品列表页同理」：那一页也有状态列，同样要显示继承来的集运状态。
+
+    ⚠️ 这条曾是**假绿**：原来只 grep 列配置里有没有 `display: (row) => row.effective_status`
+    这串字符——而该列有 `#cell-status` 插槽，NotionTable 的插槽分支优先于 GotionCell，
+    `col.display` 根本不会被调用。于是 bug 活着、测试全绿，比没有守卫更糟。
+    现在改成断言**插槽内**真的用了 effective_status。"""
+    tpl = _template_of(_REPO / "frontend" / "src" / "views" / "Items" / "index.vue")
+    assert "#cell-status" in tpl, "状态列改成不用插槽了？那要相应改回断言 col.display"
+    slot = tpl.split("#cell-status")[1][:400]
+    assert "effective_status" in slot, "物品列表页的状态插槽没用继承来的状态"
+
+
+def test_items_filter_matches_what_items_page_displays():
+    """显示继承值、筛选却按订单自身状态查 → 「界面一排已发出，筛已发出搜不到」。
+    orders.py 专门防过这个坑，items.py 一度没跟上。"""
+    import inspect
+
+    from app.routers import items as mod
+
+    src = inspect.getsource(mod.list_items)
+    assert "func.coalesce(ship_status, Order.status) == status" in src, \
+        "物品列表的状态筛选没跟显示口径对齐"
+
+
+def test_slot_columns_do_not_rely_on_col_display():
+    """通用陷阱：任何列一旦有 `#cell-xxx` 插槽，它的 `col.display` 就是死代码。
+    两者同时存在几乎必然是写错了——本项目已经栽过一次。"""
+    import re
+
+    root = _REPO / "frontend" / "src" / "views"
+    bad = []
+    for f in root.rglob("index.vue"):
+        src = f.read_text(encoding="utf-8")
+        slots = set(re.findall(r"#cell-(\w+)", _template_of(f)))
+        for m in re.finditer(r"key: '(\w+)'[^}]*?display:", src, re.S):
+            if m.group(1) in slots:
+                bad.append(f"{f.relative_to(_REPO)} 的 {m.group(1)} 列同时有插槽和 display")
+    assert not bad, "插槽会让 col.display 变成死代码：\n  " + "\n  ".join(bad)
+
+
+def test_items_api_exposes_inherited_status():
+    """前端要靠这两个字段渲染，后端不给就只能显示订单自己的国内段状态。"""
+    from app.schemas import ItemListRead
+
+    assert "effective_status" in ItemListRead.model_fields
+    assert "shipment_order_id" in ItemListRead.model_fields
+
+
+def test_price_column_is_fillable_on_new_row_only():
+    """金额由物品派生、数据行只读；但**新建一单时总得有个地方把金额填进去**，
+    否则只能先建一张空单再进面板补——用户第一次就被这个卡住了。"""
+    blk = _orders_vue().split("key: 'price_cny'")[1][:300]
+    assert "readonly: true" in blk and "newEditable: true" in blk
+    src = (_REPO / "frontend" / "src" / "components" / "NotionTable.vue").read_text(encoding="utf-8")
+    assert "col.newEditable" in src and "function newCol(" in src
 
 
 def test_status_cell_displays_inherited_value():
@@ -199,8 +322,9 @@ def test_settings_page_never_touches_raw_draft_array():
     会在渲染时抛 TypeError → **整页卡死白屏**（本页真这么炸过一次）。
     统一走带兜底的 `chain` computed，模板里不许再出现裸的 draft['fx.sources']。"""
     src = (_REPO / "frontend" / "src" / "views" / "Settings" / "index.vue").read_text(encoding="utf-8")
-    tpl = src.split("</template>")[0]
-    assert "draft['fx.sources']" not in tpl, "模板里又直接摸 draft['fx.sources'] 了"
+    assert "draft['fx.sources']" not in _template_of(
+        _REPO / "frontend" / "src" / "views" / "Settings" / "index.vue"
+    ), "模板里又直接摸 draft['fx.sources'] 了"
     assert "const chain = computed(" in src, "缺少带兜底的 chain computed"
 
 

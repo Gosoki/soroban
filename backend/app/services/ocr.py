@@ -266,12 +266,16 @@ def _detect_other_platform(full_text: str) -> Optional[str]:
 def _detect_status(full_text: str, has_express: bool) -> str:
     """判交易状态：终态优先；发货后（头部「卖家已发货/待确认收货」或已有快递单号）→ 待收货；
     「等待卖家发货」→ 待发货；都不明确时以有无快递单号兜底（有单号必已发货）。"""
+    # 终态优先，且**必须排在 has_express 判定之前**：退款单同样带快递号，
+    # 先判快递就会把退款单识别成「待收货」——这不是理论问题，之前正是这么错的。
+    if any(k in full_text for k in ("退款成功", "已退款", "退货退款", "退款")):
+        return OrderStatus.refunded.value       # 退款
+    if "交易关闭" in full_text or "已关闭" in full_text:
+        return OrderStatus.cancelled.value      # 交易关闭
     # 「交易成功」是闲鱼页面上的字样，就是**国内快递签收**这一刻 → 已签收。
     # 国际段送达是集运单的「已送达」，两者不同名、不同表。
     if "交易成功" in full_text or "交易完成" in full_text:
         return OrderStatus.signed.value         # 已签收
-    if "交易关闭" in full_text or "已关闭" in full_text:
-        return OrderStatus.cancelled.value      # 交易关闭
     if has_express or any(k in full_text for k in ("待确认收货", "卖家已发货", "待收货", "确认收货")):
         return OrderStatus.shipped.value        # 待收货
     if any(k in full_text for k in ("等待卖家发货", "等待发货", "待卖家发货", "待发货")):

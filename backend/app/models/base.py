@@ -67,9 +67,48 @@ ORDER_STATUS_RANK = {
 }
 
 
+# 旁支**终态**：走到这里就结束了，不再沿生命周期前进。
+# 它们不在 ORDER_STATUS_RANK 里，所以 order_status_rank() 返回 -1——
+# ⚠️ 而 -1 的实际效果是「**任何**推进态都 > 它，于是谁都能盖掉它」，与「不参与推进」
+# 这个本意正好相反。曾因此出过事：一张已标「退款」的单被 OCR 再识别一次，
+# 兜底判成「待发货」（rank 1 > -1）就把退款抹掉了，而退款单本来不计入看板合计
+# （见 EXCLUDED_STATUSES）→ **看板金额凭空变大**。
+# 所以「能不能覆盖」必须走 can_advance()，不能只比 rank。
+TERMINAL_STATUSES = frozenset({OrderStatus.refunded.value, OrderStatus.cancelled.value})
+
+
 def order_status_rank(status: Optional[str]) -> int:
-    """状态在生命周期里的序号；退款/交易关闭/未知一律 -1（不参与「只前进」判定）。"""
+    """状态在国内段生命周期里的序号。终态与未知值取 -1。
+
+    **别拿它单独做「能不能覆盖」的判定**——-1 会让终态被任何推进态盖掉。用 can_advance()。
+    """
     return ORDER_STATUS_RANK.get(status or "", -1)
+
+
+def is_terminal(status: Optional[str]) -> bool:
+    """是不是旁支终态（退款 / 交易关闭）。"""
+    return (status or "") in TERMINAL_STATUSES
+
+
+def can_advance(current: Optional[str], incoming: Optional[str]) -> bool:
+    """自动化写入（OCR 识别、爬虫回灌）能不能把 current 改成 incoming。
+
+    规则，按优先级：
+      1. incoming 为空 / 与 current 相同 → 不写。
+      2. **current 已是终态 → 一律不写**。退款、交易关闭是人（或平台）明确下的结论，
+         自动识别不该推翻它。这一条是本函数存在的理由。
+      3. incoming 是终态 → 允许写。平台把单关掉/退款了，账本该跟上。
+      4. 其余按 rank 只前进不回退。
+
+    ⚠️ 只约束**自动化**写入。人在界面上手动改状态不走这里——用户说了算。
+    """
+    if not incoming or incoming == current:
+        return False
+    if is_terminal(current):
+        return False
+    if is_terminal(incoming):
+        return True
+    return order_status_rank(incoming) > order_status_rank(current)
 
 
 class ShipmentStatus(str, Enum):

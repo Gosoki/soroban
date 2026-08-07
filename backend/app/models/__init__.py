@@ -25,6 +25,10 @@ from .base import (
     Source,
     StagingStatus,
     OrderStatus,
+    ORDER_STATUS_RANK,
+    TERMINAL_STATUSES,
+    can_advance,
+    is_terminal,
     order_status_rank,
     utcnow,
 )
@@ -49,6 +53,10 @@ __all__ = [
     "StagingStatus",
     "EXCLUDED_STATUSES",
     "ORDER_STATUS_RANK",
+    "ORDER_STATUS_RANK",
+    "TERMINAL_STATUSES",
+    "can_advance",
+    "is_terminal",
     "order_status_rank",
     "utcnow",
     # 表

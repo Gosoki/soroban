@@ -40,7 +40,14 @@ def build_engine(url: str) -> Engine:
     - MySQL：pool_pre_ping 防死连接（wait_timeout 掐断），pool_recycle 定期回收。"""
     if url.startswith("sqlite"):
         return create_engine(url, connect_args={"check_same_thread": False})
-    return create_engine(url, pool_pre_ping=True, pool_recycle=3600)
+    # 三个超时都要设：`connect_timeout` 只管 TCP 建连，**不管握手之后的读**。
+    # 对着「接受 TCP 却不说 MySQL 握手」的对端（有状态防火墙/NAT、卡死的服务端），
+    # pymysql 的 read_timeout 默认 None → 单次调用实测阻塞 384 秒不返回。
+    # 后台循环把这种阻塞带进事件循环时，整站会跟着周期性卡死。
+    return create_engine(
+        url, pool_pre_ping=True, pool_recycle=3600,
+        connect_args={"connect_timeout": 5, "read_timeout": 30, "write_timeout": 30},
+    )
 
 
 def _control_url() -> str:

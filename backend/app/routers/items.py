@@ -13,7 +13,7 @@ from sqlmodel import Session, select
 
 from ..auth import get_current_user
 from ..database import get_session
-from ..models import OrderItem, Order
+from ..models import OrderItem, Order, ShipmentOrder
 from ..schemas import ItemListRead
 
 router = APIRouter(
@@ -41,7 +41,16 @@ def list_items(
     if date_to:
         conds.append(Order.date <= date_to)
     if status:
-        conds.append(Order.status == status)
+        # 与**显示**口径一致（列表显示的是继承来的集运状态）。只筛 Order.status 会出现
+        # 「界面上一排『已发出』，筛『已发出』却一条都搜不到」——orders.py:85 专门防过这个坑。
+        # 用相关子查询而非 JOIN：不改变结果行形状，下面那句 func.count() 与分页才不变形。
+        ship_status = (
+            select(ShipmentOrder.status)
+            .where(ShipmentOrder.id == Order.shipment_order_id,
+                   ShipmentOrder.is_delete.is_(False))
+            .scalar_subquery()
+        )
+        conds.append(func.coalesce(ship_status, Order.status) == status)
     if platform_account:
         conds.append(Order.platform_account == platform_account)
     if platform:

@@ -38,6 +38,7 @@
         <template #cell-shipment_order_id="{ row }">
           <el-select :model-value="row.shipment_order_id" filterable placeholder="未集运"
                      size="small" class="ship-pick" popper-class="ship-pop"
+                     :persistent="false"
                      @change="(v) => onPickShipment(row, v)">
             <template #label="{ value }">
               <span class="ship-sel">
@@ -203,7 +204,7 @@ function reload() { page.value = 1; load() }
 function onPage(p) { page.value = p; load() }
 
 async function loadShipment() {
-  const res = await shipmentApi.list({ limit: 200 })
+  const res = await shipmentApi.list({ limit: 200, brief: true })
   shipmentOptions.value = res.items
 }
 
@@ -315,7 +316,19 @@ async function findByOrderNo(orderNo) {
 // 退款/交易关闭是旁支终态、未知值同样取 -1。必须与后端 models/base.py 的 ORDER_STATUS_RANK 一致
 // ——只管国内段；挂靠不再改状态（国际段由集运单表达，见后端 Order.effective_status）。
 const STATUS_RANK = { 待付款: 0, 待发货: 1, 待收货: 2, 已签收: 3 }
+// 旁支终态：走到这里就结束了。它们不在 STATUS_RANK 里 → rank 为 -1，
+// ⚠️ 而 -1 的效果是「**任何**推进态都 > 它、于是谁都能盖掉它」，与本意正好相反。
+// 曾因此出事：一张已标「退款」的单被 OCR 再识别一次、兜底判成「待发货」就把退款抹掉了，
+// 而退款单本不计入看板合计 → **看板金额凭空变大**。判定必须走 canAdvance，不能只比 rank。
+// 与后端 models/base.py 的 TERMINAL_STATUSES / can_advance 一一对应。
+const TERMINAL = ['退款', '交易关闭']
 function statusRank(s) { return STATUS_RANK[s] ?? -1 }
+function canAdvance(cur, next) {
+  if (!next || next === cur) return false
+  if (TERMINAL.includes(cur)) return false      // 终态是明确结论，自动识别不该推翻
+  if (TERMINAL.includes(next)) return true      // 平台把单关了/退款了，账本该跟上
+  return statusRank(next) > statusRank(cur)
+}
 
 // 这单还「没有真实价格」吗？= 物品全是系统占位(auto) 且合计为 0。
 // 只有这种单才允许 OCR 回填成交价；用户手填过任一单价的单绝不覆盖。
@@ -332,7 +345,7 @@ function hasNoRealPrice(base) {
 function buildMergePatch(base, data) {
   const patch = { version: base.version }
   if (data.date) patch.date = data.date
-  if (data.status && statusRank(data.status) > statusRank(base.status)) patch.status = data.status
+  if (canAdvance(base.status, data.status)) patch.status = data.status
   for (const k of ['platform', 'title', 'express_company', 'express_no']) {
     const cur = base[k]
     if (data[k] != null && data[k] !== '' && (cur == null || cur === '')) patch[k] = data[k]

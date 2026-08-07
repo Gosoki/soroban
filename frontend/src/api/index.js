@@ -64,7 +64,12 @@ export const stagingApi = {
 }
 
 export const dashboardApi = { get: () => http.get('/dashboard') }
-export const fxApi = { get: () => http.get('/fx') }
+export const fxApi = {
+  get: () => http.get('/fx'),
+  // 超时**必须**放宽：默认 15s（http.js），而后端一轮可能串行走完整条源链——
+  // 每源 httpx 20~25s × 重试次数 × 退避，最坏几分钟。15s 一定先炸在前端。
+  refresh: () => http.post('/fx/refresh', null, { timeout: 180000 }),
+}
 
 export const layoutApi = {
   get: (table) => http.get(`/layout/${table}`),

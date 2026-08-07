@@ -378,6 +378,26 @@ _install_state: dict[str, dict] = {}                 # plugin_id → {running, s
 _install_lock = threading.Lock()
 
 
+def _base_python() -> Optional[str]:
+    """能用来建插件 venv 的**真** Python 解释器路径；打包版找不到时返回 None。
+
+    ⚠️ 不能直接用 `sys.executable`：PyInstaller 打包后它是 soroban.exe 自己。
+    拿它去跑 `[soroban.exe, "-m", "venv", ...]`，bootloader 根本不解释 `-m`，
+    结果是**把 soroban 自己又启动了一遍**（实测子进程真的跑了一遍 run.py：chdir、
+    建 .env、连库跑迁移，最后卡在端口占用），而用户在界面上看到的报错是
+    「建立 Python 环境失败：address already in use」——和建 venv 毫无关系。
+    Windows 上更糟：uvicorn 无条件设 SO_REUSEADDR，影子实例会真的绑上端口常驻。
+    """
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+    import shutil
+    for cand in ("python3", "python"):
+        found = shutil.which(cand)
+        if found:
+            return found
+    return None
+
+
 def _venv_cmd(d: Path) -> list[str]:
     """建插件 venv 的命令。用 soroban 自己的解释器建——它一定存在、且与插件同机同 Python 系列。
 
@@ -386,9 +406,12 @@ def _venv_cmd(d: Path) -> list[str]:
     「装了 python3 却没装 python3-venv」很常见，标准 venv 会建到一半失败并留下半成品。
     没有 pip 也不影响安装：_pip_cmd 会借 soroban 的 pip 用 `--python` 装进去（pip 23.1+）。
     """
-    base = [sys.executable, "-m", "venv", str(d / ".venv")]
+    py = _base_python()
+    if py is None:      # 打包版且 PATH 里没有系统 python —— 调用方会先拦下，这里兜底
+        raise RuntimeError("找不到可用的 Python 解释器")
+    base = [py, "-m", "venv", str(d / ".venv")]
     try:
-        if subprocess.run([sys.executable, "-c", "import ensurepip"],
+        if subprocess.run([py, "-c", "import ensurepip"],
                           capture_output=True, timeout=30).returncode == 0:
             return base
     except (OSError, subprocess.SubprocessError):
@@ -405,7 +428,7 @@ def _pip_cmd(target_py: Path, args: list[str]) -> list[str]:
     这样即便系统 python3-venv 不完整，安装依然能走完，不必要求用户先 apt install。"""
     if _has_pip(target_py):
         return [str(target_py), "-m", "pip", "install", *args]
-    return [sys.executable, "-m", "pip", "--python", str(target_py), "install", *args]
+    return [_base_python() or sys.executable, "-m", "pip", "--python", str(target_py), "install", *args]
 
 
 def _install_worker(manifest: dict, with_browser: bool) -> None:
@@ -458,6 +481,14 @@ def install_plugin(
 ):
     """补齐插件依赖。后台执行，用 GET /api/plugins 轮询 install 字段看进度。"""
     m = _find_manifest(plugin_id)
+    if _base_python() is None:
+        # 打包版（exe）里没有可用解释器。与其拿 exe 去当 python 跑出一个影子实例，
+        # 不如明说——用户至少知道该装什么。
+        raise HTTPException(
+            status_code=409,
+            detail="打包版内没有可用的 Python 解释器，无法自动建立插件环境。"
+                   "请在本机安装 Python 3.11/3.12 后重试，或按插件 README 手工建 venv。",
+        )
     with _install_lock:
         st = _install_state.get(plugin_id)
         if st and st.get("running"):
@@ -723,6 +754,12 @@ def _run_due(session: Session) -> None:
     session.commit()
 
 
+def _run_due_in_session() -> None:
+    """同步执行一轮定时抓取。单独抽出来是为了能整体丢进线程池（见 scheduler_loop）。"""
+    with Session(get_engine()) as session:
+        _run_due(session)
+
+
 async def scheduler_loop(interval: int = 60) -> None:
     """后台循环：每 interval 秒检查一次到点的插件并触发抓取（放进 lifespan）。
 
@@ -737,8 +774,11 @@ async def scheduler_loop(interval: int = 60) -> None:
             if reason:
                 log.info("定时抓取跳过：%s", reason)
             else:
-                with Session(get_engine()) as session:
-                    _run_due(session)
+                # **必须丢进线程池**：这是个 async 协程，而 Session/pymysql 是同步 I/O。
+                # MySQL 运行中掉线时，建连会阻塞住整个事件循环——实测单次卡了 384 秒
+                # （pymysql 的 read_timeout 默认 None，connect_timeout 只管 TCP 建连
+                # 不管握手读），期间连 /api/health、静态资源都一起卡死。
+                await run_in_threadpool(_run_due_in_session)
         except Exception as e:                          # 单轮异常不结束循环
             log.warning("插件定时循环异常：%s", e)
         await asyncio.sleep(interval)

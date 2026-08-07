@@ -187,3 +187,61 @@ def test_entry_table_is_bounded():
     for i in range(MAX_ENTRIES + 500):
         t.record_failure(t.key(f"user{i}", "1.1.1.1"))
     assert len(t._fails) <= MAX_ENTRIES
+
+
+def test_backoff_survives_username_flooding():
+    """退避中的条目**恰恰是最旧的**（它一直被 429 挡回、时间戳不再刷新）。
+    只按「最旧」淘汰，攻击者刷几千个不存在的用户名就能把它挤出表、计数归零，
+    白拿一轮免罚尝试（实测把 900s 惩罚压成 27s）。淘汰必须优先丢**没有惩罚**的条目。"""
+    from app.ratelimit import FREE_TRIES, MAX_ENTRIES, LoginThrottle
+
+    t = LoginThrottle()
+    victim = ("admin", "1.2.3.4")
+    for _ in range(FREE_TRIES + 3):
+        t.record_failure(victim)
+    assert t.retry_after(victim) > 0, "夹具没把目标打进退避"
+
+    for i in range(MAX_ENTRIES + 500):           # 灌满无惩罚条目
+        t.record_failure((f"ghost{i}", "9.9.9.9"))
+
+    assert t.retry_after(victim) > 0, "退避条目被无惩罚条目挤掉了"
+
+
+def test_prune_is_fail_open():
+    """表满也要照常为新 key 建条目。反过来（表满就拒建）是 fail-closed：
+    攻击者把表填满高 count 条目就能把你自己稳定锁在门外——用提速换 DoS，更糟。"""
+    from app.ratelimit import MAX_ENTRIES, LoginThrottle
+
+    t = LoginThrottle()
+    for i in range(MAX_ENTRIES + 200):
+        t.record_failure((f"u{i}", "1.1.1.1"))
+    fresh = ("brand-new", "2.2.2.2")
+    assert t.retry_after(fresh) == 0             # 新 key 不受牵连
+    t.record_failure(fresh)                       # 且能被正常记账
+    assert t.retry_after(fresh) == 0              # 一次失败还在免罚额度内
+
+
+def test_frozen_build_never_uses_exe_as_interpreter(monkeypatch):
+    """打包后 sys.executable 是 soroban.exe 自己。拿它跑 `-m venv` 不会建环境，
+    而是**把 soroban 再启动一遍**（实测子进程真跑了迁移、最后卡在端口占用），
+    用户看到的报错是「address already in use」——和建 venv 毫无关系。"""
+    import shutil
+
+    from app.routers import plugins as plug
+
+    monkeypatch.setattr(plug.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(shutil, "which", lambda _n: None)
+    assert plug._base_python() is None, "冻结且 PATH 无 python 时必须返回 None，而不是 exe"
+
+    monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/python3" if n == "python3" else None)
+    assert plug._base_python() == "/usr/bin/python3"
+
+
+def test_install_refuses_instead_of_spawning_shadow_instance(client, monkeypatch):
+    """找不到解释器时明确 409，而不是拿 exe 去跑出一个影子实例。"""
+    from app.routers import plugins as plug
+
+    monkeypatch.setattr(plug, "_base_python", lambda: None)
+    monkeypatch.setattr(plug, "_find_manifest", lambda pid: {"id": pid, "_dir": plug.Path("/tmp")})
+    r = client.post("/api/plugins/taobao/install")
+    assert r.status_code == 409 and "Python" in r.json()["detail"]
