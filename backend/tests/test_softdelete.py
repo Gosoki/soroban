@@ -40,7 +40,11 @@ def test_batch_and_single_delete_agree(client):
     tmp = Path(tempfile.mkdtemp())
     d = tmp / "soroban-plugin-taobao"
     (d / ".state").mkdir(parents=True)
-    (d / "plugin.toml").write_text('id = "taobao"\nplatform = "taobao"\nstate_dir = ".state"\n',
+    # accounts_ledger_field 声明「本插件的账号落到账本哪一列」——
+    # 「按账号删单」那套操作据此判断可不可用。核心里原先写死的是 platform == "taobao"。
+    (d / "plugin.toml").write_text(
+        'id = "taobao"\naccounts = true\naccounts_ledger_field = "platform_account"\n'
+        'state_dir = ".state"\n',
                                    encoding="utf-8")
     old = settings.PLUGIN_DIR
     settings.PLUGIN_DIR = str(tmp)

@@ -1,5 +1,5 @@
 """插件管理层：发现、账号增删改、路径穿越防护、按账号清理。
-用临时 SCRAPER_DIR 造一个假插件，不触碰真实 scraper/、不起子进程。"""
+用临时 PLUGIN_DIR 造一个假插件，不触碰真实 plugins/、不起子进程。"""
 import json
 from pathlib import Path
 
@@ -13,15 +13,21 @@ PLUGIN_ID = "taobao"
 
 @pytest.fixture()
 def fake_plugin(tmp_path, monkeypatch):
-    """造 <tmp>/soroban-scraper-taobao/{plugin.toml,.state/}，把 SCRAPER_DIR 指过去。"""
-    d = tmp_path / "soroban-scraper-taobao"
+    """造 <tmp>/soroban-plugin-taobao/{plugin.toml,.state/}，把 PLUGIN_DIR 指过去。
+
+    设的是 **PLUGIN_DIR**（现名）而不是 SCRAPER_DIR（兼容别名）：`plugin_dir()` 优先取现名，
+    只设旧名的话这个假插件根本不会被发现，而 conftest 又把现名指向了一个空目录——
+    表现是「一堆插件测试突然全红」，看起来像插件系统坏了。
+    """
+    d = tmp_path / "soroban-plugin-taobao"
     (d / ".state").mkdir(parents=True)
     (d / "plugin.toml").write_text(
-        'id = "taobao"\nname = "淘宝订单"\nplatform = "taobao"\nversion = "0.1.0"\n'
-        'python = ".venv/bin/python"\nentry = "-m taobao_scraper"\nstate_dir = ".state"\n',
+        'id = "taobao"\nname = "淘宝订单"\nversion = "0.1.0"\n'
+        'python = ".venv/bin/python"\nentry = "-m taobao_scraper"\nstate_dir = ".state"\n'
+        'accounts = true\naccounts_ledger_field = "platform_account"\n',   # 与真实清单一致
         encoding="utf-8",
     )
-    monkeypatch.setattr(settings, "SCRAPER_DIR", str(tmp_path))
+    monkeypatch.setattr(settings, "PLUGIN_DIR", str(tmp_path))
     return d
 
 
@@ -202,15 +208,25 @@ def test_corrupt_params_json_does_not_crash():
     assert plug._account_list(cfg) == []
 
 
-def test_broken_plugin_toml_is_skipped(tmp_path, monkeypatch, client):
-    d = tmp_path / "soroban-scraper-broken"
-    d.mkdir()
+def test_unparseable_toml_is_skipped_but_bad_manifest_is_shown(tmp_path, monkeypatch, client):
+    """TOML 语法坏掉 → 跳过（连 id 都读不出来，没法在界面上称呼它）。
+    TOML 能解析但内容有问题（比如缺 id）→ **进列表并显示原因**。
+
+    后者原先也是静默跳过，用户看到的是「插件不见了」，而不是「插件的清单写错了」。
+    对着一个空列表没法排查——插件目录明明在那儿。
+    """
+    d = tmp_path / "plugins" / "soroban-plugin-broken"
+    d.mkdir(parents=True)
     (d / "plugin.toml").write_text("this is not = valid toml [[[", encoding="utf-8")
-    d2 = tmp_path / "soroban-scraper-noid"
-    d2.mkdir()
+    d2 = tmp_path / "plugins" / "soroban-plugin-noid"
+    d2.mkdir(parents=True)
     (d2 / "plugin.toml").write_text('name = "缺 id"\n', encoding="utf-8")
-    monkeypatch.setattr(settings, "SCRAPER_DIR", str(tmp_path))
-    assert client.get("/api/plugins").json() == []
+    monkeypatch.setattr(settings, "PLUGIN_DIR", str(tmp_path / "plugins"))
+    got = client.get("/api/plugins").json()
+    ids = {p["id"]: p for p in got}
+    assert "soroban-plugin-broken" not in ids, "TOML 都解析不了，不该硬凑一条出来"
+    assert "soroban-plugin-noid" in ids, "清单有问题的插件不该从界面上消失"
+    assert "id" in ids["soroban-plugin-noid"]["manifest_error"], "没告诉用户清单哪里错了"
 
 
 def test_missing_plugin_dir_is_empty(tmp_path, monkeypatch, client):

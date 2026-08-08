@@ -14,7 +14,8 @@ def fake_plugin(tmp_path, monkeypatch):
     d = tmp_path / "soroban-plugin-taobao"
     (d / ".state").mkdir(parents=True)
     (d / "plugin.toml").write_text(
-        'id = "taobao"\nname = "淘宝订单"\nplatform = "taobao"\n'
+        'id = "taobao"\nname = "淘宝订单"\n'
+        'accounts = true\naccounts_ledger_field = "platform_account"\n'
         'python = ".venv/bin/python"\nentry = "-m taobao_scraper"\nstate_dir = ".state"\n',
         encoding="utf-8")
     monkeypatch.setattr(settings, "PLUGIN_DIR", str(tmp_path))

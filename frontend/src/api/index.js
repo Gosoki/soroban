@@ -85,6 +85,11 @@ export const pluginsApi = {
   saveConfig: (id, cfg) => http.put(`/plugins/${id}/config`, cfg),
   // 授权：插件只能进它声明过、且你在这里勾选过的那些门（默认一个都不给）
   saveGrants: (id, granted) => http.put(`/plugins/${id}/grants`, { granted }),
+  // 插件私有参数（清单里 [[params]] 声明，核心只负责存/校验/渲染/下发）
+  saveParams: (id, params) => http.put(`/plugins/${id}/params`, { params }),
+  // 通用命令端点：动词由清单声明，加插件/加动词都不用再往这里加方法
+  run: (id, command, account) =>
+    http.post(`/plugins/${id}/run/${command}`, null, { params: account ? { account } : {} }),
   login: (id, account) => http.post(`/plugins/${id}/login`, null, { params: { account } }),
   fetch: (id, account) => http.post(`/plugins/${id}/fetch`, null, { params: account ? { account } : {} }),
   addAccount: (id, name, platform) => http.post(`/plugins/${id}/account`, null, { params: { name, platform } }),

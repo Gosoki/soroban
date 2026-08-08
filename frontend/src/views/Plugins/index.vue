@@ -42,17 +42,71 @@
         <div v-if="p.install && p.install.error" class="neederr">{{ p.install.error }}</div>
       </el-alert>
 
-      <!-- 插件设置：定时抓取 -->
+      <!-- 清单坏了也要列出来并说明原因，而不是让插件从界面上消失 -->
+      <el-alert v-if="p.manifest_error" type="error" :closable="false" class="needs"
+                :title="`plugin.toml 有问题：${p.manifest_error}`" />
+
+      <!-- 定时。文案不写「抓取」——不是每个插件都在抓东西（汇率是取、快递是查） -->
       <div class="field">
-        <label class="flabel">定时抓取（分钟，0=关闭）</label>
+        <label class="flabel">定时执行（分钟，0=关闭）</label>
         <el-input-number v-model="p._form.schedule_minutes" :min="0" :step="30" size="small" />
         <el-button type="primary" size="small" @click="saveConfig(p)">保存</el-button>
-        <span class="sub">{{ p.config.last_run_at ? '上次：' + fmtTime(p.config.last_run_at) : '尚未抓取' }}</span>
+        <span class="sub">{{ p.config.last_run_at ? '上次触发 ' + fmtTime(p.config.last_run_at) : '尚未执行' }}</span>
       </div>
 
-      <!-- 添加账号 -->
-      <div class="sect">添加账号</div>
-      <div class="field">
+      <!-- 上次执行结果。插件是 fire-and-forget，没有这一块就只能去翻 soroban 日志 -->
+      <div v-if="p.last_run.outcome" class="field">
+        <label class="flabel">上次结果</label>
+        <el-tag size="small" :style="typeStyle(runTagType(p.last_run.outcome))">
+          {{ { ok: '成功', failed: '失败', running: '执行中' }[p.last_run.outcome] || p.last_run.outcome }}
+        </el-tag>
+        <span class="sub">{{ p.last_run.summary }}</span>
+        <span v-if="p.last_run.at" class="sub">· {{ fmtTime(p.last_run.at) }}</span>
+      </div>
+
+      <!-- 命令：按清单声明长按钮。加插件/加动词都不用改这里 -->
+      <div v-if="p.commands.length" class="field cmds">
+        <label class="flabel">执行</label>
+        <el-button v-for="c in p.commands" :key="c.name" size="small"
+                   :type="c.primary ? 'primary' : 'default'"
+                   :disabled="!p.installed || !!c.blocked.length || (c.per === 'account' && !enabledCount(p))"
+                   :title="cmdTitle(p, c)" @click="doRun(p, c)">
+          {{ c.label }}<template v-if="c.per === 'account'">（{{ enabledCount(p) }}）</template>
+        </el-button>
+      </div>
+
+      <!-- 参数：插件私有的，核心不理解其含义，只按类型渲染控件 -->
+      <template v-if="p.params.length">
+        <div class="sect">参数</div>
+        <div v-for="pa in p.params" :key="pa.key" class="field">
+          <label class="flabel">
+            {{ pa.label }}
+            <el-tooltip v-if="pa.hint" :content="pa.hint" placement="top">
+              <el-icon class="help"><QuestionFilled /></el-icon>
+            </el-tooltip>
+          </label>
+          <el-switch v-if="pa.type === 'bool'" v-model="p._form.params[pa.key]" size="small" />
+          <el-input-number v-else-if="pa.type === 'int'" v-model="p._form.params[pa.key]"
+                           :min="pa.min" :max="pa.max" :controls="false" size="small" style="width: 120px" />
+          <el-select v-else-if="pa.type === 'select'" v-model="p._form.params[pa.key]"
+                     size="small" style="width: 160px">
+            <el-option v-for="o in pa.choices" :key="o" :label="o" :value="o" />
+          </el-select>
+          <el-input v-else v-model="p._form.params[pa.key]" size="small" style="width: 220px"
+                    :type="pa.secret ? 'password' : 'text'" :show-password="pa.secret"
+                    :placeholder="pa.secret && pa.value === '__set__' ? '已设置（留空保持不变）' : String(pa.default ?? '')" />
+        </div>
+        <div class="field">
+          <el-button type="primary" size="small" @click="saveParams(p)">保存参数</el-button>
+          <span class="sub">保存后下一次执行即按新值跑</span>
+        </div>
+      </template>
+
+      <!-- 账号：只有清单声明了 accounts 的插件才有这个维度。
+           汇率、快递查询这类插件卡片上不该出现「添加账号」——那是纯噪音，
+           而且会让人以为是自己漏配了什么。 -->
+      <div v-if="p.accounts_enabled" class="sect">添加账号</div>
+      <div v-if="p.accounts_enabled" class="field">
         <el-input v-model="p._add.name" size="small" placeholder="账号昵称" style="width: 160px"
                   @keyup.enter="doAddAccount(p)" />
         <el-select v-model="p._add.platform" size="small" filterable allow-create default-first-option
@@ -85,9 +139,9 @@
       </div>
 
       <!-- 账号列表 -->
-      <div class="sect">账号（{{ p.accounts.length }}）</div>
-      <div v-if="!p.accounts.length" class="sub">还没有账号——用上面「添加账号」加一个。</div>
-      <div v-for="a in p.accounts" :key="a.account" class="acct" :class="{ dim: !a.enabled }">
+      <div v-if="p.accounts_enabled" class="sect">账号（{{ p.accounts.length }}）</div>
+      <div v-if="p.accounts_enabled && !p.accounts.length" class="sub">还没有账号——用上面「添加账号」加一个。</div>
+      <div v-for="a in (p.accounts_enabled ? p.accounts : [])" :key="a.account" class="acct" :class="{ dim: !a.enabled }">
         <span class="c-sw">
           <el-switch v-if="a.configured" v-model="a.enabled" size="small" :disabled="!p.installed"
                      title="停用后定时与「抓取全部账号」都跳过它" @change="(v) => doToggle(p, a, v)" />
@@ -118,11 +172,6 @@
         <el-button size="small" link type="danger" @click="doDeleteAccount(p, a.account)">删除</el-button>
       </div>
 
-      <div class="field" style="margin-top: 12px">
-        <el-button size="small" :icon="Download" :disabled="!p.installed || !enabledCount(p)" @click="doFetch(p)">
-          抓取全部账号（{{ enabledCount(p) }}）
-        </el-button>
-      </div>
     </el-card>
   </div>
 </template>
@@ -130,7 +179,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Refresh, Download } from '@element-plus/icons-vue'
+import { Refresh, Download, QuestionFilled } from '@element-plus/icons-vue'
 import { pluginsApi, tagsApi } from '@/api'
 import { tagStyleAt, typeStyle } from '@/constants'
 import { fmtDateTime } from '@/utils/datetime'
@@ -147,6 +196,41 @@ function platformTagStyle(v) { return tagStyleAt(platformColor.value[v] ?? -1, v
 const fmtTime = fmtDateTime   // 后端存 naive UTC，必须补 Z 再解析，见 utils/datetime.js
 // 权限元信息由后端随列表下发（catalog），前端不写第二份说明文案——
 // 那份必然与后端漂移，而漂移的方向通常是「界面上写的比实际权限小」。
+function runTagType(outcome) {
+  return { ok: 'success', failed: 'danger', running: 'warning' }[outcome] || 'info'
+}
+// 按钮为什么点不了，鼠标悬停时说清楚——比一个灰按钮强
+function cmdTitle(p, c) {
+  if (!p.installed) return '插件未安装'
+  if (c.blocked.length) return `缺权限：${c.blocked.join('、')}——先在下面勾选授权`
+  if (c.per === 'account' && !enabledCount(p)) return '没有启用的账号'
+  return c.hint || ''
+}
+async function doRun(p, c) {
+  if (c.confirm && !window.confirm(c.confirm)) return
+  p._busy = true
+  try {
+    const r = await pluginsApi.run(p.id, c.name)
+    ElMessage.success(`已触发「${c.label}」${r.targets?.length ? '：' + r.targets.join('、') : ''}`)
+    setTimeout(load, 3000)          // 稍后刷一次，把「上次结果」拉回来
+  } catch (_) { /* 拦截器已提示 */ } finally { p._busy = false }
+}
+async function saveParams(p) {
+  p._busy = true
+  try {
+    // 空的 secret = 「保持不变」，不提交（提交空串会把已存的密钥清掉）
+    const patch = {}
+    for (const pa of p.params) {
+      const v = p._form.params[pa.key]
+      if (pa.secret && (v === '' || v == null)) continue
+      patch[pa.key] = v
+    }
+    const r = await pluginsApi.saveParams(p.id, patch)
+    p.params = r.params
+    ElMessage.success('参数已保存，下一次执行即按新值跑')
+  } catch (_) { /* 422 会显示后端的具体原因 */ } finally { p._busy = false }
+}
+
 function scopeMeta(p, key) {
   return (p.scopes?.catalog || []).find((x) => x.key === key) || {}
 }
@@ -179,7 +263,11 @@ async function load() {
       // 刷新时保留用户勾过的选项，别让轮询把复选框弹回默认
       _withBrowser: prev[p.id]?._withBrowser ?? true,
       _form: { enabled: p.config.enabled, schedule_minutes: p.config.schedule_minutes || 0,
-               granted: [...(p.scopes?.granted || [])] },
+               granted: [...(p.scopes?.granted || [])],
+               // secret 参数后端只回 '__set__'，不能把它当值填回输入框——
+               // 那样一保存就会把密钥真的改成 '__set__' 这个字符串。
+               params: Object.fromEntries((p.params || []).map(
+                 (x) => [x.key, x.value === '__set__' ? '' : x.value])) },
       _add: { name: '', platform: '淘宝' },
     }))
     // 有安装在跑就继续盯着，装完自动刷新（按钮解禁、缺依赖提示消失）
@@ -419,4 +507,6 @@ onMounted(load)
 .grant { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
 .g-name { font-weight: 600; }
 .g-hint { color: var(--txt-3); font-size: 12px; }
+.help { color: var(--txt-3); cursor: help; font-size: 13px; }
+.cmds { flex-wrap: wrap; }
 </style>

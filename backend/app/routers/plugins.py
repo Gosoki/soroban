@@ -29,7 +29,10 @@ from fastapi.concurrency import run_in_threadpool
 from sqlmodel import Session, select
 
 from ..auth import get_current_user
-from ..plugins import scopes
+# 别名 pmanifest：本文件里 `manifest` 这个名字被多个函数的 dict 参数占着，
+# 模块同名会在那些函数体内被静默遮蔽（今天没用到只是运气）。
+from ..plugins import manifest as pmanifest
+from ..plugins import params as plugin_params, scopes
 from ..config import settings
 from ..database import get_engine, get_session
 from ..models import Order, PluginConfig, User, utcnow
@@ -103,10 +106,20 @@ def discover() -> list[dict]:
                     m = tomllib.loads(f.read_text(encoding="utf-8"))
                 except Exception:
                     continue
-                if "id" not in m or m["id"] in seen:
+                mf = pmanifest.parse(m, d)
+                if mf.id in seen:
                     continue
-                seen.add(m["id"])
+                seen.add(mf.id)
+                # 同时挂上强类型清单与原始 dict：老代码继续按 dict 取键，
+                # 新代码走 `m["_m"]`。一次性全改的话这个文件要动几十处，风险不划算。
                 m["_dir"] = d
+                m["_m"] = mf
+                # 把归一后的 id/name 写回原始 dict：清单缺 id 时 parse() 会用目录名兜底，
+                # 不写回的话所有按 m["id"] 取值的老代码都会 KeyError。
+                m["id"], m["name"] = mf.id, mf.name
+                m["accounts"] = mf.accounts
+                m["scopes"] = list(mf.scopes)
+                m["settings"] = list(mf.settings)
                 out.append(m)
     return out
 
@@ -371,13 +384,46 @@ def _browser_ready(py: Path) -> bool:
         return False
 
 
-def _reap(proc: subprocess.Popen, label: str, jti: Optional[str] = None) -> None:
+def _summarize(line: str, returncode: int) -> str:
+    """把插件吐的那行 JSON 变成一句人话，放插件卡片上。
+
+    插件之间字段不统一（爬虫回 created/updated/failed，汇率回 source/rate），
+    所以取「认识的键优先，认不出就原样截断」——核心不该规定插件必须回什么，
+    但也不该让用户在卡片上看一坨 JSON。
+    """
+    try:
+        d = json.loads(line or "{}")
+    except (TypeError, ValueError):
+        d = {}
+    if not isinstance(d, dict):
+        return (line or "")[:200]
+    if d.get("error"):
+        return str(d["error"])[:200]
+    bits = []
+    for k, label in (("created", "新建"), ("updated", "更新"), ("unchanged", "无变化"),
+                     ("blocked", "挡下"), ("failed", "失败")):
+        if d.get(k):
+            bits.append(f"{label} {d[k]}")
+    if d.get("rate"):
+        bits.append(f"1元 = {str(d['rate'])[:8]}円" + (f"（{d['source']}）" if d.get("source") else ""))
+    if bits:
+        return "、".join(bits)
+    if returncode != 0:
+        return f"退出码 {returncode}"
+    return (line or "已完成")[:200]
+
+
+def _reap(proc: subprocess.Popen, label: str, jti: Optional[str] = None, on_done=None) -> None:
     """后台收割子进程：读取其 stdout 单行 JSON 结果并写日志（成功计数 / 失败原因都落 soroban 日志）。
-    插件约定 stdout 只吐一行 JSON（见 taobao_scraper/run.py），量小不会撑爆管道；30min 上限防挂死。
+    插件约定 stdout 只吐一行 JSON（见各插件的 run.py），量小不会撑爆管道；30min 上限防挂死。
 
     收割完必须**作废令牌**：任务结束后那枚令牌不该还能用二十几分钟，
     而它此刻已经落在插件的日志与环境变量里了。放 finally 里——超时被 kill 的路径同样要作废。
+
+    `on_done(ok, summary)` 把结果写回 PluginConfig 供界面显示。同样在 finally 里：
+    超时被 kill 时也要有个交代，否则卡片会永远停在「执行中…」。
     """
+    result, ok = "", False
     try:
         try:
             out, err = proc.communicate(timeout=1800)
@@ -385,21 +431,27 @@ def _reap(proc: subprocess.Popen, label: str, jti: Optional[str] = None) -> None
             proc.kill()
             proc.communicate()
             log.warning("插件 %s 超时(30min)已终止", label)
+            result = "超时（30 分钟）已终止"
             return
         except Exception as e:                                   # noqa: BLE001
             log.warning("插件 %s 结果回收异常：%s", label, e)
+            result = f"结果回收异常：{e}"
             return
         tail = [ln for ln in (out or "").strip().splitlines() if ln.strip()]
-        result = tail[-1] if tail else "(无 stdout)"
-        if proc.returncode == 0:
-            log.info("插件 %s 完成：%s", label, result)
+        line = tail[-1] if tail else ""
+        ok = proc.returncode == 0
+        result = _summarize(line, proc.returncode)
+        if ok:
+            log.info("插件 %s 完成：%s", label, line or "(无 stdout)")
         else:
             errtail = (err or "").strip()
-            log.warning("插件 %s 失败(exit=%s)：%s%s", label, proc.returncode, result,
+            log.warning("插件 %s 失败(exit=%s)：%s%s", label, proc.returncode,
+                        line or "(无 stdout)",
                         ("｜stderr: " + errtail[-300:]) if errtail else "")
     finally:
         scopes.revoke(jti)          # 任务结束 → 令牌立即失效
-
+        if on_done:
+            on_done(ok, result or "已完成")
 
 
 def plugin_settings(session: Session, manifest: dict) -> dict:
@@ -431,7 +483,8 @@ def plugin_settings(session: Session, manifest: dict) -> dict:
 
 
 def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str] = None,
-            config: Optional[dict] = None, jti: Optional[str] = None) -> int:
+            config: Optional[dict] = None, jti: Optional[str] = None,
+            on_done=None) -> int:
     """子进程调插件 CLI（fire-and-forget；返回 pid，后台线程收割其结果写日志）。
 
     token 走**环境变量** SOROBAN_TOKEN 下发，不进 argv——避免短期凭据出现在进程表(ps)/日志里。
@@ -461,7 +514,7 @@ def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str]
     label = f"{manifest.get('id', '?')}/{command}" + (f" [{acct}]" if acct else "")
     # jti 传给收割线程：进程一结束就把令牌作废。否则插件跑完之后那枚令牌还能用二十几分钟，
     # 而它此刻已经落在插件的日志/环境里了。
-    threading.Thread(target=_reap, args=(proc, label, jti), daemon=True).start()
+    threading.Thread(target=_reap, args=(proc, label, jti, on_done), daemon=True).start()
     return proc.pid
 
 
@@ -599,12 +652,12 @@ def install_plugin(
 def list_plugins(session: Session = Depends(get_session)):
     out = []
     for m in discover():
-        cfg = session.get(PluginConfig, m["id"])
+        cfg = session.get(PluginConfig, m["_m"].id)
         need = needs_cached(m)
         with _install_lock:
-            st = dict(_install_state.get(m["id"]) or {})
+            st = dict(_install_state.get(m["_m"].id) or {})
         out.append({
-            "id": m["id"], "name": m.get("name", m["id"]), "version": m.get("version"),
+            "id": m["_m"].id, "name": m["_m"].name, "version": m["_m"].version,
             "installed": not need,                  # 「装好了」= 一样不缺，而非只看 venv 在不在
             "needs": need,                          # 缺什么，逐项给前端说清
             "install": st,                           # 安装进度（running/step/error）
@@ -618,6 +671,24 @@ def list_plugins(session: Session = Depends(get_session)):
             # 权限三件套：清单要什么、用户给了什么、实际生效的是什么。
             # 三者分开给，前端才能把「插件升级后多要了一项」显示成「需要新授权」，
             # 而不是悄悄按新清单放行。
+            # 卡片按这两样渲染：参数表单 + 命令按钮。加插件不用动前端。
+            "params": pmanifest.describe_params(m["_m"], plugin_params.load(m["_m"], cfg)),
+            "commands": [
+                {"name": c.name, "label": c.label, "hint": c.hint, "per": c.per,
+                 "confirm": c.confirm, "primary": c.primary,
+                 # 缺权限的命令直接禁用并说明，而不是让用户点了收 403
+                 "blocked": sorted(set(c.needs) - set(json.loads(cfg.granted_scopes or "[]") if cfg else []))}
+                for c in m["_m"].commands
+            ],
+            "manifest_error": m["_m"].error,
+            # 前端据此决定要不要渲染账号区。不给这个字段的话，无账号插件的卡片上
+            # 会出现「添加账号」「账号（0）」——纯噪音，还会让人以为自己漏配了什么。
+            "accounts_enabled": m["_m"].accounts,
+            "last_run": {
+                "outcome": cfg.last_outcome if cfg else "",
+                "summary": cfg.last_summary if cfg else "",
+                "at": cfg.last_finished_at if cfg else None,
+            },
             "scopes": {
                 "declared": sorted(m.get("scopes") or []),
                 "granted": sorted(json.loads(cfg.granted_scopes or "[]")) if cfg else [],
@@ -711,6 +782,99 @@ def login(plugin_id: str, account: str = Query(..., description="要授权登录
     return {"started": True, "pid": _launch(m, "login", ["--account", account])}
 
 
+@router.put("/{plugin_id}/params")
+def save_params(plugin_id: str, payload: dict, session: Session = Depends(get_session)):
+    """保存插件私有参数。清单里没声明的键丢弃（插件降级时不该让保存整体失败）。"""
+    m = _find_manifest(plugin_id)
+    cfg = session.get(PluginConfig, plugin_id) or PluginConfig(plugin_id=plugin_id)
+    try:
+        values = plugin_params.save(m["_m"], cfg, payload.get("params") or {})
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    cfg.updated_at = utcnow()
+    session.add(cfg)
+    session.commit()
+    log.info("插件 %s 参数已更新：%s", plugin_id, plugin_params.redact(m["_m"], values))
+    return {"plugin_id": plugin_id,
+            "params": pmanifest.describe_params(m["_m"], values)}
+
+
+@router.post("/{plugin_id}/run/{command}")
+def run_command(plugin_id: str, command: str, account: Optional[str] = None,
+                session: Session = Depends(get_session),
+                current: User = Depends(get_current_user)):
+    """执行插件声明的任意命令。**取代写死的 login / fetch。**
+
+    加一个插件、或给已有插件加一个动词，都不用再往这里加端点——
+    命令在 plugin.toml 里声明，界面按声明长按钮，这里按声明调。
+    """
+    m = _find_manifest(plugin_id)
+    mf = m["_m"]
+    cmd = mf.command(command)
+    if cmd is None:
+        raise HTTPException(status_code=404, detail=(
+            f"插件 {plugin_id} 没有声明命令 {command}（有：{[c.name for c in mf.commands]}）"))
+    if not _python(m).exists():
+        raise HTTPException(status_code=400, detail=f"插件未安装：缺 venv（{_python(m)}）")
+
+    cfg = session.get(PluginConfig, plugin_id) or PluginConfig(plugin_id=plugin_id)
+    granted = scopes.token_scopes(m, cfg)
+    missing = set(cmd.needs) - granted
+    if missing:
+        # 缺权限就明确拒绝并说缺哪一项，而不是让子进程跑起来再收一串 403。
+        raise HTTPException(status_code=409, detail=(
+            f"「{cmd.label}」需要权限 {sorted(missing)}，请先在插件卡片上勾选授权"))
+
+    if cmd.per == "account":
+        pool = [a for a in _account_list(cfg) if a["enabled"]]
+        if account:
+            pool = [a for a in pool if a["name"] == account]
+            if not pool:
+                raise HTTPException(status_code=404, detail=f"没有启用的账号 {account}")
+        if not pool:
+            raise HTTPException(status_code=400, detail="没有可用账号：先添加账号并启用。")
+        fan = [(["--account", a["name"], "--platform", a["platform"]], a["name"]) for a in pool]
+    else:
+        fan = [([], "")]
+
+    token, jti = scopes.issue(current, plugin_id, granted)
+    conf = {**plugin_settings(session, m), "params": plugin_params.load(mf, cfg)}
+    pids = []
+    for extra, who in fan:
+        pids.append(_launch(m, cmd.name, [*extra, "--soroban-url", _SELF_URL],
+                            token=token, config=conf, jti=jti,
+                            on_done=_result_writer(plugin_id, cmd.label)))
+    cfg.last_outcome, cfg.last_summary = "running", f"{cmd.label} 执行中…"
+    cfg.last_finished_at = None
+    cfg.updated_at = utcnow()
+    session.add(cfg)
+    session.commit()
+    return {"launched": True, "command": cmd.name, "pids": pids,
+            "targets": [w for _, w in fan if w], "scopes": sorted(granted)}
+
+
+def _result_writer(plugin_id: str, label: str):
+    """子进程收割完之后把结果写回 PluginConfig，供插件卡片显示。
+
+    **开自己的 Session**：收割跑在 daemon 线程里，没有请求作用域的 session 可用。
+    写失败只记日志——结果展示失败不该影响别的东西。
+    """
+    def done(ok: bool, summary: str) -> None:
+        try:
+            with Session(get_engine()) as s:
+                cfg = s.get(PluginConfig, plugin_id)
+                if cfg is None:
+                    return
+                cfg.last_outcome = "ok" if ok else "failed"
+                cfg.last_summary = f"{label}：{summary}"[:512]
+                cfg.last_finished_at = utcnow()
+                s.add(cfg)
+                s.commit()
+        except Exception as e:                              # noqa: BLE001
+            log.warning("写回插件 %s 的运行结果失败：%s", plugin_id, e)
+    return done
+
+
 @router.post("/{plugin_id}/fetch")
 def fetch(
     plugin_id: str,
@@ -772,7 +936,9 @@ def rename_account(
     """账号改名：一次性迁移它名下的暂存/账本订单（保留标签颜色）、重命名磁盘登录会话、更新插件配置。
     只做纯改名——new 若已被占用（已有账号/数据/授权）则拒绝，不与「合并」语义混淆。"""
     m = _find_manifest(plugin_id)
-    if m.get("platform") != "taobao":                       # 账号↔platform_account 的耦合是淘宝专属；别的插件先不支持
+    if not m["_m"].ledger_field:
+        # 该操作要把账号名迁到账本的某一列上，清单没声明 accounts_ledger_field
+        # 就说明这个插件的账号与账本无关（如汇率），不支持这类操作。
         raise HTTPException(status_code=400, detail="该插件不支持账号改名。")
     new = new.strip()
     if not new or "," in new:
@@ -810,7 +976,9 @@ def rename_account(
 
 def _require_platform_account(m: dict, session: Session, account: str) -> None:
     """校验：淘宝插件 + account 确为已知账号（配置/磁盘/历史数据里出现过）。否则 400/404。"""
-    if m.get("platform") != "taobao":
+    if not m["_m"].ledger_field:
+        # 同上：清单没声明 accounts_ledger_field 就说明这个插件的账号与账本无关，
+        # 「按账号删单」无从谈起。核心不该知道任何具体插件的 id。
         raise HTTPException(status_code=400, detail="该插件不支持按账号删除订单。")
     cfg = session.get(PluginConfig, m["id"])
     if account not in _known_names(cfg, m) and not tag_value_in_use(session, "platform_account", account):

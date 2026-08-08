@@ -15,7 +15,11 @@ import pytest
 _TMPDIR = Path(tempfile.mkdtemp(prefix="soroban-tests-"))
 os.environ["DATABASE_URL"] = f"sqlite:///{_TMPDIR / 'test.db'}"
 os.environ["SECRET_KEY"] = "test-secret-key-0123456789abcdef0123456789abcdef"
-os.environ.setdefault("SCRAPER_DIR", str(_TMPDIR / "scraper-none"))   # 隔离真实 scraper/，插件发现恒为空
+# 隔离真实插件目录，插件发现恒为空。**两个名字都要设**：
+# PLUGIN_DIR 是现名、SCRAPER_DIR 是兼容别名，只设旧名的话新名会回落到仓库里的
+# plugins/，测试就变成「取决于本机装了哪些插件」——那种测试的绿是没有意义的。
+os.environ.setdefault("PLUGIN_DIR", str(_TMPDIR / "plugins-none"))
+os.environ.setdefault("SCRAPER_DIR", str(_TMPDIR / "scraper-none"))
 
 from fastapi.testclient import TestClient  # noqa: E402
 from sqlmodel import Session, select  # noqa: E402

@@ -23,4 +23,14 @@ class PluginConfig(SQLModel, table=True):
     # 而 SQLite 照单全收——不带长度的话就是「本地全绿、切到 MySQL 迁移直接失败」，
     # 本项目最常见的那类双引擎发散。512 够放满这张权限表里的全部 scope 名。
     granted_scopes: str = Field(default="[]", max_length=512, nullable=False)
+    # 上一次执行的结果。原先只有 last_run_at（还只在定时路径推进），
+    # 于是「跑完了吗、成没成、抓了几条」全埋在日志里——界面上一个字都看不到。
+    # 插件是 fire-and-forget 的，没有这三列就等于没有反馈。
+    # 刻意**不叫 last_status**：本项目的公理是「叫 status 的列必须是某个业务段的状态机」
+    # （purchase_status / shipment_status / import_status）。这一列是「上次跑得怎么样」，
+    # 不是状态机——沿用 status 会让它被 tests/test_status_taxonomy.py 的登记表要求表态，
+    # 而它压根不属于任何业务段。那条守卫这次就当场抓到了我。
+    last_outcome: str = Field(default="", max_length=16)     # ok | failed | running | ""
+    last_summary: str = Field(default="", max_length=512)   # 给人看的一句话（插件回的 JSON 摘要）
+    last_finished_at: Optional[dt.datetime] = Field(default=None, sa_type=UtcDateTime())
     updated_at: dt.datetime = Field(default_factory=utcnow, sa_type=UtcDateTime())

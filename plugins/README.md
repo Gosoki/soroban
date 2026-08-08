@@ -57,11 +57,40 @@ version = "0.1.0"
 python = "inherit"          # 依赖已在 soroban 里 → 不建 venv、不用安装
 # python = ".venv/bin/python"   # 有重依赖就走独立环境
 
-entry = "-m my_plugin"      # 标准 CLI：至少实现 fetch
-scopes = ["fx:write"]       # 要什么权限（用户勾选后才生效）
+entry = "-m my_plugin"      # 标准 CLI
+scopes = ["fx:write"]       # 要什么权限（用户在卡片上勾选后才生效）
 settings = ["fx.sources"]   # 要读核心的哪几项设置（通过 SOROBAN_CONFIG 下发）
-# accounts = true           # 按账号展开成多个子进程；不写 = 整体跑一次
+
+# 按账号展开成多个子进程；不写 = 整体跑一次（汇率、快递查询这类）
+# accounts = true
+# accounts_ledger_field = "platform_account"   # 账号名落到账本哪一列（才支持按账号改名/删单）
+
+# 能执行什么。**卡片上的按钮就是按这些长出来的**，核心不认识任何具体动词。
+[[commands]]
+name = "fetch"              # 传给你 CLI 的动词
+label = "抓取"              # 按钮上的字
+hint = "鼠标悬停时的说明"
+primary = true              # 主按钮（高亮那个）
+needs = ["fx:write"]        # 缺权限就禁用按钮并说明，而不是点了收 403
+# per = "account"           # 每个账号起一个进程；默认 plugin = 整体一次
+# confirm = "确定要清空吗？"  # 非空则先弹确认
+
+# 插件私有参数。**卡片上的表单就是按这些长出来的**，核心不理解其含义，
+# 只负责存、校验类型、渲染控件、下发（运行时在 SOROBAN_CONFIG 的 params 里）。
+[[params]]
+key = "timeout"
+label = "超时（秒）"
+type = "int"                # bool | int | str | select | secret
+default = 20
+min = 5
+max = 120
+hint = "?" 号里的说明
 ```
+
+**跨插件通用的偏好放核心**（`services/prefs.SPECS`，设置页统一渲染），插件用 `settings = [...]`
+声明要读哪几项；**只有本插件懂的**放 `[[params]]`。分不清就问一句：换个插件还成立吗？
+
+`secret` 类型的参数存下来但**不回显**（API 只回「已设置/未设置」），日志里也会脱敏。
 
 CLI 约定：**stdout 只吐一行 JSON**（soroban 解析它写日志），日志走 stderr，
 有失败就非零退出——否则「30 单全被拒」和「一切正常」在界面上长得一模一样。
