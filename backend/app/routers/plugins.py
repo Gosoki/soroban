@@ -818,6 +818,11 @@ def run_command(plugin_id: str, command: str, account: Optional[str] = None,
         raise HTTPException(status_code=400, detail=f"插件未安装：缺 venv（{_python(m)}）")
 
     cfg = session.get(PluginConfig, plugin_id) or PluginConfig(plugin_id=plugin_id)
+    if not cfg.enabled:
+        # 「启用」是这个插件的**总开关**：停用后定时不跑、手动也执行不了。
+        # 界面上按钮已经禁用，但接口不能只靠界面把关——那样别的调用方（或手滑的 curl）
+        # 照样能把一个用户明确停用的插件跑起来。
+        raise HTTPException(status_code=409, detail=f"插件「{m['_m'].name}」已停用，先在卡片上打开开关")
     granted = scopes.token_scopes(m, cfg)
     missing = set(cmd.needs) - granted
     if missing:

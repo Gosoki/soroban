@@ -10,14 +10,33 @@
     <el-card v-for="p in plugins" :key="p.id" class="plugin" v-loading="p._busy">
       <template #header>
         <div class="head">
-          <span class="pname">{{ p.name }}</span>
+          <!-- 一个开关就是「启用/停用」：停用后定时不跑、命令按钮也点不动。
+               原先叫「启用定时」，但它其实是这个插件的总开关——名字比实际管得窄，
+               会让人以为「停用了还能手动点一下」。 -->
+          <el-switch v-model="p._form.enabled" :disabled="!p.installed" @change="saveConfig(p)"
+                     :title="p._form.enabled ? '已启用（定时与手动执行都可用）' : '已停用（定时不跑，命令也点不动）'" />
+          <span class="pname" :class="{ off: !p._form.enabled }">{{ p.name }}</span>
           <span class="pver">v{{ p.version || '?' }}</span>
-          <el-tag size="small" :style="typeStyle(installTagType(p))">
-            {{ installTagText(p) }}
+          <el-tag size="small" :style="typeStyle(installTagType(p))">{{ installTagText(p) }}</el-tag>
+          <el-tag v-if="p.last_run.outcome" size="small" :style="typeStyle(runTagType(p.last_run.outcome))"
+                  :title="p.last_run.summary + (p.last_run.at ? ' · ' + fmtTime(p.last_run.at) : '')">
+            {{ { ok: '成功', failed: '失败', running: '执行中' }[p.last_run.outcome] || p.last_run.outcome }}
           </el-tag>
+          <el-tag v-if="pendingGrants(p).length" size="small" :style="typeStyle('warning')"
+                  :title="`还没授权：${pendingGrants(p).join('、')}——展开卡片勾选`">需要授权</el-tag>
+          <span v-if="p.last_run.summary" class="lastsum">{{ p.last_run.summary }}</span>
+
           <div class="grow" />
-          <span class="sw-label">启用定时</span>
-          <el-switch v-model="p._form.enabled" :disabled="!p.installed" @change="saveConfig(p)" />
+          <!-- 命令按钮留在卡片头：它们是每天要点的，不该藏进折叠里 -->
+          <el-button v-for="c in p.commands" :key="c.name" size="small"
+                     :type="c.primary ? 'primary' : 'default'"
+                     :disabled="!p.installed || !p._form.enabled || !!c.blocked.length
+                                || (c.per === 'account' && !enabledCount(p))"
+                     :title="cmdTitle(p, c)" @click.stop="doRun(p, c)">
+            {{ c.label }}<template v-if="c.per === 'account'">（{{ enabledCount(p) }}）</template>
+          </el-button>
+          <el-button link :icon="p._open ? ArrowUp : ArrowDown" :title="p._open ? '收起' : '展开设置'"
+                     @click="p._open = !p._open" />
         </div>
       </template>
 
@@ -49,38 +68,12 @@
       <!-- 折叠区：这三块都是「配一次就不动」的。卡片上每天要看的只有「上次结果」
            与命令按钮，它们留在外面；其余收起来，卡片才不会长得像配置文件。
            `v-model` 记在 _form.open 里，刷新（每 3 秒轮询安装进度）不会把用户展开的合上。 -->
-      <el-collapse v-model="p._form.open" class="fold">
-      <el-collapse-item name="cfg">
-        <template #title>
-          <span class="fold-t">设置</span>
-          <span class="fold-n">定时 {{ p.config.schedule_minutes ? p.config.schedule_minutes + ' 分钟' : '关' }}<template v-if="p.params.length"> · 参数 {{ p.params.length }}</template></span>
-        </template>
+      <div v-show="p._open" class="body">
       <div class="field">
         <label class="flabel">定时执行（分钟，0=关闭）</label>
         <el-input-number v-model="p._form.schedule_minutes" :min="0" :step="30" size="small" />
         <el-button type="primary" size="small" @click="saveConfig(p)">保存</el-button>
         <span class="sub">{{ p.config.last_run_at ? '上次触发 ' + fmtTime(p.config.last_run_at) : '尚未执行' }}</span>
-      </div>
-
-      <!-- 上次执行结果。插件是 fire-and-forget，没有这一块就只能去翻 soroban 日志 -->
-      <div v-if="p.last_run.outcome" class="field">
-        <label class="flabel">上次结果</label>
-        <el-tag size="small" :style="typeStyle(runTagType(p.last_run.outcome))">
-          {{ { ok: '成功', failed: '失败', running: '执行中' }[p.last_run.outcome] || p.last_run.outcome }}
-        </el-tag>
-        <span class="sub">{{ p.last_run.summary }}</span>
-        <span v-if="p.last_run.at" class="sub">· {{ fmtTime(p.last_run.at) }}</span>
-      </div>
-
-      <!-- 命令：按清单声明长按钮。加插件/加动词都不用改这里 -->
-      <div v-if="p.commands.length" class="field cmds">
-        <label class="flabel">执行</label>
-        <el-button v-for="c in p.commands" :key="c.name" size="small"
-                   :type="c.primary ? 'primary' : 'default'"
-                   :disabled="!p.installed || !!c.blocked.length || (c.per === 'account' && !enabledCount(p))"
-                   :title="cmdTitle(p, c)" @click="doRun(p, c)">
-          {{ c.label }}<template v-if="c.per === 'account'">（{{ enabledCount(p) }}）</template>
-        </el-button>
       </div>
 
       <!-- 参数：插件私有的，核心不理解其含义，只按类型渲染控件 -->
@@ -109,17 +102,13 @@
           <span class="sub">保存后下一次执行即按新值跑</span>
         </div>
       </template>
-      </el-collapse-item>
-
       <!-- 权限：清单声明 ∩ 你勾选 ∩ 核心已知，三者的交集才是插件实际拿到的。
            有「需要新授权」时**自动展开**——那是要人处理的事，藏起来就等于没提示。 -->
-      <el-collapse-item v-if="p.scopes.declared.length" name="scopes">
-        <template #title>
-          <span class="fold-t">权限</span>
-          <span class="fold-n">{{ p.scopes.effective.length }}/{{ p.scopes.declared.length }}</span>
-          <el-tag v-if="pendingGrants(p).length" size="small" :style="typeStyle('warning')"
-                  title="插件更新后新要了权限，需要你确认">需要新授权</el-tag>
-        </template>
+      <div class="sect">
+        权限（{{ p.scopes.effective.length }}/{{ p.scopes.declared.length }}）
+        <el-tag v-if="pendingGrants(p).length" size="small" :style="typeStyle('warning')"
+                title="插件更新后新要了权限，需要你确认">需要新授权</el-tag>
+      </div>
       <div class="grants">
         <label v-for="k in p.scopes.declared" :key="k" class="grant">
           <el-checkbox :model-value="p._form.granted.includes(k)"
@@ -167,15 +156,10 @@
         <div class="grow" />
         <el-button size="small" link type="danger" @click="doDeleteAccount(p, a.account)">删除</el-button>
       </div>
-      </el-collapse-item>
       <!-- 账号：只有清单声明了 accounts 的插件才有这个维度。
            汇率、快递查询这类插件卡片上不该出现「添加账号」——那是纯噪音，
            而且会让人以为是自己漏配了什么。 -->
-      <el-collapse-item v-if="p.accounts_enabled" name="accounts">
-        <template #title>
-          <span class="fold-t">账号</span>
-          <span class="fold-n">{{ enabledCount(p) }} 启用 / {{ p.accounts.length }}</span>
-        </template>
+      <div v-if="p.accounts_enabled" class="sect">账号（{{ enabledCount(p) }} 启用 / {{ p.accounts.length }}）</div>
       <div class="subsect">添加账号</div>
       <div v-if="p.accounts_enabled" class="field">
         <el-input v-model="p._add.name" size="small" placeholder="账号昵称" style="width: 160px"
@@ -188,8 +172,7 @@
         <span class="sub">平台加时确定、之后不可改（改名只改昵称）</span>
       </div>
 
-      </el-collapse-item>
-      </el-collapse>
+      </div>
     </el-card>
   </div>
 </template>
@@ -197,7 +180,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Refresh, Download, QuestionFilled } from '@element-plus/icons-vue'
+import { ArrowDown, ArrowUp, Refresh, QuestionFilled } from '@element-plus/icons-vue'
 import { pluginsApi, tagsApi } from '@/api'
 import { tagStyleAt, typeStyle } from '@/constants'
 import { fmtDateTime } from '@/utils/datetime'
@@ -220,6 +203,7 @@ function runTagType(outcome) {
 // 按钮为什么点不了，鼠标悬停时说清楚——比一个灰按钮强
 function cmdTitle(p, c) {
   if (!p.installed) return '插件未安装'
+  if (!p._form.enabled) return '插件已停用——打开左上角的开关'
   if (c.blocked.length) return `缺权限：${c.blocked.join('、')}——先在下面勾选授权`
   if (c.per === 'account' && !enabledCount(p)) return '没有启用的账号'
   return c.hint || ''
@@ -278,14 +262,16 @@ async function load() {
     const prev = Object.fromEntries(plugins.value.map((x) => [x.id, x]))
     plugins.value = list.map((p) => ({
       ...p, _busy: false,
+      // **永远默认收起**。曾经写成「有待授权就自动展开」，结果新装的插件全是展开的，
+      // 反而比不折叠还乱。要人处理的事改成在卡片头挂一个标签——不展开也看得见。
+      // 轮询刷新时沿用上一次的展开状态，别把用户展开的合上。
+      _open: prev[p.id]?._open ?? false,
       // 刷新时保留用户勾过的选项，别让轮询把复选框弹回默认
       _withBrowser: prev[p.id]?._withBrowser ?? true,
       _form: { enabled: p.config.enabled, schedule_minutes: p.config.schedule_minutes || 0,
                granted: [...(p.scopes?.granted || [])],
                // secret 参数后端只回 '__set__'，不能把它当值填回输入框——
                // 那样一保存就会把密钥真的改成 '__set__' 这个字符串。
-               // 默认全收；有待确认的授权就自动展开那一块
-               open: pendingGrants(p).length ? ['scopes'] : [],
                params: Object.fromEntries((p.params || []).map(
                  (x) => [x.key, x.value === '__set__' ? '' : x.value])) },
       _add: { name: '', platform: '淘宝' },
@@ -507,14 +493,19 @@ onMounted(load)
 .bar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
 .hint { color: var(--txt-3); font-size: 12px; flex: 1; }
 .plugin { margin-bottom: 16px; }
-.head { display: flex; align-items: center; gap: 10px; }
+.head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .pname { color: var(--txt-1); font-size: 15px; font-weight: 600; }
+/* 停用的插件名字变淡：一眼能从一排卡片里看出哪个没在跑 */
+.pname.off { color: var(--txt-3); font-weight: 500; }
+/* 上次结果的摘要跟在标签后面，占满剩余宽度但不换行——卡片头要保持一行高 */
+.lastsum { color: var(--txt-3); font-size: 12px; max-width: 40%; overflow: hidden;
+           text-overflow: ellipsis; white-space: nowrap; }
 .pver { color: var(--txt-3); font-size: 12px; }
 .grow { flex: 1; }
-.sw-label { color: var(--txt-2); font-size: 13px; }
 .field { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
 .flabel { color: var(--txt-2); font-size: 13px; min-width: 180px; }
 .sub { color: var(--txt-3); font-size: 12px; }
+.body { padding-top: 4px; }
 .sect { color: var(--txt-body); font-size: 13px; font-weight: 600; margin: 6px 0 10px; padding-top: 12px; border-top: 1px solid var(--border-dim); }
 .acct { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .acct.dim .aname, .acct.dim .c-plat, .acct.dim .c-auth { opacity: 0.4; }   /* 只灰昵称/平台/授权，开关和按钮保持清晰可用 */
@@ -529,10 +520,5 @@ onMounted(load)
 .g-hint { color: var(--txt-3); font-size: 12px; }
 .help { color: var(--txt-3); cursor: help; font-size: 13px; }
 .cmds { flex-wrap: wrap; }
-.fold { border-top: 1px solid var(--border-dim); margin-top: 8px; }
-.fold :deep(.el-collapse-item__header) { font-size: 13px; height: 40px; line-height: 40px; gap: 8px; }
-.fold :deep(.el-collapse-item__content) { padding-bottom: 8px; }
-.fold-t { font-weight: 600; color: var(--txt-body); }
-.fold-n { color: var(--txt-3); font-size: 12px; }
 .subsect { color: var(--txt-3); font-size: 12px; margin: 8px 0 6px; }
 </style>

@@ -201,6 +201,8 @@ def test_running_a_command_without_scope_is_409_not_403(client, fake_plugin):
     # 自己建立前提：client 夹具的库在整个会话里共享，上一条用例授过权且没收回。
     # 依赖用例顺序的测试会在「单跑这一条」时表现不同——那种绿是骗人的。
     client.put("/api/plugins/demo/grants", json={"granted": []})
+    # 先启用：「停用」那道闸排在权限之前，不打开的话这条测到的是另一件事
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
     r = client.post("/api/plugins/demo/run/run")
     assert r.status_code == 409
     assert "fx:write" in r.json()["detail"]
@@ -276,3 +278,25 @@ def test_frontend_does_not_hardcode_any_plugin_id():
     tpl = src.split("<script", 1)[0] + src.split("</script>", 1)[-1]
     bad = [m for m in re.findall(r"['\"](taobao|fx)['\"]", src)]
     assert not bad, f"前端按插件 id 分支了：{set(bad)}——应当只按后端下发的声明渲染"
+
+
+def test_disabled_plugin_cannot_be_run(client, fake_plugin):
+    """「启用」是总开关：停用的插件手动也执行不了。
+
+    界面上按钮会禁用，但接口不能只靠界面把关——别的调用方（或手滑的 curl）
+    照样能把一个用户明确停用的插件跑起来。原先这个开关只管定时，
+    名字叫「启用定时」，管得比看上去窄。
+    """
+    client.put("/api/plugins/demo/grants", json={"granted": ["fx:write"]})
+    client.put("/api/plugins/demo/config", json={"enabled": False, "schedule_minutes": 0})
+    r = client.post("/api/plugins/demo/run/run")
+    assert r.status_code == 409 and "停用" in r.json()["detail"]
+
+
+def test_enabled_plugin_passes_the_switch(client, fake_plugin):
+    """反面：启用之后这道闸不该再挡（挡住的话就成了「开关打不开」）。"""
+    client.put("/api/plugins/demo/grants", json={"granted": ["fx:write"]})
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
+    r = client.post("/api/plugins/demo/run/run")
+    # 走到这一步说明过了「停用」与「权限」两道闸；再往后是真起子进程（本机没有 demo 的入口）
+    assert r.status_code != 409 or "停用" not in str(r.json().get("detail", ""))
