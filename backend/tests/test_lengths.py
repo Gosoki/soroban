@@ -241,3 +241,23 @@ def test_server_owned_names_are_real_columns():
         real |= set(model.__table__.columns.keys())
     stale = SERVER_OWNED - real
     assert not stale, f"SERVER_OWNED 里这些名字已不是任何模型的列，名单该更新了：{sorted(stale)}"
+
+
+def test_no_text_column_has_a_server_default():
+    """带 DEFAULT 的 TEXT/BLOB 列在 **MySQL 上直接建不出来**（错误 1101），SQLite 却照单全收。
+
+    结果就是本项目最常见的那类失败：本地测试全绿、切到 MySQL 时迁移当场炸，
+    而炸的位置离根因很远（一条 ALTER TABLE 的报错，不提「你不该给 TEXT 加默认值」）。
+    需要默认值就用带长度的 VARCHAR。
+    """
+    from sqlalchemy import Text
+    from sqlmodel import SQLModel
+
+    bad = []
+    for tname, table in SQLModel.metadata.tables.items():
+        for col in table.columns:
+            if isinstance(col.type, Text) and col.server_default is not None:
+                bad.append(f"{tname}.{col.name}")
+    assert not bad, (
+        f"这些 TEXT 列带了 server_default，MySQL 上建不出来：{bad}\n"
+        "改成 sa.String(length=N)——需要默认值就说明它不该是无长度的 TEXT。")

@@ -23,7 +23,29 @@ def _template_of(path) -> str:
     src = pathlib.Path(path).read_text(encoding="utf-8")
     return src.split("<script", 1)[0]
 _ORDERS_VUE = _REPO / "frontend" / "src" / "views" / "Orders" / "index.vue"
-_SCRAPER_NORMALIZE = _REPO / "scraper" / "soroban-scraper-taobao" / "taobao_scraper" / "normalize.py"
+def plugin_source(*parts) -> Path:
+    """定位插件仓里的文件。找不到就**红**，不是 skip。
+
+    这些守卫钉的是跨仓契约（插件按字段名 POST，名字对不上 = 整批 422 静默丢同步）——
+    历史上排第一的 bug 类。原先写的是 `if not path.is_file(): pytest.skip("插件未安装")`，
+    于是把插件目录从 `scraper/` 搬到 `plugins/` 之后，它们**全部静默跳过**，
+    而整套测试依然全绿。守卫悄悄归零比没有守卫更危险。
+
+    真的没 checkout 插件仓时（CI、纯后端开发机），显式设 `SOROBAN_NO_PLUGINS=1` 跳过——
+    要跳过必须是**有人明确表示**，不能是路径写错的副作用。
+    """
+    import os
+
+    for base in ("plugins/soroban-plugin-taobao", "scraper/soroban-scraper-taobao"):
+        p = _REPO.joinpath(base, *parts)
+        if p.is_file():
+            return p
+    if os.environ.get("SOROBAN_NO_PLUGINS"):
+        pytest.skip("显式声明了本机没有插件仓（SOROBAN_NO_PLUGINS=1）")
+    raise AssertionError(
+        f"找不到插件文件 {'/'.join(parts)}。插件仓应在 plugins/soroban-plugin-taobao/。\n"
+        "本条守卫钉的是跨仓字段名契约，不能静默跳过——真没有插件仓请设 SOROBAN_NO_PLUGINS=1。")
+
 
 
 def _js_array(text: str, name: str) -> list[str]:
@@ -62,11 +84,9 @@ def test_frontend_status_rank_matches_backend():
 
 def test_scraper_status_map_targets_are_valid(constants_js):
     """爬虫 STATUS_MAP 的目标值必须都是后端 PurchaseStatus 的合法值，否则回灌整批 422。"""
-    if not _SCRAPER_NORMALIZE.is_file():
-        pytest.skip("插件未安装")
-    text = _SCRAPER_NORMALIZE.read_text(encoding="utf-8")
-    m = re.search(r"STATUS_MAP\s*=\s*\{(.*?)\n\}", text, re.S)
-    assert m, "没找到 STATUS_MAP"
+    text = plugin_source("taobao_scraper", "normalize.py").read_text(encoding="utf-8")
+    m = re.search(r"PURCHASE_STATUS_MAP\s*=\s*\{(.*?)\n\}", text, re.S)
+    assert m, "没找到 PURCHASE_STATUS_MAP"
     targets = {v for _, v in re.findall(r'"([^"]+)"\s*:\s*"([^"]+)"', m.group(1))}
     valid = {s.value for s in PurchaseStatus}
     assert targets <= valid, f"爬虫会推出后端不接受的状态：{sorted(targets - valid)}"
@@ -324,21 +344,44 @@ def test_settings_page_never_touches_raw_draft_array():
     """设置页的源列表在数据回来之前是 undefined。模板里直接 `draft['fx.sources'].xxx`
     会在渲染时抛 TypeError → **整页卡死白屏**（本页真这么炸过一次）。
     统一走带兜底的 `chain` computed，模板里不许再出现裸的 draft['fx.sources']。"""
-    src = (_REPO / "frontend" / "src" / "views" / "Settings" / "index.vue").read_text(encoding="utf-8")
-    assert "draft['fx.sources']" not in _template_of(
-        _REPO / "frontend" / "src" / "views" / "Settings" / "index.vue"
-    ), "模板里又直接摸 draft['fx.sources'] 了"
-    assert "const chain = computed(" in src, "缺少带兜底的 chain computed"
+    import re
+
+    tpl = _template_of(_REPO / "frontend" / "src" / "views" / "Settings" / "index.vue")
+    # 会炸的形状是「取下标之后直接点属性」：draft[...]. → undefined.xxx → 渲染时 TypeError。
+    # 判据取这个形状本身，而不是某个具体变量名（原先钉的是 `const chain = computed(`，
+    # 页面改成按注册表渲染、不再有那个变量之后，这条会变成一句与安全无关的空话）。
+    bad = re.findall(r"draft\[[^\]]+\]\s*\.", tpl)
+    assert not bad, f"模板里直接对可能为 undefined 的 draft 下标取属性：{bad}"
+    # 反面：凡是在模板里当数组用的，必须带兜底
+    for m in re.finditer(r"draft\[[^\]]+\](?!\s*(?:\|\||\)|\"|\s*$))", tpl):
+        seg = tpl[m.start():m.start() + 60]
+        assert "|| []" in seg or 'v-model' in tpl[max(0, m.start() - 40):m.start()], (
+            f"这处 draft 下标没兜底，数据回来之前会是 undefined：{seg!r}")
 
 
 def test_settings_source_keys_match_backend():
-    """页面上那份「源 key → 中文名」必须与后端 SOURCE_LABELS 对齐，
-    否则用户看到的是 `erapi` 这种原始 key。"""
-    from app.services.fx import SOURCE_LABELS
+    """设置页那份「源 key → 中文名」必须覆盖**能排进优先级链**的每个源，
+    否则拖拽排序时用户看到的是 `erapi` 这种原始 key。
+
+    比的是 `FX_SOURCE_CHOICES`（链上可选项）而不是 `SOURCE_LABELS`（汇率行的来源标签）——
+    后者还包含「手填」这类**不参与链**的来源：它不出现在排序列表里，
+    它的展示名由后端随 `FxRead.source_label` 一起下发。两者混为一谈会逼着页面
+    去渲染一个根本选不了的源。
+    """
+    from app.services.prefs import FX_SOURCE_CHOICES
 
     src = (_REPO / "frontend" / "src" / "views" / "Settings" / "index.vue").read_text(encoding="utf-8")
-    for key in SOURCE_LABELS:
+    for key in FX_SOURCE_CHOICES:
         assert f"{key}:" in src, f"设置页缺少源 {key} 的展示名"
+
+
+def test_every_chain_source_has_a_label():
+    """链上可选的每个源都得有中文名，否则日志与界面上会冒出原始 key。"""
+    from app.services.fx import SOURCE_LABELS
+    from app.services.prefs import FX_SOURCE_CHOICES
+
+    missing = [k for k in FX_SOURCE_CHOICES if k not in SOURCE_LABELS]
+    assert not missing, f"这些汇率源没有展示名：{missing}"
 
 
 def test_nav_is_generated_from_routes():

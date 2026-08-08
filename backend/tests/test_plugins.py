@@ -213,8 +213,8 @@ def test_broken_plugin_toml_is_skipped(tmp_path, monkeypatch, client):
     assert client.get("/api/plugins").json() == []
 
 
-def test_missing_scraper_dir_is_empty(tmp_path, monkeypatch, client):
-    monkeypatch.setattr(settings, "SCRAPER_DIR", str(tmp_path / "does-not-exist"))
+def test_missing_plugin_dir_is_empty(tmp_path, monkeypatch, client):
+    monkeypatch.setattr(settings, "PLUGIN_DIR", str(tmp_path / "does-not-exist"))
     assert client.get("/api/plugins").json() == []
 
 
@@ -312,3 +312,158 @@ def test_needs_is_cached(client, fake_plugin, monkeypatch):
     client.get("/api/plugins")
     client.get("/api/plugins")
     assert len(calls) == 1, f"探测跑了 {len(calls)} 次，缓存没生效"
+
+
+# --- 定时调度：两类插件都得跑得起来 -------------------------------------------
+
+def test_account_based_plugin_fans_out_per_account():
+    """声明了 accounts=true 的插件（淘宝）：一个账号一个子进程，各带自己的平台。"""
+    from app.routers.plugins import _fanout
+
+    class _Cfg:
+        params_json = '{"accounts": [{"name": "acctA", "platform": "淘宝", "enabled": true},'\
+                      ' {"name": "acctB", "platform": "闲鱼", "enabled": true},'\
+                      ' {"name": "acctC", "platform": "淘宝", "enabled": false}]}'.replace("true", "true")
+
+    got = _fanout({"accounts": True}, _Cfg())
+    names = [e[1] for e in got]
+    assert names == ["/acctA", "/acctB"], f"停用的账号不该展开：{names}"
+    assert got[0][0] == ["--account", "acctA", "--platform", "淘宝"]
+
+
+def test_accountless_plugin_still_runs_once():
+    """**本次要支持的主要形态**：汇率、快递查询这类插件没有账号概念。
+
+    以前 `_run_due` 只按账号展开 → 账号为空则一个都不起 → `launched` 恒为 0 →
+    `last_run_at` 永不推进 → 这类插件**永远不会被定时触发**，而界面上完全看不出异常
+    （显示「已启用」、有定时周期，只是从不运行）。
+    """
+    from app.routers.plugins import _fanout
+
+    class _Cfg:
+        params_json = "{}"
+
+    got = _fanout({"id": "fx"}, _Cfg())
+    assert len(got) == 1, "无账号插件必须整体跑一次"
+    assert got[0][0] == [], "不该给它带 --account"
+
+
+def test_accountless_plugin_does_not_get_account_flag():
+    """就算配置里意外留了账号，没声明 accounts=true 的插件也不按账号展开——
+    否则给一个不认识 --account 的插件传了这个参数，它会直接报错退出。"""
+    from app.routers.plugins import _fanout
+
+    class _Cfg:
+        params_json = '{"accounts": [{"name": "x", "platform": "淘宝", "enabled": true}]}'
+
+    got = _fanout({"id": "fx"}, _Cfg())
+    assert got == [([], "")]
+
+
+# --- 目录与命名：插件不只是爬虫 -------------------------------------------------
+
+def test_canonical_plugin_layout():
+    """插件放 `plugins/soroban-plugin-*`。
+
+    改名的理由不是审美：`scraper` 这个词把「外部数据获取」窄化成了「爬」，
+    而汇率、国际快递查询都没有爬的语义。名字窄了，下一个人就会以为这套机制不适用于它们，
+    于是绕过插件另开一条接口——那正是这次重构要消灭的东西。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    assert (root / "plugins").is_dir(), "缺 plugins/ 目录"
+    stray = [p.name for p in (root / "plugins").glob("soroban-scraper-*")]
+    assert not stray, f"plugins/ 下还留着旧前缀的目录：{stray}"
+
+
+def test_legacy_scraper_dir_is_still_discovered(tmp_path, monkeypatch):
+    """老部署把插件放在 scraper/ 下。升级后**不能**让它们凭空消失——
+    那种失败很吓人：插件列表突然空了，用户以为配置丢了。"""
+    import tomllib  # noqa: F401  （仅表明 manifest 走 toml 解析）
+
+    from app.routers import plugins as mod
+
+    legacy = tmp_path / "scraper" / "soroban-scraper-old"
+    legacy.mkdir(parents=True)
+    (legacy / "plugin.toml").write_text('id = "old"\nname = "老插件"\n', encoding="utf-8")
+    monkeypatch.setattr(mod, "_SOROBAN_ROOT", tmp_path)
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "plugins"))
+    assert [m["id"] for m in mod.discover()] == ["old"]
+
+
+def test_new_prefix_wins_when_both_exist(tmp_path, monkeypatch):
+    """搬家搬到一半（新旧目录都有同一个 id）时，新目录赢，不出现两条同名插件。"""
+    from app.routers import plugins as mod
+
+    for base, prefix in (("plugins", "soroban-plugin-x"), ("scraper", "soroban-scraper-x")):
+        d = tmp_path / base / prefix
+        d.mkdir(parents=True)
+        (d / "plugin.toml").write_text(f'id = "x"\nname = "{base}"\n', encoding="utf-8")
+    monkeypatch.setattr(mod, "_SOROBAN_ROOT", tmp_path)
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "plugins"))
+    found = mod.discover()
+    assert len(found) == 1 and found[0]["name"] == "plugins", f"新目录没赢：{found}"
+
+
+# --- 配置下发：设置项在核心、插件只声明要读哪几项 -------------------------------
+
+def test_plugin_settings_picks_declared_keys(session):
+    """插件用 plugin.toml 的 `settings = [...]` 声明它关心哪些设置，核心把当前值给它。
+
+    设置项**定义在核心**（services/prefs.SPECS）而不是 plugin.toml：设置页已经能按注册表
+    自动渲染标签、说明、取值范围、联动禁用；搬进 plugin.toml 等于把这些退回成一个
+    要手工编辑的文本文件。插件只说「我要读哪几项」。
+    """
+    from app.routers.plugins import plugin_settings
+
+    got = plugin_settings(session, {"id": "fx", "settings": ["fx.sources", "fx.attempts"]})
+    assert set(got) == {"fx.sources", "fx.attempts"}
+    assert isinstance(got["fx.sources"], list)
+
+
+def test_unknown_setting_key_is_skipped_not_fatal(session, caplog):
+    """插件与核心版本不匹配时（插件要一个核心还没有的设置），宁可少给一项，
+    也不该让整次触发失败——但必须留一行日志，否则「配置没生效」会查不出原因。"""
+    from app.routers.plugins import plugin_settings
+
+    with caplog.at_level("WARNING"):
+        got = plugin_settings(session, {"id": "x", "settings": ["fx.attempts", "nope.not_real"]})
+    assert set(got) == {"fx.attempts"}
+    assert any("不认识的设置项" in r.getMessage() for r in caplog.records)
+
+
+def test_plugin_declared_settings_are_real_keys():
+    """所有插件 plugin.toml 里声明的设置键，必须是核心注册表里真实存在的。
+
+    写错一个键不会报错——`plugin_settings` 只是跳过它。于是插件拿不到配置、
+    按内置默认值跑，而界面上看不出任何异常。这条在打包/发布前就红。
+    """
+    from app.routers.plugins import discover
+    from app.services.prefs import SPECS
+
+    bad = []
+    for m in discover():
+        for key in (m.get("settings") or []):
+            if key not in SPECS:
+                bad.append(f"{m['id']}: {key}")
+    assert not bad, f"插件声明了不存在的设置项：{bad}"
+
+
+def test_config_is_passed_by_env_not_argv():
+    """设置项可能含 API key。走 argv 的话它会出现在进程表(ps)与日志里。"""
+    import ast
+    import inspect
+    import textwrap
+
+    from app.routers import plugins as mod
+
+    src = textwrap.dedent(inspect.getsource(mod._launch))
+    tree = ast.parse(src)
+    # cmd = [...] + ... 里不许出现 config
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+                getattr(t, "id", "") == "cmd" for t in node.targets):
+            names = {n.id for n in ast.walk(node.value) if isinstance(n, ast.Name)}
+            assert "config" not in names, "配置被拼进了命令行——API key 会出现在 ps 里"
+    assert "SOROBAN_CONFIG" in src, "配置没有通过环境变量下发"

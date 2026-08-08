@@ -38,12 +38,12 @@ def test_batch_and_single_delete_agree(client):
 
     from app.config import settings
     tmp = Path(tempfile.mkdtemp())
-    d = tmp / "soroban-scraper-taobao"
+    d = tmp / "soroban-plugin-taobao"
     (d / ".state").mkdir(parents=True)
     (d / "plugin.toml").write_text('id = "taobao"\nplatform = "taobao"\nstate_dir = ".state"\n',
                                    encoding="utf-8")
-    old = settings.SCRAPER_DIR
-    settings.SCRAPER_DIR = str(tmp)
+    old = settings.PLUGIN_DIR
+    settings.PLUGIN_DIR = str(tmp)
     try:
         client.post("/api/plugins/taobao/account", params={"name": "sdacct"})
         a = client.post("/api/orders", json={"date": "2026-12-21", "platform_account": "sdacct"}).json()
@@ -54,7 +54,7 @@ def test_batch_and_single_delete_agree(client):
         assert ra.is_delete and rb.is_delete
         assert ra.version == a["version"] + 1 and rb.version == b["version"] + 1
     finally:
-        settings.SCRAPER_DIR = old
+        settings.PLUGIN_DIR = old
 
 
 def test_soft_deleted_row_still_frees_unique_key(client):

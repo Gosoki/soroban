@@ -140,12 +140,45 @@ def test_frontend_has_no_stale_field_names():
 
 def test_scraper_pushes_current_field_names():
     """爬虫按字段名 POST /api/staging；名字对不上 → 字段被忽略或 422，整批静默丢同步。"""
-    norm = _REPO / "scraper" / "soroban-scraper-taobao" / "taobao_scraper" / "normalize.py"
-    if not norm.is_file():
-        pytest.skip("插件未安装")
-    text = norm.read_text(encoding="utf-8")
-    assert '"title"' in text and '"purchase_status"' in text and '"unit_price_cny"' in text
-    assert '"shop"' not in text and '"order_status"' not in text
+    import ast
+
+    from app.schemas import StagingCreate, StagingItemIn
+    from tests.test_consistency import plugin_source
+
+    src = plugin_source("taobao_scraper", "normalize.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    # 取**真正被推送的那两个 dict 字面量**的键，而不是 grep 文件里有没有出现某个词。
+    # 文件里同时有 demo_order、注释、docstring，随便哪处出现 "purchase_status" 都能骗过
+    # 文本断言 —— 第一版就是这样：把 normalize() 里的键改成旧名 `trade_status`，
+    # 守卫照样全绿（别处还有那个词）。
+    produced = {}
+    for fn in ("normalize", "demo_order"):
+        node = next((n for n in tree.body
+                     if isinstance(n, ast.FunctionDef) and n.name == fn), None)
+        assert node is not None, f"插件里没有 {fn}()，跨仓契约的形状变了"
+        keys = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Dict):
+                keys |= {k.value for k in sub.keys
+                         if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+        produced[fn] = keys
+
+    allowed = set(StagingCreate.model_fields) | set(StagingItemIn.model_fields)
+    for fn, keys in produced.items():
+        unknown = keys - allowed
+        assert not unknown, (
+            f"插件 {fn}() 推的这些键后端不认：{sorted(unknown)}\n"
+            f"名字对不上 → 字段被 extra=forbid 拒成 422，整批静默丢同步。"
+            f"后端接受：{sorted(allowed)}")
+
+    # 必须真的推这几项，否则「键没写错」也可能是「整段没了」
+    for fn in produced:
+        must = {"title", "purchase_status"} if fn == "normalize" else {"purchase_status"}
+        missing = must - produced[fn]
+        assert not missing, f"插件 {fn}() 不再推 {sorted(missing)} 了"
+    assert "unit_price_cny" in produced["normalize"] | produced["demo_order"], \
+        "插件不再推物品单价了"
 
 
 def test_frontend_status_words_match_backend():

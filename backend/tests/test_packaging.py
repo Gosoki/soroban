@@ -81,8 +81,12 @@ def test_scraper_is_not_bundled(spec_text):
     **exe 同级目录**找它们，绝不该被打进包里。"""
     plug = (_REPO / "backend" / "app" / "routers" / "plugins.py").read_text(encoding="utf-8")
     assert "Path(sys.executable).resolve().parent" in plug
-    assert "scraper" not in spec_text.split("# --- 静态分析")[0].replace("scraper/", "×"), \
-        "spec 不该把 scraper/ 打进 exe"
+    # 查的是「插件目录有没有被列进打包内容」，不是查某个词是否出现——
+    # 目录从 scraper/ 改名成 plugins/ 之后，原来那句 `"scraper" not in ...` 变成了恒真的空话。
+    head = spec_text.split("# --- 静态分析")[0]
+    for name in ("plugins", "scraper"):
+        assert f"{name}/" not in head.replace(f"{name}/ ", "").replace(f"`{name}/`", ""), \
+            f"spec 不该把 {name}/ 打进 exe（插件各自带 venv+Playwright，体积巨大且要能单独更新）"
 
 
 def test_pyinstaller_bat_checks_for_spec():
