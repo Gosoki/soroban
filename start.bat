@@ -27,6 +27,13 @@ REM them here keeps uvicorn's port and vite's /api proxy target in sync.
 if not defined BACKEND_PORT set "BACKEND_PORT=8620"
 if not defined FRONTEND_PORT set "FRONTEND_PORT=8621"
 
+REM ---- listen address (ONE knob for both services) ----
+REM vite.config.js and backend/run.py both read HOST. Defaults to loopback only.
+REM Splitting this into two knobs is what broke it before: the dev server proxies
+REM /api to the backend, so exposing the frontend alone exposes the backend too.
+REM To expose on the LAN:  set HOST=0.0.0.0  before running this script.
+if not defined HOST set "HOST=127.0.0.1"
+
 REM ---- environment checks ----
 where node >nul 2>nul
 if errorlevel 1 goto no_node
@@ -87,12 +94,13 @@ REM Run both services in THIS console (no popup windows). Backend runs in the
 REM background via "start /b" (its output still prints here); frontend runs in the
 REM foreground so this window stays alive. Press Ctrl+C to stop.
 echo Starting backend  -^> http://127.0.0.1:%BACKEND_PORT%  (docs at /docs)
-start "soroban-backend" /b /d "%BACKEND%" "%UVICORN_BIN%" app.main:app --host 127.0.0.1 --port %BACKEND_PORT% --reload
+start "soroban-backend" /b /d "%BACKEND%" "%UVICORN_BIN%" app.main:app --host %HOST% --port %BACKEND_PORT% --reload
 
 echo Starting frontend -^> http://localhost:%FRONTEND_PORT%
 echo.
-echo soroban started. Default login: admin / admin123
+echo soroban started.
 echo Open http://localhost:%FRONTEND_PORT% in your browser. Press Ctrl+C to stop.
+if "%HOST%"=="0.0.0.0" echo [WARN] Listening on all interfaces: make sure the default password has been changed.
 echo.
 pushd "%FRONTEND%"
 call npm run dev

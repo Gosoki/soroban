@@ -8,7 +8,7 @@ from sqlalchemy import Column, Index, Text, text
 from sqlmodel import Field, Relationship, SQLModel
 
 from ...db.dialect import BinStr, UtcDateTime
-from ..base import StagingStatus, guard_cny, price_from_items, utcnow
+from ..base import ImportStatus, guard_cny, price_from_items, utcnow
 
 
 class OrderStaging(SQLModel, table=True):
@@ -37,11 +37,13 @@ class OrderStaging(SQLModel, table=True):
     express_no: Optional[str] = Field(default=None, max_length=64)
     raw_json: Optional[str] = Field(default=None, sa_column=Column(Text))  # 原始留底
     # 一行上有两个「状态」，务必分清：import_status = 导入工作流（待处理/已导入/已忽略），
-    # trade_status = 淘宝那边的真实交易状态。旧名 status / order_status 看不出区别。
-    import_status: str = Field(default=StagingStatus.pending.value, max_length=32, index=True)
-    trade_status: Optional[str] = Field(default=None, max_length=32)  # 淘宝订单真实状态(待发货/待收货/…)；导入后与账本 status 联动
+    # purchase_status = 淘宝那边的真实交易状态。旧名 status / order_status 看不出区别。
+    import_status: str = Field(default=ImportStatus.pending.value, max_length=32, index=True)
+    purchase_status: Optional[str] = Field(default=None, max_length=32)  # 淘宝订单真实状态(待发货/待收货/…)；导入后与账本 status 联动
+    # index=True 不是可选项：每次订单 PATCH（mirror_to_staging）、每次订单删除、
+    # 每次按账号批量改名，都要按这一列反查暂存行。没有索引就是每次写订单都全表扫暂存表。
     imported_order_id: Optional[int] = Field(
-        default=None, foreign_key="orders.id"
+        default=None, foreign_key="orders.id", index=True
     )
     version: int = Field(default=1)                         # 乐观锁（人工/爬虫并发编辑同一暂存行）
     scraped_at: dt.datetime = Field(default_factory=utcnow, sa_type=UtcDateTime())

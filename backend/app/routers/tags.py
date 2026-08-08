@@ -20,7 +20,7 @@ from ..maintenance import barrier
 from ..models import (
     ShipmentOrder,
     StagingItem,
-    StagingStatus,
+    ImportStatus,
     TagOption,
     Order,
     OrderStaging,
@@ -64,7 +64,7 @@ def _data_values(session: Session, field: str) -> set[str]:
             stmt = stmt.where(model.is_delete.is_(False))
         if model is OrderStaging:
             # 已忽略的暂存行是「看过后丢弃」的抓取结果，不算真在用（否则其账号会被误锁、误自动登记）
-            stmt = stmt.where(OrderStaging.import_status != StagingStatus.ignored.value)
+            stmt = stmt.where(OrderStaging.import_status != ImportStatus.ignored.value)
         for v in session.exec(stmt).all():
             if v:
                 out.add(v)
@@ -188,7 +188,7 @@ def tag_value_in_use(session: Session, field: str, name: str) -> bool:
         if hasattr(model, "is_delete"):
             stmt = stmt.where(model.is_delete.is_(False))
         if model is OrderStaging:
-            stmt = stmt.where(OrderStaging.import_status != StagingStatus.ignored.value)
+            stmt = stmt.where(OrderStaging.import_status != ImportStatus.ignored.value)
         if session.exec(stmt.limit(1)).first() is not None:
             return True
     return session.exec(
@@ -290,7 +290,7 @@ def soft_delete_account_orders(session: Session, account: str) -> int:
     )
     session.execute(
         sa_update(OrderStaging).where(OrderStaging.imported_order_id.in_(ids))
-        .values(imported_order_id=None, import_status=StagingStatus.pending.value,
+        .values(imported_order_id=None, import_status=ImportStatus.pending.value,
                 version=OrderStaging.version + 1, updated_at=now)
     )
     return len(ids)

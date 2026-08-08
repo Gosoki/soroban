@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 _REPO = Path(__file__).resolve().parents[2]
+_RUN_PY = _REPO / "backend" / "run.py"
 _SPEC = _REPO / "soroban.spec"
 
 
@@ -146,3 +147,69 @@ def test_static_mount_uses_the_cache_aware_class():
     src = inspect.getsource(main)
     tail = src[src.index("if _DIST.is_dir():"):]
     assert "_SpaStatic(directory=" in tail, "静态挂载没用带缓存策略的子类"
+
+
+def test_pyinstaller_bat_never_wipes_the_release_dir():
+    """发布目录同时是打包版的**运行数据目录**，绝不能整体删除。
+
+    exe 是便携式设计（run.py chdir 到自身所在目录），soroban.db、含 SECRET_KEY 的 .env、
+    scraper\\ 的 venv 与扫码会话全落在 exe 旁边。而 VERSION 是手工维护的常量，
+    「改个 bug 再打一次包」不会有人去改它——于是 `rmdir /s /q "%RELEASE%"` 就是
+    一次无提示、不进回收站、backup.sh 也覆盖不到的全量数据销毁。
+    """
+    bat = (_REPO / "pyinstaller.bat").read_text(encoding="utf-8", errors="replace")
+    assert 'rmdir /s /q "%RELEASE%"' not in bat, \
+        "pyinstaller.bat 不许删除 %RELEASE%——那是用户账本所在目录"
+    assert 'if not exist "%RELEASE%" mkdir "%RELEASE%"' in bat, \
+        "发布目录应幂等创建（不存在才建），而不是先删后建"
+
+
+def test_pyinstaller_bat_publishes_only_on_success():
+    """产物先落 build\\dist，成功后才拷进发布目录。
+
+    否则前端构建或 PyInstaller 失败时，用户既没拿到新 exe、发布目录里那份能跑的旧 exe
+    也已经被覆盖/删掉了。这几条失败路径在脚本里是真实存在的（:npm_build_fail / :build_fail）。
+    """
+    bat = (_REPO / "pyinstaller.bat").read_text(encoding="utf-8", errors="replace")
+    assert '--distpath "%ROOT%build\\dist"' in bat, "构建产物应先落到 build\\dist"
+    assert 'copy /y "%ROOT%build\\dist\\soroban.exe" "%RELEASE%\\soroban.exe"' in bat, \
+        "应在构建成功后才把 exe 拷进发布目录"
+    assert ":copy_fail" in bat, "拷贝失败（exe 正在运行）要有可诊断的出口"
+
+
+def test_offline_rescue_lives_in_the_app_package():
+    """离线自救的实现必须在 `app/` 下，`tools/` 只能是薄壳。
+
+    打包版拿不到 `tools/`：Analysis 入口是 run.py，run.py 与 app.* 都不 import tools，
+    spec 的 datas 也没收它。而 `app.*` 天然在 PyInstaller 的导入图里。
+    实现放错地方的后果是：MySQL 连不上时，唯一的自救指引在 exe 环境里根本执行不了，
+    用户的账本被永久锁在一个起不来的进程后面。
+    """
+    from app import rescue
+
+    assert hasattr(rescue, "use_local_db")
+    shim = (_REPO / "backend" / "tools" / "use_local_db.py").read_text(encoding="utf-8")
+    assert "from app.rescue import use_local_db" in shim, "tools 侧应复用 app.rescue，不许再抄一份"
+    assert "switch_to_local()" not in shim, "自救逻辑不许留在 tools/（打包版取不到）"
+
+
+def test_run_py_accepts_only_the_rescue_flag():
+    """run.py 的参数白名单：只放行 `--use-local-db [--yes]`，其余一律 exit 2。
+
+    放行必须排在 chdir + ensure_env 之后（SECRET_KEY 要先就位才能解密控制库里的连接串），
+    且排在 `from app.main import app` 之前——后者会连库跑迁移，而这条路径的前提正是「库连不上」。
+    """
+    src = _RUN_PY.read_text(encoding="utf-8")
+    assert '{"--use-local-db", "--yes"}' in src, "参数白名单不见了"
+    # 注意匹配真语句而不是注释里的引用：run.py 的注释里也写着 `from app.main import app`，
+    # 直接 index 会先命中那一处，把顺序断言变成一条恒假式。
+    i_env = src.index("created_env = ensure_env(rt)")
+    i_rescue = src.index("\n    if rescue:")
+    i_app = src.index("\n    from app.main import app")
+    assert i_env < i_rescue < i_app, "自救分支的位置不对（须在 ensure_env 之后、import app.main 之前）"
+
+
+def test_mysql_down_hint_covers_the_packaged_build():
+    """MySQL 连不上时的自救指引必须同时给出打包版能执行的那条。"""
+    src = (_REPO / "backend" / "app" / "database.py").read_text(encoding="utf-8")
+    assert "soroban.exe --use-local-db" in src, "指引只写了源码运行那条，打包版用户照做不了"

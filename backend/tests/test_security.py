@@ -245,3 +245,62 @@ def test_install_refuses_instead_of_spawning_shadow_instance(client, monkeypatch
     monkeypatch.setattr(plug, "_find_manifest", lambda pid: {"id": pid, "_dir": plug.Path("/tmp")})
     r = client.post("/api/plugins/taobao/install")
     assert r.status_code == 409 and "Python" in r.json()["detail"]
+
+
+# --- 源码运行路径也必须默认只绑环回 -------------------------------------------
+#
+# 上面 test_run_py_defaults_to_loopback 钉的是**打包版**（run.py）。源码运行走的是
+# start.sh / start.bat + vite dev server，那条路上后端曾经写死 --host 127.0.0.1、
+# 而前端 `vite --host` 监听全网卡——dev server 又把 /api 反代到后端，于是后端那句
+# 环回绑定形同虚设：局域网任何设备打 http://<本机IP>:8621 就能同源访问全部 API。
+# 现在两边收敛到同一个 HOST 旋钮，这里把它钉死。
+
+_FRONTEND = _REPO / "frontend"
+_START_SH = _REPO / "start.sh"
+_START_BAT = _REPO / "start.bat"
+
+
+def test_npm_scripts_do_not_force_host():
+    """package.json 里不许再出现 `--host`。
+
+    监听地址属于策略，必须落在 vite.config.js（会被 review 的地方），而不是一个
+    npm script 参数——后者是「为了手机调试临时加一下」的重灾区，加回去时没有任何
+    东西会提醒作者后端也跟着敞开了。
+    """
+    import json
+
+    scripts = json.loads((_FRONTEND / "package.json").read_text(encoding="utf-8"))["scripts"]
+    bad = [f"{k}: {v}" for k, v in scripts.items() if "--host" in v]
+    assert not bad, f"npm 脚本里不许写 --host（监听地址请走 vite.config.js 的 HOST）：{bad}"
+
+
+def test_vite_dev_server_defaults_to_loopback():
+    """vite.config.js 必须显式声明 server.host，且默认值不是通配地址。"""
+    src = (_FRONTEND / "vite.config.js").read_text(encoding="utf-8")
+    m = re.search(r"process\.env\.HOST\s*\|\|\s*['\"]([^'\"]+)['\"]", src)
+    assert m, "vite.config.js 必须用 `process.env.HOST || '<环回默认值>'` 声明监听地址"
+    assert m.group(1) in ("localhost", "127.0.0.1"), \
+        f"vite dev server 默认监听不能是 {m.group(1)!r}"
+    assert re.search(r"server\s*:\s*\{[^}]*host\s*:", src, re.S), \
+        "vite.config.js 的 server 块里必须有 host（否则 --host 一加回来就又敞开）"
+
+
+@pytest.mark.parametrize("script", [_START_SH, _START_BAT])
+def test_start_scripts_share_one_host_knob(script):
+    """启动脚本不许把后端监听地址写死——前后端必须共用同一个 HOST。"""
+    src = script.read_text(encoding="utf-8")
+    assert "--host 127.0.0.1" not in src, \
+        f"{script.name} 把后端监听写死了；应改用 HOST，否则它与前端的策略会各走各的"
+    assert "HOST" in src, f"{script.name} 必须定义并透传 HOST"
+
+
+@pytest.mark.parametrize("script", [_START_SH, _START_BAT])
+def test_start_scripts_do_not_print_default_password(script):
+    """启动脚本不许把默认口令回显到控制台。
+
+    run.py 早就为同一理由删过（见 test_run_py_does_not_print_default_password），
+    但源码运行路径漏了——而它恰恰是 README 主推的日常工作流。
+    （README 里作为文档写明默认口令是正常的，这里只管控制台输出。）
+    """
+    assert "admin123" not in script.read_text(encoding="utf-8"), \
+        f"{script.name} 不许回显默认口令"

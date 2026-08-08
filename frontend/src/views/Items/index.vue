@@ -14,9 +14,9 @@
           </el-select>
           <!-- 选项 = 国内段 + 集运段：列表显示的是继承后的状态，只列国内段的话，
                界面上一堆「已发出」却在筛选框里选不到（与订单页同款） -->
-          <el-select v-model="filters.status" placeholder="状态" clearable style="width: 120px" @change="reload">
+          <el-select v-model="filters.fulfillmentStatus" placeholder="状态" clearable style="width: 120px" @change="reload">
             <el-option-group label="国内段（商品订单）">
-              <el-option v-for="s in ORDER_STATUS" :key="s" :label="s" :value="s" />
+              <el-option v-for="s in PURCHASE_STATUS" :key="s" :label="s" :value="s" />
             </el-option-group>
             <el-option-group label="国际段（集运订单）">
               <el-option v-for="s in SHIPMENT_STATUS" :key="s" :label="s" :value="s" />
@@ -35,16 +35,16 @@
           <span v-else class="ph">—</span>
         </template>
         <template #cell-platform="{ row }">
-          <el-tag v-if="row.platform" size="small" :style="statusStyle(row.platform)">{{ row.platform }}</el-tag>
+          <el-tag v-if="row.platform" size="small" :style="platformSemanticStyle(row.platform)">{{ row.platform }}</el-tag>
           <span v-else class="ph">—</span>
         </template>
         <!-- 与商品订单页同一口径：挂了集运单就显示继承来的集运状态。
-             ⚠️ 这里必须自己取 effective_status —— 列配置里的 col.display 对**有插槽的列无效**
+             ⚠️ 这里必须自己取 fulfillment_status —— 列配置里的 col.display 对**有插槽的列无效**
              （NotionTable 的插槽分支优先于 GotionCell，而 display 只在 GotionCell 里被调用），
              曾因此让两个页面对同一张单显示不同状态、tooltip 还说着反话。 -->
-        <template #cell-status="{ row }">
-          <el-tag size="small" :style="statusStyle(row.effective_status || row.status)">
-            {{ row.effective_status || row.status }}
+        <template #cell-purchase_status="{ row }">
+          <el-tag size="small" :style="statusStyle(row.fulfillment_status)">
+            {{ row.fulfillment_status }}
           </el-tag>
         </template>
         <!-- 灰显=物品名与商品标题相同（无独立物品详情） -->
@@ -66,7 +66,7 @@
       <div v-if="editingOrder">
         <div class="edit-ctx">
           <span class="ec-shop">{{ editingOrder.title || '（无标题）' }}</span>
-          <el-tag size="small" :style="statusStyle(editingOrder.status)">{{ editingOrder.status }}</el-tag>
+          <el-tag size="small" :style="statusStyle(editingOrder.purchase_status)">{{ editingOrder.purchase_status }}</el-tag>
           <span v-if="editingOrder.platform_account" class="ec-dim">账号 {{ editingOrder.platform_account }}</span>
           <span class="ec-dim">下单 {{ editingOrder.date }}</span>
           <span v-if="editingOrder.order_no" class="ec-dim">订单号 {{ editingOrder.order_no }}</span>
@@ -81,7 +81,7 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
 import { itemsApi, ordersApi, shipmentApi, tagsApi } from '@/api'
-import { ORDER_SOURCES, ORDER_STATUS, SHIPMENT_STATUS, statusStyle, tagStyleAt } from '@/constants'
+import { ORDER_SOURCES, PURCHASE_STATUS, SHIPMENT_STATUS, platformSemanticStyle, statusStyle, tagStyleAt } from '@/constants'
 import NotionTable from '@/components/NotionTable.vue'
 import OrderEditPanel from '@/components/OrderEditPanel.vue'
 
@@ -98,11 +98,11 @@ const columns = [
   // 与商品订单页同一口径：挂了集运单就显示继承来的集运状态、整格置灰（标签仍是原色）。
   // 本页所有列都是只读的（物品要改去订单页展开面板），这里的 lock 纯粹是**视觉提示**：
   // 让人一眼看出这行的状态不是订单自己的，而是跟着集运单走的。
-  // 状态：值由 #cell-status 插槽自己取（插槽优先于 GotionCell，col.display 在这里是**死代码**，
+  // 状态：值由 #cell-purchase_status 插槽自己取（插槽优先于 GotionCell，col.display 在这里是**死代码**，
   // 所以不写 display —— 写了只会误导下一个人以为它在起作用）。
   // lock 仍然有效：它作用在 <td> 上，与插槽无关，负责把整格置灰做视觉提示。
   {
-    key: 'status', label: '状态', readonly: true, width: 84,
+    key: 'purchase_status', label: '状态', readonly: true, width: 84,
     lock: (row) => !!row.shipment_order_id,
     lockHint: '该订单已挂靠集运订单，状态跟随那张单',
   },
@@ -115,7 +115,7 @@ const total = ref(0)
 const loading = ref(false)
 const page = ref(1)
 const pageSize = 30
-const filters = reactive({ q: '', platform: '', status: '', platform_account: '', range: null })
+const filters = reactive({ q: '', platform: '', fulfillmentStatus: '', platform_account: '', range: null })
 
 // 账号标签的持久化配色（与其它页同一套色序，保证同一账号处处同色）+ 账号候选（编辑弹窗下拉用）
 const acctColor = reactive({})
@@ -138,7 +138,7 @@ async function load() {
     const params = { limit: pageSize, offset: (page.value - 1) * pageSize }
     if (filters.q) params.q = filters.q
     if (filters.platform) params.platform = filters.platform
-    if (filters.status) params.status = filters.status
+    if (filters.fulfillmentStatus) params.fulfillment_status = filters.fulfillmentStatus
     if (filters.platform_account) params.platform_account = filters.platform_account
     if (filters.range) { params.date_from = filters.range[0]; params.date_to = filters.range[1] }
     const res = await itemsApi.list(params)
@@ -168,23 +168,39 @@ async function loadShipment() {
 }
 const editTitle = computed(() => '编辑物品所属订单' + (editingOrder.value?.order_no ? ' · ' + editingOrder.value.order_no : ''))
 
+// 与 load() 同款的请求序号门：只认**最后一次打开/重取**，迟到的响应一律作废。
+// 没有它的话 editingOrder 由「最后返回」的响应决定而不是「最后点击」的那一次——
+// 连点两行「编辑」时慢响应会顶掉弹窗内容，而 OrderEditPanel/OrderItemsEditor 的每一次写
+// 都用 props.order.id，于是用户后续所有编辑都落到**另一张订单**上。
+let editSeq = 0
+
 async function openEdit(row) {
+  const my = ++editSeq
   editDirty.value = false
   editingOrder.value = null
   editingId.value = row.order_id
   editVisible.value = true
   try {
-    editingOrder.value = await ordersApi.get(row.order_id)
+    const o = await ordersApi.get(row.order_id)
+    if (my !== editSeq) return             // 已有更新的点击，丢弃这次结果
+    editingOrder.value = o
   } catch (_) {
-    editVisible.value = false   // 订单可能已删/无权限；拦截器已提示
+    if (my === editSeq) editVisible.value = false   // 订单可能已删/无权限；拦截器已提示
   }
 }
 // 409：订单被并发改过 → 拉最新，让用户在最新基础上继续改
 async function refetchEditing() {
   editDirty.value = true
-  if (editingId.value) { try { editingOrder.value = await ordersApi.get(editingId.value) } catch (_) { /* 已提示 */ } }
+  const id = editingId.value
+  if (!id) return
+  const my = ++editSeq                     // 重取也要占号，否则它会被在途的 openEdit 覆盖
+  try {
+    const o = await ordersApi.get(id)
+    if (my === editSeq) editingOrder.value = o
+  } catch (_) { /* 已提示 */ }
 }
 function onEditClosed() {
+  editSeq++                                // 序号前进：在途响应作废，别在关闭后又把内容填回来
   const dirty = editDirty.value
   editingOrder.value = null; editingId.value = null; editDirty.value = false
   if (dirty) load()   // 有改动才刷新拍平的物品列表，反映新单价/数量/金额

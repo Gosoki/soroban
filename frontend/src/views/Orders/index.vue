@@ -20,9 +20,9 @@
           </el-select>
           <!-- 选项 = 国内段 + 集运段：列表显示的是继承后的状态，只列国内段的话，
                界面上一堆「已发出」却在筛选框里选不到它 -->
-          <el-select v-model="filters.status" placeholder="状态" clearable style="width: 120px" @change="reload">
+          <el-select v-model="filters.fulfillmentStatus" placeholder="状态" clearable style="width: 120px" @change="reload">
             <el-option-group label="国内段（商品订单）">
-              <el-option v-for="s in ORDER_STATUS" :key="s" :label="s" :value="s" />
+              <el-option v-for="s in PURCHASE_STATUS" :key="s" :label="s" :value="s" />
             </el-option-group>
             <el-option-group label="国际段（集运订单）">
               <el-option v-for="s in SHIPMENT_STATUS" :key="s" :label="s" :value="s" />
@@ -39,22 +39,28 @@
           <el-select :model-value="row.shipment_order_id" filterable placeholder="未集运"
                      size="small" class="ship-pick" popper-class="ship-pop"
                      :persistent="false"
+                     remote :remote-method="searchShipment" :loading="shipSearching"
+                     remote-show-suffix reserve-keyword
+                     no-data-text="没有匹配的集运单"
+                     @visible-change="onShipDropdown"
                      @change="(v) => onPickShipment(row, v)">
             <template #label="{ value }">
               <span class="ship-sel">
-                <b>{{ shipNo(value) }}</b>
-                <el-tag v-if="shipById(value)" size="small" :style="statusStyle(shipById(value).status)">{{ shipById(value).status }}</el-tag>
+                <b>{{ shipNo(value, row) }}</b>
+                <el-tag v-if="row.fulfillment_status && row.shipment_order_id" size="small"
+                        :style="statusStyle(row.fulfillment_status)">{{ row.fulfillment_status }}</el-tag>
               </span>
             </template>
-            <!-- 清除固定在列表最上（集运单可能很多）；无归属时不显示 -->
-            <el-option v-if="row.shipment_order_id" :value="-1" label="清除">
+            <!-- 清除固定在列表最上（集运单可能很多）；无归属时不显示。
+                 搜索态下也不显示：它不是命中结果，留着会顶住 options.size，让「没有匹配」提示出不来 -->
+            <el-option v-if="row.shipment_order_id && !shipHits" :value="-1" label="清除">
               <div class="ship-clear">清除（取消集运）</div>
             </el-option>
             <el-option v-for="j in sortedShipments" :key="j.id" :label="j.shipment_no || ('#' + j.id)" :value="j.id">
               <div class="ship-opt">
                 <div class="ship-opt-top">
                   <b>{{ j.shipment_no || ('#' + j.id) }}</b>
-                  <el-tag size="small" :style="statusStyle(j.status)">{{ j.status }}</el-tag>
+                  <el-tag size="small" :style="statusStyle(j.shipment_status)">{{ j.shipment_status }}</el-tag>
                   <el-icon v-if="j.id === row.shipment_order_id" class="ship-ck"><Check /></el-icon>
                 </div>
                 <span class="ship-meta">{{ j.date }} · 运费 {{ j.jpy_settled != null ? fmtJPY(j.jpy_settled) : '待定' }}</span>
@@ -101,9 +107,9 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Camera, Check } from '@element-plus/icons-vue'
 import { shipmentApi, ordersApi, tagsApi } from '@/api'
-import { ORDER_SOURCES, ORDER_STATUS, PRICE_HELP, SHIPMENT_STATUS, statusStyle } from '@/constants'
+import { ORDER_SOURCES, PRICE_HELP, PURCHASE_STATUS, SHIPMENT_STATUS, canAdvancePurchase, statusStyle } from '@/constants'
 import { fmtJPY } from '@/utils/money'
-import { queueOrderWrite } from '@/utils/orderWrites'
+import { applyRowUpdate, queueOrderWrite } from '@/utils/orderWrites'
 import { today } from '@/utils/datetime'
 import NotionTable from '@/components/NotionTable.vue'
 import OrderItemsEditor from '@/components/OrderItemsEditor.vue'
@@ -112,7 +118,7 @@ import OrderItemsEditor from '@/components/OrderItemsEditor.vue'
 // 默认列顺序 + 统一列宽（≈ 刚好显示日期，取整多留一点 = 110）；用户可拖动改序/改宽，改动持久化
 const COL_W = 110
 const columns = [
-  { key: 'date', label: '下单日期', type: 'date', width: COL_W },
+  { key: 'date', label: '下单日期', type: 'date', width: COL_W, clearable: false },
   { key: 'platform_account', label: '账号昵称', type: 'tag', field: 'platform_account', width: COL_W },
   { key: 'platform', label: '来源', type: 'tag', field: 'platform', width: COL_W, placeholder: '来源' },
   { key: 'title', label: '商品', type: 'text', long: true, width: COL_W },
@@ -121,8 +127,8 @@ const columns = [
   // 整格置灰不可点，但标签本身保持原色；释放后自动恢复可选。
   // display 只影响显示，写回仍走 key='status'（订单自己的国内段状态）。
   {
-    key: 'status', label: '状态', type: 'select', options: ORDER_STATUS, width: COL_W, clearable: false,
-    display: (row) => row.effective_status ?? row.status,
+    key: 'purchase_status', label: '状态', type: 'select', options: PURCHASE_STATUS, width: COL_W, clearable: false,
+    display: (row) => row.fulfillment_status ?? row.purchase_status,
     lock: (row) => !!row.shipment_order_id,
     lockHint: '跟随所挂集运订单的状态；从集运单里释放后可改',
   },
@@ -148,19 +154,57 @@ const loading = ref(false)
 const page = ref(1)
 const pageSize = 30
 const focusId = ref(null)   // 跳转定位的订单 id（?focus=）
-const filters = reactive({ q: '', platform: '', status: '', platform_account: '', range: null })
+const filters = reactive({ q: '', platform: '', fulfillmentStatus: '', platform_account: '', range: null })
 const shipmentOptions = ref([])
 const accountOptions = ref([])   // 账号昵称下拉候选（标签接口）
 async function loadAccounts() {
   try { accountOptions.value = (await tagsApi.list('platform_account')).map((t) => t.value) } catch (_) { /* 已提示 */ }
 }
 
-function shipById(id) { return shipmentOptions.value.find((j) => j.id === id) }
-function shipNo(id) { const j = shipById(id); return j ? (j.shipment_no || ('#' + id)) : ('#' + id) }
+// null = 当前不在搜索态；数组 = 本次搜索的命中（**可能是空数组 = 零命中**）。
+// 不能用 `.length` 当搜索态判据：零命中同样是空数组，会静默回退成默认那批，
+// 表现为「搜不到 → 把全部集运单当成命中结果摆出来」，而 remote 模式下 el-select
+// 不做本地过滤（父组件给什么就渲染什么），no-data-text 也永远不会出现。
+const shipHits = ref(null)
+const shipSearching = ref(false)
+
+function shipById(id) {
+  return shipmentOptions.value.find((j) => j.id === id) || (shipHits.value || []).find((j) => j.id === id)
+}
+// 显示优先用订单行自带的 shipment_no：下拉只有前 200 张，挂在那之外的单曾显示成 `#101`。
+// 只有在拿不到行（比如 #label 插槽只给了 value）时才回落查下拉。
+function shipNo(id, row) {
+  if (row?.shipment_no) return row.shipment_no
+  const j = shipById(id)
+  return j?.shipment_no || ('#' + id)
+}
 // 打包中的集运单永远置顶（最常挂新订单）；其余保持原顺序（日期倒序）。sort 稳定，同组不乱。
-const sortedShipments = computed(() =>
-  [...shipmentOptions.value].sort((a, b) => (b.status === '打包中' ? 1 : 0) - (a.status === '打包中' ? 1 : 0)),
-)
+// 搜索态下展示命中结果，否则展示默认那批。
+const sortedShipments = computed(() => {
+  const base = shipHits.value ?? shipmentOptions.value
+  return [...base].sort((a, b) => (b.shipment_status === '打包中' ? 1 : 0) - (a.shipment_status === '打包中' ? 1 : 0))
+})
+// 远程搜索：默认只拉前 200 张，更早的集运单靠输入单号现查。
+// 清空输入即回到默认那批（remote 模式下 el-select 会用空串回调一次）。
+let shipSeq = 0
+async function searchShipment(kw) {
+  const q = (kw || '').trim()
+  if (!q) { shipHits.value = null; shipSearching.value = false; return }
+  const my = ++shipSeq
+  shipSearching.value = true
+  try {
+    const res = await shipmentApi.list({ q, limit: 50, brief: true })
+    if (my === shipSeq) shipHits.value = res.items       // 迟到的响应不覆盖新结果
+  } catch (_) { /* 拦截器已提示 */ } finally {
+    if (my === shipSeq) shipSearching.value = false
+  }
+}
+// 关闭下拉时丢掉搜索结果，下次打开回到默认那批。
+// 不清的话，上一行搜过的窄结果会带到下一行，看起来像「集运单丢了」。
+function onShipDropdown(visible) {
+  if (!visible) { shipHits.value = null; shipSeq++ }     // seq 前进：在途响应作废
+}
+
 function onPickShipment(row, v) {   // -1 = 列表里的「清除」项；其余为集运单 id
   saveCell(row, 'shipment_order_id', v === -1 ? null : (v ?? null))
 }
@@ -188,7 +232,7 @@ async function load() {
     const params = { limit: pageSize, offset: (page.value - 1) * pageSize }
     if (filters.q) params.q = filters.q
     if (filters.platform) params.platform = filters.platform
-    if (filters.status) params.status = filters.status
+    if (filters.fulfillmentStatus) params.fulfillment_status = filters.fulfillmentStatus
     if (filters.platform_account) params.platform_account = filters.platform_account
     if (filters.range) { params.date_from = filters.range[0]; params.date_to = filters.range[1] }
     if (focusId.value) params.id = focusId.value          // 跳转定位：隔离显示该单
@@ -212,10 +256,10 @@ async function saveCell(row, key, value) {
   try {
     // 入队串行：格子保存与展开面板/物品编辑器对同一订单的写不再并发撞 version
     await queueOrderWrite(row.id, async () => {
-      const updated = await ordersApi.update(row.id, { version: row.version, [key]: value })
-      // 不覆盖 items：展开面板里可能有尚未点「保存物品」的编辑，普通单元格保存不应清掉它
-      const { items, ...rest } = updated
-      Object.assign(row, rest)
+      const patch = { version: row.version, [key]: value }
+      const updated = await ordersApi.update(row.id, patch)
+      // 本次没送 items → 不覆盖：展开面板里可能有尚未点「保存物品」的编辑（见 applyRowUpdate）
+      applyRowUpdate(row, patch, updated)
     })
   } catch (e) {
     if (e.response?.status === 409) { ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
@@ -281,7 +325,7 @@ async function processOcr(file) {
     if (res.express_no) data.express_no = res.express_no
     if (res.order_no) data.order_no = res.order_no
     if (res.price_cny != null && res.price_cny !== '') data.price_cny = res.price_cny
-    if (res.status) data.status = res.status                // 有快递单号→待收货，否则待发货
+    if (res.purchase_status) data.purchase_status = res.purchase_status                // 有快递单号→待收货，否则待发货
     // status/platform 恒有值，故按「实质字段」判断是否真识别到内容
     const recognized = res.order_no || res.express_no || res.order_date || res.product ||
       (res.price_cny != null && res.price_cny !== '')
@@ -313,22 +357,8 @@ async function findByOrderNo(orderNo) {
 }
 
 // 国内段生命周期序：只准前进（待付款→待发货→待收货→已签收），不回退；国际段由集运单表达。
-// 退款/交易关闭是旁支终态、未知值同样取 -1。必须与后端 models/base.py 的 ORDER_STATUS_RANK 一致
-// ——只管国内段；挂靠不再改状态（国际段由集运单表达，见后端 Order.effective_status）。
-const STATUS_RANK = { 待付款: 0, 待发货: 1, 待收货: 2, 已签收: 3 }
-// 旁支终态：走到这里就结束了。它们不在 STATUS_RANK 里 → rank 为 -1，
-// ⚠️ 而 -1 的效果是「**任何**推进态都 > 它、于是谁都能盖掉它」，与本意正好相反。
-// 曾因此出事：一张已标「退款」的单被 OCR 再识别一次、兜底判成「待发货」就把退款抹掉了，
-// 而退款单本不计入看板合计 → **看板金额凭空变大**。判定必须走 canAdvance，不能只比 rank。
-// 与后端 models/base.py 的 TERMINAL_STATUSES / can_advance 一一对应。
-const TERMINAL = ['退款', '交易关闭']
-function statusRank(s) { return STATUS_RANK[s] ?? -1 }
-function canAdvance(cur, next) {
-  if (!next || next === cur) return false
-  if (TERMINAL.includes(cur)) return false      // 终态是明确结论，自动识别不该推翻
-  if (TERMINAL.includes(next)) return true      // 平台把单关了/退款了，账本该跟上
-  return statusRank(next) > statusRank(cur)
-}
+// 状态推进规则已收进 constants.js（canAdvancePurchase）：前后端各存一份必然漂移，
+// 上一轮「OCR 把退款单抹成待发货、看板金额凭空变大」的根因就是两份规则不一致。
 
 // 这单还「没有真实价格」吗？= 物品全是系统占位(auto) 且合计为 0。
 // 只有这种单才允许 OCR 回填成交价；用户手填过任一单价的单绝不覆盖。
@@ -345,7 +375,7 @@ function hasNoRealPrice(base) {
 function buildMergePatch(base, data) {
   const patch = { version: base.version }
   if (data.date) patch.date = data.date
-  if (canAdvance(base.status, data.status)) patch.status = data.status
+  if (canAdvancePurchase(base.purchase_status, data.purchase_status)) patch.purchase_status = data.purchase_status
   for (const k of ['platform', 'title', 'express_company', 'express_no']) {
     const cur = base[k]
     if (data[k] != null && data[k] !== '' && (cur == null || cur === '')) patch[k] = data[k]
@@ -378,7 +408,11 @@ async function mergeByOrderNo(existing, data) {
       // 谁先落地谁赢——本函数自己有重试所以受损的总是**用户那笔**，正是那条串行链要消灭的场景。
       const updated = await queueOrderWrite(base.id, () => ordersApi.update(base.id, patch))
       const idx = rows.value.findIndex((r) => r.id === base.id)   // 在当前页则就地刷新
-      if (idx >= 0) { const { items, ...rest } = updated; Object.assign(rows.value[idx], rest); sortRows() }
+      // 本次**送了** items（buildMergePatch 把 OCR 成交价当种子价一起发），后端已按它整体
+      // 重建物品并把成交价折进第一条的单价 → 响应才是真相，必须整体采纳。
+      // 照抄 saveCell 的「排除 items」会让页面停在合并前的「单价 0」，随后任何一次物品编辑
+      // 都会把这份陈旧数组 PATCH 回去，刚补进去的钱就没了。
+      if (idx >= 0) { applyRowUpdate(rows.value[idx], patch, updated); sortRows() }
       ElMessage.success(`已按订单号匹配更新 · 订单号 ${data.order_no}${patch.date ? ' · 下单时间 ' + patch.date : ''}`)
       return
     } catch (e) {
@@ -396,7 +430,7 @@ async function mergeByOrderNo(existing, data) {
 function ocrSummary(data) {
   const parts = []
   if (data.date) parts.push(`下单 ${data.date}`)
-  if (data.status) parts.push(`状态 ${data.status}`)
+  if (data.purchase_status) parts.push(`状态 ${data.purchase_status}`)
   if (data.platform) parts.push(`来源 ${data.platform}`)
   if (data.title) parts.push(`商品 ${data.title}`)
   if (data.express_company) parts.push(`快递 ${data.express_company}`)

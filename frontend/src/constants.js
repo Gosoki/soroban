@@ -1,11 +1,11 @@
 // 状态枚举（必须与后端 models/base.py 的枚举值一致）
 // 商品订单只记**国内段**：待付款→待发货→待收货→已签收（国内快递签收）。
-// 国际段（集运中/送达）不在这里——挂上集运单后界面显示的是那张单的状态（后端算好的 effective_status），
+// 国际段（集运中/送达）不在这里——挂上集运单后界面显示的是那张单的状态（后端算好的 fulfillment_status），
 // 释放出来则回落到订单自己的状态。同一件事只有一处记录，不会两边打架。
-// 退款 / 交易关闭是旁支终态。顺序与后端 ORDER_STATUS_RANK 一致（见 Orders 页 STATUS_RANK）。
-export const ORDER_STATUS = ['待付款', '待发货', '待收货', '已签收', '退款', '交易关闭']
+// 退款 / 交易关闭是旁支终态。顺序与后端 PURCHASE_STATUS_RANK 一致（见下方 PURCHASE_STATUS_RANK）。
+export const PURCHASE_STATUS = ['待付款', '待发货', '待收货', '已签收', '退款', '交易关闭']
 export const SHIPMENT_STATUS = ['打包中', '已发出', '已送达', '已取消']
-export const STAGING_STATUS = ['待处理', '已导入', '已忽略']   // 暂存导入工作流状态
+export const IMPORT_STATUS = ['待处理', '已导入', '已忽略']   // 暂存导入工作流状态
 export const ORDER_SOURCES = ['闲鱼', '淘宝', '京东', '拼多多', '其他']   // 订单来源平台（OCR 可自动识别）
 
 // 订单的「已签收」= 国内快递签收（淘宝「交易成功」）；集运单的「已送达」= 国际包裹到本人手上。
@@ -17,8 +17,13 @@ function statusTagType(s) {   // 内部用：语义色映射，对外走 statusS
     已送达: 'success',   // 集运单：国际包裹送到本人手上
     退款: 'danger', 交易关闭: 'info',
     打包中: 'warning', 已发出: 'primary', 已取消: 'info',
-    闲鱼: 'warning', 淘宝: 'primary', 京东: 'danger',
   }[s] || 'info'
+}
+
+// 平台名**不是状态**。原先它俩挤在同一张色表里，靠「值不重名」侥幸共存——
+// 加一个叫「淘宝」的状态（或叫「已发出」的平台）就会互相串色。拆成两张表，各管各的。
+function platformTagType(s) {
+  return { 闲鱼: 'warning', 淘宝: 'primary', 京东: 'danger' }[s] || 'info'
 }
 
 function stagingTag(s) {   // 内部用：对外走 stagingStyle
@@ -71,8 +76,28 @@ export function typeStyle(type) {
 export function statusStyle(s) {
   return typeStyle(statusTagType(s))
 }
-export function stagingStyle(s) {
+export function importStatusStyle(s) {
   return typeStyle(stagingTag(s))
+}
+// 平台标签的**语义色**：闲鱼橙 / 淘宝蓝 / 京东红，写死的三色表。
+// 与 Plugins 页的 platformTagStyle 是两回事——那个取的是用户在标签管理里配的颜色。
+// 两者渲染同一种东西却取色来源不同，同名会诱导后人「顺手去重」，把用户配色静默做没。
+export function platformSemanticStyle(s) {
+  return typeStyle(platformTagType(s))
+}
+
+// 采购段推进序与终态。**放这里而不是放某个页面里**：订单页与（将来的）任何页面都要用同一份，
+// 抄两份必然漂移——上一轮 OCR 合并把终态盖掉的事故，根因就是前后端各存了一份规则。
+// 必须与后端 models/base.py 的 PURCHASE_STATUS_RANK / PURCHASE_TERMINAL_STATUSES 一致。
+export const PURCHASE_STATUS_RANK = { 待付款: 0, 待发货: 1, 待收货: 2, 已签收: 3 }
+export const PURCHASE_TERMINAL = ['退款', '交易关闭']
+
+// 能不能把 cur 推进到 next。终态是明确结论，自动识别不该推翻它。
+export function canAdvancePurchase(cur, next) {
+  if (!next || next === cur) return false
+  if (PURCHASE_TERMINAL.includes(cur)) return false
+  if (PURCHASE_TERMINAL.includes(next)) return true
+  return (PURCHASE_STATUS_RANK[next] ?? -1) > (PURCHASE_STATUS_RANK[cur] ?? -1)
 }
 
 // 「人民币（元）」列的表头说明（订单页 / 暂存页共用；NotionTable 的 col.help 会渲染成「?」）。

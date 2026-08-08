@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from app.models import OrderStatus
+from app.models import PurchaseStatus
 
 
 def mk_order(client, **kw):
@@ -191,12 +191,12 @@ def test_pagination_bounds(client):
 
 # --- 状态白名单 ---------------------------------------------------------------
 
-@pytest.mark.parametrize("status", [s.value for s in OrderStatus])
+@pytest.mark.parametrize("status", [s.value for s in PurchaseStatus])
 def test_all_enum_statuses_accepted(client, status):
-    r = client.post("/api/orders", json={"date": "2026-03-01", "status": status})
+    r = client.post("/api/orders", json={"date": "2026-03-01", "purchase_status": status})
     assert r.status_code == 200, f"{status}: {r.text}"
 
 
 def test_bogus_status_rejected(client):
-    r = client.post("/api/orders", json={"date": "2026-03-01", "status": "不存在的状态"})
+    r = client.post("/api/orders", json={"date": "2026-03-01", "purchase_status": "不存在的状态"})
     assert r.status_code == 422

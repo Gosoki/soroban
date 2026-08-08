@@ -31,41 +31,72 @@
 
 > auto／settled 做成派生列，避免三列手动改到打架。直接用日元付款的情况：`price_cny`/`fx_rate` 留空，只填 `jpy_override`。
 
-### 淘宝订单 TaobaoOrder
-日期、订单号（唯一，可空）、店铺、链接、分类、状态（枚举：已付/已发/已收）、`快递号`（可空，归组用，多单可共享同一个）、`快递公司`（可空）、`淘宝账号`（有 2 个号，也便于机器人区分抓哪个）、`junfeng_order_id`（外键→君丰，**可空**=已买未集运）、金额 5 列（**订单总价，已含国内快递费**）。物品明细见 `OrderItem` 子表。
+### 商品订单 Order（表 `orders`）
+`date*`、`order_no`（唯一，可空）、`title`（商品标题，TEXT）、`url`、`category`、
+`purchase_status*`（**采购段**状态，枚举：待付款/待发货/待收货/已签收/退款/交易关闭）、
+`platform`（淘宝/闲鱼/…）、`platform_account`（抓哪个号）、
+`express_no`（可空，归组用，多单可共享）、`express_company`、
+`shipment_order_id`（外键→集运单，**可空**=已买未集运）、`postage_cny`（国内邮费）、
+金额 5 列。物品明细见 `OrderItem` 子表——**订单人民币价由物品派生**，不直接手填。
 
-### 订单行 OrderItem（一单多物）——**物品为最小单位**
-`taobao_order_id`（外键→淘宝订单）、`物品名`、`数量`、`price_cny`（**单价**，元）、`auto`（bool）。一个淘宝订单可含多行。
+### 订单行 OrderItem（表 `orderitem`，一单多物）——**物品为最小单位**
+`order_id*`（外键→订单）、`name*`、`quantity*`、`unit_price_cny`（**单价**，元）、`auto*`（bool）。
 
-> **「物品为最小单位」（第四十二版起，为对接其它系统而定）**：对接的最小粒度是**物品**而非订单。
-> - 每张淘宝订单/暂存**必有 ≥1 物品**；建单时没给物品，则自动补 1 条（名=商品标题、单价=订单价、`auto=True`，前端**灰显**表示系统自动、可编辑覆盖；用户一编辑即转黑）。
-> - **订单人民币价由物品派生** = Σ(单价 × 数量)，见各 model 的 `sync_from_items()`；订单列表 RMB **只读**，改价走物品展开面板。`jpy_auto` 仍 = round(派生 price_cny × fx_rate)。
+> **「物品为最小单位」**：对接的最小粒度是**物品**而非订单。
+> - 每张订单/暂存**必有 ≥1 物品**；建单时没给物品，则自动补 1 条（名=商品标题、单价=订单价、`auto=True`，前端**灰显**表示系统自动、可编辑覆盖；用户一编辑即转黑）。
+> - **订单人民币价由物品派生** = Σ(单价 × 数量) + 邮费，见各 model 的 `sync_from_items()`；订单列表 RMB **只读**，改价走物品展开面板。`jpy_auto` 仍 = round(派生 price_cny × fx_rate)。
 > - 单价口径（非行总额）：数量与单价独立；因 2 位小数，`数量>1` 且总价不整除时按单价×数量回算会有分位漂移（回填时已把这类物品标 `auto` 待复核）。
 > - 爬虫只知订单总价、不知每件单价 → 后端把总价折成第一件单价、标 `auto`，其余置 0 待人工拆分；`StagingItem` 结构与字段完全对齐 `OrderItem`。
 
-### 君丰订单 JunfengOrder
-日期、君丰单号（唯一，可空）、重量、国际运单号、状态（枚举：打包中/已发出/已签收）、备注、金额 5 列（`price_cny` = 国际运费）、`特殊费_日元`（int，直填，如关税/消费税，币种**恒日元**）。**本表 `jpy_auto` = round(运费×汇率) + 特殊费_日元**；`jpy_settled` 仍 override 优先。反查 `taobao_orders`。（国内快递费不在此，已折入淘宝订单总价。）
+### 集运单 ShipmentOrder（表 `shipmentorder`）
+`date*`、`shipment_no`（唯一，可空）、`weight`、`intl_tracking_no`（国际运单号）、
+`shipment_status*`（**集运段**状态，枚举：打包中/已发出/已送达/已取消）、`recipient`、`note`、
+金额 5 列（`price_cny` = 国际运费）、`special_fee_jpy`（int，直填，如关税/消费税，币种**恒日元**）。
+**本表 `jpy_auto` = round(运费×汇率) + special_fee_jpy**；`jpy_settled` 仍 override 优先。
+反查挂靠的商品订单。（国内快递费不在此，走 `orders.postage_cny`。）
 
-### 杂项 MiscExpense
-日期、名称、分类、备注、金额 5 列。
+### 暂存 OrderStaging / StagingItem（表 `orderstaging` / `stagingitem`）
+爬虫只写这里，人手动「导入」才进账本。字段与 `Order` 大面积对应（见 `routers/staging.py`
+的 `_SHARED_TO_ORDER`）。一行上有**两个**状态，务必分清：
+- `import_status*`：soroban 自己的**导入工作流**（待处理/已导入/已忽略）
+- `purchase_status`：淘宝那边的**真实交易状态**，与账本同枚举、导入后双向联动
 
-### 共通字段（三张表）
-- `source`：`manual` / `taobao_bot` / `junfeng_bot`，区分人填还是机器人抓
+`imported_order_id` 外键→账本订单；已导入行的共享字段编辑会**写穿**到账本（单一真源）。
+
+### 杂项 MiscExpense（表 `miscexpense`）
+`date*`、`name*`、`category`、`note`、金额 5 列。
+
+### 状态命名公理
+**状态列名 = `<业务段>_status`；同名 ⟺ 同概念（同一枚举、同一值域）。**
+不允许任何表出现名字恰为 `status` 的裸列——它曾同时指采购段、集运段、导入工作流、HTTP 响应码，
+咬过三次。这条公理由 `backend/tests/test_status_taxonomy.py` 从 `SQLModel.metadata` 反射着守。
+
+### 共通字段（三张账本表）
+- `created_via`：区分人填还是机器人抓
 - `payer_id`：外键→User，付款人（多人分摊用）
 - `version`：乐观锁，人和机器人同改一行时防「后写覆盖」
+- `is_delete`：软删（不物理删）
 - `created_at` / `updated_at`
-- 索引：`日期`、`快递号`
+
+### 其余表
+`fxrate`（每日汇率 + 来源）、`tagoption`（下拉候选/标签）、`pluginconfig`（插件与抓取账号）、
+`columnlayout`（用户拖过的列宽/列序）、`setting`（业务偏好 key-value）、`user`。
 
 ### User
-登录用。用户名 + 密码哈希。登录 token 有效期 3 个月（`TOKEN_EXPIRE_DAYS=90`）。开发期用 `python -m app.seed` 建一个 admin（默认 admin/admin123），不做开放注册。
+登录用。用户名 + 密码哈希。登录 token 有效期 3 个月（`TOKEN_EXPIRE_DAYS=90`）。
+开发期用 `python -m app.seed` 建一个 admin，不做开放注册。
 
 ### 看板
-总额 = 淘宝(商品+快递) + 君丰(运费) + 杂项 的 `jpy_settled` 相加。
+总额 = 商品订单 + 集运 + 杂项 的 `jpy_settled` 相加。
+**排除规则由模型自己声明**（`LedgerBase.ledger_exclusions()`）：采购段的「退款/交易关闭/待付款」
+与集运段的「已取消」不计入合计，软删行同样不计入。
 
 ## 关系设计
 
-- 淘宝 ↔ 君丰 = **一对多**。外键只放在淘宝一侧；ORM 提供双向导航（`taobao.junfeng_order` / `junfeng.taobao_orders`）。**不要**两边都存链接（两个真相源会漂）。
-- 原本是三层（淘宝 < 快递单 < 君丰），但快递费并入淘宝、快递单不单独记费 → 砍掉快递单表，`快递号` 降为淘宝订单上的字段 → 回到干净的三张表。代价：快递号分组不被数据库强制一致，个人规模可接受。
+- 商品订单 ↔ 集运单 = **一对多**。外键只放在商品订单一侧（`orders.shipment_order_id`）；
+  ORM 提供双向导航。**不要**两边都存链接（两个真相源会漂）。
+- 原本是三层（订单 < 快递单 < 集运），但快递费并入订单、快递单不单独记费 → 砍掉快递单表，
+  `express_no` 降为订单上的字段 → 回到干净的三张表。代价：快递号分组不被数据库强制一致，个人规模可接受。
 
 ## 决策日志
 
@@ -129,6 +160,11 @@
 - 汇率自动填充：**从 hiyori 移植抓取逻辑（直连 open.er-api.com），在 soroban 内自成一份 `services/fx.py`**。⚠️ 不要调用 hiyori 正在跑的接口——两个项目部署位置可能不同，soroban 的汇率必须能独立运行、不依赖 hiyori 是否在线。
 
 ## 进度
+
+> **以下是 append-only 的变更日志，按当时的事实写就，不随重命名回改。**
+> 所以你会在这里看到 `TaobaoOrder` / `JunfengOrder` / `junfeng_order_id` / 旧状态枚举——
+> 那是历史记录，不是过期文档。**当前**的表名与字段以上面「数据模型」章为准
+> （最终真相永远是 `backend/app/models/` 与 `alembic/versions/`）。
 
 **首版 MVP 已落地并自测通过**（2026-07-09）：
 - 后端（`backend/app/`）：models、schemas、auth(JWT)、routers(taobao/junfeng/misc/dashboard/fx/auth)、services/fx、seed、main 全部完成；后端 smoke test 25/25 通过；真实 HTTP 端到端跑通（登录/CRUD/看板/汇率），FX 实测拉到真实汇率并持久化。
@@ -832,3 +868,50 @@ baseline 建表只给了 `mysql_charset='utf8mb4'` 而没给 COLLATE，MySQL 的
 **本轮最值得记的是一条测试假绿**：`test_items_page_status_follows_shipment_too` 只 grep 源码字符串，于是 bug 活着测试全绿——比没有守卫更糟。修它时又发现我自己的模板提取写错了（`split("</template>")[0]` 会截在内层具名插槽处），改对之后立刻抓出一处真实死代码。已新增通用守卫：任何列同时有 `#cell-xxx` 插槽和 `display` 即红。
 
 **验证**：597 条后端 + 611 条（含真 MySQL 契约）+ 39 条爬虫全绿；前端构建通过；真浏览器逐页复查九个页面全部正常渲染、零报错。
+
+### 第五十九版：状态命名按业务段统一（迁移 `f8a9b0c1d2e3`）+ 修 2 个活 bug
+
+**公理**：状态列名 = `<业务段>_status`；**同名 ⟺ 同概念**（同一枚举、同一值域）；
+跨段合流的派生值必须换个词，且只出现在只读模型上。
+
+| 旧 | 新 | 为什么 |
+|---|---|---|
+| `orders.status` | `purchase_status` | 只记采购段。不叫 `trade_status`：路线图上的「卖出」同样是 trade，那时 `Order.trade_status` 与 `Sale.trade_status` 同名不同义、中文值域还高度重合（待付款/待发货/待收货） |
+| `orderstaging.trade_status` | `purchase_status` | 与上者**本来就是同一件事**（`_SHARED_TO_ORDER` 里 `trade_status → status` 那条映射就是证据），统一后该映射变成恒等 |
+| `shipmentorder.status` | `shipment_status` | 消灭最后一个裸 `status`，`coalesce(shipment_status, purchase_status)` 自解释成「两段合流」 |
+| `Order.effective_status` | `fulfillment_status` | 「effective」说不出它 fold 了哪几段，也没法扩展（不可能有第二个 effective） |
+| `OrderStatus` / `StagingStatus` | `PurchaseStatus` / `ImportStatus` | 枚举名要等于它约束的列名 |
+| `?status=`（四个端点三种含义） | `?fulfillment_status` / `?purchase_status` / `?shipment_status` / `?import_status` | 参数名必须等于它筛的那个字段 |
+| 插件 `started` | `launched` | 它只表示子进程已 fork，恒为 true，信息量 0 bit |
+
+**零数据回填**：只改列名与索引名，状态**值**一字节未动 → 迁移完全可逆，已验 `downgrade base → upgrade head` 往返。
+
+**为什么值得动 DB 列名**：裸 `status` 不只是难看，它让 `model.status` 这种鸭子类型**看起来能用**——
+看板就是这么写的，成立的唯一依据是「两张表的状态列恰好同名」。加第三个枚举时这个巧合会绷断，
+而绷断的表现是**看板金额悄悄变了**，不是报错。现在排除规则由模型自己声明（`ledger_exclusions()`），
+列从 `cls` 上取，引用到别的表在语法上就写不出来（传列进去会生成隐式交叉连接，`SUM` 乘以对侧行数）。
+
+**顺带修掉的两个活 bug**（都不是改名引起的，是改名过程中被守卫抓出来的）：
+1. **插件定时抓取从上一轮审计起就没跑过**。`run_in_threadpool` 用了却从没导入，`NameError`
+   每轮被循环的兜底 `except` 吞成一行警告。而守卫写的是 `assert "run_in_threadpool" in src`
+   ——**只 grep 源码字符串**，字符串在、名字没绑定，它分辨不了。已改成真跑一轮循环并断言
+   同步 DB I/O 落在别的线程上。这是本项目第三次栽在「grep 型断言」上。
+2. `staging.py` 的 `Order(status=...)` 漏改，被那条 AST 守卫（当初为 `unit_unit_price_cny`
+   打字错误加的）当场抓出——SQLModel 会静默丢弃未知 kwarg，不加守卫就是订单状态全部落默认值。
+
+**新增的结构守卫**（这层才是「以后不再漂回去」的实现，全部经反向验证）：
+- 没有任何裸 `status` 列；含 status 的列必须登记业务段、同名必须同枚举
+- 状态枚举值域两两不相交（自动收集，加 `SaleStatus` 时自动纳入）
+- 每个采购状态要么在推进序里要么是终态，**不许两不沾**（两不沾 → rank −1 → 被任何态盖掉）
+- OCR 关键词表前缀安全（裸「退款」会吞掉将来的「退款中」）+ 终态必须排在「有快递号」之前
+- 看板恰好聚合三张**支出**表；排除规则的列必须属于本表
+- 写模型 `extra="forbid"`：字段名漂移从「200 OK + 什么都没改 + 零日志」变成 422
+- 前端列键 / OCR 赋值键 / 筛选参数名，逐个对照后端 schema 与 OpenAPI
+  （这条上线当场抓到暂存页 `import_status` 与后端 `alias="status"` 对不上——筛选本会被静默忽略）
+- 旧 `?status=` 四个端点一律 400（FastAPI 默认忽略未知 query 参数 = 静默返回全量）
+- `_SHARED_TO_ORDER` 的读写两个方向逐字段行为级验证（读方向刻意绕过 API 直接改库，
+  否则 mirror 写进去的值会让 `_overlay` 漏字段也测得过——「巧合掩盖发散」）
+
+**验证**：677 后端（含真 MySQL 全绿 677/677）+ 39 爬虫 + 前端构建；迁移在真 MySQL 与
+真实数据副本上各跑一遍（列类型 `varchar(32) NOT NULL` 与索引名逐项核对）；
+真浏览器逐页复查九个页面全部正常、零控制台报错、零 4xx。

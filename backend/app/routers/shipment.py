@@ -11,12 +11,14 @@ from sqlmodel import Session, select
 
 from ..auth import get_current_user
 from ..database import get_session
+from ..db.dialect import ci_contains
 from ..models import ShipmentOrder, Order, utcnow
 from ..schemas import (
     ShipmentCreate, ShipmentOcrAttachResult, ShipmentRead, ShipmentUpdate, OrderItemRead, OrderBrief,
 )
 from .common import (
     guarded_bump, mirror_to_staging, raise_conflict, raise_not_found, run_ocr, soft_delete,
+    stamp_fx,
 )
 
 router = APIRouter(
@@ -27,7 +29,7 @@ router = APIRouter(
 def _brief(order: Order) -> OrderBrief:
     return OrderBrief(
         id=order.id, order_no=order.order_no, date=order.date, title=order.title,
-        status=order.status, jpy_settled=order.jpy_settled,
+        purchase_status=order.purchase_status, jpy_settled=order.jpy_settled,
         items=[OrderItemRead(id=it.id, name=it.name, quantity=it.quantity) for it in order.items],
     )
 
@@ -69,8 +71,8 @@ def _read_many(session: Session, shipments: list[ShipmentOrder],
     return [_shipment_read(s, by_parent.get(s.id, [])) for s in shipments]
 
 
-def _read(session: Session, order: ShipmentOrder) -> ShipmentRead:
-    return _read_many(session, [order])[0]
+def _read(session: Session, shipment: ShipmentOrder) -> ShipmentRead:
+    return _read_many(session, [shipment])[0]
 
 
 @router.get("")
@@ -78,21 +80,29 @@ def list_orders(
     session: Session = Depends(get_session),
     date_from: Optional[dt.date] = None,
     date_to: Optional[dt.date] = None,
-    status: Optional[str] = None,
+    shipment_status: Optional[str] = None,
     q: Optional[str] = Query(None, description="按集运单号搜索"),
     brief: bool = Query(False, description="只要集运单本身，不展开子订单与物品（供下拉选项用）"),
+    legacy_status: Optional[str] = Query(
+        None, alias="status", include_in_schema=False,
+        description="已废弃：查询参数 status 已按业务段改名"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
+    # FastAPI 对未知 query 参数**默认忽略**：改名后漏改一处调用方，
+    # 表现就是「筛选点了没反应、返回全量、HTTP 200、零日志」。响亮拒掉比静默返回错数据强。
+    if legacy_status:
+        raise HTTPException(status_code=400,
+                            detail="查询参数 status 已改名为 shipment_status")
     conds = [ShipmentOrder.is_delete.is_(False)]
     if date_from:
         conds.append(ShipmentOrder.date >= date_from)
     if date_to:
         conds.append(ShipmentOrder.date <= date_to)
-    if status:
-        conds.append(ShipmentOrder.status == status)
+    if shipment_status:
+        conds.append(ShipmentOrder.shipment_status == shipment_status)
     if q:
-        conds.append(ShipmentOrder.shipment_no.contains(q, autoescape=True))
+        conds.append(ci_contains(ShipmentOrder.shipment_no, q, session))
 
     total = session.exec(select(func.count()).select_from(ShipmentOrder).where(*conds)).one()
     rows = session.exec(
@@ -188,44 +198,45 @@ async def ocr_attach_express(
 
 
 @router.post("", response_model=ShipmentRead)
-def create_order(payload: ShipmentCreate, session: Session = Depends(get_session)):
+def create_shipment(payload: ShipmentCreate, session: Session = Depends(get_session)):
     from ..services.fx import current_rate  # 局部导入避免循环
 
-    order = ShipmentOrder(**payload.model_dump())
-    if order.fx_rate is None:                 # 新建时写入当天汇率
-        order.fx_rate = current_rate(session)
-    order.compute_money()
-    session.add(order)
+    shipment = ShipmentOrder(**payload.model_dump())
+    if shipment.fx_rate is None:                 # 新建时写入当天汇率
+        shipment.fx_rate = current_rate(session)
+    shipment.compute_money()
+    session.add(shipment)
     session.commit()
-    session.refresh(order)
-    return _read(session, order)
+    session.refresh(shipment)
+    return _read(session, shipment)
 
 
-@router.get("/{order_id}", response_model=ShipmentRead)
-def get_order(order_id: int, session: Session = Depends(get_session)):
-    order = session.get(ShipmentOrder, order_id)
-    if not order or order.is_delete:
+@router.get("/{shipment_id}", response_model=ShipmentRead)
+def get_shipment(shipment_id: int, session: Session = Depends(get_session)):
+    shipment = session.get(ShipmentOrder, shipment_id)
+    if not shipment or shipment.is_delete:
         raise_not_found("集运订单")
-    return _read(session, order)
+    return _read(session, shipment)
 
 
-@router.patch("/{order_id}", response_model=ShipmentRead)
-def update_order(order_id: int, payload: ShipmentUpdate, session: Session = Depends(get_session)):
-    order = session.get(ShipmentOrder, order_id)
-    if not order or order.is_delete:
+@router.patch("/{shipment_id}", response_model=ShipmentRead)
+def update_shipment(shipment_id: int, payload: ShipmentUpdate, session: Session = Depends(get_session)):
+    shipment = session.get(ShipmentOrder, shipment_id)
+    if not shipment or shipment.is_delete:
         raise_not_found("集运订单")
-    if not guarded_bump(session, ShipmentOrder, order_id, payload.version):
+    if not guarded_bump(session, ShipmentOrder, shipment_id, payload.version):
         raise_conflict()
 
     data = payload.model_dump(exclude_unset=True, exclude={"version"})
     for key, value in data.items():
-        setattr(order, key, value)
-    order.compute_money()
+        setattr(shipment, key, value)
+    stamp_fx(session, shipment)                 # create 当时 FxRate 表可能还是空的，每次 PATCH 重试补上
+    shipment.compute_money()
 
-    session.add(order)
+    session.add(shipment)
     session.commit()
-    session.refresh(order)
-    return _read(session, order)
+    session.refresh(shipment)
+    return _read(session, shipment)
 
 
 @router.post("/{shipment_id}/order/{order_id}", response_model=ShipmentRead)
@@ -284,18 +295,18 @@ def detach_order(shipment_id: int, order_id: int, session: Session = Depends(get
     return _read(session, shipment)
 
 
-@router.delete("/{order_id}")
-def delete_order(order_id: int, session: Session = Depends(get_session)):
-    order = session.get(ShipmentOrder, order_id)
-    if not order or order.is_delete:
+@router.delete("/{shipment_id}")
+def delete_shipment(shipment_id: int, session: Session = Depends(get_session)):
+    shipment = session.get(ShipmentOrder, shipment_id)
+    if not shipment or shipment.is_delete:
         raise_not_found("集运订单")
     # 解除关联淘宝订单的挂靠，避免留下指向已删集运单的悬空外键
     session.execute(
         sa_update(Order)
-        .where(Order.shipment_order_id == order_id, Order.is_delete.is_(False))
+        .where(Order.shipment_order_id == shipment_id, Order.is_delete.is_(False))
         .values(shipment_order_id=None, version=Order.version + 1, updated_at=utcnow())
     )
-    soft_delete(order)
-    session.add(order)
+    soft_delete(shipment)
+    session.add(shipment)
     session.commit()
     return {"ok": True}

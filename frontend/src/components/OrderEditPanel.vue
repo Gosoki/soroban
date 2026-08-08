@@ -13,8 +13,8 @@
         <el-date-picker v-model="order.date" type="date" value-format="YYYY-MM-DD" size="small"
                         :clearable="false" @change="saveField('date', order.date)" /></label>
       <label class="f"><span>状态</span>
-        <el-select v-model="order.status" size="small" @change="saveField('status', order.status)">
-          <el-option v-for="s in ORDER_STATUS" :key="s" :label="s" :value="s" />
+        <el-select v-model="order.purchase_status" size="small" @change="saveField('purchase_status', order.purchase_status)">
+          <el-option v-for="s in PURCHASE_STATUS" :key="s" :label="s" :value="s" />
         </el-select></label>
       <label class="f"><span>来源</span>
         <el-select v-model="order.platform" size="small" clearable placeholder="来源" @change="saveField('platform', order.platform)">
@@ -27,9 +27,17 @@
         </el-select></label>
       <label class="f"><span>所属集运</span>
         <el-select :persistent="false" v-model="order.shipment_order_id" size="small" clearable filterable placeholder="未集运"
+                   remote :remote-method="searchShipment" :loading="shipSearching"
+                   remote-show-suffix reserve-keyword
+                   no-data-text="没有匹配的集运单"
+                   @visible-change="onShipDropdown"
                    @change="saveField('shipment_order_id', order.shipment_order_id)">
+          <!-- 当前挂靠的那张若不在前 200 里，补一条它自己，否则选框会显示成空 -->
+          <el-option v-if="attachedMissing" :key="order.shipment_order_id"
+                     :label="(order.shipment_no || ('#' + order.shipment_order_id)) + ' · ' + (order.fulfillment_status || '')"
+                     :value="order.shipment_order_id" />
           <el-option v-for="j in sortedShipments" :key="j.id"
-                     :label="(j.shipment_no || ('#' + j.id)) + ' · ' + j.status" :value="j.id" />
+                     :label="(j.shipment_no || ('#' + j.id)) + ' · ' + j.shipment_status" :value="j.id" />
         </el-select></label>
       <label class="f"><span>订单号</span>
         <el-input v-model="order.order_no" size="small" placeholder="订单号" @change="saveField('order_no', order.order_no)" /></label>
@@ -58,12 +66,12 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { ordersApi } from '@/api'
-import { ORDER_SOURCES, ORDER_STATUS } from '@/constants'
+import { ordersApi, shipmentApi } from '@/api'
+import { ORDER_SOURCES, PURCHASE_STATUS } from '@/constants'
 import { fmtCNY, fmtJPY } from '@/utils/money'
-import { queueOrderWrite } from '@/utils/orderWrites'
+import { applyRowUpdate, queueOrderWrite } from '@/utils/orderWrites'
 import OrderItemsEditor from '@/components/OrderItemsEditor.vue'
 
 const props = defineProps({
@@ -73,10 +81,43 @@ const props = defineProps({
 })
 const emit = defineEmits(['saved', 'conflict'])
 
-// 打包中的集运单置顶（最常挂），其余按原顺序（日期倒序）
-const sortedShipments = computed(() =>
-  [...props.shipments].sort((a, b) => (b.status === '打包中' ? 1 : 0) - (a.status === '打包中' ? 1 : 0)),
-)
+// 打包中的集运单置顶（最常挂），其余按原顺序（日期倒序）。
+// 搜索态下展示命中结果，否则展示父组件传来的默认那批。
+// null = 不在搜索态；数组 = 本次命中（可能为空数组 = 零命中）。理由同 Orders 页：
+// 用 .length 判搜索态会让「零命中」静默回退成全量列表。
+const shipHits = ref(null)
+const shipSearching = ref(false)
+const sortedShipments = computed(() => {
+  const base = shipHits.value ?? props.shipments
+  return [...base].sort((a, b) => (b.shipment_status === '打包中' ? 1 : 0) - (a.shipment_status === '打包中' ? 1 : 0))
+})
+// 当前挂靠的那张不在候选里 → 得自己补一条，否则 el-select 找不到匹配 option 会显示空白，
+// 看起来像「这单没挂集运」，一旦误存就把挂靠关系抹了。
+const attachedMissing = computed(() => {
+  // 搜索态下不补：搜索结果里没有当前挂靠的那张是**正常的**（它就是没命中）。
+  // 不排除的话零命中时它恒为真，会把当前挂靠单当成唯一「命中结果」摆出来，
+  // 用户以为搜到了、点下去等于什么都没改。
+  if (shipHits.value) return false
+  const id = props.order?.shipment_order_id
+  return !!id && !sortedShipments.value.some((j) => j.id === id)
+})
+
+let shipSeq = 0
+async function searchShipment(kw) {
+  const q = (kw || '').trim()
+  if (!q) { shipHits.value = null; shipSearching.value = false; return }
+  const my = ++shipSeq
+  shipSearching.value = true
+  try {
+    const res = await shipmentApi.list({ q, limit: 50, brief: true })
+    if (my === shipSeq) shipHits.value = res.items      // 迟到的响应不覆盖新结果
+  } catch (_) { /* 拦截器已提示 */ } finally {
+    if (my === shipSeq) shipSearching.value = false
+  }
+}
+function onShipDropdown(visible) {
+  if (!visible) { shipHits.value = null; shipSeq++ }
+}
 
 // 字段级即存：与订单页格子同一 PATCH。空串归一为 null（清空）。不回传 items，免踩面板里的物品数组。
 async function saveField(key, value) {
@@ -84,9 +125,9 @@ async function saveField(key, value) {
   try {
     // 入队串行：面板里连改多个字段（或与内嵌物品编辑器并发）不会各读旧 version 互相 409
     await queueOrderWrite(props.order.id, async () => {
-      const updated = await ordersApi.update(props.order.id, { version: props.order.version, [key]: v })
-      const { items, ...rest } = updated
-      Object.assign(props.order, rest)
+      const patch = { version: props.order.version, [key]: v }
+      const updated = await ordersApi.update(props.order.id, patch)
+      applyRowUpdate(props.order, patch, updated)
       emit('saved', updated)
     })
   } catch (e) {

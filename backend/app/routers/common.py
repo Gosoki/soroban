@@ -87,6 +87,22 @@ def guarded_bump(session: Session, model, obj_id: int, expected_version: int) ->
     return res.rowcount == 1
 
 
+def stamp_fx(session: Session, obj) -> None:
+    """货款有值却没汇率 → 按这一行的记账日期补一条。
+
+    为什么必须在 **create 和 update 两处都调**：`compute_money()` 缺汇率就算不出
+    jpy_auto/jpy_settled，而看板的 `SUM(jpy_settled)` 对 NULL 视而不见——这笔钱会被
+    静默吞掉，但笔数照数（「笔数 +1、金额 +0」）。只在 create 补是关不上的：
+    全新部署、或后台 fx_loop 还没成功跑过一次时，FxRate 表是空的，create 只能盖上 None；
+    真正闭合缺口的是 update 侧那一刀，因为每次 PATCH 都会重试，顺带还能自愈存量脏行。
+
+    取 `rate_for_date` 而非 `current_rate`：一笔补录的上月支出该按当天牌价折算，
+    不该按今天的。staging.py 早就是这个口径，这里向既有惯例收敛。"""
+    if obj.price_cny is not None and obj.fx_rate is None:
+        from ..services.fx import rate_for_date          # 局部导入避免循环
+        obj.fx_rate = rate_for_date(session, obj.date)
+
+
 def soft_delete(obj) -> None:
     """软删一行：置 is_delete，并像其它写入一样推进乐观锁版本 + updated_at。
 
@@ -103,19 +119,23 @@ def mirror_to_staging(session: Session, order, built_items) -> None:
     否则删单/清账本会把暂存复位为待处理、再导入时用到陈旧的暂存快照，丢掉在订单页做的物品/价格编辑。
     built_items 为 build_items 的产物（非空才镜像物品；None=仅镜像共享字段，如只改了状态）。
 
-    订单页 PATCH 与集运页「内含快递」自动挂靠都会改 order.status，故放 common 供两处共用。"""
+    订单页 PATCH 与集运页「内含快递」自动挂靠都会改共享字段，故放 common 供两处共用。
+    （原注释说的是「都会改 order.status」，与 shipment.py 里「只挂靠、不动状态」的现行
+    行为直接矛盾——那是旧 OCR 自动挂靠时代的遗留说法。）
+
+    字段清单从 `_SHARED_TO_ORDER` 派生：它、`_overlay`、这里，原本是三份手写清单。"""
     from sqlmodel import select
 
     from ..models import OrderStaging, StagingItem
+    from .staging import _SHARED_TO_ORDER
 
     st = session.exec(
         select(OrderStaging).where(OrderStaging.imported_order_id == order.id)
     ).first()
     if st is None:
         return
-    st.order_date, st.order_no, st.title = order.date, order.order_no, order.title
-    st.platform_account, st.platform, st.express_no = order.platform_account, order.platform, order.express_no
-    st.postage_cny, st.fx_rate, st.trade_status = order.postage_cny, order.fx_rate, order.status
+    for staging_field, order_field in _SHARED_TO_ORDER.items():
+        setattr(st, staging_field, getattr(order, order_field))
     if built_items is not None:
         st.items = [StagingItem(**d) for d in built_items]
     st.sync_from_items()

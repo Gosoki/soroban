@@ -17,7 +17,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
-from ..models import OrderStatus   # 状态枚举值的唯一真相，避免与后端漂移
+from ..models import PurchaseStatus   # 状态枚举值的唯一真相，避免与后端漂移
 
 # 常见快递公司：关键词 → 规范全称。按「越具体越靠前」不重要（子串命中即可），
 # 但保证能覆盖淘宝寄件常见家；命中后统一输出规范名，便于「快递公司」列做标签归组。
@@ -43,10 +43,18 @@ COMPANY_MAP = {
 
 # OCR 只用于闲鱼——淘宝/京东走爬虫抓取。故 OCR 产出的来源恒为「闲鱼」；
 # 仅当截图出现明确的淘宝/京东强标记且无任何闲鱼信号时，判为「拿错截图」并拒识、提示改用爬虫。
-_XIANYU_CUES = ("蚂蚁森林能量", "开箱视频", "担保账户", "担保交易", "闲鱼", "收货前拍摄", "芝麻信用")
+# 「成交价」是闲鱼独有的价格标签（淘宝/京东都叫「实付款」），而且本模块已经拿它当解析锚点用
+# （见 parse_order_fields 的成交价那段）——复用既有锚点，不引入新的魔法字符串。
+_XIANYU_CUES = ("蚂蚁森林能量", "开箱视频", "担保账户", "担保交易", "闲鱼", "收货前拍摄",
+                "芝麻信用", "成交价")
 # 强平台标记：出现且无闲鱼信号才判为该平台。刻意不含「淘宝/花呗」等宽泛词——闲鱼隶属淘宝，
 # 其页面也可能出现「淘宝」字样，用宽泛词会误伤闲鱼截图。
-_JD_MARKERS = ("京东", "京东物流", "京豆", "白条", "自营", "PLUS会员")
+# 同理**必须与 COMPANY_MAP 的快递公司名互不相交**：裸「京东」既是快递公司（京东物流）
+# 又当平台标记时，「闲鱼卖家用京东快递发货」的截图会被同一次识别既解析出
+# express_company='京东物流'、又打上 reject_reason='疑似京东订单截图'，前端据此不建单。
+# 「自营」同样太宽（「原厂自营」之类的商品描述会命中），收紧成「京东自营」。
+# 这条不相交性由 test_platform_markers_dont_collide_with_couriers 守着。
+_JD_MARKERS = ("京东自营", "京东超市", "京豆", "白条", "PLUS会员", "京享值")
 _TAOBAO_MARKERS = ("天猫", "旺旺", "官方旗舰店")
 
 # 闲鱼物流卡通卡车模板：作为文案兜不住时的补充信号（有卡车 → 闲鱼）。多尺度模板匹配，
@@ -161,10 +169,30 @@ def _match_company(text: str) -> Optional[str]:
     return None
 
 
+def _nearest_company(anchor: dict, tokens: list[dict], row_tol: float) -> Optional[str]:
+    """标签行本身不含公司名时，在它同行、再不行就上下最近处找一个。
+
+    只在**已经由真标签定位到快递号**之后调用——此时公司名只是补充信息，取错的代价远小于
+    「整页第一个含公司词的框」那种把商品标题当锚点的做法。"""
+    same_row = [t for t in tokens
+                if t is not anchor and abs(t["cy"] - anchor["cy"]) <= row_tol]
+    for t in sorted(same_row, key=lambda t: abs(t["cy"] - anchor["cy"])):
+        if (c := _match_company(t["text"])):
+            return c
+    for t in sorted(tokens, key=lambda t: abs(t["cy"] - anchor["cy"])):
+        if t is not anchor and (c := _match_company(t["text"])):
+            return c
+    return None
+
+
 def _same_row_value(anchor: dict, tokens: list[dict], row_tol: float,
-                    min_len: int, key: str = "digits") -> Optional[str]:
+                    min_len: int, key: str = "digits", allow_below: bool = True) -> Optional[str]:
     """在与 anchor 同一行（y 接近）里找 key 值（digits/tracking）最长的框，优先取右侧的。
-    找不到同行则退回到 anchor 下方最近的框。"""
+    找不到同行则退回到 anchor 下方最近的框。
+
+    `allow_below=False` 用于**内容词锚点**（如快递公司名）——真标签（「订单编号」「快递单号」）
+    只会出现在它的值旁边，往下兜底是安全的；而公司名可能出现在页面任何地方（商品标题里的
+    「顺丰包邮」），往下兜底会一路抓到页面下方的订单号，把它当成快递号。"""
     cands = [t for t in tokens if t is not anchor and t[key]
              and len(t[key]) >= min_len]
     same_row = [t for t in cands if abs(t["cy"] - anchor["cy"]) <= row_tol]
@@ -172,6 +200,8 @@ def _same_row_value(anchor: dict, tokens: list[dict], row_tol: float,
         right = [t for t in same_row if t["x0"] >= anchor["x0"]]
         pick = min(right or same_row, key=lambda t: abs(t["cy"] - anchor["cy"]))
         return pick[key]
+    if not allow_below:
+        return None
     below = [t for t in cands if t["cy"] > anchor["cy"]]
     if below:
         return min(below, key=lambda t: t["cy"] - anchor["cy"])[key]
@@ -263,24 +293,36 @@ def _detect_other_platform(full_text: str) -> Optional[str]:
     return None
 
 
-def _detect_status(full_text: str, has_express: bool) -> str:
-    """判交易状态：终态优先；发货后（头部「卖家已发货/待确认收货」或已有快递单号）→ 待收货；
-    「等待卖家发货」→ 待发货；都不明确时以有无快递单号兜底（有单号必已发货）。"""
-    # 终态优先，且**必须排在 has_express 判定之前**：退款单同样带快递号，
-    # 先判快递就会把退款单识别成「待收货」——这不是理论问题，之前正是这么错的。
-    if any(k in full_text for k in ("退款成功", "已退款", "退货退款", "退款")):
-        return OrderStatus.refunded.value       # 退款
-    if "交易关闭" in full_text or "已关闭" in full_text:
-        return OrderStatus.cancelled.value      # 交易关闭
-    # 「交易成功」是闲鱼页面上的字样，就是**国内快递签收**这一刻 → 已签收。
-    # 国际段送达是集运单的「已送达」，两者不同名、不同表。
-    if "交易成功" in full_text or "交易完成" in full_text:
-        return OrderStatus.signed.value         # 已签收
-    if has_express or any(k in full_text for k in ("待确认收货", "卖家已发货", "待收货", "确认收货")):
-        return OrderStatus.shipped.value        # 待收货
-    if any(k in full_text for k in ("等待卖家发货", "等待发货", "待卖家发货", "待发货")):
-        return OrderStatus.paid.value           # 待发货
-    return OrderStatus.paid.value               # 兜底：待发货
+_EXPRESS = "<有快递号>"   # 伪关键词：这一条不看文案，看有没有识别出快递单号
+
+# 判交易状态的**有序**规则表：从上往下，第一条命中即返回。顺序本身是语义的一部分：
+#
+#  1. 终态排在最前，且**必须排在 _EXPRESS 之前**：退款单同样带快递号，
+#     先判快递就会把退款单识别成「待收货」——这不是理论问题，之前正是这么错的。
+#  2. 「交易成功」是闲鱼页面上的字样，就是**国内快递签收**这一刻 → 已签收。
+#     国际段送达是集运单的「已送达」，两者不同名、不同表。
+#
+# ⚠️ 加新状态时注意**子串吞并**：靠前的关键词是靠后关键词的子串时，靠后那条永远轮不到。
+# 现在最危险的是裸「退款」——将来做退货流程加「退款中」，它会被这条吞成终态「退款」，
+# 而终态之后 `can_advance_purchase` 对该单一律 False，等于这张单从此再也不会被自动更新。
+# `tests/test_ocr_parse.py` 的前缀安全守卫会在那一刻先红。
+_STATUS_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("退款成功", "已退款", "退货退款", "退款"), PurchaseStatus.refunded.value),
+    (("交易关闭", "已关闭"), PurchaseStatus.cancelled.value),
+    (("交易成功", "交易完成"), PurchaseStatus.signed.value),
+    ((_EXPRESS,), PurchaseStatus.shipped.value),
+    (("待确认收货", "卖家已发货", "待收货", "确认收货"), PurchaseStatus.shipped.value),
+    (("等待卖家发货", "等待发货", "待卖家发货", "待发货"), PurchaseStatus.paid.value),
+)
+
+
+def _detect_purchase_status(full_text: str, has_express: bool) -> str:
+    """判交易状态：按 `_STATUS_RULES` 自上而下取第一条命中；都不命中兜底「待发货」。"""
+    for patterns, status in _STATUS_RULES:
+        for p in patterns:
+            if (has_express if p is _EXPRESS else p in full_text):
+                return status
+    return PurchaseStatus.paid.value               # 兜底：待发货
 
 
 def _load_truck_ref():
@@ -348,14 +390,38 @@ def parse_order_fields(ocr_result) -> dict:
     heights = [t["h"] for t in tokens if t["h"] > 0]
     row_tol = (sum(heights) / len(heights) * 0.8) if heights else 12.0
 
-    # 快递公司 + 快递号：快递名所在框即锚点；快递号取本框或同行数字（10~15 位居多，min=8 容错）
-    for t in tokens:
-        canonical = _match_company(t["text"])
-        if canonical:
-            out["express_company"] = canonical
-            run = _extract_tracking(t["text"], 8)   # 保留字母前缀（如顺丰 SF）
-            out["express_no"] = run or _same_row_value(t, tokens, row_tol, 8, key="tracking")
+    # 快递公司 + 快递号。两段式，**先真标签、后公司名**：
+    #   「顺丰/天天/菜鸟/京东」这些词会出现在商品标题里（「顺丰包邮」），英文标题还会因
+    #   items / systems 里的裸子串 ems 命中。原先是「整页第一个含公司关键词的框即锚点、命中即
+    #   break」，于是标题框抢走锚点、真正的快递行再也轮不到，而 _same_row_value 的向下兜底
+    #   又没有距离上限——express_no 被抓成页面下方的**订单号**（两者完全相同），
+    #   还连带把「等待卖家发货」判成「待收货」。
+    for kw in ("快递单号", "运单号", "物流单号"):
+        for t in tokens:
+            if kw not in t["text"]:
+                continue
+            no = _extract_tracking(t["text"], 8) or _same_row_value(
+                t, tokens, row_tol, 8, key="tracking")
+            if no:
+                out["express_no"] = no
+                out["express_company"] = _match_company(t["text"]) or _nearest_company(t, tokens, row_tol)
+                break
+        if out["express_no"]:
             break
+    if not out["express_no"]:
+        # 退回公司名锚点：逐个尝试，取不到值就继续找下一个（不再命中即 break），
+        # 且只认同行——公司名不是标签，往下兜底就是上面那个 bug 的成因。
+        for t in tokens:
+            canonical = _match_company(t["text"])
+            if not canonical:
+                continue
+            no = _extract_tracking(t["text"], 8) or _same_row_value(
+                t, tokens, row_tol, 8, key="tracking", allow_below=False)
+            if no:
+                out["express_company"], out["express_no"] = canonical, no
+                break
+            if out["express_company"] is None:
+                out["express_company"] = canonical    # 只认出公司、没有单号：仍然报公司
 
     # 订单号：锚点为含「订单编号/订单号」的框；值为本框或同行最长数字（多为 15~20 位）
     for t in tokens:
@@ -413,15 +479,19 @@ def recognize_order(image_bytes: bytes) -> dict:
     # （文案线索或卡通卡车）时，判为拿错截图 → 拒识并提示改用爬虫（reject_reason 非空）。
     full = "\n".join(item[1] for item in (result or []))
     other = _detect_other_platform(full)
-    is_xianyu = _is_xianyu(full) or _truck_present(arr)
-    if other and not is_xianyu:
+    # 只有真看到淘宝/京东强标记、需要判「拿错截图」时才求闲鱼信号：卡车是全图 8 尺度
+    # matchTemplate，一张 1080×2400 就是 1 秒量级、长截图更久，而绝大多数闲鱼截图 other 为
+    # None，这笔钱纯属白付。
+    # ⚠️ **不要**再把它提成 `is_xianyu = ...` 变量提前算——这里最初就是短路写法，
+    # 是一次「改成拒识语义」的重构顺手提成变量才把短路弄丢的。短路必须留在分支里。
+    if other and not (_is_xianyu(full) or _truck_present(arr)):
         fields["platform"] = None
         fields["reject_reason"] = f"疑似{other}订单截图；OCR 仅支持闲鱼，淘宝/京东请用爬虫抓取"
     else:
         fields["platform"] = "闲鱼"
         fields["reject_reason"] = None
     # 交易状态：有快递单号（已发货）→ 待收货，否则待发货（另按头部状态语细分终态）
-    fields["status"] = _detect_status(full, bool(fields.get("express_no")))
+    fields["purchase_status"] = _detect_purchase_status(full, bool(fields.get("express_no")))
     # 注：旧版在「交易成功」时会清空快递公司/快递号（认为已完成的单不需要物流信息）。现在快递号
     # 是集运「内含快递」联动的匹配键——清掉就再也匹配不上该订单，故保留。误取风险本就很低：
     # 快递号必须以 COMPANY_MAP 命中的快递公司名为锚点、且同行有「≥8 位含≥6 个数字」的串才会被抓。

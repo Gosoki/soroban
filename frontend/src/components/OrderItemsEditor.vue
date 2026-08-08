@@ -19,14 +19,21 @@
                                placeholder="单价" @change="onItemEdit(it)" /></td>
           <td class="c-act"><el-button link type="danger" :icon="Delete" tabindex="-1" @click="removeItem(i)" /></td>
         </tr>
-        <!-- 末尾草稿行：输入名称并失焦/回车即成为新物品并自动写库 -->
-        <tr class="draft-row">
-          <td><el-input v-model="draft.name" size="small" placeholder="+ 新物品名，输入后自动保存"
-                        @change="commitDraft" @keyup.enter="commitDraft" /></td>
+        <!-- 末尾草稿行：三个格子只攒草稿，按回车或点右侧 ✓ 才落库。
+             **不能挂 @change**：原生 change 在失焦时就触发，用户按自然顺序从左往右填
+             （名 → 数量 → 单价）时，刚离开名字框就已经以「数量 1、无单价」提交并清空草稿，
+             随后填的数量与单价留在孤儿 draft 里，永远进不了库。与 NotionTable 的幽灵新建行同一范式。 -->
+        <tr class="draft-row" @keyup.enter="commitDraft">
+          <td><el-input v-model="draft.name" size="small" placeholder="+ 新物品名，填完按回车" /></td>
           <td><el-input-number v-model="draft.quantity" :min="1" :controls="false" size="small" /></td>
           <td><el-input-number v-model="draft.price" :min="0" :precision="2" :controls="false"
-                               size="small" placeholder="单价" @keyup.enter="commitDraft" /></td>
-          <td class="c-act"></td>
+                               size="small" placeholder="单价" /></td>
+          <td class="c-act">
+            <el-button link :type="draftReady ? 'success' : 'info'" :icon="draftReady ? Check : Plus"
+                       :disabled="!draftReady || committingDraft" tabindex="-1"
+                       :title="draftReady ? '添加这条物品（或按回车）' : '先填物品名'"
+                       @click="commitDraft" />
+          </td>
         </tr>
       </tbody>
     </table>
@@ -49,15 +56,17 @@
 <script setup>
 import { computed, reactive, ref, watchEffect } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, QuestionFilled } from '@element-plus/icons-vue'
+import { Check, Delete, Plus, QuestionFilled } from '@element-plus/icons-vue'
 import { ordersApi } from '@/api'
-import { queueOrderWrite } from '@/utils/orderWrites'
+import { applyRowUpdate, queueOrderWrite } from '@/utils/orderWrites'
 
 // order 必须含 id / version / items / postage_cny / title（订单页的行 或 ordersApi.get 的结果都满足）
 const props = defineProps({ order: { type: Object, required: true } })
 const emit = defineEmits(['saved', 'conflict'])
 
 const draft = reactive({ name: '', quantity: 1, price: null })
+const committingDraft = ref(false)
+const draftReady = computed(() => !!(draft.name && draft.name.trim()))
 
 const GOODS_HINT =
   '懒人入口：不想拆物品明细时，直接填这一单的货款（不含邮费）。'
@@ -105,12 +114,16 @@ async function saveItems() {
   try {
     // 整个「读 version→PATCH→回写」入队串行，避免与同订单的其它保存并发撞 version 互相 409
     await queueOrderWrite(props.order.id, async () => {
-      const updated = await ordersApi.update(props.order.id, { version: props.order.version, items })
-      Object.assign(props.order, updated)   // 同步 version + 派生订单价 + 物品（就地更新调用方持有的对象）
+      const patch = { version: props.order.version, items }
+      const updated = await ordersApi.update(props.order.id, patch)
+      applyRowUpdate(props.order, patch, updated)   // 送了 items → 整体采纳（含后端重折算的单价）
       emit('saved', updated)
     })
+    return true
   } catch (e) {
     if (e.response?.status === 409) { ElMessage.warning('数据已变，已刷新'); emit('conflict') }
+    else ElMessage.error(e.response?.data?.detail || '保存失败')
+    return false
   }
 }
 
@@ -128,13 +141,16 @@ function onItemEdit(it) {
 async function savePostage() {
   try {
     await queueOrderWrite(props.order.id, async () => {
-      const updated = await ordersApi.update(props.order.id, { version: props.order.version, postage_cny: itemPrice(props.order.postage_cny) })
-      const { items, ...rest } = updated
-      Object.assign(props.order, rest)
+      const patch = { version: props.order.version, postage_cny: itemPrice(props.order.postage_cny) }
+      const updated = await ordersApi.update(props.order.id, patch)
+      applyRowUpdate(props.order, patch, updated)
       emit('saved', updated)
     })
+    return true
   } catch (e) {
     if (e.response?.status === 409) { ElMessage.warning('数据已变，已刷新'); emit('conflict') }
+    else ElMessage.error(e.response?.data?.detail || '保存失败')
+    return false
   }
 }
 
@@ -148,13 +164,26 @@ async function removeItem(i) {
   saveItems()
 }
 
-// 末尾草稿录入完成：转为正式物品(auto=false)、清空草稿、自动写库
+// 末尾草稿录入完成：转为正式物品(auto=false)、写库、**成功后**才清空草稿
 async function commitDraft() {
-  if (!draft.name || !draft.name.trim()) return
-  ensureItems().push({ name: draft.name.trim(), quantity: Number(draft.quantity) || 1,
-                       unit_price_cny: itemPrice(draft.price), auto: false })
-  draft.name = ''; draft.quantity = 1; draft.price = null
-  await saveItems()
+  if (!draftReady.value || committingDraft.value) return
+  const row = { name: draft.name.trim(), quantity: Number(draft.quantity) || 1,
+                unit_price_cny: itemPrice(draft.price), auto: false }
+  const items = ensureItems()
+  items.push(row)
+  committingDraft.value = true
+  try {
+    // 成功才清空草稿：失败（409 等）时把用户刚敲的内容留在格子里让他改，而不是连人带字一起吞掉。
+    // 同理失败要把乐观塞进去的那条也撤回，否则界面上会留一条其实没入库的物品。
+    if (await saveItems()) {
+      draft.name = ''; draft.quantity = 1; draft.price = null
+    } else {
+      const i = items.indexOf(row)
+      if (i !== -1) items.splice(i, 1)
+    }
+  } finally {
+    committingDraft.value = false
+  }
 }
 </script>
 

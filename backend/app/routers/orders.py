@@ -11,11 +11,12 @@ from sqlmodel import Session, select
 
 from ..auth import get_current_user
 from ..database import get_session
-from ..models import ShipmentOrder, OrderItem, StagingStatus, Order, OrderStaging, utcnow
+from ..db.dialect import ci_contains
+from ..models import ShipmentOrder, OrderItem, ImportStatus, Order, OrderStaging, utcnow
 from ..schemas import OrderCreate, OrderRead, OrderUpdate, norm_code, norm_id
 from .common import (
     build_items, goods_seed, guarded_bump, mirror_to_staging, raise_conflict, raise_not_found,
-    run_ocr, soft_delete,
+    run_ocr, soft_delete, stamp_fx,
 )
 
 router = APIRouter(
@@ -61,7 +62,8 @@ def list_orders(
         None, alias="id", description="定位单条：供集运页点订单号跳转过来隔离显示"),
     date_from: Optional[dt.date] = None,
     date_to: Optional[dt.date] = None,
-    status: Optional[str] = None,
+    fulfillment_status: Optional[str] = None,
+    purchase_status: Optional[str] = Query(None, description="只按订单**自身**的采购段状态筛（不看挂靠的集运单）"),
     platform: Optional[str] = None,
     platform_account: Optional[str] = None,
     express_no: Optional[str] = None,
@@ -69,9 +71,17 @@ def list_orders(
     unassigned: Optional[bool] = Query(None, description="仅未挂靠集运的订单（供集运页点选添加）"),
     order_no: Optional[str] = Query(None, description="按订单号精确匹配（OCR 去重用，区别于模糊 q）"),
     q: Optional[str] = Query(None, description="按订单号搜索（子串模糊）"),
+    legacy_status: Optional[str] = Query(
+        None, alias="status", include_in_schema=False,
+        description="已废弃：查询参数 status 已按业务段改名"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
+    # FastAPI 对未知 query 参数**默认忽略**：改名后漏改一处调用方，
+    # 表现就是「筛选点了没反应、返回全量、HTTP 200、零日志」。响亮拒掉比静默返回错数据强。
+    if legacy_status:
+        raise HTTPException(status_code=400,
+                            detail="查询参数 status 已改名为 fulfillment_status（显示口径）或 purchase_status（订单自身）")
     conds = [Order.is_delete.is_(False)]
     if only_id is not None:
         conds.append(Order.id == only_id)
@@ -81,18 +91,20 @@ def list_orders(
         conds.append(Order.date >= date_from)
     if date_to:
         conds.append(Order.date <= date_to)
-    if status:
-        # 筛选口径必须与**显示**口径一致（effective_status）：显示的是集运单状态、
+    if fulfillment_status:
+        # 筛选口径必须与**显示**口径一致（fulfillment_status）：显示的是集运单状态、
         # 筛选却按订单自身状态，就会出现「列表里明明显示着一堆『已发出』，
         # 筛『已发出』却一条都搜不到」。用相关子查询而非 JOIN——不改变结果行的形状，
         # 也就不会影响上面那句 count 与下面的分页。
         ship_status = (
-            select(ShipmentOrder.status)
+            select(ShipmentOrder.shipment_status)
             .where(ShipmentOrder.id == Order.shipment_order_id,
                    ShipmentOrder.is_delete.is_(False))
             .scalar_subquery()
         )
-        conds.append(func.coalesce(ship_status, Order.status) == status)
+        conds.append(func.coalesce(ship_status, Order.purchase_status) == fulfillment_status)
+    if purchase_status:
+        conds.append(Order.purchase_status == purchase_status)
     if platform:
         conds.append(Order.platform == platform)
     if platform_account:
@@ -107,7 +119,7 @@ def list_orders(
         conds.append(Order.order_no == norm_id(order_no))
     if q:   # 统一模糊搜：物品名 / 商品标题 / 订单号 / 快递号（物品名用 EXISTS 子查询，不重复行）
         conds.append(
-            Order.order_no.contains(q, autoescape=True)
+            ci_contains(Order.order_no, q, session)
             | Order.title.contains(q, autoescape=True)
             | Order.express_no.contains(q, autoescape=True)
             | Order.items.any(OrderItem.name.contains(q, autoescape=True))
@@ -117,7 +129,7 @@ def list_orders(
     rows = session.exec(
         select(Order)
         .where(*conds)
-        # 两个关系都预加载：items 供 OrderRead 展开，shipment_order 供 effective_status。
+        # 两个关系都预加载：items 供 OrderRead 展开，shipment_order 供 fulfillment_status。
         # 少一个都会变成整页逐行发 SQL（N+1）——tests/test_queries.py 钉着查询条数。
         .options(selectinload(Order.items), selectinload(Order.shipment_order))
         .order_by(Order.date.desc(), Order.id.desc())
@@ -202,6 +214,7 @@ def update_order(order_id: int, payload: OrderUpdate, session: Session = Depends
         seed = payload.price_cny if payload.price_cny is not None else order.price_cny
         order.items = [OrderItem(**d)
                        for d in build_items([], goods_seed(seed, order.postage_cny), order.title)]
+    stamp_fx(session, order)                 # 同上：缺汇率的行每次 PATCH 都重试补，顺带自愈存量脏行
     order.sync_from_items()                  # 无论是否改物品：价格恒由物品派生，并按新 fx/override 重算日元
     mirror_to_staging(session, order, built)  # 若由暂存导入：镜像回暂存行，避免删单后重导丢失编辑
 
@@ -223,7 +236,7 @@ def delete_order(order_id: int, session: Session = Depends(get_session)):
     session.execute(
         sa_update(OrderStaging)
         .where(OrderStaging.imported_order_id == order_id)
-        .values(imported_order_id=None, import_status=StagingStatus.pending.value,
+        .values(imported_order_id=None, import_status=ImportStatus.pending.value,
                 version=OrderStaging.version + 1, updated_at=utcnow())
     )
     session.commit()

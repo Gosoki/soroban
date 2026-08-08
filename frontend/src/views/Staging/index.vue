@@ -12,8 +12,8 @@
           <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
             <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
           </el-select>
-          <el-select v-model="filters.status" placeholder="全部状态" clearable style="width: 120px" @change="reload">
-            <el-option v-for="s in STAGING_STATUS" :key="s" :label="s" :value="s" />
+          <el-select v-model="filters.importStatus" placeholder="全部状态" clearable style="width: 120px" @change="reload">
+            <el-option v-for="s in IMPORT_STATUS" :key="s" :label="s" :value="s" />
           </el-select>
           <el-select v-model="filters.platform_account" placeholder="账号昵称" clearable filterable style="width: 120px" @change="reload">
             <el-option v-for="a in accountOptions" :key="a" :label="a" :value="a" />
@@ -29,7 +29,7 @@
           <span :class="{ ph: !(row.items && row.items.length), 'auto-txt': allTitleItems(row) }">{{ itemSummary(row) }}</span>
         </template>
         <template #cell-import_status="{ row }">
-          <el-tag :style="stagingStyle(row.import_status)" size="small">{{ row.import_status }}</el-tag>
+          <el-tag :style="importStatusStyle(row.import_status)" size="small">{{ row.import_status }}</el-tag>
         </template>
 
         <template #expand="{ row }">
@@ -58,7 +58,7 @@
 
         <template #actions="{ row }">
           <template v-if="row.imported_order_id">
-            <el-tag :style="stagingStyle('已导入')" size="small">已导入 #{{ row.imported_order_id }}</el-tag>
+            <el-tag :style="importStatusStyle('已导入')" size="small">已导入 #{{ row.imported_order_id }}</el-tag>
           </template>
           <template v-else>
             <el-button size="small" type="primary" @click="doImport(row)">导入</el-button>
@@ -77,8 +77,9 @@
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Plus } from '@element-plus/icons-vue'
+import { applyRowUpdate } from '@/utils/orderWrites'
 import { stagingApi, tagsApi } from '@/api'
-import { ORDER_SOURCES, PRICE_HELP, STAGING_STATUS, ORDER_STATUS, stagingStyle } from '@/constants'
+import { ORDER_SOURCES, PRICE_HELP, IMPORT_STATUS, PURCHASE_STATUS, importStatusStyle } from '@/constants'
 import { fmtDate } from '@/utils/datetime'
 import NotionTable from '@/components/NotionTable.vue'
 
@@ -90,7 +91,7 @@ const columns = [
   { key: 'platform', label: '来源', type: 'tag', field: 'platform', width: COL_W, placeholder: '来源' },
   { key: 'title', label: '商品', type: 'text', long: true, width: COL_W },   // 标题长：点开弹宽框看全
   { key: 'price_cny', label: '人民币（元）', format: 'cny', readonly: true, width: COL_W, help: PRICE_HELP },   // 由物品单价×数量派生
-  { key: 'trade_status', label: '交易状态', type: 'select', options: ORDER_STATUS, width: COL_W },
+  { key: 'purchase_status', label: '交易状态', type: 'select', options: PURCHASE_STATUS, width: COL_W },
   { key: 'items', label: '物品', readonly: true, width: COL_W, expand: true },
   { key: 'order_no', label: '订单号', type: 'text', width: COL_W, placeholder: '订单号' },
   { key: 'express_no', label: '快递号', type: 'text', width: COL_W, placeholder: '快递号' },
@@ -105,7 +106,7 @@ const loading = ref(false)
 const page = ref(1)
 const pageSize = 30
 // 默认只看「待处理」（抓进来待逐单导入的）；清空筛选或切状态即可看全部/已导入/已忽略
-const filters = reactive({ q: '', platform: '', status: '待处理', platform_account: '', range: null })
+const filters = reactive({ q: '', platform: '', importStatus: '待处理', platform_account: '', range: null })
 const accountOptions = ref([])   // 账号昵称下拉候选（标签接口）
 async function loadAccounts() {
   try { accountOptions.value = (await tagsApi.list('platform_account')).map((t) => t.value) } catch (_) { /* 已提示 */ }
@@ -138,7 +139,7 @@ async function load() {
     const params = { limit: pageSize, offset: (page.value - 1) * pageSize }
     if (filters.q) params.q = filters.q
     if (filters.platform) params.platform = filters.platform
-    if (filters.status) params.status = filters.status
+    if (filters.importStatus) params.import_status = filters.importStatus
     if (filters.platform_account) params.platform_account = filters.platform_account
     if (filters.range) { params.date_from = filters.range[0]; params.date_to = filters.range[1] }
     const res = await stagingApi.list(params)
@@ -154,9 +155,9 @@ function onPage(p) { page.value = p; load() }
 
 async function saveCell(row, key, value) {
   try {
-    const updated = await stagingApi.update(row.id, { version: row.version, [key]: value })
-    const { items, ...rest } = updated       // 不覆盖展开面板里未保存的物品编辑
-    Object.assign(row, rest)
+    const patch = { version: row.version, [key]: value }
+    const updated = await stagingApi.update(row.id, patch)
+    applyRowUpdate(row, patch, updated)      // 没送 items → 不覆盖展开面板里未保存的物品编辑
   } catch (e) {
     if (e.response?.status === 409) {
       ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新')
@@ -186,9 +187,9 @@ async function saveItems(row) {
 async function savePostage(row) {
   const postage = (row.postage_cny === '' || row.postage_cny == null) ? null : Number(row.postage_cny)
   try {
-    const updated = await stagingApi.update(row.id, { version: row.version, postage_cny: postage })
-    const { items, ...rest } = updated
-    Object.assign(row, rest)
+    const patch = { version: row.version, postage_cny: postage }
+    const updated = await stagingApi.update(row.id, patch)
+    applyRowUpdate(row, patch, updated)
   } catch (e) {
     if (e.response?.status === 409) { ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
   }

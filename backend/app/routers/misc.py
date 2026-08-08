@@ -11,7 +11,7 @@ from ..auth import get_current_user
 from ..database import get_session
 from ..models import MiscExpense
 from ..schemas import MiscCreate, MiscRead, MiscUpdate
-from .common import guarded_bump, raise_conflict, raise_not_found, soft_delete
+from .common import guarded_bump, raise_conflict, raise_not_found, soft_delete, stamp_fx
 
 router = APIRouter(
     prefix="/api/misc", tags=["misc"], dependencies=[Depends(get_current_user)]
@@ -19,7 +19,7 @@ router = APIRouter(
 
 
 @router.get("")
-def list_items(
+def list_expenses(
     session: Session = Depends(get_session),
     date_from: Optional[dt.date] = None,
     date_to: Optional[dt.date] = None,
@@ -50,54 +50,52 @@ def list_items(
 
 
 @router.post("", response_model=MiscRead)
-def create_item(payload: MiscCreate, session: Session = Depends(get_session)):
-    from ..services.fx import current_rate  # 局部导入避免循环
-
-    item = MiscExpense(**payload.model_dump())
-    if item.price_cny is not None and item.fx_rate is None:
-        # 有人民币价却没填汇率 → 补当天汇率（对齐集运 create）。否则 compute_money 算不出
-        # jpy_auto/jpy_settled，该笔支出会静默不计入看板合计、结算列空白。
-        item.fx_rate = current_rate(session)
-    item.compute_money()
-    session.add(item)
+def create_expense(payload: MiscCreate, session: Session = Depends(get_session)):
+    expense = MiscExpense(**payload.model_dump())
+    stamp_fx(session, expense)
+    expense.compute_money()
+    session.add(expense)
     session.commit()
-    session.refresh(item)
-    return item
+    session.refresh(expense)
+    return expense
 
 
-@router.get("/{item_id}", response_model=MiscRead)
-def get_item(item_id: int, session: Session = Depends(get_session)):
-    item = session.get(MiscExpense, item_id)
-    if not item or item.is_delete:
+@router.get("/{expense_id}", response_model=MiscRead)
+def get_expense(expense_id: int, session: Session = Depends(get_session)):
+    expense = session.get(MiscExpense, expense_id)
+    if not expense or expense.is_delete:
         raise_not_found("杂项")
-    return item
+    return expense
 
 
-@router.patch("/{item_id}", response_model=MiscRead)
-def update_item(item_id: int, payload: MiscUpdate, session: Session = Depends(get_session)):
-    item = session.get(MiscExpense, item_id)
-    if not item or item.is_delete:
+@router.patch("/{expense_id}", response_model=MiscRead)
+def update_expense(expense_id: int, payload: MiscUpdate, session: Session = Depends(get_session)):
+    expense = session.get(MiscExpense, expense_id)
+    if not expense or expense.is_delete:
         raise_not_found("杂项")
-    if not guarded_bump(session, MiscExpense, item_id, payload.version):
+    if not guarded_bump(session, MiscExpense, expense_id, payload.version):
         raise_conflict()
 
     data = payload.model_dump(exclude_unset=True, exclude={"version"})
     for key, value in data.items():
-        setattr(item, key, value)
-    item.compute_money()
+        setattr(expense, key, value)
+    # 幽灵新建行最自然的用法是「先敲名称回车建行 → 再点人民币格填金额」，
+    # 金额是在这条 PATCH 里才第一次出现的。不在这里补汇率，这行就永远算不出日元。
+    stamp_fx(session, expense)
+    expense.compute_money()
 
-    session.add(item)
+    session.add(expense)
     session.commit()
-    session.refresh(item)
-    return item
+    session.refresh(expense)
+    return expense
 
 
-@router.delete("/{item_id}")
-def delete_item(item_id: int, session: Session = Depends(get_session)):
-    item = session.get(MiscExpense, item_id)
-    if not item or item.is_delete:
+@router.delete("/{expense_id}")
+def delete_expense(expense_id: int, session: Session = Depends(get_session)):
+    expense = session.get(MiscExpense, expense_id)
+    if not expense or expense.is_delete:
         raise_not_found("杂项")
-    soft_delete(item)
-    session.add(item)
+    soft_delete(expense)
+    session.add(expense)
     session.commit()
     return {"ok": True}

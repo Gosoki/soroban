@@ -58,9 +58,15 @@ if errorlevel 1 goto pyinstaller_fail
 
 rem ===== Prepare release directory =====
 echo.
-echo [1/3] Cleaning and creating release dir %RELEASE% ...
-if exist "%RELEASE%" rmdir /s /q "%RELEASE%"
-mkdir "%RELEASE%"
+echo [1/3] Preparing release dir %RELEASE% ...
+rem NEVER wipe %RELEASE%: it doubles as the RUNTIME data dir. The exe is portable by
+rem design (run.py chdir's to its own folder), so soroban.db, .env with the SECRET_KEY,
+rem and scraper\ venvs + login sessions all live right here. VERSION is a hand-edited
+rem constant, so "fix a bug, rebuild" would silently delete the whole ledger -- no
+rem prompt, no recycle bin, and backup.sh only covers backend\soroban.db.
+rem mkdir is idempotent below; onefile emits a single soroban.exe, so there are no
+rem stale artefacts that would need cleaning anyway.
+if not exist "%RELEASE%" mkdir "%RELEASE%"
 if exist "%ROOT%build" rmdir /s /q "%ROOT%build"
 
 rem ===== Build frontend =====
@@ -94,9 +100,15 @@ if not exist "%ROOT%soroban.spec" (
     pause
     exit /b 1
 )
+rem Build into build\dist first, copy into the release dir only on success. Keeps the
+rem whole thing near-atomic: if PyInstaller (or the npm build above) fails, the working
+rem exe and the data already sitting in %RELEASE% are untouched.
 "%PY%" -m PyInstaller --clean --noconfirm "%ROOT%soroban.spec" ^
-    --distpath "%RELEASE%" --workpath "%ROOT%build"
+    --distpath "%ROOT%build\dist" --workpath "%ROOT%build\work"
 if errorlevel 1 goto build_fail
+
+copy /y "%ROOT%build\dist\soroban.exe" "%RELEASE%\soroban.exe" >nul
+if errorlevel 1 goto copy_fail
 
 rem frontend\dist and alembic migrations are bundled INTO soroban.exe (see soroban.spec).
 rem Scraper plugins (scraper\soroban-scraper-*) are NOT bundled; drop the scraper folder
@@ -112,7 +124,9 @@ echo ========================================
 dir /b "%RELEASE%"
 echo ----------------------------------------
 echo   Run soroban.exe. It creates soroban.db + .env next to itself on first run,
-echo   seeds an admin (admin / admin123), then serves API + frontend on one port.
+echo   seeds an admin, then serves API + frontend on one port.
+echo   This dir is also the DATA dir: soroban.db / .env / scraper\ live here and are
+echo   preserved across rebuilds. Back them up before moving or deleting it.
 echo   Open http://127.0.0.1:8620 in your browser (set BACKEND_PORT to change the port).
 echo   Ship a "scraper" folder next to the exe if you use crawler plugins.
 echo ========================================
@@ -142,6 +156,14 @@ popd
 echo ERROR: frontend build failed
 pause
 exit /b 1
+:copy_fail
+echo.
+echo [ERROR] Could not copy soroban.exe into "%RELEASE%".
+echo         It is probably still running -- close it and run this script again.
+echo         The previous exe and your data in that folder are untouched.
+pause
+exit /b 1
+
 :build_fail
 echo ERROR: soroban.exe build failed
 pause

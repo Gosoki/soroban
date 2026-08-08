@@ -14,11 +14,11 @@ from app.models import (
     Order,
     OrderItem,
     OrderStaging,
-    OrderStatus,
+    PurchaseStatus,
     ShipmentOrder,
     ShipmentStatus,
     StagingItem,
-    StagingStatus,
+    ImportStatus,
 )
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -56,7 +56,7 @@ def test_order_total_price_column_kept():
 def test_staging_two_statuses_are_distinguishable():
     """一行上两个「状态」：导入工作流 vs 真实交易状态。旧名 status / order_status 看不出区别。"""
     cols = OrderStaging.__table__.columns
-    assert "import_status" in cols and "trade_status" in cols
+    assert "import_status" in cols and "purchase_status" in cols
     assert "status" not in cols and "order_status" not in cols
 
 
@@ -73,7 +73,7 @@ def test_created_via_replaces_source():
 def test_order_and_shipment_status_literals_are_disjoint():
     """订单状态与集运状态曾共用「已签收」——而 EXCLUDED_STATUSES 这类集合会同时作用于两张表，
     同字面量意味着「改一个枚举会静默影响另一张表的过滤」。现在必须完全不相交。"""
-    order = {s.value for s in OrderStatus}
+    order = {s.value for s in PurchaseStatus}
     shipment = {s.value for s in ShipmentStatus}
     assert not (order & shipment), f"两个状态枚举又有了同名值：{sorted(order & shipment)}"
 
@@ -84,9 +84,9 @@ def test_two_legs_use_distinct_words():
       · 集运单（国际段）：包裹到本人手上 = 「已送达」
     曾经两边都叫「已签收」，而 EXCLUDED_STATUSES 这类集合同时作用于两张表——
     同字面量意味着「改一个枚举会静默影响另一张表的过滤」。"""
-    assert OrderStatus.signed.value == "已签收"
+    assert PurchaseStatus.signed.value == "已签收"
     assert ShipmentStatus.delivered.value == "已送达"
-    assert "已入仓" not in {s.value for s in OrderStatus}, "已入仓 已取消，别再冒出来"
+    assert "已入仓" not in {s.value for s in PurchaseStatus}, "已入仓 已取消，别再冒出来"
     assert "已签收" not in {s.value for s in ShipmentStatus}
 
 
@@ -95,12 +95,12 @@ def test_status_enum_attribute_names_do_not_collide_confusingly():
     现在订单侧只到 signed（已签收，国内段终点），集运侧 delivered（已送达）。"""
     assert not hasattr(ShipmentStatus, "arrived")
     assert not hasattr(ShipmentStatus, "signed")
-    assert not hasattr(OrderStatus, "delivered")
-    assert not hasattr(OrderStatus, "consolidating"), "国际段状态不该回到订单枚举里"
+    assert not hasattr(PurchaseStatus, "delivered")
+    assert not hasattr(PurchaseStatus, "consolidating"), "国际段状态不该回到订单枚举里"
 
 
 def test_staging_status_enum_untouched():
-    assert {s.value for s in StagingStatus} == {"待处理", "已导入", "已忽略"}
+    assert {s.value for s in ImportStatus} == {"待处理", "已导入", "已忽略"}
 
 
 # --- 三、函数名不该骗人 -------------------------------------------------------
@@ -127,7 +127,7 @@ def test_frontend_has_no_stale_field_names():
         r"\brow\.shop\b": "row.title",
         r"\bit\.price_cny\b": "it.unit_price_cny",
         r"key: 'shop'": "key: 'title'",
-        r"key: 'order_status'": "key: 'trade_status'",
+        r"key: 'order_status'": "key: 'purchase_status'",
     }
     hits = []
     for f in (_REPO / "frontend" / "src").rglob("*.vue"):
@@ -144,7 +144,7 @@ def test_scraper_pushes_current_field_names():
     if not norm.is_file():
         pytest.skip("插件未安装")
     text = norm.read_text(encoding="utf-8")
-    assert '"title"' in text and '"trade_status"' in text and '"unit_price_cny"' in text
+    assert '"title"' in text and '"purchase_status"' in text and '"unit_price_cny"' in text
     assert '"shop"' not in text and '"order_status"' not in text
 
 
@@ -153,5 +153,4 @@ def test_frontend_status_words_match_backend():
     js = (_REPO / "frontend" / "src" / "constants.js").read_text(encoding="utf-8")
     assert "'已签收'" in js and "'已送达'" in js
     assert "'已入仓'" not in js, "前端还留着已取消的「已入仓」"
-    orders_vue = (_REPO / "frontend" / "src" / "views" / "Orders" / "index.vue").read_text(encoding="utf-8")
-    assert "已签收: 3" in orders_vue, "Orders 页的 STATUS_RANK 没跟着改"
+    assert "已签收: 3" in js, "constants.js 的 PURCHASE_STATUS_RANK 没跟着改"

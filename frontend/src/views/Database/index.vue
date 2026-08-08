@@ -214,7 +214,22 @@ async function onSourceChanged(target, name, detail) {
       ElMessage.success(`已重新迁移并切换到 ${name}`)
     }
     await loadStatus()
-  } catch (_) { /* 拦截器已提示 */ } finally { busy.value = null }
+  } catch (e) {
+    // migrate 与 switch 都可能再返回 409，而 409 被 http 拦截器**刻意跳过**（留给页面处理）。
+    // 这里原先是空 catch：弹窗关掉、loading 停掉、既无成功也无失败提示、loadStatus 也被跳过
+    // —— 用户完全不知道到底切没切。上面 doSwitch 为同一件事写了处理，这条分支漏了。
+    if (e.response?.status === 409) {
+      // 只提示不递归：迁移与切换之间源库又被写了（爬虫回灌 / 汇率刷新 / 另一个标签页）。
+      // 递归重试会在爬虫逐单回灌时变成关不掉的弹窗循环。
+      ElMessage({
+        type: 'warning', duration: 8000,
+        message: (e.response?.data?.detail || '迁移与切换之间源库又有改动')
+          + '——**未切换**，当前仍连着原来的库。请等抓取/刷新结束后再试一次。',
+      })
+    }
+    // 其余错误拦截器已提示
+    await loadStatus()                       // 无论成败都把真实状态拉回来，别让界面停在猜测里
+  } finally { busy.value = null }
 }
 
 async function doDelete(row) {

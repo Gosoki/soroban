@@ -63,6 +63,23 @@ def anon() -> TestClient:
 
 
 @pytest.fixture()
+def mk(client):
+    """断言式造数：POST 必须成功，否则当场红。
+
+    裸 `client.post(...)` 造数是本套件的历史地雷——写模型是 `extra="forbid"`，
+    键名一旦漂移（改列名那类重构）POST 全部 422，行根本没建出来，而断言
+    「这些行不计入合计」在**没有这些行**时同样成立，于是重构与守卫同时失效、测试全绿。
+    造数一律走这里，让下一个人默认掉进正确的坑。
+    """
+    def _mk(url: str, payload: dict) -> dict:
+        r = client.post(url, json=payload)
+        assert r.status_code == 200, f"造数失败 {url}: {r.status_code} {r.text}"
+        return r.json()
+
+    return _mk
+
+
+@pytest.fixture()
 def session():
     with Session(get_engine()) as s:
         yield s

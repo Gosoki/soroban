@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from app.models import ORDER_STATUS_RANK, OrderStatus, ShipmentStatus, StagingStatus
+from app.models import PURCHASE_STATUS_RANK, PurchaseStatus, ShipmentStatus, ImportStatus
 
 _REPO = Path(__file__).resolve().parents[2]
 _CONSTANTS_JS = _REPO / "frontend" / "src" / "constants.js"
@@ -38,7 +38,7 @@ def constants_js() -> str:
 
 
 def test_frontend_order_status_matches_backend(constants_js):
-    assert _js_array(constants_js, "ORDER_STATUS") == [s.value for s in OrderStatus]
+    assert _js_array(constants_js, "PURCHASE_STATUS") == [s.value for s in PurchaseStatus]
 
 
 def test_frontend_shipment_status_matches_backend(constants_js):
@@ -46,27 +46,29 @@ def test_frontend_shipment_status_matches_backend(constants_js):
 
 
 def test_frontend_staging_status_matches_backend(constants_js):
-    assert _js_array(constants_js, "STAGING_STATUS") == [s.value for s in StagingStatus]
+    assert _js_array(constants_js, "IMPORT_STATUS") == [s.value for s in ImportStatus]
 
 
 def test_frontend_status_rank_matches_backend():
-    """Orders 页的 STATUS_RANK 决定 OCR 合并时状态能否推进；与后端 ORDER_STATUS_RANK 必须一致。"""
-    text = _ORDERS_VUE.read_text(encoding="utf-8")
-    m = re.search(r"const STATUS_RANK\s*=\s*\{(.*?)\}", text, re.S)
-    assert m, "没在 Orders/index.vue 里找到 STATUS_RANK"
+    """前端的推进序决定 OCR 合并时状态能否推进；与后端 PURCHASE_STATUS_RANK 必须一致。
+
+    它已从 Orders 页搬进 constants.js —— 两个页面各存一份必然漂移。"""
+    text = _CONSTANTS_JS.read_text(encoding="utf-8")
+    m = re.search(r"const PURCHASE_STATUS_RANK\s*=\s*\{(.*?)\}", text, re.S)
+    assert m, "没在 constants.js 里找到 PURCHASE_STATUS_RANK"
     fe = {k: int(v) for k, v in re.findall(r"([^\s,{]+)\s*:\s*(\d+)", m.group(1))}
-    assert fe == ORDER_STATUS_RANK
+    assert fe == PURCHASE_STATUS_RANK
 
 
 def test_scraper_status_map_targets_are_valid(constants_js):
-    """爬虫 STATUS_MAP 的目标值必须都是后端 OrderStatus 的合法值，否则回灌整批 422。"""
+    """爬虫 STATUS_MAP 的目标值必须都是后端 PurchaseStatus 的合法值，否则回灌整批 422。"""
     if not _SCRAPER_NORMALIZE.is_file():
         pytest.skip("插件未安装")
     text = _SCRAPER_NORMALIZE.read_text(encoding="utf-8")
     m = re.search(r"STATUS_MAP\s*=\s*\{(.*?)\n\}", text, re.S)
     assert m, "没找到 STATUS_MAP"
     targets = {v for _, v in re.findall(r'"([^"]+)"\s*:\s*"([^"]+)"', m.group(1))}
-    valid = {s.value for s in OrderStatus}
+    valid = {s.value for s in PurchaseStatus}
     assert targets <= valid, f"爬虫会推出后端不接受的状态：{sorted(targets - valid)}"
 
 
@@ -74,60 +76,61 @@ def test_status_rank_covers_all_forward_statuses():
     """生命周期里「会前进」的状态都要有 rank；终态刻意不在表里（取 -1）。
 
     ⚠️ 但 -1 **不能**单独用来判「能不能覆盖」——见下面那条。"""
-    from app.models import is_terminal, order_status_rank
-    for s in OrderStatus:
-        if is_terminal(s.value):
-            assert order_status_rank(s.value) == -1
+    from app.models import is_purchase_terminal, purchase_status_rank
+    for s in PurchaseStatus:
+        if is_purchase_terminal(s.value):
+            assert purchase_status_rank(s.value) == -1
         else:
-            assert order_status_rank(s.value) >= 0, f"{s.value} 缺 rank"
+            assert purchase_status_rank(s.value) >= 0, f"{s.value} 缺 rank"
 
 
 def test_terminal_status_is_never_overwritten_by_automation():
     """本项目栽过的坑：终态 rank 为 -1，而 -1 的效果是「**任何**推进态都 > 它」，
     于是一张已标「退款」的单被 OCR 再识别一次就被抹成「待发货」——
     退款本不计入看板合计，抹掉后**看板金额凭空变大**（实测 188606→211975）。"""
-    from app.models import can_advance
+    from app.models import can_advance_purchase
 
     for terminal in ("退款", "交易关闭"):
         for incoming in ("待付款", "待发货", "待收货", "已签收"):
-            assert not can_advance(terminal, incoming), \
+            assert not can_advance_purchase(terminal, incoming), \
                 f"终态「{terminal}」被「{incoming}」盖掉了"
 
 
 def test_automation_may_still_set_terminal_status():
     """反向：平台把单关了/退款了，账本该跟上。"""
-    from app.models import can_advance
+    from app.models import can_advance_purchase
 
-    assert can_advance("待收货", "退款")
-    assert can_advance("已签收", "交易关闭")
+    assert can_advance_purchase("待收货", "退款")
+    assert can_advance_purchase("已签收", "交易关闭")
 
 
 def test_can_advance_only_moves_forward():
-    from app.models import can_advance
+    from app.models import can_advance_purchase
 
-    assert can_advance("待发货", "待收货")
-    assert not can_advance("已签收", "待发货"), "不该回退"
-    assert not can_advance("待收货", "待收货"), "相同值不该触发写入"
-    assert not can_advance("待收货", None)
+    assert can_advance_purchase("待发货", "待收货")
+    assert not can_advance_purchase("已签收", "待发货"), "不该回退"
+    assert not can_advance_purchase("待收货", "待收货"), "相同值不该触发写入"
+    assert not can_advance_purchase("待收货", None)
 
 
 def test_frontend_merge_uses_the_same_terminal_rule():
     """前端 OCR 合并有自己一份 rank（跨语言没法直接共用）。至少钉住：
     它必须有终态保护、且不能再退回到「只比 rank」。"""
     src = (_REPO / "frontend" / "src" / "views" / "Orders" / "index.vue").read_text(encoding="utf-8")
-    assert "function canAdvance(" in src, "前端合并没有终态保护"
-    assert "const TERMINAL = ['退款', '交易关闭']" in src
-    assert "canAdvance(base.status, data.status)" in src, "合并判定没走 canAdvance"
-    assert "statusRank(data.status) > statusRank(base.status)" not in src, "又退回只比 rank 了"
+    assert "canAdvancePurchase" in src, "前端合并没有走终态保护"
+    assert "canAdvancePurchase(base.purchase_status, data.purchase_status)" in src, \
+        "合并判定没走 canAdvancePurchase"
+    # 不再断言「某串不存在」：改名之后那类否定断言会恒真（假绿）。
+    # 真正的保护是行为级的 test_ocr_merge_never_downgrades_terminal_status。
 
 
 def test_ocr_recognises_refund_before_express():
     """退款单同样带快递号。先判快递就会把退款单识别成「待收货」——之前正是这么错的。"""
     from app.services import ocr
 
-    assert ocr._detect_status("退款成功 买家已收到退款", False) == "退款"
-    assert ocr._detect_status("退款成功 买家已收到退款", True) == "退款", "有快递号也该判退款"
-    assert ocr._detect_status("交易关闭", True) == "交易关闭"
+    assert ocr._detect_purchase_status("退款成功 买家已收到退款", False) == "退款"
+    assert ocr._detect_purchase_status("退款成功 买家已收到退款", True) == "退款", "有快递号也该判退款"
+    assert ocr._detect_purchase_status("交易关闭", True) == "交易关闭"
 
 
 def test_layout_table_whitelist_covers_frontend_tables():
@@ -210,8 +213,8 @@ def test_status_column_is_still_a_click_to_pick_tag():
     """状态必须保持「点标签就能选」——和其它标签列一致的交互。
     曾经为了显示继承来的集运状态，把它换成过 el-select 下拉，交互就和别的列不一样了。"""
     src = _orders_vue()
-    assert "key: 'status', label: '状态', type: 'select'" in src, "状态列不再是 select 单元格（点标签选）"
-    assert "#cell-status" not in src, "状态列又被自定义槽接管了，交互会和其它标签列不一致"
+    assert "key: 'purchase_status', label: '状态', type: 'select'" in src, "状态列不再是 select 单元格（点标签选）"
+    assert "#cell-purchase_status" not in src, "状态列又被自定义槽接管了，交互会和其它标签列不一致"
 
 
 def test_status_locks_when_attached_but_items_does_not():
@@ -221,7 +224,7 @@ def test_status_locks_when_attached_but_items_does_not():
     物品列**不锁**——挂靠不改变「这单买了什么」，物品该照常能改（走展开面板）。
     曾误把它一起锁上，是把「物品列表页同理」错读成了「物品这一列同理」。"""
     src = _orders_vue()
-    st = src.split("key: 'status'")[1][:400]
+    st = src.split("key: 'purchase_status'")[1][:400]
     assert "lock: (row) => !!row.shipment_order_id" in st, "状态列没有按挂靠锁定"
     assert "lockHint" in st, "状态列锁定了却没给提示"
 
@@ -232,14 +235,14 @@ def test_status_locks_when_attached_but_items_does_not():
 def test_items_page_status_follows_shipment_too():
     """「物品列表页同理」：那一页也有状态列，同样要显示继承来的集运状态。
 
-    ⚠️ 这条曾是**假绿**：原来只 grep 列配置里有没有 `display: (row) => row.effective_status`
-    这串字符——而该列有 `#cell-status` 插槽，NotionTable 的插槽分支优先于 GotionCell，
+    ⚠️ 这条曾是**假绿**：原来只 grep 列配置里有没有 `display: (row) => row.fulfillment_status`
+    这串字符——而该列有 `#cell-purchase_status` 插槽，NotionTable 的插槽分支优先于 GotionCell，
     `col.display` 根本不会被调用。于是 bug 活着、测试全绿，比没有守卫更糟。
-    现在改成断言**插槽内**真的用了 effective_status。"""
+    现在改成断言**插槽内**真的用了 fulfillment_status。"""
     tpl = _template_of(_REPO / "frontend" / "src" / "views" / "Items" / "index.vue")
-    assert "#cell-status" in tpl, "状态列改成不用插槽了？那要相应改回断言 col.display"
-    slot = tpl.split("#cell-status")[1][:400]
-    assert "effective_status" in slot, "物品列表页的状态插槽没用继承来的状态"
+    assert "#cell-purchase_status" in tpl, "状态列改成不用插槽了？那要相应改回断言 col.display"
+    slot = tpl.split("#cell-purchase_status")[1][:400]
+    assert "fulfillment_status" in slot, "物品列表页的状态插槽没用继承来的状态"
 
 
 def test_items_filter_matches_what_items_page_displays():
@@ -250,7 +253,7 @@ def test_items_filter_matches_what_items_page_displays():
     from app.routers import items as mod
 
     src = inspect.getsource(mod.list_items)
-    assert "func.coalesce(ship_status, Order.status) == status" in src, \
+    assert "func.coalesce(ship_status, Order.purchase_status) == fulfillment_status" in src, \
         "物品列表的状态筛选没跟显示口径对齐"
 
 
@@ -274,7 +277,7 @@ def test_items_api_exposes_inherited_status():
     """前端要靠这两个字段渲染，后端不给就只能显示订单自己的国内段状态。"""
     from app.schemas import ItemListRead
 
-    assert "effective_status" in ItemListRead.model_fields
+    assert "fulfillment_status" in ItemListRead.model_fields
     assert "shipment_order_id" in ItemListRead.model_fields
 
 
@@ -289,8 +292,8 @@ def test_price_column_is_fillable_on_new_row_only():
 
 def test_status_cell_displays_inherited_value():
     """锁定期间要显示**继承来的**集运状态，而不是订单自己的国内段状态。"""
-    blk = _orders_vue().split("key: 'status'")[1][:400]
-    assert "display: (row) => row.effective_status" in blk
+    blk = _orders_vue().split("key: 'purchase_status'")[1][:400]
+    assert "display: (row) => row.fulfillment_status" in blk
 
 
 def test_locked_cell_greys_the_cell_not_the_tag():

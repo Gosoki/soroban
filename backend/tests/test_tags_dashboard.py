@@ -116,19 +116,23 @@ def _clear_ledger():
         s.commit()
 
 
-def test_dashboard_totals_and_exclusions(client):
+def test_dashboard_totals_and_exclusions(client, mk):
     _clear_ledger()
     # 计入
-    client.post("/api/orders", json={"date": "2026-08-05", "price_cny": "100", "fx_rate": "20",
-                                     "status": "待发货"})
-    client.post("/api/shipment", json={"date": "2026-08-05", "price_cny": "50", "fx_rate": "20"})
-    client.post("/api/misc", json={"date": "2026-08-05", "name": "杂", "price_cny": "10", "fx_rate": "20"})
+    mk("/api/orders", {"date": "2026-08-05", "price_cny": "100", "fx_rate": "20",
+                       "purchase_status": "待发货"})
+    mk("/api/shipment", {"date": "2026-08-05", "price_cny": "50", "fx_rate": "20"})
+    mk("/api/misc", {"date": "2026-08-05", "name": "杂", "price_cny": "10", "fx_rate": "20"})
     # 不计入
     for st in ("退款", "交易关闭", "待付款"):
-        client.post("/api/orders", json={"date": "2026-08-05", "price_cny": "999", "fx_rate": "20",
-                                         "status": st})
-    client.post("/api/shipment", json={"date": "2026-08-05", "price_cny": "999", "fx_rate": "20",
-                                       "status": "已取消"})
+        mk("/api/orders", {"date": "2026-08-05", "price_cny": "999", "fx_rate": "20",
+                           "purchase_status": st})
+    mk("/api/shipment", {"date": "2026-08-05", "price_cny": "999", "fx_rate": "20",
+                         "shipment_status": "已取消"})
+    # 造数落地的元断言：排除类断言天然恒真——「被排除的行没建出来」与「排除逻辑正确」
+    # 给出同一个数。不钉住这几行确实存在且带着钱，下面 6 条断言就是摆设（本文件出过这事）。
+    assert client.get("/api/orders", params={"limit": 200}).json()["total"] == 4
+    assert client.get("/api/shipment", params={"limit": 200}).json()["total"] == 2
     d = client.get("/api/dashboard").json()
     assert d["order_jpy"] == 2000
     assert d["shipment_jpy"] == 1000
@@ -155,8 +159,8 @@ def test_dashboard_empty_is_zero(client):
 
 def test_excluded_statuses_are_all_real_enum_values(client):
     """EXCLUDED_STATUSES 里每个值都必须是某个枚举的真实值，否则排除规则静默失效。"""
-    from app.models import OrderStatus, ShipmentStatus
-    valid = {s.value for s in OrderStatus} | {s.value for s in ShipmentStatus}
+    from app.models import PurchaseStatus, ShipmentStatus
+    valid = {s.value for s in PurchaseStatus} | {s.value for s in ShipmentStatus}
     assert EXCLUDED_STATUSES <= valid
 
 

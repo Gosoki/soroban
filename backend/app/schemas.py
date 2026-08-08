@@ -4,19 +4,19 @@ import datetime as dt
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Optional
 
-from pydantic import field_validator, model_validator
+from pydantic import ConfigDict, field_validator, model_validator
 from sqlmodel import Field, SQLModel
 
 from .config import FX_MAX, FX_MIN, FX_QUANTUM
 from .models import (
+    ImportStatus,
     MiscExpense,
     Order,
     OrderItem,
     OrderStaging,
-    OrderStatus,
+    PurchaseStatus,
     ShipmentOrder,
     ShipmentStatus,
-    StagingStatus,
     TagOption,
 )
 
@@ -33,6 +33,43 @@ def _len(model, column: str) -> int:
     「Data too long」→ OperationalError → 500。不卡这一刀就是双引擎发散（与 TagIn 已有的
     max_length 同一个理由，这里把它补齐到全部输入列）。"""
     return model.__table__.columns[column].type.length
+
+
+# 显式传 null 清空 NOT NULL 列的中文列名。key 是列名，值是用户在界面上看到的叫法。
+# 只用于错误文案；缺项时回落到列名本身，不影响校验是否生效。
+_REQUIRED_LABELS = {
+    "date": "日期",
+    "name": "名称",
+    "purchase_status": "交易状态",
+    "shipment_status": "集运状态",
+    "order_date": "下单日期",
+}
+
+
+def _reject_null_on_required(model, *fields: str):
+    """生成一个 model_validator：显式传 `null` 清空 NOT NULL 列时 422，而不是让它撞到数据库。
+
+    为什么需要：写模型用 `Optional[...] = None` + `exclude_unset` 来区分「没传」和「传了 null」，
+    但「传了 null」这条路此前没有任何校验——值原样 setattr 到 NOT NULL 列，直到 commit 才被
+    数据库拦下，经全局 IntegrityError 处理器变成 409「数据完整性冲突」。而前端把 409 当乐观锁
+    冲突处理，弹「数据已变，已刷新」并整表重拉：用户既没看懂错在哪，也不知道自己那一步本就不允许。
+    （最容易撞上的是日期格——el-date-picker 默认 clearable，点 ✕ 就发 date=null。）
+
+    **可空性从 `Model.__table__` 反查，不手抄清单**：本仓有前科——`_overlay` 手抄的共享字段
+    清单与 `_SHARED_TO_ORDER` 漂掉过一个 `platform`。列改名或改可空性时，这里自动跟着走。
+    """
+    def _check_required(self):
+        bad = []
+        for f in fields:
+            if f in self.model_fields_set and getattr(self, f, None) is None:
+                col = model.__table__.columns.get(f)
+                if col is not None and not col.nullable:
+                    bad.append(_REQUIRED_LABELS.get(f, f))
+        if bad:
+            raise ValueError("「" + "」「".join(bad) + "」不能清空")
+        return self
+
+    return model_validator(mode="after")(_check_required)
 
 
 def _clip(v: Optional[str], limit: int) -> Optional[str]:
@@ -118,9 +155,22 @@ def _bounded_jpy(v: Optional[int], label: str = "金额") -> Optional[int]:
 
 _WEIGHT_MAX = Decimal("999999.99")    # ShipmentOrder.weight = Numeric(8,2) 的上限
 
-_STAGING_STATUS = {s.value for s in StagingStatus}
-_ORDER_STATUS = {s.value for s in OrderStatus}
+_IMPORT_STATUS = {s.value for s in ImportStatus}
+_PURCHASE_STATUS = {s.value for s in PurchaseStatus}
 _SHIPMENT_STATUS = {s.value for s in ShipmentStatus}
+
+
+# --- 写模型一律拒绝未知字段 -------------------------------------------------
+#
+# 默认的 `extra="ignore"` 在本项目是个**静默失败**装置：客户端把字段名写错（改名漏改、
+# 前端和后端不同步、爬虫发旧名），pydantic 会默默丢掉它 → `model_dump(exclude_unset=True)`
+# 得到空 dict → setattr 循环空转 → 而 `guarded_bump` 已经把 version 自增了。
+# 结果是「200 OK + 什么都没改 + 零日志」，还会把别的客户端顶成 409。
+#
+# 已核实所有写入方发的都是窄 body（前端表格 `{version, [col.key]: v}`、编辑面板同款、
+# 新建走列配置、爬虫走 _PUSH_FIELDS），forbid 是安全的。
+# 这一条对**未来**任何错名同样生效（比如把 sale_status 发到 /api/orders），不会过期。
+_FORBID = ConfigDict(extra="forbid")
 
 
 # --- 通用金额输入校验 mixin ---------------------------------------------------
@@ -210,8 +260,14 @@ class LoginResponse(SQLModel):
 # --- 淘宝订单 ---------------------------------------------------------------
 
 class ItemInBase(SQLModel):
-    """物品行输入（订单/暂存共用）。price_cny=单价（元）；订单价由 Σ(单价×数量) 派生。
-    auto 由客户端回传：未改动的「系统自动」项保持 True（前端灰显），用户一编辑即传 False。"""
+    """物品行输入（订单/暂存共用）。**unit_price_cny=单价**（元）；订单价由 Σ(单价×数量) 派生。
+    auto 由客户端回传：未改动的「系统自动」项保持 True（前端灰显），用户一编辑即传 False。
+
+    forbid 不能只加在顶层写模型上：`items[]` 是整个请求体里唯一装钱的地方，单价键名写错
+    （比如沿用旧名 `price_cny`）会被 pydantic 静默丢弃 → build_items 记 0.00 + auto=True
+    → 订单价派生成 ¥0.00，接口还返回 200。同一个错名放顶层是 422，放这里却是静默丢钱。"""
+    model_config = _FORBID
+
     name: str
     quantity: int = Field(default=1, ge=1, le=1_000_000)   # ≥1 防负/零算出负订单价；≤1e6 防离谱数量把总价撑爆列上限
     unit_price_cny: Optional[Decimal] = None               # **单价**；订单的 price_cny 是总价
@@ -254,10 +310,10 @@ class ItemListRead(SQLModel):
     title: Optional[str] = None
     platform_account: Optional[str] = None
     platform: Optional[str] = None
-    status: str                                # 订单自己的**国内段**状态
-    # 界面该显示的状态：订单挂了集运单就跟随那张单，否则等于 status。
-    # 与商品订单页同一口径（见 models/order/order.py 的 Order.effective_status）。
-    effective_status: str = ""
+    purchase_status: str                                # 订单自己的**国内段**状态
+    # 界面该显示的状态：订单挂了集运单就跟随那张单，否则等于 purchase_status。
+    # 与商品订单页同一口径（见 models/order/order.py 的 Order.fulfillment_status）。
+    fulfillment_status: str = ""
     shipment_order_id: Optional[int] = None    # 有值 = 已挂靠 → 该格锁定
     express_no: Optional[str] = None
 
@@ -291,12 +347,12 @@ class OrderFieldsIn(SQLModel):
 
 class OrderBase(MoneyIn, PostageIn, OrderFieldsIn):
     date: dt.date
-    status: str = OrderStatus.paid.value
+    purchase_status: str = PurchaseStatus.paid.value
 
-    @field_validator("status")
+    @field_validator("purchase_status")
     @classmethod
     def _status(cls, v: str) -> str:
-        return _check(v, _ORDER_STATUS, "淘宝状态")
+        return _check(v, _PURCHASE_STATUS, "淘宝状态")
 
 
 def _check_postage_within_total(price_cny, postage_cny, items) -> None:
@@ -307,6 +363,7 @@ def _check_postage_within_total(price_cny, postage_cny, items) -> None:
 
 
 class OrderCreate(OrderBase):
+    model_config = _FORBID
     items: list[OrderItemIn] = []
 
     @model_validator(mode="after")
@@ -316,15 +373,18 @@ class OrderCreate(OrderBase):
 
 
 class OrderUpdate(MoneyIn, PostageIn, OrderFieldsIn):
+    model_config = _FORBID
     version: int                                   # 乐观锁必填
     date: Optional[dt.date] = None
-    status: Optional[str] = None
+    purchase_status: Optional[str] = None
     items: Optional[list[OrderItemIn]] = None      # 给了就整体替换
 
-    @field_validator("status")
+    _no_null_required = _reject_null_on_required(Order, "date", "purchase_status")
+
+    @field_validator("purchase_status")
     @classmethod
     def _status(cls, v: Optional[str]) -> Optional[str]:
-        return v if v is None else _check(v, _ORDER_STATUS, "淘宝状态")
+        return v if v is None else _check(v, _PURCHASE_STATUS, "淘宝状态")
 
 
 class OrderRead(MoneyOut):
@@ -335,15 +395,18 @@ class OrderRead(MoneyOut):
     title: Optional[str] = None
     url: Optional[str] = None
     category: Optional[str] = None
-    status: str                     # 订单自己的**国内段**状态（挂靠期间也原样保留）
-    # 界面该显示的状态：挂着集运单就是那张单的状态，否则等于 status。
+    purchase_status: str                     # 订单自己的**国内段**状态（挂靠期间也原样保留）
+    # 界面该显示的状态：挂着集运单就是那张单的状态，否则等于 purchase_status。
     # 由后端算而不是前端拼：筛选、排序、导出都要用同一个口径，算两遍必然对不上。
-    effective_status: str
+    fulfillment_status: str
     platform: Optional[str] = None
     express_no: Optional[str] = None
     express_company: Optional[str] = None
     platform_account: Optional[str] = None
     shipment_order_id: Optional[int] = None
+    # 挂靠集运单的单号。下拉选项有条数上限，显示不能靠「下拉里恰好有这张」——
+    # 显示的真相在订单行上，下拉只负责挑选。与 fulfillment_status 同一条预加载，不多查一次。
+    shipment_no: Optional[str] = None
     payer_id: Optional[int] = None
     note: Optional[str] = None
     created_via: str
@@ -390,24 +453,28 @@ class ShipmentFieldsIn(SQLModel):
 
 class ShipmentBase(MoneyIn, ShipmentFieldsIn):
     date: dt.date
-    status: str = ShipmentStatus.packing.value
+    shipment_status: str = ShipmentStatus.packing.value
 
-    @field_validator("status")
+    @field_validator("shipment_status")
     @classmethod
     def _status(cls, v: str) -> str:
         return _check(v, _SHIPMENT_STATUS, "集运状态")
 
 
 class ShipmentCreate(ShipmentBase):
+    model_config = _FORBID
     pass
 
 
 class ShipmentUpdate(MoneyIn, ShipmentFieldsIn):
+    model_config = _FORBID
     version: int
     date: Optional[dt.date] = None
-    status: Optional[str] = None
+    shipment_status: Optional[str] = None
 
-    @field_validator("status")
+    _no_null_required = _reject_null_on_required(ShipmentOrder, "date", "shipment_status")
+
+    @field_validator("shipment_status")
     @classmethod
     def _status(cls, v: Optional[str]) -> Optional[str]:
         return v if v is None else _check(v, _SHIPMENT_STATUS, "集运状态")
@@ -418,7 +485,7 @@ class OrderBrief(SQLModel):
     order_no: Optional[str] = None
     date: dt.date
     title: Optional[str] = None
-    status: str
+    purchase_status: str    # 订单自己的采购段状态（本对象是**订单**摘要，不是集运单）
     jpy_settled: Optional[int] = None
     items: list[OrderItemRead] = []
 
@@ -429,7 +496,7 @@ class ShipmentRead(MoneyOut):
     shipment_no: Optional[str] = None
     weight: Optional[Decimal] = None
     intl_tracking_no: Optional[str] = None
-    status: str
+    shipment_status: str
     special_fee_jpy: Optional[int] = None
     recipient: Optional[str] = None
     payer_id: Optional[int] = None
@@ -470,13 +537,17 @@ class MiscBase(MoneyIn, MiscFieldsIn):
 
 
 class MiscCreate(MiscBase):
+    model_config = _FORBID
     pass
 
 
 class MiscUpdate(MoneyIn, MiscFieldsIn):
+    model_config = _FORBID
     version: int
     date: Optional[dt.date] = None
     name: Optional[str] = None
+
+    _no_null_required = _reject_null_on_required(MiscExpense, "date", "name")
 
 
 class MiscRead(MoneyOut):
@@ -555,7 +626,7 @@ class StagingBase(PostageIn):
     fx_rate: Optional[Decimal] = None
     order_date: Optional[dt.date] = None
     express_no: Optional[str] = Field(default=None, max_length=_len(OrderStaging, "express_no"))
-    trade_status: Optional[str] = None       # 交易状态（待发货/待收货/…），导入后与账本联动
+    purchase_status: Optional[str] = None    # 采购段交易状态（待发货/待收货/…），导入后与账本联动
 
     @field_validator("price_cny")
     @classmethod
@@ -577,14 +648,15 @@ class StagingBase(PostageIn):
     def _norm_order_no(cls, v: Optional[str]) -> Optional[str]:
         return norm_id(v)
 
-    @field_validator("trade_status")
+    @field_validator("purchase_status")
     @classmethod
-    def _order_status(cls, v: Optional[str]) -> Optional[str]:
-        return v if v is None else _check(v, _ORDER_STATUS, "订单状态")
+    def _purchase_status(cls, v: Optional[str]) -> Optional[str]:
+        return v if v is None else _check(v, _PURCHASE_STATUS, "订单状态")
 
 
 class StagingCreate(StagingBase):
-    import_status: str = StagingStatus.pending.value
+    model_config = _FORBID
+    import_status: str = ImportStatus.pending.value
     items: list[StagingItemIn] = []
 
     @model_validator(mode="after")
@@ -594,6 +666,7 @@ class StagingCreate(StagingBase):
 
 
 class StagingUpdate(StagingBase):
+    model_config = _FORBID
     version: int                                       # 乐观锁必填
     import_status: Optional[str] = None
     items: Optional[list[StagingItemIn]] = None       # 给了就整体替换
@@ -601,7 +674,7 @@ class StagingUpdate(StagingBase):
     @field_validator("import_status")
     @classmethod
     def _import_status(cls, v: Optional[str]) -> Optional[str]:
-        return v if v is None else _check(v, _STAGING_STATUS, "导入状态")
+        return v if v is None else _check(v, _IMPORT_STATUS, "导入状态")
 
 
 class StagingRead(StagingBase):

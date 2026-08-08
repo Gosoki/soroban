@@ -7,7 +7,7 @@ from sqlalchemy import Column, Index, Text, text
 from sqlmodel import Field, Relationship
 
 from ...db.dialect import BinStr
-from ..base import LedgerBase, OrderStatus, price_from_items
+from ..base import PURCHASE_EXCLUDED, LedgerBase, PurchaseStatus, price_from_items
 
 
 class Order(LedgerBase, table=True):
@@ -42,7 +42,7 @@ class Order(LedgerBase, table=True):
     title: Optional[str] = Field(default=None, sa_type=Text)
     url: Optional[str] = Field(default=None, sa_column=Column(Text))  # 商品链接（可能很长）
     category: Optional[str] = Field(default=None, max_length=64)   # 分类
-    status: str = Field(default=OrderStatus.paid.value, max_length=32, index=True)
+    purchase_status: str = Field(default=PurchaseStatus.paid.value, max_length=32, index=True)
     platform: Optional[str] = Field(default=None, max_length=32, index=True, sa_type=BinStr(32))   # 来源平台（闲鱼/淘宝/京东）
     express_no: Optional[str] = Field(default=None, max_length=64, index=True)    # 快递号（归组用）
     express_company: Optional[str] = Field(default=None, max_length=64)           # 快递公司
@@ -58,8 +58,13 @@ class Order(LedgerBase, table=True):
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
 
+    @classmethod
+    def ledger_exclusions(cls):
+        """看板不计入：待付款（还没花钱）/ 退款 / 交易关闭。只排采购段自己的值。"""
+        return [(cls.purchase_status, PURCHASE_EXCLUDED)]
+
     @property
-    def effective_status(self) -> str:
+    def fulfillment_status(self) -> str:
         """界面上该显示的状态：**挂着集运单就跟随集运单，否则用自己的**。
 
         `status` 只记国内段（下单→国内快递签收），国际段的唯一真相是集运单的 `status`。
@@ -77,8 +82,25 @@ class Order(LedgerBase, table=True):
         """
         ship = self.shipment_order
         if ship is not None and not ship.is_delete:
-            return ship.status
-        return self.status
+            return ship.shipment_status
+        return self.purchase_status
+
+    @property
+    def shipment_no(self) -> Optional[str]:
+        """挂靠集运单的单号，未挂靠/已软删则 None。
+
+        订单行**自带**这个值，是为了让界面显示不依赖「集运单下拉里恰好有这一张」。
+        下拉只取前 200 张（否则 DOM 会炸），挂在第 200 名之外的订单曾因此显示成 `#101`
+        这种查无此单的内部 id。显示与选择是两件事：显示的真相在订单行上，
+        下拉只负责「挑一张出来」。
+
+        与 `effective_status` 共用同一个软删判断，也共用同一条预加载要求
+        （`selectinload(Order.shipment_order)`）——因此不产生额外查询。
+        """
+        ship = self.shipment_order
+        if ship is not None and not ship.is_delete:
+            return ship.shipment_no
+        return None
 
     def sync_from_items(self) -> None:
         """订单价 = Σ(物品单价×数量) + 邮费，再重算日元。改动 items/邮费 后必须调用。"""

@@ -12,22 +12,26 @@
 from fastapi import APIRouter, Depends
 
 from ..auth import get_current_user
-from ..models import ORDER_STATUS_RANK, TERMINAL_STATUSES, OrderStatus, ShipmentStatus
+from ..models import PURCHASE_STATUS_RANK, PURCHASE_TERMINAL_STATUSES, PurchaseStatus, ShipmentStatus
 
 router = APIRouter(prefix="/api/meta", tags=["meta"], dependencies=[Depends(get_current_user)])
 
 
-@router.get("/order-status")
-def order_status_rules():
-    """订单状态机：合法值、生命周期序、终态集合。
+@router.get("/status-rules")
+def status_rules():
+    """各业务段的状态机：合法值、生命周期序、终态集合。**按段分键**。
 
-    消费方（如爬虫）据此实现 can_advance：
+    消费方（如爬虫）据此实现 can_advance_purchase：
       终态不可被推进态覆盖；推进态只前进不回退；未知值 rank 为 -1。
-    与 `models/base.can_advance` 同源——那里是权威实现，这里只是把数据搬出来。
+    与 `models/base.can_advance_purchase` 同源——那里是权威实现，这里只是把数据搬出来。
     """
     return {
-        "values": [s.value for s in OrderStatus],
-        "rank": dict(ORDER_STATUS_RANK),
-        "terminal": sorted(TERMINAL_STATUSES),
-        "shipment_values": [s.value for s in ShipmentStatus],
+        "purchase": {
+            "values": [s.value for s in PurchaseStatus],
+            "rank": dict(PURCHASE_STATUS_RANK),
+            "terminal": sorted(PURCHASE_TERMINAL_STATUSES),
+        },
+        # 国际段目前没有「推进序」的概念（人工推进），只暴露合法值。
+        # 按段分键而不是把它塞成 shipment_values：加卖出段时是新增一个键，不是再拍一个前缀。
+        "shipment": {"values": [s.value for s in ShipmentStatus]},
     }

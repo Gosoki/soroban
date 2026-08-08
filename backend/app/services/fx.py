@@ -32,6 +32,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 import httpx
+from fastapi.concurrency import run_in_threadpool
 from sqlmodel import Session, col, select
 
 from ..config import FX_MAX, FX_MIN, FX_QUANTUM, settings
@@ -307,26 +308,42 @@ def rate_for_date(session: Session, d: Optional[dt.date]) -> Optional[Decimal]:
     return current_rate(session)
 
 
+def _refresh_round_blocking() -> int:
+    """在**工作线程**里跑完一轮刷新，返回下一次的间隔秒数。
+
+    自开自关 Session、并用 `asyncio.run` 起一个属于本线程的事件循环来跑 `refresh_and_store`。
+    这样 refresh_and_store 只有一份实现（HTTP 路由那条路径原样复用），而这条后台路径上
+    的**同步 DB I/O 一点都不落在主事件循环上**。多起一个循环的开销对 6 小时一次的任务
+    可以忽略；httpx 的 AsyncClient 在该循环内自建自销，不跨循环复用。"""
+    from . import prefs
+
+    with Session(get_engine()) as session:
+        asyncio.run(refresh_and_store(session))
+        # 间隔每轮重读：在「设置」页改完不必重启就能生效
+        return int(prefs.load(session)["fx.refresh_seconds"])
+
+
 async def fx_loop() -> None:
     """后台定时刷新（间隔 settings.FX_REFRESH，默认 6h）。任何异常都不结束循环。
 
     只读屏障期间跳过：本循环**直接用 Session 写** FxRate，绕过 HTTP 中间件，
     不自己检查就会在数据库迁移的拷贝过程中往源库插行（见 app/maintenance.py）。
-    跳过没有代价——汇率下一轮再抓即可，抓不到还有历史兜底。"""
+    跳过没有代价——汇率下一轮再抓即可，抓不到还有历史兜底。
+
+    DB 活全部 offload 到线程池：协程体里直接跑同步 Session/pymysql，会在「MySQL 掉线但
+    TCP 还通」时把整个事件循环冻住（scheduler_loop 实测单次卡 384 秒——pymysql 的
+    read_timeout 默认是 None，connect_timeout 只管建连）。那次是同一类问题、同一个修法，
+    fx_loop 当时漏了。"""
     from ..maintenance import barrier
-    from . import prefs
 
     interval = settings.FX_REFRESH          # 读不到设置时的兜底（如库还没建好）
     while True:
         try:
-            reason = barrier.blocked_reason()
+            reason = barrier.blocked_reason()      # 纯内存 + 一把锁，不碰库，留在事件循环上无妨
             if reason:
                 log.info("汇率刷新跳过：%s", reason)
             else:
-                with Session(get_engine()) as session:
-                    await refresh_and_store(session)
-                    # 间隔每轮重读：在「设置」页改完不必重启就能生效
-                    interval = int(prefs.load(session)["fx.refresh_seconds"])
+                interval = await run_in_threadpool(_refresh_round_blocking)
         except Exception as e:
             log.warning("汇率刷新循环异常: %s", e)
         await asyncio.sleep(interval)

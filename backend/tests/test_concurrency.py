@@ -9,7 +9,7 @@ import pytest
 from sqlmodel import Session, select
 
 from app.database import get_engine
-from app.models import Order, OrderStaging, ShipmentOrder, StagingStatus
+from app.models import Order, OrderStaging, ShipmentOrder, ImportStatus
 from app.routers.common import guarded_bump
 
 
@@ -41,7 +41,7 @@ def test_import_gate_claims_only_once(client):
             return sess.execute(
                 sa_update(OrderStaging)
                 .where(OrderStaging.id == s["id"], OrderStaging.imported_order_id.is_(None))
-                .values(import_status=StagingStatus.imported.value, imported_order_id=fake_order_id,
+                .values(import_status=ImportStatus.imported.value, imported_order_id=fake_order_id,
                         version=OrderStaging.version + 1, updated_at=utcnow())
             ).rowcount
 
@@ -121,3 +121,41 @@ def test_order_edit_bumps_mirrored_staging_version(client):
     after = next(x for x in client.get("/api/staging", params={"limit": 500}).json()["items"]
                  if x["id"] == s["id"])["version"]
     assert after > before
+
+
+# --- 跨表写的锁序必须全仓一致 -------------------------------------------------
+
+def test_multi_table_writers_take_locks_in_one_order():
+    """同时写 orders 与 orderstaging 的函数，必须**先 orders 后 orderstaging**。
+
+    反向就是 AB-BA 锁环：同一对「暂存行 ↔ 已导入订单」被两条路径并发写时，
+    MySQL/InnoDB 报 1213 死锁回滚一方，而 main.py 只挂了 IntegrityError / ValueError
+    两个 handler，OperationalError(1213) 会直接逃成裸 500。
+
+    这条只能静态查：**SQLite 是单写者串行，死锁在本地测试里永远复现不出来**，
+    而项目支持双引擎。上一轮的教训正是「只在 MySQL 上炸」的问题 SQLite 测不到。
+    """
+    import ast
+    import inspect
+    from pathlib import Path
+
+    _ORDER, _STAGING = "Order", "OrderStaging"
+    bad = []
+    for path in sorted((Path(__file__).resolve().parents[1] / "app" / "routers").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+            seq = []
+            for node in ast.walk(fn):
+                if not (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "guarded_bump"):
+                    continue
+                if len(node.args) < 2:
+                    continue
+                model = getattr(node.args[1], "id", None)
+                if model in (_ORDER, _STAGING):
+                    seq.append((node.lineno, model))
+            seq.sort()
+            models = [m for _, m in seq]
+            if _ORDER in models and _STAGING in models and models.index(_STAGING) < models.index(_ORDER):
+                bad.append(f"{path.name}::{fn.name} 先锁 {_STAGING} 后锁 {_ORDER}（行 {[l for l, _ in seq]}）")
+    assert not bad, ("跨表写的锁序不一致，MySQL 上会死锁：\n  " + "\n  ".join(bad)
+                     + "\n统一成 orders → orderstaging（orders 是共享字段的唯一真源）。")

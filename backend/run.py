@@ -58,19 +58,32 @@ def ensure_env(rt: Path) -> bool:
 
 
 def main() -> None:
-    # 本入口不接受任何命令行参数。加这道保险是因为：打包成 exe 后 sys.executable 就是
-    # exe 自己，任何「拿它当 python 跑」的误用（如 `soroban.exe -m venv …`）都会静默地
-    # **把 soroban 再启动一遍**——建 .env、连库跑迁移，最后卡在端口占用。
-    # 直接报错退出，能把这类误用从「莫名其妙的影子实例」变成一眼可见的错误。
-    if sys.argv[1:]:
-        print(f"soroban 不接受命令行参数（收到 {sys.argv[1:]}）。"
-              "如果你想用它当 Python 解释器跑模块，那是用错了——请用系统的 python。",
-              file=sys.stderr)
-        raise SystemExit(2)
+    # 本入口只接受一个**精确白名单**：`--use-local-db [--yes]`（MySQL 连不上时的离线自救）。
+    # 其余一律拒绝。这道保险是因为：打包成 exe 后 sys.executable 就是 exe 自己，任何
+    # 「拿它当 python 跑」的误用（如 `soroban.exe -m venv …`）都会静默地**把 soroban 再启动
+    # 一遍**——建 .env、连库跑迁移，最后卡在端口占用。直接报错退出，能把这类误用从
+    # 「莫名其妙的影子实例」变成一眼可见的错误。
+    argv = sys.argv[1:]
+    rescue = False
+    if argv:
+        if set(argv) <= {"--use-local-db", "--yes"} and "--use-local-db" in argv:
+            rescue = True
+        else:
+            print(f"soroban 不接受命令行参数（收到 {argv}）。"
+                  "如果你想用它当 Python 解释器跑模块，那是用错了——请用系统的 python。",
+                  file=sys.stderr)
+            raise SystemExit(2)
     rt = _runtime_dir()
     os.chdir(rt)  # 让 .env / soroban.db（默认 sqlite:///./soroban.db）落在 exe 同级
 
     created_env = ensure_env(rt)           # ← 必须在任何 app.* 导入之前
+
+    # 自救必须排在 chdir + ensure_env 之后（app.config 在导入时就读 .env 定 SECRET_KEY，
+    # 而控制库的 MySQL 连接串是用它加密的），且排在 `from app.main import app` 之前——
+    # 后者会连库跑迁移，而这条路径存在的前提正是「库连不上」。
+    if rescue:
+        from app.rescue import use_local_db
+        raise SystemExit(use_local_db(assume_yes="--yes" in argv))
 
     # 默认只监听环回：要暴露到局域网得**显式**设 HOST=0.0.0.0。
     # 之前默认 0.0.0.0，配上「无 .env → 默认 SECRET_KEY」就是开箱即用的认证绕过。

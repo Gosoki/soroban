@@ -176,8 +176,9 @@ def create_db_and_tables() -> None:
                 "连接当前数据库（MySQL）失败：%s\n"
                 "  soroban 不会自动退回本地 SQLite——那份数据停在切换当天，"
                 "对着它继续记账会造成两边各有一半。\n"
-                "  请先确认 MySQL 已启动、网络可达；确实要暂时切回本地账本，执行：\n"
-                "    cd backend && .venv/bin/python -m tools.use_local_db",
+                "  请先确认 MySQL 已启动、网络可达；确实要暂时切回本地账本：\n"
+                "    源码运行： cd backend && .venv/bin/python -m tools.use_local_db\n"
+                "    打包版　： soroban.exe --use-local-db      （在 exe 所在目录开命令行执行）",
                 e,
             )
         raise

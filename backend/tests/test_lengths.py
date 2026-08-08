@@ -14,7 +14,7 @@ from app.models import MiscExpense, Order, OrderItem, OrderStaging, ShipmentOrde
 # `title`（商品标题）不在此列——它已放宽成 TEXT 列，不限长也不截断。
 CLIPPED = {"name"}
 # 服务端决定或已有枚举白名单的列，不接受任意客户端字符串，无需长度校验
-SERVER_OWNED = {"created_via", "status", "import_status", "trade_status"}
+SERVER_OWNED = {"created_via", "purchase_status", "shipment_status", "import_status"}
 
 # (输入 schema, 对应模型)
 PAIRS = [
@@ -228,3 +228,16 @@ def test_staging_update_validates_length(client):
     r = client.patch(f"/api/staging/{s['id']}",
                      json={"version": s["version"], "express_no": "x" * 65})
     assert r.status_code == 422
+
+
+def test_server_owned_names_are_real_columns():
+    """豁免名单的元断言：留着旧名永远不会红，保护范围却在悄悄缩小。
+
+    改名时最容易漏的就是这类名单——`status` 改成 `purchase_status` 之后，
+    名单里那个 `status` 不再匹配任何字段，于是新列**静默地失去了长度校验**。
+    """
+    real = set()
+    for _, model in PAIRS:
+        real |= set(model.__table__.columns.keys())
+    stale = SERVER_OWNED - real
+    assert not stale, f"SERVER_OWNED 里这些名字已不是任何模型的列，名单该更新了：{sorted(stale)}"

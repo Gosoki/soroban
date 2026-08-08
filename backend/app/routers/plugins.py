@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 from sqlmodel import Session, select
 
 from ..auth import create_access_token, get_current_user
@@ -222,8 +223,12 @@ _needs_cache: dict[str, tuple[float, list[dict]]] = {}
 _NEEDS_TTL = 60.0                                    # 秒
 
 
-def needs(manifest: dict) -> list[dict]:
-    """`_needs` 的带缓存版本。
+def needs_cached(manifest: dict) -> list[dict]:
+    """`probe_needs` 的带缓存版本（60s）。
+
+    名字必须自解释「带不带缓存」：叫 needs/_needs 时，下划线在 Python 里读作「私有」，
+    读不出真正的区别，而两处调用哪一处写反都是静默故障——装完依赖用缓存版会报「仍缺依赖」，
+    轮询接口用非缓存版会每次 spawn 三四个探测子进程。
 
     必须缓存：探测依赖要在**插件自己的解释器**里 `import`（每个模块一次子进程）再问一次
     Playwright 浏览器路径。而 GET /api/plugins 是前端**轮询**的接口——不缓存的话，每次轮询
@@ -234,12 +239,12 @@ def needs(manifest: dict) -> list[dict]:
     now = time.monotonic()
     if hit and now - hit[0] < _NEEDS_TTL:
         return hit[1]
-    val = _needs(manifest)
+    val = probe_needs(manifest)
     _needs_cache[key] = (now, val)
     return val
 
 
-def _needs(manifest: dict) -> list[dict]:
+def probe_needs(manifest: dict) -> list[dict]:
     """插件还缺哪些依赖。返回 [{key, label, hint}]；空列表 = 可以用了。
 
     分三档而不是笼统一句「未安装」：三者的补法完全不同（建 venv / 装 pip 包 / 下浏览器），
@@ -466,7 +471,7 @@ def _install_worker(manifest: dict, with_browser: bool) -> None:
             tail = (r.stderr or r.stdout or "").strip()[-500:]
             return fail(f"{label}失败：{tail or '未知错误'}")
     _needs_cache.pop(pid, None)                      # 装完立刻失效缓存，别让前端看着旧结论
-    remaining = _needs(manifest)
+    remaining = probe_needs(manifest)
     with _install_lock:
         _install_state[pid].update(
             running=False, step="完成", done_at=utcnow().isoformat(),
@@ -503,7 +508,7 @@ def list_plugins(session: Session = Depends(get_session)):
     out = []
     for m in discover():
         cfg = session.get(PluginConfig, m["id"])
-        need = needs(m)
+        need = needs_cached(m)
         with _install_lock:
             st = dict(_install_state.get(m["id"]) or {})
         out.append({

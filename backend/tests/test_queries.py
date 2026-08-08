@@ -58,14 +58,14 @@ def test_staging_list_is_not_n_plus_1(client):
             "items": [{"name": "x", "quantity": 1, "unit_price_cny": "1"}]}).json()
         client.post(f"/api/staging/{s['id']}/import")
     with count_queries() as a:
-        client.get("/api/staging", params={"status": "已导入", "limit": 100})
+        client.get("/api/staging", params={"import_status": "已导入", "limit": 100})
     for i in range(6):
         s = client.post("/api/staging", json={
             "order_no": f"QS-B-{i}",
             "items": [{"name": "x", "quantity": 1, "unit_price_cny": "1"}]}).json()
         client.post(f"/api/staging/{s['id']}/import")
     with count_queries() as b:
-        client.get("/api/staging", params={"status": "已导入", "limit": 100})
+        client.get("/api/staging", params={"import_status": "已导入", "limit": 100})
     assert b["n"] <= a["n"] + 1, (
         f"暂存列表查询数随行数增长（{a['n']} 条 → {b['n']} 条）\n" + "\n".join(b["sql"])
     )
@@ -112,15 +112,46 @@ def test_shipment_brief_skips_children(client):
         assert any(x["orders"] for x in full), "非 brief 仍应展开（集运页自己的面板要用）"
 
 
-def test_scheduler_loop_does_not_block_event_loop():
+def test_scheduler_loop_runs_db_work_off_the_event_loop():
     """协程里做同步 DB I/O，MySQL 运行中掉线会阻塞整个事件循环——
-    实测单次卡 384 秒（pymysql read_timeout 默认 None），期间 /api/health 都一起卡死。"""
-    import inspect
+    实测单次卡 384 秒（pymysql read_timeout 默认 None），期间 /api/health 都一起卡死。
+
+    ⚠️ 这条**必须真跑一轮**，不能只 grep 源码里有没有 `run_in_threadpool`。
+    上一版就是 grep 版：`run_in_threadpool` 被用了却从没导入，NameError 每轮被循环的
+    兜底 `except` 吞成一行警告 —— 定时抓取实际上一直没跑，而测试一路全绿。
+    字符串在源码里，名字却没绑定，grep 分辨不了这两件事。
+    """
+    import asyncio
+    import threading
 
     from app.routers import plugins as mod
 
-    src = inspect.getsource(mod.scheduler_loop)
-    assert "run_in_threadpool" in src, "定时循环又在事件循环里直接做同步 DB I/O 了"
+    ran_in = {}
+    loop_thread = None
+
+    def fake_run_due():
+        ran_in["thread"] = threading.current_thread().ident
+
+    async def one_round():
+        nonlocal loop_thread
+        loop_thread = threading.current_thread().ident
+        # 只跑一轮：把 sleep 变成取消信号
+        async def stop(_):
+            raise asyncio.CancelledError
+        orig_sleep, orig_run = mod.asyncio.sleep, mod._run_due_in_session
+        mod._run_due_in_session = fake_run_due
+        mod.asyncio.sleep = stop
+        try:
+            await mod.scheduler_loop(interval=0)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            mod.asyncio.sleep, mod._run_due_in_session = orig_sleep, orig_run
+
+    asyncio.run(one_round())
+    assert "thread" in ran_in, "定时循环一轮下来根本没调到 _run_due_in_session（多半是抛异常被吞了）"
+    assert ran_in["thread"] != loop_thread, (
+        "同步 DB I/O 是在事件循环线程上跑的——MySQL 掉线会把整个服务卡死")
 
 
 def test_mysql_engine_has_read_and_write_timeouts():
@@ -132,3 +163,89 @@ def test_mysql_engine_has_read_and_write_timeouts():
     src = inspect.getsource(database.build_engine)
     for k in ("connect_timeout", "read_timeout", "write_timeout"):
         assert k in src, f"MySQL engine 缺 {k}"
+
+
+# --- BinStr 列的模糊搜索必须仍是大小写不敏感 ------------------------------------
+
+def test_binstr_columns_use_ci_contains_for_search():
+    """被 LIKE 搜索的 BinStr 列必须走 `ci_contains`，不能裸 `.contains()`。
+
+    BinStr 让 MySQL 的 `=` 逐字节（唯一性 / 等值批改需要），副作用是同列上的 LIKE
+    也跟着变大小写敏感，而 SQLite 的 LIKE 对 ASCII 本来就不敏感——同一份数据、
+    同一个搜索词，两个后端返回不同结果。
+
+    只能静态查：**本地跑在 SQLite 上，这个差异复现不出来**。
+    """
+    import ast
+    from pathlib import Path
+
+    from sqlmodel import SQLModel
+
+    # 从 metadata 反查哪些列在 MySQL 上带 bin 排序规则，不手抄清单
+    binstr = set()
+    for t in SQLModel.metadata.tables.values():
+        for c in t.columns:
+            variant = getattr(c.type, "_variant_mapping", {}).get("mysql")
+            if variant is not None and "bin" in str(getattr(variant, "collation", "") or ""):
+                binstr.add(c.name)
+    assert binstr, "没识别出任何 BinStr 列——探测方式可能已过期，请检查 dialect.BinStr"
+
+    bad = []
+    for path in sorted((Path(__file__).resolve().parents[1] / "app" / "routers").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            if node.func.attr != "contains" or not isinstance(node.func.value, ast.Attribute):
+                continue
+            col = node.func.value.attr
+            if col in binstr:
+                bad.append(f"{path.name}:{node.lineno} {col}.contains(...)")
+    assert not bad, ("这些 BinStr 列用了裸 .contains()，MySQL 上会变成大小写敏感：\n  "
+                     + "\n  ".join(bad) + "\n改用 db.dialect.ci_contains(col, q, session)。")
+
+
+def test_fx_loop_runs_db_work_off_the_event_loop():
+    """`fx_loop` 的 DB 活必须在别的线程上，不能占着事件循环。
+
+    与 test_scheduler_loop_runs_db_work_off_the_event_loop 同一类问题、同一个修法：
+    协程体里直接跑同步 Session/pymysql，在「MySQL 掉线但 TCP 还通」时会把整个事件循环
+    冻住（scheduler_loop 实测单次 384 秒）。当时只修了 scheduler_loop，fx_loop 漏了。
+
+    ⚠️ 同样**必须真跑一轮**，不能只 grep 源码里有没有 `run_in_threadpool`——
+    上一次就吃过这个亏：名字出现在源码里、却根本没导入，NameError 被循环的兜底 except
+    吞成一行警告，而测试一路全绿。
+    """
+    import asyncio
+    import threading
+
+    from app.services import fx as mod
+
+    ran_in = {}
+    loop_thread = None
+
+    def fake_round() -> int:
+        ran_in["thread"] = threading.current_thread().ident
+        return 0
+
+    async def one_round():
+        nonlocal loop_thread
+        loop_thread = threading.current_thread().ident
+
+        async def stop(_):
+            raise asyncio.CancelledError
+
+        orig_sleep, orig_round = mod.asyncio.sleep, mod._refresh_round_blocking
+        mod._refresh_round_blocking = fake_round
+        mod.asyncio.sleep = stop
+        try:
+            await mod.fx_loop()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            mod.asyncio.sleep, mod._refresh_round_blocking = orig_sleep, orig_round
+
+    asyncio.run(one_round())
+    assert ran_in.get("thread"), "fx_loop 这一轮根本没跑到 DB 活（可能被异常吞了）"
+    assert ran_in["thread"] != loop_thread, \
+        "fx_loop 的 DB 活跑在事件循环线程上：MySQL 掉线时会冻住整个服务"

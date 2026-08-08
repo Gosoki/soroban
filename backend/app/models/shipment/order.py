@@ -7,7 +7,7 @@ from sqlalchemy import Index, text
 from sqlmodel import Field, Relationship
 
 from ...db.dialect import BinStr
-from ..base import LedgerBase, ShipmentStatus
+from ..base import SHIPMENT_EXCLUDED, LedgerBase, ShipmentStatus
 
 
 class ShipmentOrder(LedgerBase, table=True):
@@ -26,11 +26,16 @@ class ShipmentOrder(LedgerBase, table=True):
     shipment_no: Optional[str] = Field(default=None, max_length=64, sa_type=BinStr(64))   # 集运单号；活跃行唯一键，故逐字节比较
     weight: Optional[Decimal] = Field(default=None, max_digits=8, decimal_places=2)  # 重量kg
     intl_tracking_no: Optional[str] = Field(default=None, max_length=128)  # 国际运单号
-    status: str = Field(default=ShipmentStatus.packing.value, max_length=32, index=True)
+    shipment_status: str = Field(default=ShipmentStatus.packing.value, max_length=32, index=True)
     special_fee_jpy: Optional[int] = Field(default=None)    # 特殊费（恒日元：关税/消费税等）
     recipient: Optional[str] = Field(default=None, max_length=128, sa_type=BinStr(128))   # 收货人（标签，被标签改名按值精确匹配）
 
     orders: list["Order"] = Relationship(back_populates="shipment_order")  # noqa: F821
+
+    @classmethod
+    def ledger_exclusions(cls):
+        """看板不计入：已取消的集运单。只排国际段自己的值。"""
+        return [(cls.shipment_status, SHIPMENT_EXCLUDED)]
 
     def compute_money(self, extra_jpy: int = 0) -> None:
         # 集运 jpy_auto = round(运费×汇率) + 特殊费_日元

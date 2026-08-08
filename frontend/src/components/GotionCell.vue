@@ -26,8 +26,11 @@
 
   <!-- date -->
   <div v-else-if="col.type === 'date'" class="gtn-disp" @click="!editing && start()">
+    <!-- clearable 必须显式透传：el-date-picker 默认 true，编辑态一悬停就出 ✕，点下去发
+         date=null 撞 NOT NULL 列 → 409「数据完整性冲突」→ 前端当成乐观锁冲突弹「数据已变」。 -->
     <el-date-picker v-if="editing" ref="inp" v-model="editVal" type="date" value-format="YYYY-MM-DD"
-                    size="small" class="gtn-in" @change="commit" @visible-change="(v) => !v && close()" />
+                    :clearable="col.clearable !== false"
+                    size="small" class="gtn-in" @change="commit()" @visible-change="(v) => !v && close()" />
     <template v-else>
       <span v-if="disp !== null">{{ disp }}</span>
       <span v-else class="ph">{{ emptyText }}</span>
@@ -46,15 +49,15 @@
     </template>
     <el-input ref="inp" v-model="editVal" v-click-outside="onClickOutside" type="textarea"
               class="gtn-long-in" :rows="4" resize="none"
-              @keydown.enter.exact.prevent="commit" @keydown.esc="close" />
+              @keydown.enter.exact.prevent="commit(true)" @keydown.esc="close" />
   </el-popover>
 
   <!-- text / decimal / int -->
   <div v-else class="gtn-disp" @click="!editing && start()">
     <el-input-number v-if="editing && col.type === 'int'" ref="inp" v-model="editVal" :controls="false"
-                     size="small" class="gtn-in" @blur="commit" @keydown.enter="commit" @keydown.esc="close" />
+                     size="small" class="gtn-in" @blur="commit()" @keydown.enter="commit(true)" @keydown.esc="close" />
     <el-input v-else-if="editing" ref="inp" v-model="editVal" size="small" class="gtn-in"
-              @blur="commit" @keydown.enter="commit" @keydown.esc="close" />
+              @blur="commit()" @keydown.enter="commit(true)" @keydown.esc="close" />
     <template v-else>
       <span v-if="disp !== null" :class="col.format ? 'derived' : ''">{{ disp }}</span>
       <span v-else class="ph">{{ emptyText }}</span>
@@ -77,7 +80,7 @@ const props = defineProps({
   // 例如订单挂上集运单后，状态跟随那张单，本格不该再能改。
   locked: { type: Boolean, default: false },
 })
-const emit = defineEmits(['change'])
+const emit = defineEmits(['change', 'submit'])
 
 const editing = ref(false)
 const editVal = ref(null)
@@ -123,7 +126,10 @@ function norm(v) {
   if (props.col.type === 'int') return v === null ? null : Number(v)
   return v
 }
-function commit() {
+// fromEnter：回车才算「这一格填完了、可以提交整行」。**必须显式传参**，不能靠事件冒泡猜——
+// GotionCell 在 keydown 阶段就 commit 并把 editing 置 false，Vue 在 keydown 与 keyup 之间
+// 已经把 <el-input v-if="editing"> 卸载、焦点回落 body，父层 <tr @keyup.enter> 再也收不到事件。
+function commit(fromEnter = false) {
   if (!editing.value) return          // 防 @blur 与 @keydown.enter 重复提交 → 重复 PATCH
   const raw = editVal.value
   // 数值列基本校验：非法值不提交、保持编辑态（避免脏字符串发后端）
@@ -134,7 +140,11 @@ function commit() {
   }
   editing.value = false
   const v = norm(raw)
+  // 必填列兜底：不管是哪条路径把值清空的（✕、全选删、粘贴空串），都不往后端发 null。
+  // 后端也有同样的闸门并会返回可读的 422，这里只是不让用户白跑一趟。
+  if (v === null && props.col.clearable === false) return
   if (String(v ?? '') !== String(props.modelValue ?? '')) emit('change', v)
+  if (fromEnter) emit('submit')       // change 是同步派发，此刻草稿已经写进父层的 newRow
 }
 function choose(o) {
   editing.value = false

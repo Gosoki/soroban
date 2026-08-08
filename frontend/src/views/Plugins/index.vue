@@ -73,7 +73,7 @@
         </span>
         <span class="aname" :title="a.account">{{ a.account }}</span>
         <span class="c-plat">
-          <el-tag v-if="a.platform" size="small" :style="platformStyle(a.platform)">{{ a.platform }}</el-tag>
+          <el-tag v-if="a.platform" size="small" :style="platformTagStyle(a.platform)">{{ a.platform }}</el-tag>
         </span>
         <span class="c-auth">
           <el-tag size="small" :style="typeStyle(a.authorized ? 'success' : 'warning')">
@@ -120,7 +120,8 @@ const platformTags = ref([])   // [{value,color}] 来源平台标签集（下拉
 
 const platformOpts = computed(() => platformTags.value.map((t) => t.value))
 const platformColor = computed(() => Object.fromEntries(platformTags.value.map((t) => [t.value, t.color])))
-function platformStyle(v) { return tagStyleAt(platformColor.value[v] ?? -1, v) }
+// 取用户在标签管理里配的颜色（不是 constants 里那套写死的语义色，别混用）
+function platformTagStyle(v) { return tagStyleAt(platformColor.value[v] ?? -1, v) }
 
 const fmtTime = fmtDateTime   // 后端存 naive UTC，必须补 Z 再解析，见 utils/datetime.js
 function enabledCount(p) { return p.accounts.filter((a) => a.configured && a.enabled).length }
@@ -192,7 +193,17 @@ async function doInstall(p) {
     await pluginsApi.install(p.id, p._withBrowser)
     p.install = { running: true, step: '准备', error: null }
     scheduleInstallPoll()
-  } catch (_) { /* 拦截器已提示 */ }
+  } catch (e) {
+    // 409 被 http 拦截器**刻意跳过**（留给页面自己处理），这里不显式弹就是点了毫无反馈。
+    // 后端两条 409 分支里，「打包版内没有可用的 Python 解释器」是专门写给用户看的两句话操作指引，
+    // 3 秒读不完 → 用 duration 8000（与同文件 doDeleteAccountStaging 的长文案一致）。
+    // 不要写进 p.install.error：那是服务端字段，下一次 load()/轮询会用服务端的 {} 覆盖掉，
+    // 表现成「错误提示自己消失」。
+    if (e.response?.status === 409) {
+      ElMessage({ type: 'error', duration: 8000, message: e.response?.data?.detail || '无法开始安装' })
+    }
+    // 其余状态码拦截器已提示
+  }
 }
 
 async function saveConfig(p) {

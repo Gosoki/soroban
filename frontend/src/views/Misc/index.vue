@@ -25,8 +25,8 @@ import NotionTable from '@/components/NotionTable.vue'
 
 
 const columns = [
-  { key: 'date', label: '日期', type: 'date', width: 140 },
-  { key: 'name', label: '名称', type: 'text', minWidth: 150, placeholder: '名称' },
+  { key: 'date', label: '日期', type: 'date', width: 140, clearable: false },
+  { key: 'name', label: '名称', type: 'text', minWidth: 150, placeholder: '名称', clearable: false },
   { key: 'category', label: '分类', type: 'text', width: 120 },
   { key: 'price_cny', label: '人民币（元）', type: 'decimal', format: 'cny', width: 110, placeholder: '实付人民币' },
   { key: 'fx_rate', label: '汇率', type: 'decimal', width: 90, placeholder: '当天汇率' },

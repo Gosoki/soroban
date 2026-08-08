@@ -9,7 +9,10 @@
    两条路径都由本模块产出（见 emit_active_unique / drop_active_unique），迁移脚本只描述
    「哪几列、什么条件下唯一」，不关心具体方言。
 
-2. **方言探测**——is_sqlite / is_mysql 供 database.py、env.py、迁移按方言短路。
+2. **方言探测**——is_sqlite / is_mysql，供**迁移脚本**按方言短路（6 个迁移在用），
+   外加 services/db_migrate.py 与 routers/dashboard.py。
+   database.py 与 alembic/env.py **不**走这里：它们拿得到的是引擎/连接对象，
+   直接读 `dialect.name` 更直白，没必要绕一层函数。
 """
 from __future__ import annotations
 
@@ -74,6 +77,36 @@ def bin_collation(bind=None) -> str:
         return BIN_COLLATION if found else BIN_COLLATION_FALLBACK
     except Exception:                            # noqa: BLE001  探测失败就用保守值
         return BIN_COLLATION_FALLBACK
+
+
+# 与 BIN_COLLATION 配套的**大小写不敏感**排序规则，只用于模糊搜索（见 ci_contains）。
+CI_COLLATION = "utf8mb4_0900_ai_ci"
+CI_COLLATION_FALLBACK = "utf8mb4_general_ci"    # 8.0 以前 / MariaDB
+
+
+def ci_contains(col, q: str, bind=None):
+    """BinStr 列上的**模糊搜索**：显式拉回大小写不敏感，与 SQLite 的 LIKE 对齐。
+
+    BinStr 让 MySQL 的 `=` 逐字节，但它有个没被论证过的副作用：同列上的 `LIKE` 也跟着
+    变成大小写敏感（MySQL 的 LIKE 采用列的排序规则，列的 coercibility 低于字面量），
+    而 SQLite 的 LIKE 对 ASCII 本来就不敏感。于是同一份数据、同一个搜索词，
+    两个后端返回不同结果——正是引入 BinStr 那一版想消灭的那类发散。
+
+    引入 BinStr 是为了「唯一性」与「等值批改」两件事，不包括搜索；这里把搜索口径拉回原状。
+    非 BinStr 列（title / express_no / 物品名）本来就是 ci，不必也不该走这里。"""
+    if not is_mysql(bind):
+        return col.contains(q, autoescape=True)
+    return col.collate(_ci_collation(bind)).contains(q, autoescape=True)
+
+
+def _ci_collation(bind=None) -> str:
+    try:
+        from sqlalchemy import text as _text
+        conn = bind.connection if hasattr(bind, "connection") else bind
+        found = conn.execute(_text("SHOW COLLATION LIKE :c"), {"c": CI_COLLATION}).first()
+        return CI_COLLATION if found else CI_COLLATION_FALLBACK
+    except Exception:                            # noqa: BLE001  探测失败就用保守值
+        return CI_COLLATION_FALLBACK
 
 
 def UtcDateTime():                              # noqa: N802  —— 当类型用，故用类型的命名风格

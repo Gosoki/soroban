@@ -48,9 +48,9 @@ def test_manual_attach_does_not_touch_status(client):
     """点选挂靠 = 「打算放进这个包裹」，货未必已到集运仓 → 不推进状态。
     两条挂靠路径都不改状态：国际段由集运单表达，挂上自动跟随、释放自动回落。"""
     s = mk_ship(client, shipment_no="JF-ST1")
-    o = mk_order(client, status="待收货")
+    o = mk_order(client, purchase_status="待收货")
     client.post(f"/api/shipment/{s['id']}/order/{o['id']}")
-    assert client.get(f"/api/orders/{o['id']}").json()["status"] == "待收货"
+    assert client.get(f"/api/orders/{o['id']}").json()["purchase_status"] == "待收货"
 
 
 def test_attach_inherits_status_and_detach_restores(client):
@@ -59,16 +59,16 @@ def test_attach_inherits_status_and_detach_restores(client):
     关键是挂靠期间 `status` 必须原样保留——曾经自动挂靠会把「集运中」写进 status，
     那样一释放，回落到的就是被覆盖过的值，而不是真实的国内段状态。"""
     s = mk_ship(client, shipment_no="JF-ST2")          # 新建集运单默认「打包中」
-    o = mk_order(client, status="已签收")
+    o = mk_order(client, purchase_status="已签收")
 
     client.post(f"/api/shipment/{s['id']}/order/{o['id']}")
     got = client.get(f"/api/orders/{o['id']}").json()
-    assert got["status"] == "已签收", "挂靠不该动订单自己的国内段状态"
-    assert got["effective_status"] == "打包中", "挂靠后显示的应是集运单的状态"
+    assert got["purchase_status"] == "已签收", "挂靠不该动订单自己的国内段状态"
+    assert got["fulfillment_status"] == "打包中", "挂靠后显示的应是集运单的状态"
 
     client.delete(f"/api/shipment/{s['id']}/order/{o['id']}")
     got = client.get(f"/api/orders/{o['id']}").json()
-    assert got["status"] == got["effective_status"] == "已签收", "释放后应回落到自身状态"
+    assert got["purchase_status"] == got["fulfillment_status"] == "已签收", "释放后应回落到自身状态"
 
 
 def test_attach_is_idempotent(client):
@@ -124,7 +124,17 @@ def test_attach_bumps_order_version(client):
 
 
 def test_bad_shipment_status_rejected(client):
-    assert client.post("/api/shipment", json={"date": "2026-06-01", "status": "无此状态"}).status_code == 422
+    """非法集运状态必须被**白名单校验器**拒掉，而不是被别的什么东西顺手拒掉。
+
+    只断言 422 是不够的：写模型是 `extra="forbid"`，任何写错的键同样返回 422，
+    于是改名之后这条测试会拿着 `extra_forbidden` 继续绿，而它本该守的枚举校验器
+    早已无人过问（本条就这么失守过一轮）。断言拒绝的**理由**，让它改名即红。
+    """
+    r = client.post("/api/shipment", json={"date": "2026-06-01", "shipment_status": "无此状态"})
+    assert r.status_code == 422
+    err = r.json()["detail"][0]
+    assert err["type"] == "value_error" and err["loc"][-1] == "shipment_status", \
+        f"422 来自旁路而非状态白名单校验器：{err}"
 
 
 def test_special_fee_negative_rejected(client):
@@ -160,31 +170,37 @@ def test_status_filter_matches_what_is_displayed(client):
     """筛选口径必须与显示口径一致。曾经的隐患：列表里显示的是集运单状态（继承来的），
     筛选却按订单自身状态查——于是「界面上一排『已发出』，筛『已发出』一条也搜不到」。"""
     s = mk_ship(client, shipment_no="JF-FLT1")
-    o = mk_order(client, status="已签收")
+    o = mk_order(client, purchase_status="已签收")
     client.post(f"/api/shipment/{s['id']}/order/{o['id']}")
     client.patch(f"/api/shipment/{s['id']}", json={
-        "version": client.get(f"/api/shipment/{s['id']}").json()["version"], "status": "已发出"})
+        "version": client.get(f"/api/shipment/{s['id']}").json()["version"], "shipment_status": "已发出"})
 
-    hit = client.get("/api/orders", params={"status": "已发出", "limit": 200}).json()["items"]
+    hit = client.get("/api/orders", params={"fulfillment_status": "已发出", "limit": 200}).json()["items"]
     assert any(x["id"] == o["id"] for x in hit), "按继承来的集运状态筛不到该订单"
 
-    miss = client.get("/api/orders", params={"status": "已签收", "limit": 200}).json()["items"]
-    assert all(x["id"] != o["id"] for x in miss), "挂靠中的订单不该再被自身国内段状态筛出来"
+    # 两个筛选参数现在语义分明，各自都要对：
+    # `fulfillment_status` = 界面显示的那个（挂靠期间是集运单的），所以按「已签收」筛不到它；
+    # `purchase_status`    = 订单**自身**的采购段状态，挂靠期间原样保留，所以能筛到。
+    # 原先只有一个叫 `status` 的参数，它比的却是 coalesce 出来的值——名字没说清筛的是哪个。
+    miss = client.get("/api/orders", params={"fulfillment_status": "已签收", "limit": 200}).json()["items"]
+    assert all(x["id"] != o["id"] for x in miss), "挂靠中的订单显示的是集运状态，不该被「已签收」筛出来"
+    own = client.get("/api/orders", params={"purchase_status": "已签收", "limit": 200}).json()["items"]
+    assert any(x["id"] == o["id"] for x in own), "订单自身的国内段状态在挂靠期间必须原样保留、且可单独筛"
 
 
-def test_effective_status_falls_back_when_shipment_soft_deleted(client):
+def test_fulfillment_status_falls_back_when_shipment_soft_deleted(client):
     """集运单被软删后界面上已经看不见它了，再拿它的状态显示就是个查无此处的幽灵值。"""
     s = mk_ship(client, shipment_no="JF-SD1")
-    o = mk_order(client, status="已签收")
+    o = mk_order(client, purchase_status="已签收")
     client.post(f"/api/shipment/{s['id']}/order/{o['id']}")
     client.delete(f"/api/shipment/{s['id']}")
-    assert client.get(f"/api/orders/{o['id']}").json()["effective_status"] == "已签收"
+    assert client.get(f"/api/orders/{o['id']}").json()["fulfillment_status"] == "已签收"
 
 
-def test_unattached_order_effective_status_equals_own(client):
-    o = mk_order(client, status="待收货")
+def test_unattached_order_fulfillment_status_equals_own(client):
+    o = mk_order(client, purchase_status="待收货")
     got = client.get(f"/api/orders/{o['id']}").json()
-    assert got["status"] == got["effective_status"] == "待收货"
+    assert got["purchase_status"] == got["fulfillment_status"] == "待收货"
 
 
 def test_ocr_auto_attach_does_not_write_status():
@@ -195,12 +211,12 @@ def test_ocr_auto_attach_does_not_write_status():
     from app.routers import shipment as mod
 
     src = inspect.getsource(mod.ocr_attach_express)
-    assert '"status"' not in src and "OrderStatus" not in src, \
+    assert '"status"' not in src and "PurchaseStatus" not in src, \
         "自动挂靠又开始写订单状态了"
 
 
 def test_order_status_enum_is_domestic_only():
-    from app.models import OrderStatus
+    from app.models import PurchaseStatus
 
-    assert {s.value for s in OrderStatus} == {
+    assert {s.value for s in PurchaseStatus} == {
         "待付款", "待发货", "待收货", "已签收", "退款", "交易关闭"}

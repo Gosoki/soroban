@@ -12,7 +12,12 @@ UVICORN_BIN="$BACKEND/.venv/bin/uvicorn"
 # 端口：避开常见默认(8000/5173)，防与其它项目冲突。可用环境变量覆盖，如 BACKEND_PORT=9620 ./start.sh
 BACKEND_PORT="${BACKEND_PORT:-8620}"
 FRONTEND_PORT="${FRONTEND_PORT:-8621}"
-export BACKEND_PORT FRONTEND_PORT   # vite.config 读这俩配端口/代理；后端读 BACKEND_PORT 拼插件回灌地址
+
+# 监听地址：前后端**同一个**旋钮，默认只绑环回。要暴露到局域网：HOST=0.0.0.0 ./start.sh
+# 分成两个旋钮会出事——前端 dev server 反代 /api 到后端，前端单边对外就等于后端也对外。
+HOST="${HOST:-127.0.0.1}"
+
+export BACKEND_PORT FRONTEND_PORT HOST   # vite.config 读这仨配监听/端口/代理；后端读 BACKEND_PORT 拼插件回灌地址
 
 green() { printf "\033[32m%s\033[0m\n" "$1"; }
 yellow() { printf "\033[33m%s\033[0m\n" "$1"; }
@@ -93,7 +98,7 @@ cleanup() {
 trap cleanup INT TERM
 
 green "启动后端  → http://127.0.0.1:$BACKEND_PORT  (API 文档 /docs)"
-( cd "$BACKEND" && exec "$UVICORN_BIN" app.main:app --host 127.0.0.1 --port "$BACKEND_PORT" --reload ) &
+( cd "$BACKEND" && exec "$UVICORN_BIN" app.main:app --host "$HOST" --port "$BACKEND_PORT" --reload ) &
 BACK_PID=$!
 
 green "启动前端  → http://localhost:$FRONTEND_PORT"
@@ -101,8 +106,10 @@ green "启动前端  → http://localhost:$FRONTEND_PORT"
 FRONT_PID=$!
 
 echo
-green "soroban 已启动。默认账号 admin / admin123"
-green "浏览器打开 http://localhost:$FRONTEND_PORT ，Ctrl+C 停止全部。"
+green "soroban 已启动。浏览器打开 http://localhost:$FRONTEND_PORT ，Ctrl+C 停止全部。"
+if [ "$HOST" = "0.0.0.0" ]; then
+  red "⚠️  已对外监听（HOST=0.0.0.0），前后端都能被局域网访问：请确认已改掉默认密码。"
+fi
 echo
 
 wait

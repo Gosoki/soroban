@@ -14,14 +14,15 @@ from sqlmodel import Session, select
 
 from ..auth import get_current_user
 from ..database import get_session
+from ..db.dialect import ci_contains
 from ..models import (
     OrderItem,
-    Source,
+    CreatedVia,
     StagingItem,
-    StagingStatus,
+    ImportStatus,
     Order,
     OrderStaging,
-    OrderStatus,
+    PurchaseStatus,
     utcnow,
 )
 from ..schemas import StagingCreate, StagingItemRead, StagingRead, StagingUpdate, OrderRead
@@ -33,6 +34,14 @@ router = APIRouter(
 
 # 已导入行：暂存字段 → 账本字段的映射（单一真源写穿账本；status=导入工作流状态留暂存自身）。
 # price_cny 不在此列：它由物品单价×数量派生（见 sync_from_items），改价走物品、不直接写。
+# 写穿被拒时给用户看的中文列名（只用于错误文案，缺项回落到列名本身）。
+_SHARED_LABELS = {
+    "order_date": "下单日期",
+    "order_no": "订单号",
+    "purchase_status": "交易状态",
+    "title": "商品标题",
+}
+
 _SHARED_TO_ORDER = {
     "order_date": "date",
     "order_no": "order_no",
@@ -42,7 +51,7 @@ _SHARED_TO_ORDER = {
     "express_no": "express_no",
     "postage_cny": "postage_cny",
     "fx_rate": "fx_rate",
-    "trade_status": "status",
+    "purchase_status": "purchase_status",
 }
 
 
@@ -55,18 +64,19 @@ def _linked_order(session: Session, row: OrderStaging) -> Optional[Order]:
 
 
 def _overlay(row: OrderStaging, order: Optional[Order]) -> StagingRead:
-    """已导入行的共享字段用账本的实时值覆盖显示（单一真源，两页永远一致）。"""
+    """已导入行的共享字段用账本的实时值覆盖显示（单一真源，两页永远一致）。
+
+    字段清单**从 `_SHARED_TO_ORDER` 派生**，不再手抄一份。原先这里是九行手写赋值，
+    与 `_SHARED_TO_ORDER`、`mirror_to_staging` 构成三份各自维护的清单——已经漂了一项
+    （这里漏了 `platform`）。当时没造成可见错误，因为 `mirror_to_staging` 会把它写进
+    暂存行、读出来正好是对的；但那是**巧合掩盖了发散**：任何一条绕过 mirror 的写路径
+    都会让它现形。`test_naming.py` 的守卫钉住「三处覆盖同一份清单」。
+    """
     data = StagingRead.model_validate(row)
     if order is not None:
-        data.order_date = order.date
-        data.order_no = order.order_no
-        data.title = order.title
-        data.platform_account = order.platform_account
-        data.express_no = order.express_no
-        data.price_cny = order.price_cny
-        data.postage_cny = order.postage_cny
-        data.fx_rate = order.fx_rate
-        data.trade_status = order.status
+        for staging_field, order_field in _SHARED_TO_ORDER.items():
+            setattr(data, staging_field, getattr(order, order_field))
+        data.price_cny = order.price_cny   # 派生列，不在 _SHARED_TO_ORDER 里（改价走物品）
         data.items = [
             StagingItemRead(id=it.id, name=it.name, quantity=it.quantity,
                             unit_price_cny=it.unit_price_cny, auto=it.auto)
@@ -97,16 +107,25 @@ def _read(session: Session, row: OrderStaging) -> StagingRead:
 @router.get("")
 def list_staging(
     session: Session = Depends(get_session),
-    import_status: Optional[str] = Query(None, alias="status",
-                                         description="导入状态（待处理/已导入/已忽略）"),
+    import_status: Optional[str] = Query(
+        None, description="导入工作流状态（待处理/已导入/已忽略）。"
+             "原先它的 wire 名是 status——同一个词在四个端点上指三件事，已按业务段拆开"),
     platform: Optional[str] = None,
     platform_account: Optional[str] = None,
     date_from: Optional[dt.date] = None,
     date_to: Optional[dt.date] = None,
     q: Optional[str] = Query(None, description="模糊搜：物品名/商品标题/订单号/快递号"),
+    legacy_status: Optional[str] = Query(
+        None, alias="status", include_in_schema=False,
+        description="已废弃：查询参数 status 已按业务段改名"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
+    # FastAPI 对未知 query 参数**默认忽略**：改名后漏改一处调用方，
+    # 表现就是「筛选点了没反应、返回全量、HTTP 200、零日志」。响亮拒掉比静默返回错数据强。
+    if legacy_status:
+        raise HTTPException(status_code=400,
+                            detail="查询参数 status 已改名为 import_status")
     conds = []
     if import_status:
         conds.append(OrderStaging.import_status == import_status)
@@ -120,7 +139,7 @@ def list_staging(
         conds.append(OrderStaging.order_date <= date_to)
     if q:   # 统一模糊搜：物品名 / 商品标题 / 订单号 / 快递号（物品名用 EXISTS 子查询，不重复行）
         conds.append(
-            OrderStaging.order_no.contains(q, autoescape=True)
+            ci_contains(OrderStaging.order_no, q, session)
             | OrderStaging.title.contains(q, autoescape=True)
             | OrderStaging.express_no.contains(q, autoescape=True)
             | OrderStaging.items.any(StagingItem.name.contains(q, autoescape=True))
@@ -159,19 +178,39 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
     row = session.get(OrderStaging, row_id)
     if not row:
         raise_not_found("暂存记录")
+    data = payload.model_dump(exclude_unset=True, exclude={"items", "version", "price_cny"})  # 价由物品派生
+    order = _linked_order(session, row)       # 普通 SELECT，不取写锁
+
+    # 锁序恒为 orders → orderstaging。全仓另外几条同时写这两张表的路径
+    # （orders.update_order / orders.delete_order / import_staging / tags.soft_delete_account_orders）
+    # 都是这个方向；这里若反过来（先暂存后账本）就构成 AB-BA 锁环——同一对「暂存行 ↔ 已导入订单」
+    # 被两条路径并发写时，MySQL/InnoDB 报 1213 死锁并回滚一方，而 main.py 只挂了
+    # IntegrityError / ValueError 两个 handler，OperationalError(1213) 会直接逃成裸 500。
+    # SQLite 是单写者串行，这个 bug 在本地测试里**永远复现不出来**。
+    if order is not None:
+        # 已导入：共享字段写穿到账本（唯一真源），仅「导入状态」留在暂存自身。
+        # 账本侧也走乐观锁：原子自增账本 version，让订单页也能察觉此次改动。
+        if not guarded_bump(session, Order, order.id, order.version):
+            raise_conflict()
     # 暂存行乐观锁：加载后被爬虫/他人改过 → 409，前端刷新（version 原子自增 + 刷新 updated_at）
     if not guarded_bump(session, OrderStaging, row_id, payload.version):
         raise_conflict()
-    data = payload.model_dump(exclude_unset=True, exclude={"items", "version", "price_cny"})  # 价由物品派生
-    order = _linked_order(session, row)
 
     if order is not None:
-        # 已导入：共享字段写穿到账本（唯一真源），仅「导入状态」留在暂存自身。
-        # 账本侧再走一次乐观锁：原子自增账本 version，让淘宝页也能察觉此次改动。
-        if not guarded_bump(session, Order, order.id, order.version):
-            raise_conflict()
         for key, value in data.items():
             if key in _SHARED_TO_ORDER:
+                # 写穿时不许把账本必填列写空。约束的真身不在 StagingUpdate 上——爬虫回灌、
+                # 未导入行编辑都合法地要 null，放 schema 会误伤；只有写穿这一刻才必须挡。
+                # 不挡的话 null 会一路走到 commit，被数据库拦成 409「数据完整性冲突」，
+                # 而前端把 409 当乐观锁冲突，弹「数据已变，已刷新」——用户完全不知道错在哪。
+                # 也**不要**在这里 coalesce 成默认值（import_staging 那样）：导入是「批量入账时
+                # 兜底未知值」，编辑是「用户明确按了清除」，把清除静默换成今天的日期比 409 更糟。
+                col = Order.__table__.columns.get(_SHARED_TO_ORDER[key])
+                if value is None and col is not None and not col.nullable:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"该记录已导入账本，「{_SHARED_LABELS.get(key, key)}」不能清空（账本必填）",
+                    )
                 setattr(order, _SHARED_TO_ORDER[key], value)
                 setattr(row, key, value)   # 暂存行自身原始列也同步，避免 tags._data_values / 列表筛选读到陈旧值
             elif key == "import_status":
@@ -240,7 +279,7 @@ def ignore_staging(row_id: int, session: Session = Depends(get_session)):
     res = session.execute(
         sa_update(OrderStaging)
         .where(OrderStaging.id == row_id, OrderStaging.imported_order_id.is_(None))
-        .values(import_status=StagingStatus.ignored.value,
+        .values(import_status=ImportStatus.ignored.value,
                 version=OrderStaging.version + 1, updated_at=utcnow())
     )
     if res.rowcount != 1:
@@ -273,8 +312,8 @@ def import_staging(row_id: int, session: Session = Depends(get_session)):
         express_no=row.express_no,
         postage_cny=row.postage_cny,         # 邮费随单迁移
         fx_rate=row.fx_rate or rate_for_date(session, row.order_date),  # 优先暂存记录的汇率；否则按下单日期匹配
-        status=row.trade_status or OrderStatus.paid.value,   # 订单状态一同迁移
-        created_via=Source.imported.value,
+        purchase_status=row.purchase_status or PurchaseStatus.paid.value,   # 订单状态一同迁移
+        created_via=CreatedVia.imported.value,
     )
     # 物品（含单价/auto）随单迁移；订单价由物品派生（= 暂存价，一致）。暂存无物品时兜底自动生成 1 条。
     if row.items:
@@ -294,8 +333,8 @@ def import_staging(row_id: int, session: Session = Depends(get_session)):
         sa_update(OrderStaging)
         .where(OrderStaging.id == row_id, OrderStaging.imported_order_id.is_(None))
         .values(
-            import_status=StagingStatus.imported.value,
-            trade_status=order.status,          # 快照对齐账本（此后以账本为准，读时覆盖）
+            import_status=ImportStatus.imported.value,
+            purchase_status=order.purchase_status,          # 快照对齐账本（此后以账本为准，读时覆盖）
             imported_order_id=order.id,
             version=OrderStaging.version + 1,
             updated_at=utcnow(),

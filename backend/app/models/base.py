@@ -29,14 +29,16 @@ def utcnow() -> dt.datetime:
 
 # --- 枚举（作为「允许值」的唯一真相；DB 里存字符串值，schema 里做校验）----------
 
-class Source(str, Enum):
+# 名字必须与列名 created_via 一致：叫 Source 时会被读成「平台=淘宝」，
+# 而它其实是「由淘宝爬虫写入」——恰好又和 Order.platform == "淘宝" 是两件事。
+class CreatedVia(str, Enum):
     manual = "manual"
     imported = "imported"       # 从暂存表导入
     taobao_bot = "taobao_bot"
     shipment_bot = "shipment_bot"
 
 
-class OrderStatus(str, Enum):
+class PurchaseStatus(str, Enum):
     """**只记国内段**：从下单到国内快递签收。
 
     国际段（集运中/送达）不在这里——它的唯一真相是所挂靠集运单的 `ShipmentStatus`。
@@ -57,40 +59,40 @@ class OrderStatus(str, Enum):
 
 
 # 国内段生命周期序：只准前进不回退（OCR 合并 / 爬虫回灌时据此判定）。
-# 退款/交易关闭是旁支终态，不参与推进 → 用 order_status_rank() 取 -1。
+# 退款/交易关闭是旁支终态，不参与推进 → 用 purchase_status_rank() 取 -1。
 # 国际段不在序里——它由集运单自己的状态表达，订单不复制。
-ORDER_STATUS_RANK = {
-    OrderStatus.unpaid.value: 0,
-    OrderStatus.paid.value: 1,
-    OrderStatus.shipped.value: 2,
-    OrderStatus.signed.value: 3,
+PURCHASE_STATUS_RANK = {
+    PurchaseStatus.unpaid.value: 0,
+    PurchaseStatus.paid.value: 1,
+    PurchaseStatus.shipped.value: 2,
+    PurchaseStatus.signed.value: 3,
 }
 
 
 # 旁支**终态**：走到这里就结束了，不再沿生命周期前进。
-# 它们不在 ORDER_STATUS_RANK 里，所以 order_status_rank() 返回 -1——
+# 它们不在 PURCHASE_STATUS_RANK 里，所以 purchase_status_rank() 返回 -1——
 # ⚠️ 而 -1 的实际效果是「**任何**推进态都 > 它，于是谁都能盖掉它」，与「不参与推进」
 # 这个本意正好相反。曾因此出过事：一张已标「退款」的单被 OCR 再识别一次，
 # 兜底判成「待发货」（rank 1 > -1）就把退款抹掉了，而退款单本来不计入看板合计
 # （见 EXCLUDED_STATUSES）→ **看板金额凭空变大**。
-# 所以「能不能覆盖」必须走 can_advance()，不能只比 rank。
-TERMINAL_STATUSES = frozenset({OrderStatus.refunded.value, OrderStatus.cancelled.value})
+# 所以「能不能覆盖」必须走 can_advance_purchase()，不能只比 rank。
+PURCHASE_TERMINAL_STATUSES = frozenset({PurchaseStatus.refunded.value, PurchaseStatus.cancelled.value})
 
 
-def order_status_rank(status: Optional[str]) -> int:
+def purchase_status_rank(status: Optional[str]) -> int:
     """状态在国内段生命周期里的序号。终态与未知值取 -1。
 
-    **别拿它单独做「能不能覆盖」的判定**——-1 会让终态被任何推进态盖掉。用 can_advance()。
+    **别拿它单独做「能不能覆盖」的判定**——-1 会让终态被任何推进态盖掉。用 can_advance_purchase()。
     """
-    return ORDER_STATUS_RANK.get(status or "", -1)
+    return PURCHASE_STATUS_RANK.get(status or "", -1)
 
 
-def is_terminal(status: Optional[str]) -> bool:
+def is_purchase_terminal(status: Optional[str]) -> bool:
     """是不是旁支终态（退款 / 交易关闭）。"""
-    return (status or "") in TERMINAL_STATUSES
+    return (status or "") in PURCHASE_TERMINAL_STATUSES
 
 
-def can_advance(current: Optional[str], incoming: Optional[str]) -> bool:
+def can_advance_purchase(current: Optional[str], incoming: Optional[str]) -> bool:
     """自动化写入（OCR 识别、爬虫回灌）能不能把 current 改成 incoming。
 
     规则，按优先级：
@@ -104,11 +106,11 @@ def can_advance(current: Optional[str], incoming: Optional[str]) -> bool:
     """
     if not incoming or incoming == current:
         return False
-    if is_terminal(current):
+    if is_purchase_terminal(current):
         return False
-    if is_terminal(incoming):
+    if is_purchase_terminal(incoming):
         return True
-    return order_status_rank(incoming) > order_status_rank(current)
+    return purchase_status_rank(incoming) > purchase_status_rank(current)
 
 
 class ShipmentStatus(str, Enum):
@@ -120,7 +122,7 @@ class ShipmentStatus(str, Enum):
     cancelled = "已取消"
 
 
-class StagingStatus(str, Enum):
+class ImportStatus(str, Enum):
     pending = "待处理"
     imported = "已导入"
     ignored = "已忽略"
@@ -128,12 +130,20 @@ class StagingStatus(str, Enum):
 
 # 看板合计要排除的状态：未付款/退款/交易关闭都不计入（金额与物品仍照常显示，只是不加总）。
 # 不再用「负数行」冲抵退款——打上退款/关闭标记即自动不计入。
-EXCLUDED_STATUSES = {
-    OrderStatus.unpaid.value,          # 待付款：还没花钱，不计入
-    OrderStatus.refunded.value,        # 退款
-    OrderStatus.cancelled.value,       # 交易关闭
-    ShipmentStatus.cancelled.value,     # 集运已取消
-}
+#
+# **按段拆开**：原先是一个大集合，被同一个 `notin_` 同时喂给订单表和集运表，
+# 「订单表不会误伤集运的值」全靠「两个枚举值域恰好不相交」这条巧合撑着。
+# 那是把一个巧合当成了契约：加第三个枚举（卖出段）时它会绷断，而绷断的表现是
+# **看板金额悄悄变了**，不是报错。现在每张表只排除自己那一段的值。
+PURCHASE_EXCLUDED = frozenset({
+    PurchaseStatus.unpaid.value,          # 待付款：还没花钱，不计入
+    PurchaseStatus.refunded.value,        # 退款
+    PurchaseStatus.cancelled.value,       # 交易关闭
+})
+SHIPMENT_EXCLUDED = frozenset({ShipmentStatus.cancelled.value})   # 集运已取消
+
+# 两段的并集。现在各表只用自己那半，本常量只剩「全部不计入的状态」这层文档语义。
+EXCLUDED_STATUSES = PURCHASE_EXCLUDED | SHIPMENT_EXCLUDED
 
 
 def guard_cny(p: Decimal) -> Decimal:
@@ -169,11 +179,28 @@ def price_from_items(items) -> Decimal:
 # --- 共通基类：日期/备注/来源/付款人/乐观锁/软删/时间戳 + 金额输入与派生 --------
 
 class LedgerBase(SQLModel):
+    @classmethod
+    def ledger_exclusions(cls):
+        """看板合计要跳过哪些行：`[(状态列, 不计入的值集合), ...]`，每条都不能命中。
+
+        空列表 = 这张表没有「计入/不计入」的状态维度（杂项支出就是）。
+
+        **为什么是列表而不是单条**：将来加卖出/退货这类并行的状态轴时，是往列表里
+        追一项，而不是改看板的函数签名。
+
+        **为什么列从 `cls` 上取**：看板原先写的是 `model.status`——鸭子类型，
+        唯一依据是「两张表的状态列恰好同名」。改成把列**传进去**同样不行：
+        `_sum(session, Order, ShipmentOrder.status)` 这种手滑不报错，SQLAlchemy 会把
+        对侧表自动加进 FROM 生成隐式交叉连接，`SUM` 乘以对侧行数——**看板金额静默变大**。
+        从 `cls` 上取，引用到别的表在语法上就写不出来。
+        """
+        return []
+
     date: dt.date = Field(index=True)                       # 记录日期
     note: Optional[str] = Field(default=None, sa_type=Text)  # sa_type（非 sa_column）→ 每个子表各建一份，避免共享 Column 报错
     # created_via = 这行**怎么进来的**（手填/从暂存导入/机器人）。刻意不叫 source——
     # 那会和 platform（UI 标签就叫「来源」，值是 淘宝/闲鱼/京东）撞义。
-    created_via: str = Field(default=Source.manual.value, max_length=32, index=True)
+    created_via: str = Field(default=CreatedVia.manual.value, max_length=32, index=True)
     payer_id: Optional[int] = Field(default=None, foreign_key="user.id")
     version: int = Field(default=1)                          # 乐观锁
     is_delete: bool = Field(default=False, index=True)       # 软删标记（True=已删，查询默认过滤）

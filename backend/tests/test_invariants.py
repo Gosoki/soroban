@@ -3,6 +3,7 @@
 审计反复发现的一类 bug：单条路径守得很严（带注释解释为什么），批量/另一个入口却整个绕过。
 这里按「规则」而不是按「端点」组织测试，新增入口时照着补一条即可。
 """
+import datetime as dt
 import pytest
 
 from app.config import settings
@@ -137,3 +138,71 @@ def test_plugin_account_rename_length_capped(client, fake_plugin):
     r = client.post("/api/plugins/taobao/account/rename",
                     params={"old": "shortname", "new": "b" * 65})
     assert r.status_code == 422
+
+
+# --- 有钱必有汇率 -------------------------------------------------------------
+
+def test_price_without_fx_rate_never_survives_a_write(client, fx_today, mk):
+    """任何写入口都不许留下「有人民币价、却算不出日元」的行。
+
+    看板是 `SUM(jpy_settled)`，NULL 被静默跳过——这类行的金额会被吞掉，而笔数照数
+    （「笔数 +1、金额 +0」）。杂项就这么漏过：create 只在「建行时就带了 price_cny」
+    才补汇率，update 完全不补，而幽灵新建行最自然的用法恰恰是「先敲名称建行 →
+    再点金额格填钱」，那条路径下汇率永远是 NULL。
+    """
+    # 先建空行（此时无价、无汇率），再单独 PATCH 补价——补价这一步必须顺带补上汇率
+    row = mk("/api/misc", {"date": "2026-04-01", "name": "打包胶带"})
+    assert row["fx_rate"] is None and row["jpy_settled"] is None
+
+    r = client.patch(f"/api/misc/{row['id']}", json={"version": row["version"], "price_cny": "30"})
+    assert r.status_code == 200, r.text
+    after = r.json()
+    assert after["fx_rate"] is not None, "补价没补汇率：这笔钱会被看板静默吞掉"
+    assert after["jpy_settled"] is not None
+
+    ship = mk("/api/shipment", {"date": "2026-04-01"})
+    r = client.patch(f"/api/shipment/{ship['id']}", json={"version": ship["version"], "price_cny": "30"})
+    assert r.status_code == 200, r.text
+    assert r.json()["jpy_settled"] is not None
+
+
+def test_no_ledger_row_has_money_without_jpy(client, fx_today, mk, session):
+    """跨三张账本表的不变量：只要库里有汇率，任何写入口都不许留下「有钱、算不出日元」的行。
+
+    比只钉杂项有价值——将来任何一张表再犯同样的错都会在这里红。
+
+    **为什么自己造数而不是扫全库**：库里一条汇率记录都没有时（全新部署 + fx_loop 还没
+    成功跑过），带价订单照样建得出来，`current_rate` 只能盖上 None——这是一个真实存在
+    的产品缺口，但它的正确行为需要产品决策（拒收？还是允许并显式提示？），不该由这条
+    不变量单方面定义成「红」。所以这里把前提写进夹具（fx_today 保证当天有牌价），
+    只断言「有汇率可取时，没有任何写路径会把它漏掉」。那个缺口另行记录待决。
+    """
+    from decimal import Decimal
+
+    from sqlmodel import select
+
+    from app.models import MiscExpense, Order, ShipmentOrder
+
+    # 三张表 × 两条路径（建行即带价 / 先建空行再补价），共 6 种写法
+    mk("/api/misc", {"date": "2026-04-02", "name": "直接带价", "price_cny": "12"})
+    mk("/api/shipment", {"date": "2026-04-02", "price_cny": "12"})
+    mk("/api/orders", {"date": "2026-04-02", "price_cny": "12"})
+    for url, body in (("/api/misc", {"date": "2026-04-02", "name": "后补价"}),
+                      ("/api/shipment", {"date": "2026-04-02"}),
+                      ("/api/orders", {"date": "2026-04-02"})):
+        row = mk(url, body)
+        r = client.patch(f"{url}/{row['id']}", json={"version": row["version"], "price_cny": "12"})
+        assert r.status_code == 200, f"{url} 补价失败: {r.text}"
+
+    bad = []
+    for model in (Order, ShipmentOrder, MiscExpense):
+        rows = session.exec(
+            select(model).where(
+                model.is_delete == False,                    # noqa: E712  SQL 表达式，不能用 is
+                model.date == dt.date(2026, 4, 2),
+                model.price_cny > Decimal("0"),
+                model.jpy_settled.is_(None),
+            )
+        ).all()
+        bad += [f"{model.__name__}#{r.id} price_cny={r.price_cny} fx_rate={r.fx_rate}" for r in rows]
+    assert not bad, "这些行有钱却算不出日元，看板会静默少算：\n  " + "\n  ".join(bad)

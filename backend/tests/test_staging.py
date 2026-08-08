@@ -28,17 +28,17 @@ def test_multiple_null_order_no_allowed(client):
 
 def test_import_creates_order_and_marks_row(client):
     s = mk_staging(client, order_no="S-IMP-1", title="店", platform="淘宝",
-                   order_date="2026-05-01", trade_status="待发货",
+                   order_date="2026-05-01", purchase_status="待发货",
                    items=[{"name": "物品", "quantity": 2, "unit_price_cny": "30.00"}])
     r = client.post(f"/api/staging/{s['id']}/import")
     assert r.status_code == 200, r.text
     o = r.json()
     assert o["order_no"] == "S-IMP-1"
     assert o["platform"] == "淘宝"
-    assert o["status"] == "待发货"
+    assert o["purchase_status"] == "待发货"
     assert o["created_via"] == "imported"
     assert Decimal(o["price_cny"]) == Decimal("60.00")
-    row = client.get("/api/staging", params={"status": "已导入", "limit": 200}).json()["items"]
+    row = client.get("/api/staging", params={"import_status": "已导入", "limit": 200}).json()["items"]
     assert any(x["id"] == s["id"] and x["imported_order_id"] == o["id"] for x in row)
 
 
@@ -134,7 +134,7 @@ def test_staging_optimistic_lock(client):
 
 
 def test_staging_bad_order_status_rejected(client):
-    r = client.post("/api/staging", json={"order_no": "S-BADST", "trade_status": "乱七八糟"})
+    r = client.post("/api/staging", json={"order_no": "S-BADST", "purchase_status": "乱七八糟"})
     assert r.status_code == 422
 
 

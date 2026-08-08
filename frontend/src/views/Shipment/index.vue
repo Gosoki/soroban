@@ -6,7 +6,7 @@
         <template #toolbar>
           <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
                           start-placeholder="起" end-placeholder="止" @change="reload" />
-          <el-select v-model="filters.status" placeholder="状态" clearable style="width: 110px" @change="reload">
+          <el-select v-model="filters.shipmentStatus" placeholder="状态" clearable style="width: 110px" @change="reload">
             <el-option v-for="s in SHIPMENT_STATUS" :key="s" :label="s" :value="s" />
           </el-select>
           <el-input v-model="filters.q" placeholder="搜集运单号" clearable style="width: 150px" @change="reload" />
@@ -122,12 +122,12 @@ function gotoOrder(t) { router.push({ path: '/orders', query: { focus: t.id } })
 
 
 const columns = [
-  { key: 'date', label: '日期', type: 'date', width: 130 },
+  { key: 'date', label: '日期', type: 'date', width: 130, clearable: false },
   { key: 'shipment_no', label: '集运单号', type: 'text', minWidth: 120, placeholder: '集运单号' },
   { key: 'intl_tracking_no', label: '国际运单号', type: 'text', minWidth: 120 },
   { key: 'recipient', label: '收货人', type: 'tag', field: 'recipient', width: 100 },
   { key: 'weight', label: '重量kg', type: 'decimal', width: 80 },
-  { key: 'status', label: '状态', type: 'select', options: SHIPMENT_STATUS, width: 100, clearable: false },
+  { key: 'shipment_status', label: '状态', type: 'select', options: SHIPMENT_STATUS, width: 100, clearable: false },
   { key: 'price_cny', label: '运费（元）', type: 'decimal', format: 'cny', width: 110, placeholder: '实付运费' },
   { key: 'fx_rate', label: '汇率', type: 'decimal', width: 80, placeholder: '当天汇率' },
   { key: 'special_fee_jpy', label: '特殊费（円）', type: 'int', format: 'jpy', width: 110, placeholder: '关税/消费税' },
@@ -143,7 +143,7 @@ const total = ref(0)
 const loading = ref(false)
 const page = ref(1)
 const pageSize = 30
-const filters = reactive({ range: null, status: '', q: '' })
+const filters = reactive({ range: null, shipmentStatus: '', q: '' })
 const unassignedOptions = ref([])
 
 // 请求序号：筛选/翻页可以在上一次响应回来前再发一次，慢的那次后到会把新数据整个覆盖掉
@@ -155,7 +155,7 @@ async function load() {
   try {
     const params = { limit: pageSize, offset: (page.value - 1) * pageSize }
     if (filters.range) { params.date_from = filters.range[0]; params.date_to = filters.range[1] }
-    if (filters.status) params.status = filters.status
+    if (filters.shipmentStatus) params.shipment_status = filters.shipmentStatus
     if (filters.q) params.q = filters.q
     const res = await shipmentApi.list(params)
     if (my !== loadSeq) return          // 已有更新的请求发出，丢弃这次的结果
@@ -179,7 +179,7 @@ async function saveCell(row, key, value) {
 
 async function addRow(data = {}, done) {
   try {
-    const created = await shipmentApi.create({ date: today(), status: '打包中', ...data })
+    const created = await shipmentApi.create({ date: today(), shipment_status: '打包中', ...data })
     rows.value.unshift(created)
     total.value++
     done?.(true)

@@ -79,11 +79,14 @@
         <tbody>
           <!-- 幽灵新建行：放最上，与「最新在上」一致；任意格输入即建行 -->
           <!-- 幽灵新建行：填格子只攒草稿，按回车或点左侧 ✓ 才落库（见 commitNew） -->
-          <tr v-if="addable" class="gtn-new" @keyup.enter="commitNew">
-            <td class="gtn-td-id gtn-new-num" :class="{ ready: hasNew }"
-                :title="hasNew ? '提交新建这一行（或在格子里按回车）' : '在右侧格子里填内容即可新建一行'"
+          <tr v-if="addable" class="gtn-new">
+            <td class="gtn-td-id gtn-new-num" :class="{ ready: hasNew, busy: committing }"
+                :title="committing ? '正在提交…'
+                  : hasNew ? '提交新建这一行（或在格子里按回车）' : '在右侧格子里填内容即可新建一行'"
                 @click="commitNew">
-              <el-icon><component :is="hasNew ? Check : Plus" /></el-icon>
+              <el-icon :class="{ spin: committing }">
+                <component :is="committing ? Loading : hasNew ? Check : Plus" />
+              </el-icon>
             </td>
             <td v-if="hasActions"></td>
             <td v-if="expandable"></td>
@@ -92,7 +95,8 @@
                    的列——如订单的人民币：平时由物品单价×数量派生、不许直接改，
                    但新建一单时总得有个地方把金额填进去。 -->
               <GotionCell v-if="(!col.readonly || col.newEditable) && !$slots['cell-' + col.key]" new-row
-                          :model-value="newRow[col.key]" :col="newCol(col)" @change="(v) => onNew(col, v)" />
+                          :model-value="newRow[col.key]" :col="newCol(col)"
+                          @change="(v) => onNew(col, v)" @submit="commitNew" />
               <!-- 只读/自定义列在新建行显其占位提示（如「集运订单」显「选择」）；无占位则留空 -->
               <div v-else-if="col.placeholder" class="gtn-new-ph">{{ col.placeholder }}</div>
             </td>
@@ -130,7 +134,7 @@
 <script setup>
 import { computed, onMounted, reactive, ref, useSlots, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowRight, Brush, Check, Delete, Edit, Plus, QuestionFilled, Setting } from '@element-plus/icons-vue'
+import { ArrowRight, Brush, Check, Delete, Edit, Loading, Plus, QuestionFilled, Setting } from '@element-plus/icons-vue'
 import GotionCell from './GotionCell.vue'
 import { layoutApi, tagsApi } from '@/api'
 import { TAG_PALETTE, tagStyleAt } from '@/constants'
@@ -297,18 +301,31 @@ watch(() => props.openId, (id, prev) => {
 function onNew(col, value) {
   newRow[col.key] = value
 }
+const committing = ref(false)
 function commitNew() {
-  if (!hasNew.value) return
+  // committing 门闩：草稿要等 POST 回来才清空，在途这段时间 hasNew 仍为真，
+  // 再点一次 ✓（或再按一次回车）就会把同一份草稿再 POST 一遍 → 两条重复订单。
+  if (!hasNew.value || committing.value) return
   const data = {}
   Object.keys(newRow).forEach((k) => {
     if (newRow[k] !== null && newRow[k] !== '') data[k] = newRow[k]
   })
-  // 成功才清空草稿：失败（如订单号撞唯一约束）时把用户刚敲的内容留在格子里让他改，
-  // 而不是连人带字一起吞掉。父页的 addRow 收到第二个参数就回调它。
-  emit('add', data, (ok) => {
-    if (ok === false) return
-    Object.keys(newRow).forEach((k) => delete newRow[k])
-  })
+  committing.value = true
+  let settled = false
+  // done 在契约上是**可选**的（父页写的是 done?.(true)）。哪个父页将来早退没调它，
+  // 只在 done 里解锁就会让幽灵行永久点不动——那比偶发多建一条更糟。故加超时兜底
+  // （20s > api 层 15s 默认超时），最坏情况只是「短暂锁一会儿」。
+  const timer = setTimeout(() => finish(false), 20000)
+  function finish(ok) {
+    if (settled) return
+    settled = true
+    clearTimeout(timer)
+    committing.value = false
+    // 成功才清空草稿：失败（如订单号撞唯一约束）时把用户刚敲的内容留在格子里让他改，
+    // 而不是连人带字一起吞掉。
+    if (ok !== false) Object.keys(newRow).forEach((k) => delete newRow[k])
+  }
+  emit('add', data, finish)
 }
 
 // —— 列拖拽换位 ——
@@ -403,6 +420,10 @@ function stopResize() {
 .gtn-new-num:hover { color: #67c23a; background: rgba(103, 194, 58, 0.1); }
 /* 草稿已有内容 → ✓ 亮起，提示「可以提交了」 */
 .gtn-new-num.ready { color: #67c23a; background: rgba(103, 194, 58, 0.12); }
+/* 提交在途：点不动 + 转圈。在途零反馈正是用户第二次点击、建出重复单的成因 */
+.gtn-new-num.busy { color: #909399; background: transparent; pointer-events: none; cursor: progress; }
+.gtn-new-num .spin { animation: gtn-spin 1s linear infinite; }
+@keyframes gtn-spin { to { transform: rotate(360deg); } }
 .gtn-new-ph { height: 36px; padding: 0 8px; display: flex; align-items: center; color: #5b6880; font-size: 13px; }
 
 .gtn-tagcfg { margin-left: 4px; color: #6b7a93; cursor: pointer; font-size: 13px; }

@@ -306,8 +306,8 @@ def test_needs_is_cached(client, fake_plugin, monkeypatch):
     """GET /api/plugins 是前端轮询的接口，而探测依赖要 spawn 好几个子进程。
     不缓存的话，装依赖时前端秒级轮询会把机器拖垮。"""
     calls = []
-    real = plug._needs
-    monkeypatch.setattr(plug, "_needs", lambda m: (calls.append(1), real(m))[1])
+    real = plug.probe_needs
+    monkeypatch.setattr(plug, "probe_needs", lambda m: (calls.append(1), real(m))[1])
     client.get("/api/plugins")
     client.get("/api/plugins")
     client.get("/api/plugins")
