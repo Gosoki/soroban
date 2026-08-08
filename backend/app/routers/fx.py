@@ -50,7 +50,12 @@ def _auto_provider() -> str:
 def _read(session: Session, row) -> FxRead:
     """FxRate 行 → FxRead。两个端点共用：抄两遍迟早有一边忘了加新字段。"""
     if not row:
-        return FxRead(base=settings.FX_BASE, quote=settings.FX_QUOTE)
+        # ⚠️ 这条早退分支同样要带 `auto_provider`：库里一条汇率都没有，
+        # 恰恰是最需要告诉用户「有没有插件在供给」的时刻——设置页就是靠它
+        # 在「有插件但还没跑」和「压根没装插件」之间说对话。
+        # 漏掉的话那句提示永远显示成「没有能自动取汇率的插件」。
+        return FxRead(base=settings.FX_BASE, quote=settings.FX_QUOTE,
+                      auto_provider=_auto_provider())
     return FxRead(
         base=settings.FX_BASE,
         quote=settings.FX_QUOTE,

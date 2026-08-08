@@ -42,7 +42,7 @@
       <el-input-number v-model="goodsInput" :min="0" :precision="2" :controls="false" size="small"
                        :disabled="!isSingleUnitItem" :placeholder="isSingleUnitItem ? '直接填金额' : '由明细算出'"
                        style="width: 130px" @change="applyGoods" />
-      <el-tooltip placement="top" :content="GOODS_HINT">
+      <el-tooltip placement="top" :content="GOODS_HINT" popper-class="wrap-tip">
         <el-icon class="lb-help"><QuestionFilled /></el-icon>
       </el-tooltip>
       <span class="postage-lb pl">邮费（元）</span>

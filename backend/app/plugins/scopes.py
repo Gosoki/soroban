@@ -40,16 +40,22 @@ class ScopeSpec(NamedTuple):
 
 # 唯一一张权限表。新增一种能力 = 这里加一条 + 在对应路由上挂 x-scope。
 SCOPES: dict[str, ScopeSpec] = {
-    "meta:read": ScopeSpec("读状态机规则", "只读，不含任何业务数据"),
-    "staging:read": ScopeSpec("读暂存订单", "用于增量去重，避免重复推送"),
-    "staging:write": ScopeSpec("写暂存订单", "新建/更新暂存行。**不含**导入账本、忽略、删除"),
-    "staging:promote": ScopeSpec("把暂存单导入账本", "越过人工确认闸门直接建账本单", risk="high"),
-    "orders:read": ScopeSpec("读商品订单", "含金额"),
-    "shipment:read": ScopeSpec("读集运单", "含金额"),
-    "shipment:update": ScopeSpec("改集运单", "PATCH 会顺带盖汇率并重算日元金额", risk="medium"),
-    "fx:write": ScopeSpec("写入汇率", "每天最多一行，值受核心区间校验，写不进离谱值"),
-    "data:own": ScopeSpec("读写本插件自己的存储", "与账本隔离，其它插件读不到"),
+    # label 是勾选框上的名字，**别往里塞解释**——它要跟在复选框后面排成一列，
+    # 塞进整句话就把每一行撑成一根长条、长短不一还扫不出重点。
+    # 五个字上下：短到能扫、长到能读懂。要说的话放 hint（悬停才显示，能换行、能限宽）。
+    "meta:read": ScopeSpec("读状态机规则", "只读状态机规则，不含任何业务数据"),
+    "staging:read": ScopeSpec("读暂存订单", "读暂存订单，用于增量去重、避免重复推送"),
+    "staging:write": ScopeSpec("写暂存订单", "新建与更新暂存行。\n不含：导入账本、忽略、删除"),
+    "staging:promote": ScopeSpec("导入账本", "把暂存单直接建成账本单，\n越过「人工确认」这道闸。", risk="high"),
+    "orders:read": ScopeSpec("读商品订单", "读商品订单，含金额"),
+    "shipment:read": ScopeSpec("读集运单", "读集运单，含金额"),
+    "shipment:update": ScopeSpec("改集运单", "修改集运单。\n注意它会顺带盖汇率并重算日元金额。", risk="medium"),
+    # 一天可以有多条汇率（每次抓取追加一条），所以这里不再说「每天最多一行」。
+    # 写进来的值仍会被核心按 [FX_MIN, FX_MAX] 复核，写不进离谱值。
+    "fx:write": ScopeSpec("写入汇率", "记一条汇率。\n值由核心复核区间，写不进离谱数；\n你手填的那条不会被它盖掉。"),
+    "data:own": ScopeSpec("插件自有存储", "读写本插件自己的存储，\n与账本隔离，其它插件读不到。"),
 }
+
 
 # 进程内活跃令牌集：jti → 到期单调时刻。任务收割后立即剔除。
 # 这是 `auth.py` 明确拒绝过的「令牌版本列 + 迁移」之外唯一便宜的撤销手段；

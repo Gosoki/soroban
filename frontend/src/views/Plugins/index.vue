@@ -89,7 +89,7 @@
         <div v-for="pa in p.params" :key="pa.key" class="field">
           <label class="flabel">
             {{ pa.label }}
-            <el-tooltip v-if="pa.hint" :content="pa.hint" placement="top">
+            <el-tooltip v-if="pa.hint" :content="pa.hint" placement="top" popper-class="wrap-tip">
               <el-icon class="help"><QuestionFilled /></el-icon>
             </el-tooltip>
           </label>
@@ -117,13 +117,19 @@
                 title="插件更新后新要了权限，需要你确认">需要新授权</el-tag>
       </div>
       <div class="grants">
+        <!-- 一行只放「勾选框 + 短名 + 风险标 + ? 」。说明放进 tooltip：
+             整句塞在行内会把每一行撑成一根长条，而且长短不一、扫不出重点。 -->
         <label v-for="k in p.scopes.declared" :key="k" class="grant">
           <el-checkbox :model-value="p._form.granted.includes(k)"
                        @change="(v) => toggleGrant(p, k, v)" />
           <span class="g-name">{{ scopeMeta(p, k).label || k }}</span>
           <el-tag v-if="scopeMeta(p, k).risk === 'high'" size="small" :style="typeStyle('danger')">高风险</el-tag>
           <el-tag v-else-if="scopeMeta(p, k).risk === 'medium'" size="small" :style="typeStyle('warning')">留意</el-tag>
-          <span class="g-hint">{{ scopeMeta(p, k).hint }}</span>
+          <el-tooltip v-if="scopeMeta(p, k).hint" :content="scopeMeta(p, k).hint"
+                      placement="top" popper-class="wrap-tip">
+            <el-icon class="help"><QuestionFilled /></el-icon>
+          </el-tooltip>
+          <span class="g-key">{{ k }}</span>
         </label>
         <div class="sub">
           没勾的权限插件一个都用不了（默认全拒）。插件更新后自己多写一项权限**不会**自动生效——
@@ -534,7 +540,8 @@ onMounted(load)
 .grants { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
 .grant { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
 .g-name { font-weight: 600; }
-.g-hint { color: var(--txt-3); font-size: 12px; }
+/* 只显示权限 key（fx:write 这种），给愿意深究的人看；说明在 ? 里 */
+.g-key { color: var(--txt-3); font-size: 11px; font-family: ui-monospace, monospace; }
 .help { color: var(--txt-3); cursor: help; font-size: 13px; }
 .cmds { flex-wrap: wrap; }
 .subsect { color: var(--txt-3); font-size: 12px; margin: 8px 0 6px; }

@@ -358,3 +358,52 @@ def test_fx_card_tells_the_truth_about_who_provides_rates(client, fake_plugin, t
     monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "gone"))
     mod._needs_cache.clear()
     assert client.get("/api/fx").json()["auto_provider"] == "", "插件没了却还说有人在自动取汇率"
+
+
+# --- 文案：标签要短，说明进提示 ------------------------------------------------
+
+def test_scope_labels_stay_short():
+    """权限的 `label` 是勾选框后面的短名，别往里塞解释。
+
+    它要跟在复选框后排成一列——长了就把每一行撑成一根长条，长短不一还扫不出重点。
+    要说的话放 `hint`（悬停才显示，能换行、能限宽）。
+    """
+    from app.plugins.scopes import SCOPES
+
+    # 五个字上下：短到能扫、长到能读懂。放宽到 8 是给「插件自有存储」这类留余地，
+    # 真正要拦的是有人把整句解释塞进 label。
+    long = {k: v.label for k, v in SCOPES.items() if len(v.label) > 8}
+    assert not long, f"这些权限名太长了，把解释挪进 hint：{long}"
+
+
+def test_scope_hints_do_not_claim_one_row_per_day():
+    """汇率一天可以有多条了（每次抓取追加一条）。
+
+    权限说明里若还写着「每天最多一行」，那是在向用户描述一个已经不存在的限制——
+    比不写更糟。这条守的是「文案跟着行为走」，不是措辞洁癖。
+    """
+    from app.plugins.scopes import SCOPES
+
+    stale = [k for k, v in SCOPES.items() if "每天最多" in v.hint or "一天一行" in v.hint]
+    assert not stale, f"这些权限说明与「一天多条」的现行行为矛盾：{stale}"
+
+
+def test_long_hints_are_shown_in_a_wrapping_tooltip():
+    """长说明必须走会换行的提示气泡，不能塞在行内。
+
+    Element 的 tooltip 默认不换行，长句会拉成一根横贯屏幕的长条；popper 挂在 body 上，
+    scoped 样式够不着，所以限宽与换行放在全局的 `.wrap-tip`。
+    这条同时钉住「有 .wrap-tip 这个类」和「用到它的地方确实带上了」。
+    """
+    import re
+
+    css = (_REPO / "frontend" / "src" / "styles" / "tokens.css").read_text(encoding="utf-8")
+    assert "wrap-tip" in css, "缺全局的 .wrap-tip 样式，提示会拉成一根长条"
+    assert "max-width" in css.split("wrap-tip")[1][:200], ".wrap-tip 没限宽"
+
+    bad = []
+    for f in sorted((_REPO / "frontend" / "src").rglob("*.vue")):
+        for tag in re.findall(r"<el-tooltip\b[^>]*>", f.read_text(encoding="utf-8"), re.S):
+            if "popper-class" not in tag:
+                bad.append(f"{f.name}: {tag[:60]}")
+    assert not bad, "这些 tooltip 没带 popper-class（长内容会不换行）：\n  " + "\n  ".join(bad)

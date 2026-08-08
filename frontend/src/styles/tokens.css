@@ -110,3 +110,13 @@ html.dark {
 .gtn-disp, .derived, .item-tbl, .money, .el-table td .cell {
   font-variant-numeric: tabular-nums;
 }
+
+
+/* 提示气泡：限宽 + 换行。Element 默认不换行，长句会拉成一根横贯屏幕的长条，
+   而且 `\n` 也不生效。两条一起给：max-width 负责折行，pre-line 让手写的换行生效。
+   popper 挂在 body 上，scoped 样式够不着，所以放全局。 */
+.el-popper.wrap-tip {
+  max-width: 320px;
+  white-space: pre-line;
+  line-height: 1.7;
+}

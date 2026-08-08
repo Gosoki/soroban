@@ -150,3 +150,37 @@ def test_day_detail_marks_the_used_row_and_uses_jst(client, session):
     assert next(x for x in got if x["used"])["source"] == "manual"
     for x in got:
         assert len(x["at"]) == 5 and x["at"][2] == ":", f"抓取时刻不是 HH:MM：{x['at']!r}"
+
+
+def test_empty_rate_response_still_says_who_provides(client, session):
+    """库里一条汇率都没有时，`GET /api/fx` **仍要**说清有没有插件在供给。
+
+    `_read` 有一条「没有行就早退」的分支，它漏掉过 `auto_provider`——
+    而那恰恰是最需要这个字段的时刻：设置页靠它在「有插件但还没跑」与
+    「压根没装插件」之间说对话，漏掉就永远显示成后者。
+
+    讽刺的是 `_read` 的 docstring 自己写着「抄两遍迟早有一边忘了加新字段」，
+    然后就是那条早退分支忘了。
+    """
+    for r in session.exec(select(FxRate)).all():
+        session.delete(r)
+    session.commit()
+    got = client.get("/api/fx").json()
+    assert got["rate"] is None
+    assert "auto_provider" in got, "没有汇率时的响应缺了 auto_provider"
+
+
+def test_both_branches_of_read_return_the_same_fields(client, session):
+    """两条分支（有行 / 无行）返回的字段集必须一致。
+
+    早退分支少一个字段，表现是「某个状态下界面上少一块东西」，而那个状态往往
+    正是最少被测到的那个。这条比逐字段断言更耐改。
+    """
+    for r in session.exec(select(FxRate)).all():
+        session.delete(r)
+    session.commit()
+    empty = set(client.get("/api/fx").json())
+
+    _add(session, dt.date.today(), "23.5")
+    filled = set(client.get("/api/fx").json())
+    assert empty == filled, f"两条分支字段不一致，无行时少了：{sorted(filled - empty)}"

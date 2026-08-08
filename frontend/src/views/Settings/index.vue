@@ -36,7 +36,7 @@
       <div v-for="sp in g.items" :key="sp.key" class="field">
         <label class="flabel">
           {{ sp.label }}
-          <el-tooltip v-if="sp.hint" :content="sp.hint" placement="top">
+          <el-tooltip v-if="sp.hint" :content="sp.hint" placement="top" popper-class="wrap-tip">
             <el-icon class="help"><QuestionFilled /></el-icon>
           </el-tooltip>
         </label>
