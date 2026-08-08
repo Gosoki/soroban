@@ -190,18 +190,23 @@ def test_binstr_columns_use_ci_contains_for_search():
                 binstr.add(c.name)
     assert binstr, "没识别出任何 BinStr 列——探测方式可能已过期，请检查 dialect.BinStr"
 
+    # 只认 .contains 是不够的：改用 .like(f"%{q}%") / .ilike / .startswith 一样会走列的
+    # 排序规则，一样在 MySQL 上大小写敏感——而守卫会静默放行。这条守的是本地测不出来的
+    # 双引擎发散，被等价写法绕过 = 缺陷重新裸奔。
+    _LIKE_OPS = {"contains", "like", "ilike", "startswith", "endswith"}
+
     bad = []
     for path in sorted((Path(__file__).resolve().parents[1] / "app" / "routers").glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
                 continue
-            if node.func.attr != "contains" or not isinstance(node.func.value, ast.Attribute):
+            if node.func.attr not in _LIKE_OPS or not isinstance(node.func.value, ast.Attribute):
                 continue
             col = node.func.value.attr
             if col in binstr:
-                bad.append(f"{path.name}:{node.lineno} {col}.contains(...)")
-    assert not bad, ("这些 BinStr 列用了裸 .contains()，MySQL 上会变成大小写敏感：\n  "
+                bad.append(f"{path.name}:{node.lineno} {col}.{node.func.attr}(...)")
+    assert not bad, ("这些 BinStr 列用了裸的 LIKE 类操作，MySQL 上会变成大小写敏感：\n  "
                      + "\n  ".join(bad) + "\n改用 db.dialect.ci_contains(col, q, session)。")
 
 

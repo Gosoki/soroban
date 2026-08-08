@@ -249,14 +249,29 @@ _CLEARABLE_PAGES = [
 
 
 def _column_options(page: str) -> dict[str, str]:
-    """从页面列配置里粗取每个 `key: 'xxx'` 所在那一条的原文，供检查 clearable 标记。"""
+    """从页面列配置里取每个 `key: 'xxx'` 所属的**完整**列定义原文，供检查 clearable 标记。
+
+    结束花括号必须**配平**着找，不能 `find("}")` 拿第一个：列定义里可以有嵌套对象
+    （`options: {...}`、`lock: (row) => ({...})`），拿内层的 `}` 会把片段截断，
+    让本来标了 `clearable: false` 的列看起来没标 —— 那是假红。假红比假绿安全，
+    但同样有害：没人愿意留一条时不时无故变红的测试，最后它会被删掉。
+    """
     src = (_VIEWS / page / "index.vue").read_text(encoding="utf-8")
-    # 列定义要么是一行 `{ ... key: 'x' ... }`，要么跨几行；按 key 出现处向前后各取一段
     out = {}
     for m in re.finditer(r"key: '(\w+)'", src):
         start = src.rfind("{", 0, m.start())
-        end = src.find("}", m.end())
-        if start != -1 and end != -1:
+        if start == -1:
+            continue
+        depth, end = 0, -1
+        for i in range(start, len(src)):
+            if src[i] == "{":
+                depth += 1
+            elif src[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end != -1:
             out[m.group(1)] = src[start:end + 1]
     return out
 

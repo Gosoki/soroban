@@ -136,11 +136,26 @@ def test_multi_table_writers_take_locks_in_one_order():
     而项目支持双引擎。上一轮的教训正是「只在 MySQL 上炸」的问题 SQLite 测不到。
     """
     import ast
-    import inspect
     from pathlib import Path
 
     _ORDER, _STAGING = "Order", "OrderStaging"
-    bad = []
+
+    def _model_of(call: ast.Call):
+        """取 guarded_bump 的 model 实参名。位置参数与关键字参数都要认。
+
+        只看 `node.args[1]` 是不够的——`guarded_bump(session, model=Order, ...)` 这种
+        等价写法会让整条守卫**静默失效**，而它守的是一条本地永远测不出来的 MySQL 缺陷
+        （SQLite 单写者串行，死锁复现不了）。守卫被绕过 = 那条缺陷重新裸奔。
+        """
+        if len(call.args) >= 2:
+            return getattr(call.args[1], "id", _UNKNOWN)
+        for kw in call.keywords:
+            if kw.arg == "model":
+                return getattr(kw.value, "id", _UNKNOWN)
+        return _UNKNOWN
+
+    _UNKNOWN = "<无法静态判定>"
+    bad, unknown = [], []
     for path in sorted((Path(__file__).resolve().parents[1] / "app" / "routers").glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
@@ -148,10 +163,10 @@ def test_multi_table_writers_take_locks_in_one_order():
             for node in ast.walk(fn):
                 if not (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "guarded_bump"):
                     continue
-                if len(node.args) < 2:
-                    continue
-                model = getattr(node.args[1], "id", None)
-                if model in (_ORDER, _STAGING):
+                model = _model_of(node)
+                if model == _UNKNOWN:
+                    unknown.append(f"{path.name}:{node.lineno} {fn.name}")
+                elif model in (_ORDER, _STAGING):
                     seq.append((node.lineno, model))
             seq.sort()
             models = [m for _, m in seq]
@@ -159,3 +174,6 @@ def test_multi_table_writers_take_locks_in_one_order():
                 bad.append(f"{path.name}::{fn.name} 先锁 {_STAGING} 后锁 {_ORDER}（行 {[l for l, _ in seq]}）")
     assert not bad, ("跨表写的锁序不一致，MySQL 上会死锁：\n  " + "\n  ".join(bad)
                      + "\n统一成 orders → orderstaging（orders 是共享字段的唯一真源）。")
+    # 静默跳过判定不了的调用，等于给绕过留后门：宁可在这里红，逼作者把模型写成字面量。
+    assert not unknown, ("这些 guarded_bump 调用的 model 参数无法静态判定，锁序守卫覆盖不到：\n  "
+                         + "\n  ".join(unknown) + "\n请直接把模型类名写成字面量实参。")
