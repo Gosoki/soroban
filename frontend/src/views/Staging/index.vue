@@ -245,16 +245,14 @@ onMounted(() => { loadAccounts(); load() })
 
 <style scoped>
 .bar { margin-bottom: 10px; }
-.hint { color: #7d8aa3; font-size: 12px; }
-.pager { margin-top: 12px; justify-content: flex-end; }
-.ph { color: #5b6880; }
-.auto-txt { color: #6b7488; font-style: italic; }   /* 列表「物品」格：自动生成(名=标题)时灰显 */
+.hint { color: var(--txt-3); font-size: 12px; }
+.auto-txt { color: var(--txt-3); font-style: italic; }   /* 列表「物品」格：自动生成(名=标题)时灰显 */
 .expand { padding: 12px 20px; }
-.ex-title { color: #9ba8bf; font-size: 13px; margin-bottom: 8px; }
+.ex-title { color: var(--txt-2); font-size: 13px; margin-bottom: 8px; }
 .item-row { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
 /* 灰显：系统自动生成/自动定价的物品（编辑即去灰） */
-.item-row.item-auto :deep(.el-input__inner) { color: #6b7488; font-style: italic; }
+.item-row.item-auto :deep(.el-input__inner) { color: var(--txt-3); font-style: italic; }
 .postage-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
-.postage-lb { color: #9ba8bf; font-size: 13px; }
-.postage-hint { color: #7d8aa3; font-size: 12px; }
+.postage-lb { color: var(--txt-2); font-size: 13px; }
+.postage-hint { color: var(--txt-3); font-size: 12px; }
 </style>

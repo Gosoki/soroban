@@ -94,7 +94,7 @@ class Order(LedgerBase, table=True):
         这种查无此单的内部 id。显示与选择是两件事：显示的真相在订单行上，
         下拉只负责「挑一张出来」。
 
-        与 `effective_status` 共用同一个软删判断，也共用同一条预加载要求
+        与 `fulfillment_status` 共用同一个软删判断，也共用同一条预加载要求
         （`selectinload(Order.shipment_order)`）——因此不产生额外查询。
         """
         ship = self.shipment_order

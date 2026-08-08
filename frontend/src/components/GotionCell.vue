@@ -157,17 +157,16 @@ function choose(o) {
 .gtn-disp.sel.locked { cursor: not-allowed; opacity: .85; }
 .gtn-disp { height: 36px; padding: 0 8px; display: flex; align-items: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gtn-disp.sel { cursor: pointer; }
-.gtn-disp:hover { background: rgba(24, 144, 255, 0.06); }
-.ph { color: #5b6880; }
+.gtn-disp:hover { background: var(--brand-weak); }
 .derived { color: #8fb8ff; }
 
 .gtn-opts { display: flex; flex-direction: column; gap: 4px; }
 .gtn-opt { display: flex; align-items: center; padding: 4px 6px; border-radius: 4px; cursor: pointer; }
-.gtn-opt:hover { background: #1b2942; }
+.gtn-opt:hover { background: var(--bg-row-hover); }
 .gtn-opt.active { background: rgba(24, 144, 255, 0.15); }
-.gtn-ck { margin-left: auto; color: #67c23a; font-size: 14px; }
-.gtn-opt.clear { color: #9ba8bf; font-size: 12px; border-top: 1px solid #28354a; }
-.gtn-opt.clear:hover { color: #f56c6c; }
+.gtn-ck { margin-left: auto; color: var(--ok); font-size: 14px; }
+.gtn-opt.clear { color: var(--txt-2); font-size: 12px; border-top: 1px solid var(--border); }
+.gtn-opt.clear:hover { color: var(--danger); }
 
 /* 长文本弹窗编辑：宽 textarea，失焦自动保存 */
 .gtn-long-in { width: 100% !important; }

@@ -323,3 +323,59 @@ def test_filter_keys_declared_and_used_match_exactly(subtests=None):
             bad.append(f"{page}: 声明了没人读 {sorted(declared - used) or '—'}；"
                        f"读了没声明 {sorted(used - declared) or '—'}")
     assert not bad, "筛选器键集对不上：\n  " + "\n  ".join(bad)
+
+
+# --- 设计 token 不许再漂 ------------------------------------------------------
+
+_TOKENS_CSS = _REPO / "frontend" / "src" / "styles" / "tokens.css"
+
+# 这些取值有 token 了，`.vue` 的 <style> 里不许再出现字面量。
+# 之所以按「值」而不是按「数量」卡：数量阈值会随页面增加而失效，而一个已经有 token
+# 的颜色再次出现字面量，就是一次确凿的漂移。
+_TOKENIZED = {
+    "#606266": "Element 亮色灰，在暗底上只有 2.78:1，低于 WCAG AA → var(--txt-2)",
+    "#909399": "→ var(--txt-3)",
+    "#c0c4cc": "→ var(--txt-2)",
+    "#9ba8bf": "→ var(--txt-2)",
+    "#7d8aa3": "→ var(--txt-3)",
+    "#5b6880": "→ var(--txt-3)",
+    "#c7d2e6": "→ var(--txt-body)",
+    "#d6deea": "→ var(--txt-body)",
+    "#409eff": "Element 默认蓝，与品牌蓝 #1890ff 并排出现 → var(--brand)",
+    "#1890ff": "→ var(--brand)",
+    "#67c23a": "Element 绿，与家规的 emerald 并排出现 → var(--ok)",
+    "#e6a23c": "→ var(--warn)",
+    "#f56c6c": "→ var(--danger)",
+    "#28354a": "→ var(--border)",
+    "#2a3446": "→ var(--border)",
+    "#0b1220": "→ var(--bg-page)",
+    "#131c2f": "→ var(--bg-card)",
+}
+
+
+def test_design_tokens_exist():
+    """token 层必须存在且被 main.js 引入——否则下面那条守卫会变成一句空话。"""
+    assert _TOKENS_CSS.exists(), "缺 frontend/src/styles/tokens.css"
+    main = (_REPO / "frontend" / "src" / "main.js").read_text(encoding="utf-8")
+    i_el = main.index("theme-chalk/dark/css-vars.css")
+    i_tok = main.index("styles/tokens.css")
+    assert i_el < i_tok, "tokens.css 必须排在 Element 暗色变量之后，否则 --el-color-* 覆盖不生效"
+
+
+def test_no_style_block_reintroduces_a_tokenized_color():
+    """`.vue` 的 <style> 里不许再写已经有 token 的颜色字面量。
+
+    审计基线：全仓 222 处硬编码 hex / 54 个不同值，同一语义角色最多分裂成 4 套；
+    其中 Settings/Database 两页是照 Element **亮色**默认值写的，而应用恒暗色——
+    `#606266` 在卡片底上只有 2.78:1，13px 正文，是实打实的可读性缺陷而非审美问题。
+    """
+    import re
+
+    bad = []
+    for path in sorted((_REPO / "frontend" / "src").rglob("*.vue")):
+        src = path.read_text(encoding="utf-8")
+        for block in re.findall(r"<style[^>]*>.*?</style>", src, re.S):
+            for lit, hint in _TOKENIZED.items():
+                if lit in block.lower():
+                    bad.append(f"{path.relative_to(_REPO)}: {lit}  {hint}")
+    assert not bad, "这些颜色已经有 token 了，别再写字面量：\n  " + "\n  ".join(sorted(set(bad)))

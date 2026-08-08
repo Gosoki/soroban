@@ -59,9 +59,9 @@ async function submit() {
 .login-card { width: 360px; }
 .head { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
 .logo {
-  width: 44px; height: 44px; border-radius: 8px; background: #1890ff; color: #fff;
+  width: 44px; height: 44px; border-radius: 8px; background: var(--brand); color: #fff;
   font-size: 24px; font-weight: 700; display: flex; align-items: center; justify-content: center;
 }
-.title { font-size: 18px; font-weight: 600; color: #e6edf7; }
-.sub { font-size: 12px; color: #7d8aa3; }
+.title { font-size: 18px; font-weight: 600; color: var(--txt-1); }
+.sub { font-size: 12px; color: var(--txt-3); }
 </style>

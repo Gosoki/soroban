@@ -42,7 +42,7 @@ class PurchaseStatus(str, Enum):
     """**只记国内段**：从下单到国内快递签收。
 
     国际段（集运中/送达）不在这里——它的唯一真相是所挂靠集运单的 `ShipmentStatus`。
-    订单一旦挂上集运单，展示的状态就跟随那张单（见 `Order.effective_status`）；
+    订单一旦挂上集运单，展示的状态就跟随那张单（见 `Order.fulfillment_status`）；
     释放出来则回落到本列。这样同一件事只有一处记录，不会像以前那样
     「订单说集运中、它挂的集运单说已发出」。
     """

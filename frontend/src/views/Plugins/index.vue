@@ -353,21 +353,21 @@ onMounted(load)
 .needact { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
 .neederr { margin-top: 8px; font-size: 12px; color: var(--el-color-danger); white-space: pre-wrap; word-break: break-all; }
 .bar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-.hint { color: #7d8aa3; font-size: 12px; flex: 1; }
+.hint { color: var(--txt-3); font-size: 12px; flex: 1; }
 .plugin { margin-bottom: 16px; }
 .head { display: flex; align-items: center; gap: 10px; }
-.pname { color: #e6edf7; font-size: 15px; font-weight: 600; }
-.pver { color: #7d8aa3; font-size: 12px; }
+.pname { color: var(--txt-1); font-size: 15px; font-weight: 600; }
+.pver { color: var(--txt-3); font-size: 12px; }
 .grow { flex: 1; }
-.sw-label { color: #9ba8bf; font-size: 13px; }
+.sw-label { color: var(--txt-2); font-size: 13px; }
 .field { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-.flabel { color: #9ba8bf; font-size: 13px; min-width: 180px; }
-.sub { color: #7d8aa3; font-size: 12px; }
-.sect { color: #c7d2e6; font-size: 13px; font-weight: 600; margin: 6px 0 10px; padding-top: 12px; border-top: 1px solid #1c2740; }
+.flabel { color: var(--txt-2); font-size: 13px; min-width: 180px; }
+.sub { color: var(--txt-3); font-size: 12px; }
+.sect { color: var(--txt-body); font-size: 13px; font-weight: 600; margin: 6px 0 10px; padding-top: 12px; border-top: 1px solid var(--border-dim); }
 .acct { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .acct.dim .aname, .acct.dim .c-plat, .acct.dim .c-auth { opacity: 0.4; }   /* 只灰昵称/平台/授权，开关和按钮保持清晰可用 */
 .c-sw { width: 40px; flex: none; display: inline-flex; }                   /* 固定列，孤儿无开关也占位，保证对齐 */
-.aname { width: 104px; flex: none; color: #e6edf7; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.aname { width: 104px; flex: none; color: var(--txt-1); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .c-plat { min-width: 64px; flex: none; display: inline-flex; }
 .c-auth { min-width: 58px; flex: none; display: inline-flex; }
 .c-state { min-width: 56px; flex: none; display: inline-flex; }

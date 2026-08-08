@@ -137,38 +137,38 @@ function calc(input) {
 
 <style scoped>
 /* 自然块，上下内边距对称 */
-.calc { padding: 10px 12px; border-top: 1px solid #1c2740; }
+.calc { padding: 10px 12px; border-top: 1px solid var(--border-dim); }
 /* 结果行：折叠箭头在左、答案在右，同一行齐平 */
 .calc-row { display: flex; align-items: center; gap: 6px; min-height: 26px; margin: 8px 0 0; }
 .calc-tog { display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
   width: 24px; height: 22px; padding: 0; border: none; background: transparent; border-radius: 5px;
-  color: #7d8aa3; font-size: 16px; transition: transform .18s, color .15s, background .15s; }
-.calc-tog:hover { background: #172236; color: #c7d2e6; }
+  color: var(--txt-3); font-size: 16px; transition: transform .18s, color .15s, background .15s; }
+.calc-tog:hover { background: #172236; color: var(--txt-body); }
 .calc-tog.open { transform: rotate(90deg); }
 .calc-in {
   width: 100%; height: 32px; box-sizing: border-box; padding: 0 10px;
-  background: #0b1220; border: 1px solid #253149; border-radius: 6px;
-  color: #e6edf7; font-size: 14px; outline: none;
+  background: var(--bg-page); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--txt-1); font-size: 14px; outline: none;
 }
-.calc-in:focus { border-color: #1890ff; }
-.calc-in::placeholder { color: #5b6880; font-size: 13px; }
+.calc-in:focus { border-color: var(--brand); }
+.calc-in::placeholder { color: var(--txt-3); font-size: 13px; }
 /* 答案：靠右，和左侧折叠箭头同一行齐平 */
 .calc-res {
   margin-left: auto; min-width: 0; text-align: right;
-  color: #67c23a; font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums;
+  color: var(--ok); font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.calc-res.err { color: #7d8aa3; }
+.calc-res.err { color: var(--txt-3); }
 .calc-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 8px; }
 .k {
-  height: 30px; border: 1px solid #253149; border-radius: 6px; cursor: pointer;
-  background: #131c2f; color: #d6deea; font-size: 13px; padding: 0;
+  height: 30px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+  background: var(--bg-card); color: var(--txt-body); font-size: 13px; padding: 0;
   display: flex; align-items: center; justify-content: center; user-select: none;
 }
-.k:hover { background: #1b2942; }
+.k:hover { background: var(--bg-row-hover); }
 .k:active { background: #22314c; }
 .k.op { color: #7f9cff; }
-.k.fn { color: #9ba8bf; }
-.k.eq { background: #1890ff; border-color: #1890ff; color: #fff; }
+.k.fn { color: var(--txt-2); }
+.k.eq { background: var(--brand); border-color: var(--brand); color: #fff; }
 .k.eq:hover { background: #2b9bff; }
 </style>

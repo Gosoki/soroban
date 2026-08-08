@@ -98,5 +98,4 @@ onMounted(load)
 </script>
 
 <style scoped>
-.pager { margin-top: 12px; justify-content: flex-end; }
 </style>

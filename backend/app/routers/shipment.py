@@ -161,7 +161,7 @@ async def ocr_attach_express(
                 skipped.append(od)                       # 已挂别的集运单：交给用户手动处理
                 continue
             # **只挂靠，不动状态**：订单的 status 只记国内段，国际段由所挂集运单表达
-            # （见 Order.effective_status）。这里曾写过 status="集运中"——那会污染国内段状态，
+            # （见 Order.fulfillment_status）。这里曾写过 status="集运中"——那会污染国内段状态，
             # 一旦释放出来，回落到的就是被覆盖过的值而不是真实的「已签收」。
             values = {"shipment_order_id": shipment_id,
                       "version": Order.version + 1, "updated_at": utcnow()}
@@ -245,7 +245,7 @@ def attach_order(shipment_id: int, order_id: int, session: Session = Depends(get
     仅允许「未挂靠」的商品单：已挂在别的集运单 → 422（先移除再加，防误抢）。
 
     **不改订单状态**——两条挂靠路径都不改。订单的 status 只记国内段，
-    界面显示的国际段状态由本集运单表达（见 Order.effective_status），
+    界面显示的国际段状态由本集运单表达（见 Order.fulfillment_status），
     挂上就自动跟随、释放就自动回落，没有需要写的东西。"""
     shipment = session.get(ShipmentOrder, shipment_id)
     if not shipment or shipment.is_delete:

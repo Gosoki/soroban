@@ -1,0 +1,112 @@
+/* soroban 设计 token —— 全站唯一的取值来源。
+ *
+ * 为什么要有这一层：审计时全仓有 222 处硬编码 hex（54 个不同值），同一个语义角色最多
+ * 分裂成 4 套取值。最要命的不是不好看，是**可读性**：Settings/Database 两页是照
+ * Element 的**亮色**默认值写的（#606266 / #909399 / #c0c4cc），而应用恒暗色
+ * （main.js 无条件加 .dark，没有切换入口）。实测 #606266 在卡片底 #131c2f 上只有
+ * 2.78:1 对比度，13px 正文——低于 WCAG AA 的 4.5:1，也低于大字号的 3:1。
+ *
+ * 新写样式一律取 var(--…)，不要再往 .vue 里写字面 hex。
+ */
+
+:root {
+  /* --- 底色层次（由深到浅）------------------------------------------------ */
+  --bg-page: #0b1220;          /* 页面底 */
+  --bg-card: #131c2f;          /* 卡片 / 表格行 */
+  --bg-head: #161f33;          /* 卡片头 / 表头 */
+  --bg-hover: #18233a;         /* 悬停 / 填充 */
+  --bg-row-hover: #1b2942;     /* 表格行悬停 */
+
+  /* --- 文字三档。括号里是在 --bg-card 上的实测对比度 ---------------------- */
+  --txt-1: #e6edf7;            /* 主文字（14.0:1） */
+  --txt-2: #9ba8bf;            /* 次要说明（7.08:1） */
+  --txt-3: #7d8aa3;            /* 弱提示 / 占位符（4.89:1，AA 下限之上） */
+  --txt-body: #c7d2e6;         /* 表格正文 / 摘要行（11.0:1）——比 --txt-1 略收，长文更耐读 */
+  /* 全场用量最大的两个就是 --txt-2 / --txt-3，且实测达标；刻意不采用 Element
+     亮色那套（#606266 / #909399 / #c0c4cc）——它们是给白底用的。 */
+
+  /* --- 边框 ---------------------------------------------------------------- */
+  --border: #28354a;           /* 卡片 / 表格外框（用量最大，收敛到这一个） */
+  --border-soft: #202c44;      /* 表格内部横线：刻意比竖线浅，弱化行分隔 */
+  --border-dim: #1c2740;       /* 侧栏等低对比分隔 */
+  --border-strong: #3a4a6b;    /* 需要被"抓住"的元素：列宽拖拽把手、滚动条 */
+
+  /* --- 主色：全站只有一个蓝 ------------------------------------------------ */
+  /* #1890ff 承载品牌识别（logo / 侧栏选中态），所以是它同化 Element，而不是反过来。
+     覆盖 --el-color-primary 让 stock 控件跟着走，手写处一律 var(--brand)。 */
+  --brand: #1890ff;
+  --brand-weak: rgba(24, 144, 255, 0.08);   /* 悬停底 */
+  --brand-line: rgba(24, 144, 255, 0.35);   /* 虚线框 / 落点 */
+
+  /* --- 语义色：与 constants.js 的 TAG_PALETTE 实心色同源 -------------------- */
+  /* 家规写在 constants.js 的 TYPE_TINT 注释里：状态标签统一「柔和底色」。
+     但图标、边框、环形图此前直接硬编码了 Element 那套（#67c23a/#e6a23c/#f56c6c），
+     于是同一行里标签是 emerald、删除图标是 Element 红。这里收敛成一套。 */
+  --ok: #10b981;
+  --warn: #f59e0b;
+  --danger: #ef4444;
+  --ok-weak: rgba(16, 185, 129, 0.14);
+  --danger-weak: rgba(239, 68, 68, 0.12);
+
+  /* --- 圆角三档 ------------------------------------------------------------ */
+  --r-sm: 4px;                 /* 控件 / 单元格 */
+  --r-md: 8px;                 /* 卡片 / 表格 */
+  --r-lg: 16px;                /* 浮层 / 投放区 */
+
+}
+
+/* Element 的暗色变量定义在 `html.dark` 上，特异性高于 `:root`——覆盖必须同选择器，
+   否则被压掉、控件还是旧色。色阶按 Element 自己的算法算出（向 #141414 混，dark-2 向白混 20%），
+   只改 base 不改色阶的话，按钮 hover / 禁用态还会露出旧蓝。 */
+html.dark {
+  --el-color-primary: #1890ff;
+  --el-color-primary-light-3: #176bb8;
+  --el-color-primary-light-5: #16528a;
+  --el-color-primary-light-7: #15395b;
+  --el-color-primary-light-8: #152d43;
+  --el-color-primary-light-9: #14202b;
+  --el-color-primary-dark-2: #46a6ff;
+  --el-color-success: #10b981;
+  --el-color-success-light-3: #118860;
+  --el-color-success-light-5: #12664a;
+  --el-color-success-light-7: #134635;
+  --el-color-success-light-8: #13352a;
+  --el-color-success-light-9: #14241f;
+  --el-color-success-dark-2: #40c79a;
+  --el-color-warning: #f59e0b;
+  --el-color-warning-light-3: #b2750e;
+  --el-color-warning-light-5: #845910;
+  --el-color-warning-light-7: #583d11;
+  --el-color-warning-light-8: #413012;
+  --el-color-warning-light-9: #2a2213;
+  --el-color-warning-dark-2: #f7b13c;
+  --el-color-danger: #ef4444;
+  --el-color-danger-light-3: #ad3636;
+  --el-color-danger-light-5: #822c2c;
+  --el-color-danger-light-7: #562222;
+  --el-color-danger-light-8: #401e1e;
+  --el-color-danger-light-9: #2a1919;
+  --el-color-danger-dark-2: #f26969;
+  --el-color-error: #ef4444;
+  --el-color-error-light-3: #ad3636;
+  --el-color-error-light-5: #822c2c;
+  --el-color-error-light-7: #562222;
+  --el-color-error-light-8: #401e1e;
+  --el-color-error-light-9: #2a1919;
+  --el-color-error-dark-2: #f26969;
+}
+
+/* --- 全站复用的小工具类 ---------------------------------------------------
+ * 下面这几条此前在 5 个页面里被逐字抄了 5 遍，并且已经开始漂移
+ * （.postage-hint 的颜色两处不同、.postage-row 的 margin 8px vs 10px）。
+ */
+.pager { margin-top: 12px; display: flex; justify-content: flex-end; }
+.ph { color: var(--txt-3); }                     /* 空值占位符 */
+.hint { color: var(--txt-3); font-size: 13px; }  /* 页首说明 */
+.sub { color: var(--txt-3); font-size: 12px; }   /* 次要说明 */
+
+/* 金额必须等宽：记账应用的核心视图是一列一列的钱，比例数字下 1 和 8 不等宽，
+   整列上下对不齐。看板与计算器早就加了 tabular-nums，表格里反而没有。 */
+.gtn-disp, .derived, .item-tbl, .money, .el-table td .cell {
+  font-variant-numeric: tabular-nums;
+}

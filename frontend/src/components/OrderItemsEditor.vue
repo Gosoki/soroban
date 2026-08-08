@@ -188,24 +188,24 @@ async function commitDraft() {
 </script>
 
 <style scoped>
-.lb-help { color: #909399; cursor: help; font-size: 13px; margin-left: 2px; }
+.lb-help { color: var(--txt-3); cursor: help; font-size: 13px; margin-left: 2px; }
 .postage-lb.pl { margin-left: 16px; }
 .oie { padding: 12px 20px; }
 /* 二级子表格：视觉与一级列表(NotionTable)一致——同样的边框、行高与悬停；无表头填充 */
-.item-tbl { border-collapse: collapse; font-size: 13px; color: #d6deea; table-layout: fixed; }
+.item-tbl { border-collapse: collapse; font-size: 13px; color: var(--txt-body); table-layout: fixed; }
 .item-tbl col.c-name { width: 240px; }
 .item-tbl col.c-qty { width: 90px; }
 .item-tbl col.c-price { width: 120px; }
 .item-tbl col.c-act { width: 56px; }
-.item-tbl thead th { height: 30px; font-weight: 500; color: #7d8aa3; text-align: left; padding: 0 10px; border-bottom: 1px solid #28354a; }
-.item-tbl td { height: 36px; padding: 0; border-bottom: 1px solid #202c44; border-right: 1px solid #28354a; }
-.item-tbl tbody tr:hover td { background: #1b2942; }
+.item-tbl thead th { height: 30px; font-weight: 500; color: var(--txt-3); text-align: left; padding: 0 10px; border-bottom: 1px solid var(--border); }
+.item-tbl td { height: 36px; padding: 0; border-bottom: 1px solid var(--border-soft); border-right: 1px solid var(--border); }
+.item-tbl tbody tr:hover td { background: var(--bg-row-hover); }
 .item-tbl td.c-act { text-align: center; }
 /* 灰显：系统自动生成/自动定价的物品（编辑即去灰） */
-.item-tbl tr.item-auto :deep(.el-input__inner) { color: #6b7488; font-style: italic; }
+.item-tbl tr.item-auto :deep(.el-input__inner) { color: var(--txt-3); font-style: italic; }
 .postage-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
-.postage-lb { color: #9ba8bf; font-size: 13px; }
-.postage-hint { color: #6b7488; font-size: 12px; }
+.postage-lb { color: var(--txt-2); font-size: 13px; }
+.postage-hint { color: var(--txt-3); font-size: 12px; }
 /* 单元格内输入做成无边框，贴合一级列表的扁平格子观感 */
 .item-tbl :deep(.el-input__wrapper),
 .item-tbl :deep(.el-input-number .el-input__wrapper) {

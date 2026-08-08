@@ -138,14 +138,14 @@ async function saveField(key, value) {
 </script>
 
 <style scoped>
-.oep-sum { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; padding: 4px 20px 10px; font-size: 13px; color: #c7d2e6; }
-.oep-sum b { color: #e6edf7; }
+.oep-sum { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; padding: 4px 20px 10px; font-size: 13px; color: var(--txt-body); }
+.oep-sum b { color: var(--txt-1); }
 .oep-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 16px; padding: 4px 20px 8px; }
 .f { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-.f > span { color: #9ba8bf; font-size: 12px; }
+.f > span { color: var(--txt-2); font-size: 12px; }
 .f-wide { grid-column: 1 / -1; }
 .f :deep(.el-select), .f :deep(.el-input), .f :deep(.el-date-editor) { width: 100%; }
 .fnum { width: 100% !important; }
 .fnum :deep(.el-input__inner) { text-align: left; }
-.oep-subtitle { padding: 8px 20px 0; color: #7d8aa3; font-size: 12px; border-top: 1px solid #202c44; margin-top: 6px; }
+.oep-subtitle { padding: 8px 20px 0; color: var(--txt-3); font-size: 12px; border-top: 1px solid var(--border-soft); margin-top: 6px; }
 </style>

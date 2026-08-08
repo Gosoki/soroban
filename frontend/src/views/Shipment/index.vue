@@ -402,37 +402,35 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
-.pager { margin-top: 12px; justify-content: flex-end; }
-.ph { color: #5b6880; }
 .expand { padding: 12px 20px; }
-.ex-title { color: #9ba8bf; font-size: 13px; margin-bottom: 8px; }
+.ex-title { color: var(--txt-2); font-size: 13px; margin-bottom: 8px; }
 
 /* 工具栏 OCR 建单入口（拖拽由 window 监听统一处理，这里只负责点击选图） */
 .ocr-up { display: inline-flex; }
 .ocr-up :deep(.el-upload) { display: inline-flex; }
 .ocr-drop {
   display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 14px;
-  border: 1px dashed #3a4a6b; border-radius: 4px; color: #7f9cff; font-size: 13px;
+  border: 1px dashed var(--border-strong); border-radius: 4px; color: #7f9cff; font-size: 13px;
   white-space: nowrap; cursor: pointer;
 }
-.ocr-drop:hover { border-color: #409eff; background: rgba(64, 158, 255, 0.08); }
-.ocr-drop.busy { color: #7d8aa3; }
+.ocr-drop:hover { border-color: var(--brand); background: var(--brand-weak); }
+.ocr-drop.busy { color: var(--txt-3); }
 .ocr-ic { font-size: 15px; }
 
 /* 行内「绑定快递单」投放区：平时低调，拖拽中(armed)亮起，悬停(over)高亮 */
 .bind-drop {
   display: flex; align-items: center; justify-content: center; gap: 5px;
-  height: 26px; padding: 0 8px; border: 1px dashed #3a4a6b; border-radius: 4px;
+  height: 26px; padding: 0 8px; border: 1px dashed var(--border-strong); border-radius: 4px;
   color: #6b7a99; font-size: 12px; white-space: nowrap; cursor: pointer;
   transition: border-color .15s, background .15s, color .15s;
 }
-.bind-drop:hover { border-color: #409eff; color: #7f9cff; }
+.bind-drop:hover { border-color: var(--brand); color: #7f9cff; }
 .bind-drop.armed { border-color: #5a7cc0; color: #7f9cff; background: rgba(64, 158, 255, 0.06); }
 .bind-drop.over {
-  border-color: #67c23a; color: #9ae06a; background: rgba(103, 194, 58, 0.14);
+  border-color: var(--ok); color: #9ae06a; background: rgba(103, 194, 58, 0.14);
   box-shadow: 0 0 0 2px rgba(103, 194, 58, 0.25);
 }
-.bind-drop.busy { color: #7d8aa3; cursor: default; }
+.bind-drop.busy { color: var(--txt-3); cursor: default; }
 /* 子元素不接收拖拽事件，否则 dragleave 会在图标/文字间来回误触发导致高亮闪烁 */
 .bind-drop > * { pointer-events: none; }
 .bind-ic { font-size: 13px; }
@@ -442,7 +440,7 @@ onBeforeUnmount(() => {
 .drag-hint {
   position: fixed; top: 18px; left: 50%; transform: translateX(-50%); z-index: 9000;
   pointer-events: none; display: flex; align-items: center; gap: 8px;
-  padding: 12px 22px; border: 1px dashed #409eff; border-radius: 10px;
+  padding: 12px 22px; border: 1px dashed var(--brand); border-radius: 10px;
   background: rgba(16, 25, 44, 0.95); box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
   color: #cfe0ff; font-size: 13px; white-space: nowrap;
 }
@@ -452,6 +450,6 @@ onBeforeUnmount(() => {
 .add-line { margin-top: 10px; display: flex; align-items: center; gap: 10px; }
 .tb-pick { width: 320px; }
 .tb-opt { display: flex; flex-direction: column; line-height: 1.25; }
-.tb-meta { color: #7d8aa3; font-size: 11px; }
+.tb-meta { color: var(--txt-3); font-size: 11px; }
 .small { font-size: 12px; }
 </style>

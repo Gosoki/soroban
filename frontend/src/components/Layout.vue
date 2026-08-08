@@ -159,25 +159,25 @@ async function submitPwd() {
 .layout { display: flex; height: 100vh; overflow: hidden; }
 .sidebar {
   width: 220px; flex-shrink: 0; background: #0f1728;
-  display: flex; flex-direction: column; border-right: 1px solid #1c2740;
+  display: flex; flex-direction: column; border-right: 1px solid var(--border-dim);
 }
 .brand { display: flex; align-items: center; gap: 10px; padding: 18px 16px; }
 .brand-logo {
-  width: 40px; height: 40px; border-radius: 8px; background: #1890ff;
+  width: 40px; height: 40px; border-radius: 8px; background: var(--brand);
   color: #fff; font-size: 22px; font-weight: 700;
   display: flex; align-items: center; justify-content: center; flex-shrink: 0;
 }
 .brand-text { min-width: 0; }
-.brand-title { font-size: 15px; color: #e6edf7; font-weight: 600; }
-.brand-sub { font-size: 12px; color: #7d8aa3; }
+.brand-title { font-size: 15px; color: var(--txt-1); font-weight: 600; }
+.brand-sub { font-size: 12px; color: var(--txt-3); }
 .brand-close { flex-shrink: 0; margin-left: auto; color: #a6adb4 !important; padding: 4px !important; }
 .menu { flex: 1; border-right: none; overflow-y: auto; }
 .menu :deep(.el-menu-item) { margin: 4px 8px; border-radius: 6px; }
-.menu :deep(.el-menu-item.is-active) { background: #1890ff; }
-.foot { padding: 12px 16px; border-top: 1px solid #1c2740; display: flex; flex-direction: column; gap: 8px; }
-/* 页脚信息行统一：同色(#c7d2e6)、同字号(13)、常规字重 */
-.fx { font-size: 13px; color: #c7d2e6; display: flex; align-items: center; gap: 6px; }
-.user { display: flex; align-items: center; gap: 6px; color: #c7d2e6; font-size: 13px; }
+.menu :deep(.el-menu-item.is-active) { background: var(--brand); }
+.foot { padding: 12px 16px; border-top: 1px solid var(--border-dim); display: flex; flex-direction: column; gap: 8px; }
+/* 页脚信息行统一：同色(var(--txt-body))、同字号(13)、常规字重 */
+.fx { font-size: 13px; color: var(--txt-body); display: flex; align-items: center; gap: 6px; }
+.user { display: flex; align-items: center; gap: 6px; color: var(--txt-body); font-size: 13px; }
 .foot-btns { display: flex; gap: 8px; }
 .foot-btns :deep(.el-button) { font-size: 13px; }   /* 与汇率/管理员/计算器统一 13px（el small 默认 12px） */
 .content { flex: 1; overflow: auto; padding: 20px; min-width: 0; }
@@ -206,7 +206,7 @@ async function submitPwd() {
   left: max(12px, env(safe-area-inset-left, 0px));
   top: max(12px, env(safe-area-inset-top, 0px));
   z-index: 5020; width: 44px; height: 44px; border-radius: 10px;
-  background: #121b2e; border: 1px solid #253149; color: #ecf2ff;
+  background: #121b2e; border: 1px solid var(--border); color: #ecf2ff;
   display: flex; align-items: center; justify-content: center; cursor: pointer;
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.45); padding: 0;
 }

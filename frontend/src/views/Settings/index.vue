@@ -195,25 +195,25 @@ onMounted(load)
 <style scoped>
 .set-page { max-width: 820px; }
 .title { margin: 0 0 8px; font-size: 20px; }
-.lead { margin: 0 0 16px; color: #909399; font-size: 12px; line-height: 1.8; }
+.lead { margin: 0 0 16px; color: var(--txt-3); font-size: 12px; line-height: 1.8; }
 .lead code { background: var(--el-fill-color-light); padding: 1px 5px; border-radius: 3px; }
 .card { margin-bottom: 16px; }
 .card-hd { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-weight: 600; margin-bottom: 12px; }
-.cur { font-weight: 400; font-size: 13px; color: #606266; display: flex; align-items: center; gap: 8px; }
+.cur { font-weight: 400; font-size: 13px; color: var(--txt-2); display: flex; align-items: center; gap: 8px; }
 .field { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
 .field.col { align-items: flex-start; flex-direction: column; gap: 8px; }
-.flabel { width: 132px; flex: none; font-size: 13px; color: #606266; display: flex; align-items: center; gap: 4px; }
+.flabel { width: 132px; flex: none; font-size: 13px; color: var(--txt-2); display: flex; align-items: center; gap: 4px; }
 .field.col .flabel { width: auto; }
-.help { color: #909399; cursor: help; font-size: 13px; }
-.sub { color: #909399; font-size: 12px; }
+.help { color: var(--txt-3); cursor: help; font-size: 13px; }
+.sub { color: var(--txt-3); font-size: 12px; }
 .sub.warn { color: var(--el-color-warning); }
 .chain { width: 100%; border: 1px solid var(--el-border-color-lighter); border-radius: 6px; overflow: hidden; }
 .chain-row { display: flex; align-items: center; gap: 8px; padding: 8px 12px; font-size: 13px; }
 .chain-row + .chain-row { border-top: 1px solid var(--el-border-color-lighter); }
-.ord { width: 18px; color: #909399; font-size: 12px; }
+.ord { width: 18px; color: var(--txt-3); font-size: 12px; }
 .sname { font-weight: 600; }
-.sdesc { color: #909399; font-size: 12px; }
+.sdesc { color: var(--txt-3); font-size: 12px; }
 .grow { flex: 1; }
-.chain-add { padding: 8px 12px; border-top: 1px dashed var(--el-border-color-lighter); font-size: 12px; color: #909399; display: flex; align-items: center; gap: 8px; }
+.chain-add { padding: 8px 12px; border-top: 1px dashed var(--el-border-color-lighter); font-size: 12px; color: var(--txt-3); display: flex; align-items: center; gap: 8px; }
 .acts { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
 </style>

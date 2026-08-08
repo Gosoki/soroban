@@ -211,11 +211,9 @@ onMounted(() => { loadAcctColors(); loadShipment(); load() })
 
 <style scoped>
 .bar { margin-bottom: 10px; }
-.hint { color: #7d8aa3; font-size: 12px; }
-.pager { margin-top: 12px; justify-content: flex-end; }
-.ph { color: #5b6880; }
-.auto-txt { color: #6b7488; font-style: italic; }
+.hint { color: var(--txt-3); font-size: 12px; }
+.auto-txt { color: var(--txt-3); font-style: italic; }
 .edit-ctx { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 0 20px 4px; font-size: 13px; }
-.edit-ctx .ec-shop { color: #e6edf7; font-weight: 600; }
-.edit-ctx .ec-dim { color: #7d8aa3; font-size: 12px; }
+.edit-ctx .ec-shop { color: var(--txt-1); font-weight: 600; }
+.edit-ctx .ec-dim { color: var(--txt-3); font-size: 12px; }
 </style>

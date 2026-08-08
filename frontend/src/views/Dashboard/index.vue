@@ -70,14 +70,14 @@ function donutStyle(m) {
   if (t <= 0) return { background: '#1c2740' }
   const a = (m.order_jpy / t) * 100
   const b = a + (m.shipment_jpy / t) * 100
-  return { background: `conic-gradient(#67C23A 0 ${a}%, #E6A23C ${a}% ${b}%, #F56C6C ${b}% 100%)` }
+  return { background: `conic-gradient(var(--ok) 0 ${a}%, var(--warn) ${a}% ${b}%, var(--danger) ${b}% 100%)` }
 }
 
 const cards = computed(() => [
   { label: '总支出', value: data.total_jpy, color: '#1890ff', sub: `汇率 1元≈${data.fx_rate ?? '—'}円` },
-  { label: '商品（含快递）', value: data.order_jpy, color: '#67C23A', sub: `${data.order_count} 单` },
-  { label: '集运运费', value: data.shipment_jpy, color: '#E6A23C', sub: `${data.shipment_count} 单` },
-  { label: '杂项', value: data.misc_jpy, color: '#F56C6C', sub: `${data.misc_count} 项` },
+  { label: '商品（含快递）', value: data.order_jpy, color: 'var(--ok)', sub: `${data.order_count} 单` },
+  { label: '集运运费', value: data.shipment_jpy, color: 'var(--warn)', sub: `${data.shipment_count} 单` },
+  { label: '杂项', value: data.misc_jpy, color: 'var(--danger)', sub: `${data.misc_count} 项` },
 ])
 
 async function load() {
@@ -93,19 +93,19 @@ onMounted(load)
 
 <style scoped>
 .stat {
-  background: #131c2f; border: 1px solid #28354a; border-top: 3px solid #1890ff;
+  background: var(--bg-card); border: 1px solid var(--border); border-top: 3px solid var(--brand);
   border-radius: 8px; padding: 16px; margin-bottom: 16px;
 }
-.stat-label { color: #9ba8bf; font-size: 13px; }
-.stat-value { color: #e6edf7; font-size: 26px; font-weight: 700; margin: 6px 0; }
-.stat-sub { color: #7d8aa3; font-size: 12px; }
+.stat-label { color: var(--txt-2); font-size: 13px; }
+.stat-value { color: var(--txt-1); font-size: 26px; font-weight: 700; margin: 6px 0; }
+.stat-sub { color: var(--txt-3); font-size: 12px; }
 
 /* —— 按月支出：点行展开环状比例图 —— */
 .dot { width: 8px; height: 8px; border-radius: 2px; display: inline-block; flex-shrink: 0; }
-.dot.tb { background: #67C23A; }
-.dot.sp { background: #E6A23C; }
-.dot.mc { background: #F56C6C; }
-.m-empty { color: #7d8aa3; text-align: center; padding: 24px; font-size: 13px; }
+.dot.tb { background: var(--ok); }
+.dot.sp { background: var(--warn); }
+.dot.mc { background: var(--danger); }
+.m-empty { color: var(--txt-3); text-align: center; padding: 24px; font-size: 13px; }
 
 .mrow {
   padding: 12px 14px; border-radius: 8px; cursor: pointer;
@@ -116,10 +116,10 @@ onMounted(load)
 .mrow.cur { background: rgba(24, 144, 255, 0.07); border: 1px dashed rgba(24, 144, 255, 0.5); }
 .mrow-top { display: flex; align-items: center; justify-content: space-between; }
 .mrow-left { display: flex; align-items: center; gap: 8px; }
-.chev { color: #7d8aa3; transition: transform .18s; }
+.chev { color: var(--txt-3); transition: transform .18s; }
 .chev.open { transform: rotate(90deg); }
-.mrow-month { color: #e6edf7; font-size: 15px; font-weight: 600; letter-spacing: .3px; }
-.mrow-total { color: #e6edf7; font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.mrow-month { color: var(--txt-1); font-size: 15px; font-weight: 600; letter-spacing: .3px; }
+.mrow-total { color: var(--txt-1); font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
 
 /* 展开：左环图 + 右图例 */
 .mdetail { display: flex; align-items: center; gap: 22px; padding: 14px 6px 6px 26px; flex-wrap: wrap; }
@@ -130,14 +130,14 @@ onMounted(load)
   mask: radial-gradient(transparent 56%, #000 57%);
 }
 .donut-center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
-  color: #e6edf7; font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
-.dc-cap { color: #7d8aa3; font-size: 11px; font-weight: 400; margin-bottom: 1px; }
+  color: var(--txt-1); font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.dc-cap { color: var(--txt-3); font-size: 11px; font-weight: 400; margin-bottom: 1px; }
 
 .dlegend { flex: 1; min-width: 220px; }
-.dl-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; font-size: 13px; border-bottom: 1px solid #1c2740; }
+.dl-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; font-size: 13px; border-bottom: 1px solid var(--border-dim); }
 .dl-row:last-child { border-bottom: none; }
-.dl-k { color: #c7d2e6; flex: 1; }
-.dl-p { color: #9ba8bf; width: 56px; text-align: right; font-variant-numeric: tabular-nums; }
-.dl-v { color: #e6edf7; width: 104px; text-align: right; font-variant-numeric: tabular-nums; }
-.dl-c { color: #7d8aa3; font-size: 12px; width: 48px; text-align: right; }
+.dl-k { color: var(--txt-body); flex: 1; }
+.dl-p { color: var(--txt-2); width: 56px; text-align: right; font-variant-numeric: tabular-nums; }
+.dl-v { color: var(--txt-1); width: 104px; text-align: right; font-variant-numeric: tabular-nums; }
+.dl-c { color: var(--txt-3); font-size: 12px; width: 48px; text-align: right; }
 </style>

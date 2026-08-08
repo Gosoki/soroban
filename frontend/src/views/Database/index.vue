@@ -254,8 +254,8 @@ onMounted(loadStatus)
 .title { margin: 0 0 16px; font-size: 20px; }
 .card { margin-bottom: 16px; }
 .card-hd { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-weight: 600; margin-bottom: 10px; }
-.hint { color: #909399; font-size: 12px; }
-.dash { color: #c0c4cc; }
+.hint { color: var(--txt-3); font-size: 12px; }
+.dash { color: var(--txt-2); }
 .row-ic { margin-right: 4px; vertical-align: -2px; }
 .form { margin-top: 6px; }
 

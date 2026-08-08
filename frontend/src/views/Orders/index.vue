@@ -531,17 +531,16 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
-.pager { margin-top: 12px; justify-content: flex-end; }
 /* OCR 上传：工具栏里的点选按钮（拖拽走整窗覆盖层，这里只负责点击选图）。 */
 .ocr-up { display: inline-flex; }
 .ocr-up :deep(.el-upload) { display: inline-flex; }
 .ocr-drop {
   display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 14px;
-  border: 1px dashed #3a4a6b; border-radius: 4px; color: #7f9cff; font-size: 13px;
+  border: 1px dashed var(--border-strong); border-radius: 4px; color: #7f9cff; font-size: 13px;
   white-space: nowrap; cursor: pointer;
 }
-.ocr-drop:hover { border-color: #409eff; background: rgba(64, 158, 255, 0.08); }
-.ocr-drop.busy { color: #7d8aa3; }
+.ocr-drop:hover { border-color: var(--brand); background: var(--brand-weak); }
+.ocr-drop.busy { color: var(--txt-3); }
 .ocr-ic { font-size: 15px; }
 
 /* 整窗拖拽覆盖层：居中的上传提示框，不拦截拖拽事件 */
@@ -552,27 +551,26 @@ onBeforeUnmount(() => {
 }
 .ocr-overlay-box {
   width: min(460px, 76vw); padding: 40px 32px; text-align: center;
-  border: 2px dashed #409eff; border-radius: 16px;
+  border: 2px dashed var(--brand); border-radius: 16px;
   background: rgba(16, 25, 44, 0.92); box-shadow: 0 12px 48px rgba(0, 0, 0, 0.5);
 }
 .ocr-overlay-ic { font-size: 44px; color: #6ea8ff; margin-bottom: 12px; }
 .ocr-overlay-title { font-size: 18px; font-weight: 600; color: #eaf1ff; }
 .ocr-overlay-sub { margin-top: 6px; font-size: 13px; color: #8a9ab8; }
 .focus-chip { font-weight: 500; }
-.focus-empty { color: #9ba8bf; font-size: 13px; padding: 16px; text-align: center; }
-.ph { color: #5b6880; }
-.auto-txt { color: #6b7488; font-style: italic; }   /* 列表「物品」格：自动生成(名=标题)时灰显 */
+.focus-empty { color: var(--txt-2); font-size: 13px; padding: 16px; text-align: center; }
+.auto-txt { color: var(--txt-3); font-style: italic; }   /* 列表「物品」格：自动生成(名=标题)时灰显 */
 /* 集运点选：内嵌无边框，像格子里的选择 */
 .ship-pick { width: 100%; }
 .ship-pick :deep(.el-select__wrapper),
 .ship-pick :deep(.el-input__wrapper) { box-shadow: none !important; background: transparent; }
 /* 隐藏下拉箭头/清除叉，避免误触；清除改放到下拉列表里 */
 .ship-pick :deep(.el-select__suffix) { display: none; }
-.ship-clear { color: #9ba8bf; font-size: 12px; }
+.ship-clear { color: var(--txt-2); font-size: 12px; }
 .ship-opt { display: flex; flex-direction: column; gap: 3px; line-height: 1.3; }
 .ship-opt-top { display: flex; align-items: center; gap: 8px; }
-.ship-meta { color: #7d8aa3; font-size: 11px; }
-.ship-ck { margin-left: auto; color: #67c23a; font-size: 14px; }
+.ship-meta { color: var(--txt-3); font-size: 11px; }
+.ship-ck { margin-left: auto; color: var(--ok); font-size: 14px; }
 /* 单元格里显示所选集运单：单号 + 状态标签 */
 .ship-sel { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
 .ship-sel b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
