@@ -5,6 +5,9 @@ passlib[bcrypt]>=1.7
 bcrypt<4.1  # P8: 4.1+ breaks passlib (__about__ AttributeError)
 python-jose[cryptography]>=3.3
 python-multipart>=0.0.9
+# ⚠️ 核心自身已不再 import httpx（汇率抓取搬进了 plugins/soroban-plugin-fx）。
+# 保留是**刻意的**：plugin.toml 写 python="inherit" 的轻插件直接跑在核心解释器里、
+# 直接 import httpx。删掉它汇率插件当场起不来（tests/test_fx_freshness.py 钉着这条）。
 httpx>=0.27
 pydantic-settings>=2.2
 alembic>=1.13          # 数据库迁移

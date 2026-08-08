@@ -46,7 +46,15 @@
       <el-alert v-if="p.manifest_error" type="error" :closable="false" class="needs"
                 :title="`plugin.toml 有问题：${p.manifest_error}`" />
 
-      <!-- 定时。文案不写「抓取」——不是每个插件都在抓东西（汇率是取、快递是查） -->
+      <!-- 折叠区：这三块都是「配一次就不动」的。卡片上每天要看的只有「上次结果」
+           与命令按钮，它们留在外面；其余收起来，卡片才不会长得像配置文件。
+           `v-model` 记在 _form.open 里，刷新（每 3 秒轮询安装进度）不会把用户展开的合上。 -->
+      <el-collapse v-model="p._form.open" class="fold">
+      <el-collapse-item name="cfg">
+        <template #title>
+          <span class="fold-t">设置</span>
+          <span class="fold-n">定时 {{ p.config.schedule_minutes ? p.config.schedule_minutes + ' 分钟' : '关' }}<template v-if="p.params.length"> · 参数 {{ p.params.length }}</template></span>
+        </template>
       <div class="field">
         <label class="flabel">定时执行（分钟，0=关闭）</label>
         <el-input-number v-model="p._form.schedule_minutes" :min="0" :step="30" size="small" />
@@ -77,7 +85,7 @@
 
       <!-- 参数：插件私有的，核心不理解其含义，只按类型渲染控件 -->
       <template v-if="p.params.length">
-        <div class="sect">参数</div>
+        <div class="subsect">参数</div>
         <div v-for="pa in p.params" :key="pa.key" class="field">
           <label class="flabel">
             {{ pa.label }}
@@ -101,29 +109,18 @@
           <span class="sub">保存后下一次执行即按新值跑</span>
         </div>
       </template>
+      </el-collapse-item>
 
-      <!-- 账号：只有清单声明了 accounts 的插件才有这个维度。
-           汇率、快递查询这类插件卡片上不该出现「添加账号」——那是纯噪音，
-           而且会让人以为是自己漏配了什么。 -->
-      <div v-if="p.accounts_enabled" class="sect">添加账号</div>
-      <div v-if="p.accounts_enabled" class="field">
-        <el-input v-model="p._add.name" size="small" placeholder="账号昵称" style="width: 160px"
-                  @keyup.enter="doAddAccount(p)" />
-        <el-select v-model="p._add.platform" size="small" filterable allow-create default-first-option
-                   placeholder="导入平台" style="width: 140px">
-          <el-option v-for="o in platformOpts" :key="o" :label="o" :value="o" />
-        </el-select>
-        <el-button type="primary" size="small" :disabled="!p.installed" @click="doAddAccount(p)">添加</el-button>
-        <span class="sub">平台加时确定、之后不可改（改名只改昵称）</span>
-      </div>
-
-      <!-- 权限：清单声明 ∩ 你勾选 ∩ 核心已知，三者的交集才是插件实际拿到的 -->
-      <div v-if="p.scopes.declared.length" class="sect">
-        权限（{{ p.scopes.effective.length }}/{{ p.scopes.declared.length }}）
-        <el-tag v-if="pendingGrants(p).length" size="small" :style="typeStyle('warning')"
-                title="插件更新后新要了权限，需要你确认">需要新授权</el-tag>
-      </div>
-      <div v-if="p.scopes.declared.length" class="grants">
+      <!-- 权限：清单声明 ∩ 你勾选 ∩ 核心已知，三者的交集才是插件实际拿到的。
+           有「需要新授权」时**自动展开**——那是要人处理的事，藏起来就等于没提示。 -->
+      <el-collapse-item v-if="p.scopes.declared.length" name="scopes">
+        <template #title>
+          <span class="fold-t">权限</span>
+          <span class="fold-n">{{ p.scopes.effective.length }}/{{ p.scopes.declared.length }}</span>
+          <el-tag v-if="pendingGrants(p).length" size="small" :style="typeStyle('warning')"
+                  title="插件更新后新要了权限，需要你确认">需要新授权</el-tag>
+        </template>
+      <div class="grants">
         <label v-for="k in p.scopes.declared" :key="k" class="grant">
           <el-checkbox :model-value="p._form.granted.includes(k)"
                        @change="(v) => toggleGrant(p, k, v)" />
@@ -139,7 +136,6 @@
       </div>
 
       <!-- 账号列表 -->
-      <div v-if="p.accounts_enabled" class="sect">账号（{{ p.accounts.length }}）</div>
       <div v-if="p.accounts_enabled && !p.accounts.length" class="sub">还没有账号——用上面「添加账号」加一个。</div>
       <div v-for="a in (p.accounts_enabled ? p.accounts : [])" :key="a.account" class="acct" :class="{ dim: !a.enabled }">
         <span class="c-sw">
@@ -171,7 +167,29 @@
         <div class="grow" />
         <el-button size="small" link type="danger" @click="doDeleteAccount(p, a.account)">删除</el-button>
       </div>
+      </el-collapse-item>
+      <!-- 账号：只有清单声明了 accounts 的插件才有这个维度。
+           汇率、快递查询这类插件卡片上不该出现「添加账号」——那是纯噪音，
+           而且会让人以为是自己漏配了什么。 -->
+      <el-collapse-item v-if="p.accounts_enabled" name="accounts">
+        <template #title>
+          <span class="fold-t">账号</span>
+          <span class="fold-n">{{ enabledCount(p) }} 启用 / {{ p.accounts.length }}</span>
+        </template>
+      <div class="subsect">添加账号</div>
+      <div v-if="p.accounts_enabled" class="field">
+        <el-input v-model="p._add.name" size="small" placeholder="账号昵称" style="width: 160px"
+                  @keyup.enter="doAddAccount(p)" />
+        <el-select v-model="p._add.platform" size="small" filterable allow-create default-first-option
+                   placeholder="导入平台" style="width: 140px">
+          <el-option v-for="o in platformOpts" :key="o" :label="o" :value="o" />
+        </el-select>
+        <el-button type="primary" size="small" :disabled="!p.installed" @click="doAddAccount(p)">添加</el-button>
+        <span class="sub">平台加时确定、之后不可改（改名只改昵称）</span>
+      </div>
 
+      </el-collapse-item>
+      </el-collapse>
     </el-card>
   </div>
 </template>
@@ -266,6 +284,8 @@ async function load() {
                granted: [...(p.scopes?.granted || [])],
                // secret 参数后端只回 '__set__'，不能把它当值填回输入框——
                // 那样一保存就会把密钥真的改成 '__set__' 这个字符串。
+               // 默认全收；有待确认的授权就自动展开那一块
+               open: pendingGrants(p).length ? ['scopes'] : [],
                params: Object.fromEntries((p.params || []).map(
                  (x) => [x.key, x.value === '__set__' ? '' : x.value])) },
       _add: { name: '', platform: '淘宝' },
@@ -509,4 +529,10 @@ onMounted(load)
 .g-hint { color: var(--txt-3); font-size: 12px; }
 .help { color: var(--txt-3); cursor: help; font-size: 13px; }
 .cmds { flex-wrap: wrap; }
+.fold { border-top: 1px solid var(--border-dim); margin-top: 8px; }
+.fold :deep(.el-collapse-item__header) { font-size: 13px; height: 40px; line-height: 40px; gap: 8px; }
+.fold :deep(.el-collapse-item__content) { padding-bottom: 8px; }
+.fold-t { font-weight: 600; color: var(--txt-body); }
+.fold-n { color: var(--txt-3); font-size: 12px; }
+.subsect { color: var(--txt-3); font-size: 12px; margin: 8px 0 6px; }
 </style>

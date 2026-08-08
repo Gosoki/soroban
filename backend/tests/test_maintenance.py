@@ -136,12 +136,6 @@ def test_begin_write_is_atomic_with_check():
 
 # --- 屏障：非 HTTP 写路径 ------------------------------------------------------
 
-def test_fx_loop_checks_barrier():
-    """fx_loop 直接用 Session 写 FxRate，绕过 HTTP 中间件，必须自己查屏障。"""
-    src = (__import__("pathlib").Path(__file__).resolve().parents[1]
-           / "app" / "services" / "fx.py").read_text(encoding="utf-8")
-    body = src.split("async def fx_loop")[1]
-    assert "barrier.blocked_reason()" in body, "fx_loop 没查只读屏障"
 
 
 def test_scheduler_loop_checks_barrier():

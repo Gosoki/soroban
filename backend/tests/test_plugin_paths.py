@@ -271,7 +271,6 @@ _PLUGIN_CLOSED = {
     "POST /api/shipment/{shipment_id}/ocr-express",
     "POST /api/shipment/{shipment_id}/order/{order_id}",  # 挂靠/解挂是人的决定
     "DELETE /api/shipment/{shipment_id}/order/{order_id}",
-    "POST /api/fx/refresh",                               # 「立即刷新」是人点的按钮
 }
 
 

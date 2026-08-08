@@ -59,7 +59,8 @@ python = "inherit"          # 依赖已在 soroban 里 → 不建 venv、不用�
 
 entry = "-m my_plugin"      # 标准 CLI
 scopes = ["fx:write"]       # 要什么权限（用户在卡片上勾选后才生效）
-settings = ["fx.sources"]   # 要读核心的哪几项设置（通过 SOROBAN_CONFIG 下发）
+settings = ["fx.stale_hours"]  # 要读核心的哪几项设置（**跨插件通用的偏好**才放核心；
+                               # 只有本插件懂的用下面的 [[params]]）
 
 # 按账号展开成多个子进程；不写 = 整体跑一次（汇率、快递查询这类）
 # accounts = true

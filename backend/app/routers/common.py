@@ -93,7 +93,7 @@ def stamp_fx(session: Session, obj) -> None:
     为什么必须在 **create 和 update 两处都调**：`compute_money()` 缺汇率就算不出
     jpy_auto/jpy_settled，而看板的 `SUM(jpy_settled)` 对 NULL 视而不见——这笔钱会被
     静默吞掉，但笔数照数（「笔数 +1、金额 +0」）。只在 create 补是关不上的：
-    全新部署、或后台 fx_loop 还没成功跑过一次时，FxRate 表是空的，create 只能盖上 None；
+    全新部署、没装汇率插件、或插件还没成功跑过一次时，FxRate 表是空的，create 只能盖上 None；
     真正闭合缺口的是 update 侧那一刀，因为每次 PATCH 都会重试，顺带还能自愈存量脏行。
 
     取 `rate_for_date` 而非 `current_rate`：一笔补录的上月支出该按当天牌价折算，

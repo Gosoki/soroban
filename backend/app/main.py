@@ -21,7 +21,6 @@ from .routers import (
 )
 from .routers.plugins import scheduler_loop
 from .services.ingest import load_kinds
-from .services.fx import fx_loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("soroban")
@@ -54,7 +53,6 @@ async def lifespan(app: FastAPI):
     _check_secret_key()
     create_db_and_tables()          # Alembic upgrade head（幂等；旧库自动接管，见 database.py）
     tasks = [
-        asyncio.create_task(fx_loop()),
         asyncio.create_task(scheduler_loop()),
         # 控制引擎恒为 SQLite（存 app_db_config），故 WAL 截断循环始终运行
         asyncio.create_task(wal_checkpoint_loop(600)),   # 每 10 分钟截断一次 WAL

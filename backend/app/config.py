@@ -34,7 +34,6 @@ class Settings(BaseSettings):
     # 抓取逻辑从 hiyori 移植、本项目自带一份；不调用 hiyori 的接口（部署位置可能不同）。
     FX_BASE: str = "CNY"
     FX_QUOTE: str = "JPY"
-    FX_REFRESH: int = 21600  # 6h；免费源约每日更新一次
     # Frontend dev origin(s) for CORS（默认前端端口 8621；同源托管/vite 代理下其实用不到）。
     CORS_ORIGINS: list[str] = ["http://localhost:8621", "http://127.0.0.1:8621"]
 

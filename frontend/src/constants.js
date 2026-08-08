@@ -113,3 +113,14 @@ export const PRICE_HELP = `「人民币」由物品派生：Σ(单价 × 数量)
 误差上限 = 数量 × 0.005 元（4 件 2 分，100 件 5 毛），方向不固定。这是已知取舍，不影响记账用途。
 
 要完全消掉需要给订单加「整单优惠」字段——淘宝那边有这个数据，且同一次请求就能拿到，不增加爬虫访问量。`
+
+
+// 汇率来源的展示名。**纯展示层的翻译表**——核心只认识 "manual"（用户手填），
+// 其余标识由汇率插件自报（见 plugins/soroban-plugin-fx 的 sources 参数）。
+// 表里没有的原样显示裸 key：宁可显示 "xxx"，也不要为一个标签让核心去认识插件。
+export const FX_SOURCE_NAMES = {
+  boc: '中国银行', google: '谷歌财经', erapi: '通用汇率 API', manual: '手填',
+}
+export function fxSourceName(r) {
+  return FX_SOURCE_NAMES[r?.source] || r?.source_label || r?.source || ''
+}

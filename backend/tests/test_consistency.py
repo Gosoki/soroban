@@ -359,29 +359,8 @@ def test_settings_page_never_touches_raw_draft_array():
             f"这处 draft 下标没兜底，数据回来之前会是 undefined：{seg!r}")
 
 
-def test_settings_source_keys_match_backend():
-    """设置页那份「源 key → 中文名」必须覆盖**能排进优先级链**的每个源，
-    否则拖拽排序时用户看到的是 `erapi` 这种原始 key。
-
-    比的是 `FX_SOURCE_CHOICES`（链上可选项）而不是 `SOURCE_LABELS`（汇率行的来源标签）——
-    后者还包含「手填」这类**不参与链**的来源：它不出现在排序列表里，
-    它的展示名由后端随 `FxRead.source_label` 一起下发。两者混为一谈会逼着页面
-    去渲染一个根本选不了的源。
-    """
-    from app.services.prefs import FX_SOURCE_CHOICES
-
-    src = (_REPO / "frontend" / "src" / "views" / "Settings" / "index.vue").read_text(encoding="utf-8")
-    for key in FX_SOURCE_CHOICES:
-        assert f"{key}:" in src, f"设置页缺少源 {key} 的展示名"
 
 
-def test_every_chain_source_has_a_label():
-    """链上可选的每个源都得有中文名，否则日志与界面上会冒出原始 key。"""
-    from app.services.fx import SOURCE_LABELS
-    from app.services.prefs import FX_SOURCE_CHOICES
-
-    missing = [k for k in FX_SOURCE_CHOICES if k not in SOURCE_LABELS]
-    assert not missing, f"这些汇率源没有展示名：{missing}"
 
 
 def test_nav_is_generated_from_routes():

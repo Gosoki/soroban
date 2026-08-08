@@ -433,9 +433,9 @@ def test_plugin_settings_picks_declared_keys(session):
     """
     from app.routers.plugins import plugin_settings
 
-    got = plugin_settings(session, {"id": "fx", "settings": ["fx.sources", "fx.attempts"]})
-    assert set(got) == {"fx.sources", "fx.attempts"}
-    assert isinstance(got["fx.sources"], list)
+    got = plugin_settings(session, {"id": "x", "settings": ["fx.manual_rate", "fx.stale_hours"]})
+    assert set(got) == {"fx.manual_rate", "fx.stale_hours"}
+    assert isinstance(got["fx.stale_hours"], int)
 
 
 def test_unknown_setting_key_is_skipped_not_fatal(session, caplog):
@@ -444,8 +444,8 @@ def test_unknown_setting_key_is_skipped_not_fatal(session, caplog):
     from app.routers.plugins import plugin_settings
 
     with caplog.at_level("WARNING"):
-        got = plugin_settings(session, {"id": "x", "settings": ["fx.attempts", "nope.not_real"]})
-    assert set(got) == {"fx.attempts"}
+        got = plugin_settings(session, {"id": "x", "settings": ["fx.stale_hours", "nope.not_real"]})
+    assert set(got) == {"fx.stale_hours"}
     assert any("不认识的设置项" in r.getMessage() for r in caplog.records)
 
 

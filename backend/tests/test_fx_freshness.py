@@ -14,6 +14,7 @@
 """
 import datetime as dt
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from sqlmodel import select
@@ -188,3 +189,122 @@ def test_no_manual_rate_means_no_silent_zero(client, session):
                if x["order_no"] == "FXFB-2")
     assert got["jpy_settled"] in (None, 0) and got["jpy_settled"] != 0, \
         f"没有汇率时日元应为空而不是 0，实际 {got['jpy_settled']!r}"
+
+
+# --- 设置项本身的行为（原 test_fx_source.py 的 prefs 用例，改用还留在核心的两个键）------
+
+def test_settings_roundtrip(client):
+    """设置存得进、读得回，且**表单元信息由后端下发**——
+    前端不该自己写死取值范围（「后端允许 1..8760、前端写死 1..5」那种两边各说各话）。"""
+    body = client.get("/api/settings").json()
+    assert body["values"]["fx.stale_hours"] == 48
+    sp = next(x for x in body["specs"] if x["key"] == "fx.stale_hours")
+    assert sp["min"] == 1 and sp["max"] and sp["label"]
+
+    assert client.put("/api/settings", json={"values": {"fx.stale_hours": 24}}).status_code == 200
+    assert client.get("/api/settings").json()["values"]["fx.stale_hours"] == 24
+    client.put("/api/settings", json={"values": {"fx.stale_hours": 48}})
+
+
+@pytest.mark.parametrize("patch", [
+    {"fx.stale_hours": 0},              # 下界
+    {"fx.stale_hours": 99999},          # 上界
+    {"fx.manual_rate": "999"},          # 超出汇率合理区间
+    {"fx.manual_rate": "不是数"},        # 解析不出来
+    {"不存在的键": 1},                   # 未注册
+])
+def test_settings_rejects_bad_values(client, patch):
+    """任一项不合规就整体 422，不做部分写入——半套设置比旧设置更难排查。"""
+    assert client.put("/api/settings", json={"values": patch}).status_code == 422
+
+
+def test_settings_partial_update_keeps_others(client):
+    """只提交变了的键。整包提交会把别人刚在另一个标签页改过的项一起盖回去。"""
+    client.put("/api/settings", json={"values": {"fx.manual_rate": "20.0", "fx.stale_hours": 36}})
+    client.put("/api/settings", json={"values": {"fx.stale_hours": 12}})
+    got = client.get("/api/settings").json()["values"]
+    assert got["fx.stale_hours"] == 12 and got["fx.manual_rate"] == "20.0"
+    client.put("/api/settings", json={"values": {"fx.manual_rate": "", "fx.stale_hours": 48}})
+
+
+def test_corrupt_stored_value_falls_back_to_default(client, session):
+    """库里存着坏值（手改过、或降级后残留的旧格式）→ 退回默认并告警，不让整页打不开。"""
+    from app.models import Setting
+
+    row = session.get(Setting, "fx.stale_hours") or Setting(key="fx.stale_hours", value="48")
+    row.value = '"not an int"'
+    session.add(row)
+    session.commit()
+    assert client.get("/api/settings").json()["values"]["fx.stale_hours"] == 48
+
+
+# --- 摘源之后的两条元断言 -------------------------------------------------------
+
+def test_core_only_knows_its_own_source():
+    """核心只认识它自己会写的那一个源。其余标识由插件自报，认不出原样透传裸 key——
+    核心维护一份它已经不会产出、也无法穷举的源名表，只会烂掉。"""
+    assert set(fx.SOURCE_LABELS) == {"manual"}
+
+
+def test_no_source_config_leaks_back_into_core():
+    """汇率**怎么取**是插件的事。源顺序/重试/取价口径以任何形式回流核心设置，这里就红。"""
+    from app.services.prefs import SPECS
+
+    assert {k for k in SPECS if k.startswith("fx.")} == {"fx.manual_rate", "fx.stale_hours"}, \
+        f"核心设置里出现了不该有的汇率项：{sorted(SPECS)}"
+
+
+def test_core_has_no_background_loop_writing_fx():
+    """核心不得重新引入自己写 FxRate 的后台循环。
+
+    原来 fx_loop 直接用 Session 写 FxRate、绕过 HTTP 中间件，要自己查只读屏障。
+    搬进插件后这条路径没了——但约束还在：再加一条后台循环就等于把屏障重新开一个洞。
+    """
+    import re as _re
+
+    src = (Path(__file__).resolve().parents[1] / "app" / "services" / "fx.py").read_text(encoding="utf-8")
+    assert not _re.search(r"async def \w*loop", src), \
+        "services/fx.py 又出现了后台循环：汇率写入应经 POST /api/plugins/ingest"
+
+
+def test_core_never_imports_httpx_for_rates():
+    """核心自己不抓汇率了 → `app/services/fx.py` 不该再 import httpx。
+
+    ⚠️ 但 **requirements 里的 httpx 必须保留**：汇率插件的 plugin.toml 写着
+    `python = "inherit"`（跑核心的解释器、零安装），它直接 import httpx。
+    删掉那条依赖，汇率插件当场起不来，而没有任何测试会拦住——所以这条断言只管
+    「核心代码不用它」，requirements 那边由下面一条守着。
+    """
+    src = (Path(__file__).resolve().parents[1] / "app" / "services" / "fx.py").read_text(encoding="utf-8")
+    assert "import httpx" not in src, "核心又自己抓汇率了？取数应当在插件里"
+
+
+def test_httpx_stays_in_requirements_for_inherit_plugins():
+    """httpx 是「核心自己不 import、但必须保留」的依赖——很容易被当成无用依赖删掉。
+
+    `python = "inherit"` 的轻插件（汇率就是）直接跑在核心解释器里、直接 import httpx。
+    这条把那个理由钉在测试里，而不是只写在注释里。
+    """
+    req = (Path(__file__).resolve().parents[1] / "requirements.txt").read_text(encoding="utf-8")
+    assert "httpx" in req, (
+        "requirements.txt 里的 httpx 被删了。它看起来没人用（核心已不 import），"
+        "但 python=\"inherit\" 的插件靠它跑——删掉汇率插件当场起不来。")
+
+
+def test_saving_manual_rate_takes_effect_immediately(client, session):
+    """填了手填汇率、点保存 → 库里立刻有一条，界面马上显示得出来。
+
+    `ensure_manual_rate` 平时只在「需要汇率却一条都没有」时才落行（建单时）。
+    保存设置不触发它的话，用户看到的是「已保存」+「库里还没有汇率」，像是没保存上——
+    而实际上要等到下次建单才会生效。真浏览器复查时就是这么发现的。
+    """
+    for row in session.exec(select(FxRate)).all():
+        session.delete(row)
+    session.commit()
+    assert client.get("/api/fx").json()["rate"] is None
+
+    assert client.put("/api/settings", json={"values": {"fx.manual_rate": "20.5"}}).status_code == 200
+    got = client.get("/api/fx").json()
+    assert got["rate"] and Decimal(got["rate"]) == Decimal("20.5"), "保存后界面上仍看不到汇率"
+    assert got["source"] == "manual"
+    client.put("/api/settings", json={"values": {"fx.manual_rate": ""}})
