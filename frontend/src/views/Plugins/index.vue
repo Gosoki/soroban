@@ -13,7 +13,7 @@
           <!-- 一个开关就是「启用/停用」：停用后定时不跑、命令按钮也点不动。
                原先叫「启用定时」，但它其实是这个插件的总开关——名字比实际管得窄，
                会让人以为「停用了还能手动点一下」。 -->
-          <el-switch v-model="p._form.enabled" :disabled="!p.installed" @change="saveConfig(p)"
+          <el-switch v-if="!p.missing" v-model="p._form.enabled" :disabled="!p.installed" @change="saveConfig(p)"
                      :title="p._form.enabled ? '已启用（定时与手动执行都可用）' : '已停用（定时不跑，命令也点不动）'" />
           <span class="pname" :class="{ off: !p._form.enabled }">{{ p.name }}</span>
           <span class="pver">v{{ p.version || '?' }}</span>
@@ -28,15 +28,20 @@
 
           <div class="grow" />
           <!-- 命令按钮留在卡片头：它们是每天要点的，不该藏进折叠里 -->
-          <el-button v-for="c in p.commands" :key="c.name" size="small"
+          <el-button v-for="c in (p.missing ? [] : p.commands)" :key="c.name" size="small"
                      :type="c.primary ? 'primary' : 'default'"
                      :disabled="!p.installed || !p._form.enabled || !!c.blocked.length
                                 || (c.per === 'account' && !enabledCount(p))"
                      :title="cmdTitle(p, c)" @click.stop="doRun(p, c)">
             {{ c.label }}<template v-if="c.per === 'account'">（{{ enabledCount(p) }}）</template>
           </el-button>
-          <el-button link :icon="p._open ? ArrowUp : ArrowDown" :title="p._open ? '收起' : '展开设置'"
-                     @click="p._open = !p._open" />
+          <!-- 目录已不在、库里还留着配置的插件：不给开关与命令，只给一个清理入口。
+               它带着用户当初给的授权——不显示的话，以后放一个同 id 的插件进来会静默继承。 -->
+          <el-button v-if="p.missing" size="small" type="danger" plain @click="doForget(p)">
+            清理残留配置
+          </el-button>
+          <el-button v-else link :icon="p._open ? ArrowUp : ArrowDown"
+                     :title="p._open ? '收起' : '展开设置'" @click="p._open = !p._open" />
         </div>
       </template>
 
@@ -62,8 +67,10 @@
       </el-alert>
 
       <!-- 清单坏了也要列出来并说明原因，而不是让插件从界面上消失 -->
-      <el-alert v-if="p.manifest_error" type="error" :closable="false" class="needs"
-                :title="`plugin.toml 有问题：${p.manifest_error}`" />
+      <el-alert v-if="p.manifest_error" :type="p.missing ? 'warning' : 'error'" :closable="false" class="needs"
+                :title="p.missing
+                  ? `插件目录已不在，库里还留着它的配置${p.scopes.granted.length ? '（含授权：' + p.scopes.granted.join('、') + '）' : ''}`
+                  : `plugin.toml 有问题：${p.manifest_error}`" />
 
       <!-- 折叠区：这三块都是「配一次就不动」的。卡片上每天要看的只有「上次结果」
            与命令按钮，它们留在外面；其余收起来，卡片才不会长得像配置文件。
@@ -207,6 +214,16 @@ function cmdTitle(p, c) {
   if (c.blocked.length) return `缺权限：${c.blocked.join('、')}——先在下面勾选授权`
   if (c.per === 'account' && !enabledCount(p)) return '没有启用的账号'
   return c.hint || ''
+}
+async function doForget(p) {
+  if (!window.confirm(`清理「${p.id}」的残留配置？\n\n会删掉它的授权、定时、账号与上次结果。\n`
+    + `留着的话，以后放一个同 id 的插件进来会直接继承这份授权。`)) return
+  p._busy = true
+  try {
+    await pluginsApi.forget(p.id)
+    ElMessage.success('已清理')
+    await load()
+  } catch (_) { /* 拦截器已提示 */ } finally { p._busy = false }
 }
 async function doRun(p, c) {
   if (c.confirm && !window.confirm(c.confirm)) return

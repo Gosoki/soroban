@@ -199,11 +199,13 @@ async def ocr_attach_express(
 
 @router.post("", response_model=ShipmentRead)
 def create_shipment(payload: ShipmentCreate, session: Session = Depends(get_session)):
-    from ..services.fx import stamp_rate  # 局部导入避免循环
+    from ..services.fx import rate_for_date  # 局部导入避免循环
 
     shipment = ShipmentOrder(**payload.model_dump())
-    if shipment.fx_rate is None:                 # 新建时写入当天汇率（过期会记警告，见 stamp_rate）
-        shipment.fx_rate = stamp_rate(session, f"建集运订单 {payload.shipment_no or '(无单号)'}")
+    if shipment.fx_rate is None:
+        # 同商品订单：按**单据日期**折算，不是今天
+        shipment.fx_rate = rate_for_date(
+            session, shipment.date, what=f"建集运订单 {payload.shipment_no or '(无单号)'}")
     shipment.compute_money()
     session.add(shipment)
     session.commit()

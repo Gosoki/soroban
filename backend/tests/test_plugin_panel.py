@@ -300,3 +300,61 @@ def test_enabled_plugin_passes_the_switch(client, fake_plugin):
     r = client.post("/api/plugins/demo/run/run")
     # 走到这一步说明过了「停用」与「权限」两道闸；再往后是真起子进程（本机没有 demo 的入口）
     assert r.status_code != 409 or "停用" not in str(r.json().get("detail", ""))
+
+
+# --- 插件被删掉之后 -------------------------------------------------------------
+
+def test_deleted_plugin_leaves_a_visible_leftover(client, fake_plugin, tmp_path, monkeypatch):
+    """删掉插件目录之后，它在库里的配置（**含授权**）必须在界面上看得见。
+
+    这是用户问出来的一个真问题：装了汇率插件、授了权、跑过一次，然后把目录删掉——
+    `pluginconfig` 里留下一行 `granted_scopes=["fx:write","meta:read"]`，
+    而界面上完全看不到。以后放一个同 id 的插件进来（别人写的、或被改过的），
+    它会**静默继承**那份授权，用户从没重新批准过。
+    """
+    from app.routers import plugins as mod
+
+    client.put("/api/plugins/demo/grants", json={"granted": ["fx:write"]})
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 30})
+
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "gone"))
+    mod._needs_cache.clear()
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}
+    assert "demo" in got, "插件删掉后，它残留的配置从界面上消失了"
+    assert got["demo"]["missing"] is True
+    assert got["demo"]["scopes"]["granted"] == ["fx:write"], "残留的授权没暴露出来"
+    assert got["demo"]["commands"] == [], "插件都不在了，不该还列出可执行的命令"
+
+
+def test_leftover_config_can_be_cleaned(client, fake_plugin, tmp_path, monkeypatch):
+    """清理之后那份授权就真的没了——下次装同 id 的插件必须重新授权。"""
+    from app.routers import plugins as mod
+
+    client.put("/api/plugins/demo/grants", json={"granted": ["fx:write"]})
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "gone"))
+    mod._needs_cache.clear()
+    assert client.delete("/api/plugins/demo/config").status_code == 200
+    assert "demo" not in {p["id"] for p in client.get("/api/plugins").json()}
+
+
+def test_installed_plugin_config_cannot_be_wiped_by_accident(client, fake_plugin):
+    """还装着的插件不许用这个接口清配置——误点一下把授权和账号全清掉太伤。
+    要停用就用卡片上的开关。"""
+    r = client.delete("/api/plugins/demo/config")
+    assert r.status_code == 409 and "还装着" in r.json()["detail"]
+
+
+def test_fx_card_tells_the_truth_about_who_provides_rates(client, fake_plugin, tmp_path, monkeypatch):
+    """`GET /api/fx` 要如实说「现在有没有插件能自动取汇率」。
+
+    没有插件却还写着「自动获取由插件负责」的话，用户点过去是个空页面——
+    而这恰好是最需要他去填手填汇率的时刻。
+    """
+    from app.routers import plugins as mod
+
+    # fake_plugin 声明的是 fx:write，正好算「能提供汇率的插件」
+    assert client.get("/api/fx").json()["auto_provider"] == "演示插件"
+
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "gone"))
+    mod._needs_cache.clear()
+    assert client.get("/api/fx").json()["auto_provider"] == "", "插件没了却还说有人在自动取汇率"

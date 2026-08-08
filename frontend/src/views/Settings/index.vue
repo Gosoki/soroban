@@ -22,8 +22,14 @@
           </template>
           <span v-else class="sub">库里还没有汇率</span>
           <!-- 这条**必须在 v-if="fx.rate" 之外**：一条汇率都没有的时候，恰恰最需要告诉用户
-               汇率从哪来。放进去过一次，结果「没有汇率」时链接反而不见了。 -->
-          <router-link to="/plugins" class="sub">自动获取由汇率插件负责 →</router-link>
+               汇率从哪来。放进去过一次，结果「没有汇率」时链接反而不见了。
+               而且要**按事实说**：插件被删掉之后还写着「由插件负责」，点过去是个空页面。 -->
+          <router-link v-if="fx.auto_provider" to="/plugins" class="sub">
+            自动获取由「{{ fx.auto_provider }}」插件负责 →
+          </router-link>
+          <router-link v-else to="/plugins" class="sub warn">
+            没有能自动取汇率的插件，现在只用手填值 →
+          </router-link>
         </span>
       </div>
 

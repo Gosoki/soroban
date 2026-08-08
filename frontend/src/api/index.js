@@ -65,6 +65,9 @@ export const stagingApi = {
 
 export const dashboardApi = { get: () => http.get('/dashboard') }
 export const fxApi = {
+  // 按天汇总 + 某天的各次抓取。一天可以有多条，页面据此回看「那天几点是多少」
+  history: (days = 30) => http.get('/fx/history', { params: { days } }),
+  historyDay: (on) => http.get(`/fx/history/${on}`),
   get: () => http.get('/fx'),
   // 超时**必须**放宽：默认 15s（http.js），而后端一轮可能串行走完整条源链——
   // 每源 httpx 20~25s × 重试次数 × 退避，最坏几分钟。15s 一定先炸在前端。
@@ -86,6 +89,8 @@ export const pluginsApi = {
   saveGrants: (id, granted) => http.put(`/plugins/${id}/grants`, { granted }),
   // 插件私有参数（清单里 [[params]] 声明，核心只负责存/校验/渲染/下发）
   saveParams: (id, params) => http.put(`/plugins/${id}/params`, { params }),
+  // 清理已删插件在库里的残留配置（授权/定时/账号/上次结果）
+  forget: (id) => http.delete(`/plugins/${id}/config`),
   // 通用命令端点：动词由清单声明，加插件/加动词都不用再往这里加方法
   run: (id, command, account) =>
     http.post(`/plugins/${id}/run/${command}`, null, { params: account ? { account } : {} }),

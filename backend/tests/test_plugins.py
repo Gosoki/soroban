@@ -229,9 +229,15 @@ def test_unparseable_toml_is_skipped_but_bad_manifest_is_shown(tmp_path, monkeyp
     assert "id" in ids["soroban-plugin-noid"]["manifest_error"], "没告诉用户清单哪里错了"
 
 
-def test_missing_plugin_dir_is_empty(tmp_path, monkeypatch, client):
+def test_missing_plugin_dir_lists_only_leftovers(tmp_path, monkeypatch, client):
+    """插件目录不存在时，列表里只剩「库里还留着配置」的那些（带 missing 标记）。
+
+    刻意**不是空列表**：残留配置带着用户当初给的授权，藏起来的话，
+    以后放一个同 id 的插件进来会静默继承它。
+    """
     monkeypatch.setattr(settings, "PLUGIN_DIR", str(tmp_path / "does-not-exist"))
-    assert client.get("/api/plugins").json() == []
+    got = client.get("/api/plugins").json()
+    assert all(p["missing"] for p in got), f"目录都没了，却有插件报告说自己装着：{got}"
 
 
 # --- 依赖安装（缺什么 → 一键补齐）------------------------------------------------

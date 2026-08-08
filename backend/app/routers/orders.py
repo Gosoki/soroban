@@ -149,13 +149,16 @@ async def ocr_order(file: UploadFile = File(...)):
 
 @router.post("", response_model=OrderRead)
 def create_order(payload: OrderCreate, session: Session = Depends(get_session)):
-    from ..services.fx import stamp_rate  # 局部导入避免循环
+    from ..services.fx import rate_for_date  # 局部导入避免循环
 
     data = payload.model_dump(exclude={"items", "price_cny"})   # 订单价由物品派生，不直接落库
     order = Order(**data)
     _check_shipment(session, order.shipment_order_id)   # 挂靠的集运单不存在/已删 → 友好 422（而非 FK 撞库转 409）
-    if order.fx_rate is None:                 # 新建时写入当天汇率（过期会记警告，见 stamp_rate）
-        order.fx_rate = stamp_rate(session, f"建商品订单 {order.order_no or '(无单号)'}")
+    if order.fx_rate is None:
+        # 按**下单那天**折算，不是今天。爬虫会抓回前几天买的东西，
+        # 用今天的汇率记几天前的单是实打实的记错账。那天没有记录就退回最新的（见 rate_for_date）。
+        order.fx_rate = rate_for_date(
+            session, order.date, what=f"建商品订单 {order.order_no or '(无单号)'}")
     # 最小单位是物品：至少 1 条（无物品则按商品名+货款自动生成，灰显可改）。
     # 播种用「货款」= 订单价种子 - 邮费，避免把邮费也摊进物品单价（否则 sync 加邮费会重复计）。
     seed_goods = goods_seed(payload.price_cny, payload.postage_cny)

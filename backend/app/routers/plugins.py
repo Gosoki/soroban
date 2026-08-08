@@ -650,8 +650,9 @@ def install_plugin(
 
 @router.get("")
 def list_plugins(session: Session = Depends(get_session)):
-    out = []
+    out, seen_ids = [], set()
     for m in discover():
+        seen_ids.add(m["_m"].id)
         cfg = session.get(PluginConfig, m["_m"].id)
         need = needs_cached(m)
         with _install_lock:
@@ -667,6 +668,7 @@ def list_plugins(session: Session = Depends(get_session)):
                 "schedule_minutes": cfg.schedule_minutes if cfg else 0,
                 "last_run_at": cfg.last_run_at if cfg else None,
             },
+            "missing": False,
             "accounts": _display_accounts(cfg, m),
             # 权限三件套：清单要什么、用户给了什么、实际生效的是什么。
             # 三者分开给，前端才能把「插件升级后多要了一项」显示成「需要新授权」，
@@ -696,7 +698,47 @@ def list_plugins(session: Session = Depends(get_session)):
                 "catalog": scopes.describe(),
             },
         })
+
+    # 目录里已经没有、但库里还留着配置的插件。**必须列出来**：
+    # 它带着用户当初给的授权（granted_scopes）。留在库里不显示的话，
+    # 以后放一个**同 id** 的插件进来（别人写的、或被改过的），它会静默继承那份授权——
+    # 而整套权限的原则是「默认拒绝、升级不静默扩权」。列出来 + 给个清理按钮。
+    for cfg in session.exec(select(PluginConfig)).all():
+        if cfg.plugin_id in seen_ids:
+            continue
+        out.append({
+            "id": cfg.plugin_id, "name": cfg.plugin_id, "version": "",
+            "installed": False, "missing": True, "needs": [], "install": {},
+            "python": "", "params": [], "commands": [], "accounts": [],
+            "accounts_enabled": False,
+            "manifest_error": "插件目录已不在，这是库里残留的配置",
+            "config": {"enabled": bool(cfg.enabled),
+                       "schedule_minutes": cfg.schedule_minutes,
+                       "last_run_at": cfg.last_run_at},
+            "last_run": {"outcome": cfg.last_outcome, "summary": cfg.last_summary,
+                         "at": cfg.last_finished_at},
+            "scopes": {"declared": [], "granted": sorted(json.loads(cfg.granted_scopes or "[]")),
+                       "effective": [], "catalog": scopes.describe()},
+        })
     return out
+
+
+@router.delete("/{plugin_id}/config")
+def forget_plugin(plugin_id: str, session: Session = Depends(get_session)):
+    """清理某个插件在库里的残留配置（授权、定时、账号、上次结果）。
+
+    只允许清理**目录里已经不存在**的插件——还装着的插件要停用就用开关，
+    误点一下把授权和账号全清掉太伤。
+    """
+    if any(m["_m"].id == plugin_id for m in discover()):
+        raise HTTPException(status_code=409, detail="该插件还装着，先删掉它的目录再清理配置")
+    cfg = session.get(PluginConfig, plugin_id)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail="没有这个插件的配置")
+    session.delete(cfg)
+    session.commit()
+    log.info("已清理插件 %s 的残留配置（含授权 %s）", plugin_id, cfg.granted_scopes)
+    return {"plugin_id": plugin_id, "removed": True}
 
 
 @router.put("/{plugin_id}/grants")

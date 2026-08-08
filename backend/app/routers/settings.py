@@ -31,9 +31,8 @@ def put_settings(payload: SettingsUpdate, session: Session = Depends(get_session
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     if "fx.manual_rate" in payload.values:
-        # 用户刚明确填了一个汇率，就该**立刻**生效。
-        # `ensure_manual_rate` 平时只在「需要汇率却一条都没有」时才落行，
-        # 于是保存之后界面仍显示「库里还没有汇率」——像是没保存上。
-        from ..services.fx import ensure_manual_rate
-        ensure_manual_rate(session)
+        # 用户刚明确填了一个汇率，就该**立刻**记一条。一天可以有多条，所以每次填都追加——
+        # 手填在 `pick_on` 里优先于机器抓的，所以当天此后的自动抓取不会盖掉它。
+        from ..services.fx import record_manual_rate
+        record_manual_rate(session)
     return {"values": values, "specs": prefs.describe()}

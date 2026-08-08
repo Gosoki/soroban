@@ -52,14 +52,45 @@ def _sane(rate: Decimal) -> Decimal:
 
 
 def latest_stored(session: Session) -> Optional[FxRate]:
-    return session.exec(select(FxRate).order_by(col(FxRate.date).desc())).first()
+    """全库最新的一条。一天可能有多条，所以要按 (日期, 抓取时刻) 两级排。
+
+    只按 date 排的话，同一天的多条里返回哪一条取决于数据库的实现，
+    表现是「刷新一下汇率就变了」——最难查的那种不确定性。
+    """
+    return session.exec(
+        select(FxRate).order_by(col(FxRate.date).desc(), col(FxRate.fetched_at).desc())
+    ).first()
+
+
+def rows_on(session: Session, d: dt.date) -> list[FxRate]:
+    """某一天的全部汇率，新的在前。汇率页与 `pick_on` 共用。"""
+    return list(session.exec(
+        select(FxRate).where(FxRate.date == d).order_by(col(FxRate.fetched_at).desc())
+    ).all())
+
+
+def pick_on(session: Session, d: dt.date) -> Optional[FxRate]:
+    """某一天该用哪一条：**手填优先，其次该日最后一条**。
+
+    「手填优先」与 `can_advance_purchase` 是同一条原则：人明确填过的值，
+    机器不该悄悄盖掉。一天多条之后这条规则必须落在**读**这一侧——
+    写侧只管追加，不做取舍（追加式存储才能回看「那天几点是多少」）。
+    """
+    rows = rows_on(session, d)
+    if not rows:
+        return None
+    manual = [r for r in rows if r.source == SOURCE_MANUAL]
+    return (manual or rows)[0]
 
 
 
 
 def store(session: Session, rate: Decimal, source: str,
           on: Optional[dt.date] = None) -> tuple[FxRate, bool]:
-    """写一条汇率（每天一行，重复写即覆盖）。返回 (行, 是否新建)。
+    """记一条汇率。**一天可以有多条**——每次抓取追加一条，不覆盖。返回 (行, 是否新建)。
+
+    追加而不是覆盖，是为了两件事：① 补录几天前的订单要按**那一天**折算，而那天可能抓过
+    好几次；② 汇率页要能回看「那天几点是多少」。取哪一条是**读**侧的事（见 `pick_on`）。
 
     ⚠️ **只 add/flush，不 commit**。提交由调用方决定。
     原先它自己 commit()，那样任何把它当子步骤的调用方都无法回滚——通用写入通道给每一项
@@ -67,15 +98,10 @@ def store(session: Session, rate: Decimal, source: str,
     「rejected」给插件，而那一行其实已经落库了。这是最难查的一类错误（回执与事实相反）。
     """
     d = on or dt.datetime.now(JST).date()
-    row = session.exec(select(FxRate).where(FxRate.date == d)).first()
-    created = row is None
-    if row:
-        row.rate, row.source, row.fetched_at = rate, source, utcnow()
-    else:
-        row = FxRate(date=d, rate=rate, source=source)
+    row = FxRate(date=d, rate=rate, source=source)
     session.add(row)
     session.flush()
-    return row, created
+    return row, True
 
 
 def _store(session: Session, rate: Decimal, source: str) -> FxRate:
@@ -121,6 +147,28 @@ def current_rate(session: Session) -> Optional[Decimal]:
     """
     row = latest_stored(session)
     return row.rate if row else None
+
+
+def record_manual_rate(session: Session) -> Optional[FxRate]:
+    """把设置里的「手填汇率」记成今天的一条。用户每次保存都追加一条。
+
+    追加而不是覆盖：一天多条是这套存储的常态，而手填在 `pick_on` 里优先于机器抓的——
+    所以当天此后的自动抓取不会把它盖掉，同时「今天几点改成了多少」也留得住。
+    """
+    from . import prefs
+
+    raw = (prefs.load(session).get("fx.manual_rate") or "").strip()
+    if not raw:
+        return None
+    try:
+        rate = _sane(Decimal(raw))
+    except (InvalidOperation, ValueError) as e:
+        log.warning("手填汇率 %r 不可用（%s），忽略", raw, e)
+        return None
+    row, _ = store(session, rate, SOURCE_MANUAL)
+    session.commit()
+    log.info("已记下手填汇率：1 %s = %s %s", settings.FX_BASE, rate, settings.FX_QUOTE)
+    return row
 
 
 def ensure_manual_rate(session: Session) -> Optional[FxRate]:
@@ -184,10 +232,9 @@ def rate_for_date(session: Session, d: Optional[dt.date],
     传了 `what`（这行汇率是给谁盖的）就走告警版本：库里一条都没有时按设置里的手填值兜一条、
     用了过期汇率时记一条警告。不传 = 纯查询，安静。
     """
-    row = None
-    if d is not None:
-        row = session.exec(select(FxRate).where(FxRate.date == d)).first()
+    row = pick_on(session, d) if d is not None else None
     if row is None:
+        # 那天没有记录（比如爬虫补录的是很久以前的单）→ 退回全库最新的一条。
         row = latest_stored(session) or (ensure_manual_rate(session) if what else None)
     return _pick(session, row, what)
 
