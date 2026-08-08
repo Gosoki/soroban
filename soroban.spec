@@ -5,7 +5,7 @@
    导致全新 clone 打包时在最后一步报「spec 找不到」——.gitignore 里已加 `!soroban.spec` 反排除。
 
 打包成**单文件** soroban.exe：一个进程同时提供 API 与前端页面（同源、单端口）。
-运行时 backend/run.py 会先 `os.chdir(exe 同级目录)`，于是 `.env`、`soroban.db`、`scraper/`
+运行时 backend/run.py 会先 `os.chdir(exe 同级目录)`，于是 `.env`、`soroban.db`、`plugins/`
 都相对 exe 解析——整包可随目录一起分发。
 
 下面每一项 datas / hiddenimports 都对应代码里一处**运行时按路径或按名字加载**的东西，
@@ -14,7 +14,7 @@ PyInstaller 静态分析看不到，必须显式声明。改代码时若动了�
   backend/app/database.py      _ROOT = Path(sys._MEIPASS)          → 需要 alembic.ini + alembic/
   backend/app/main.py          _DIST = _MEIPASS/frontend/dist      → 需要 frontend/dist
   backend/app/services/ocr.py  Path(__file__).with_name(...png)    → 需要 app/services/xianyu_truck.png
-  backend/app/routers/plugins.py  _SOROBAN_ROOT = exe 同级          → scraper/ **不打包**，随包放 exe 旁边
+  backend/app/routers/plugins.py  _SOROBAN_ROOT = exe 同级          → plugins/ **不打包**，随包放 exe 旁边
 """
 from pathlib import Path
 

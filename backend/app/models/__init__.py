@@ -33,6 +33,7 @@ from .base import (
 )
 from .config.layout import ColumnLayout
 from .config.plugin import PluginConfig
+from .config.record import PluginRecord
 from .config.setting import Setting
 from .config.tag import TagOption
 from .fx.rate import FxRate
@@ -70,4 +71,5 @@ __all__ = [
     "ColumnLayout",
     "TagOption",
     "PluginConfig",
+    "PluginRecord",
 ]

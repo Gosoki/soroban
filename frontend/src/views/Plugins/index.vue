@@ -1,11 +1,11 @@
 <template>
   <div>
     <div class="bar">
-      <span class="hint">soroban 扫 scraper/ 下 soroban-scraper-* 目录作为插件。这里加账号、授权、启停、定时；插件只管抓取，抓到的单进「暂存订单」待处理。</span>
+      <span class="hint">soroban 扫 plugins/ 下 soroban-plugin-* 目录作为插件。这里加账号、授权、启停、定时。抓取类插件抓到的单进「暂存订单」待处理。</span>
       <el-button size="small" :icon="Refresh" :loading="loading" @click="load">刷新</el-button>
     </div>
 
-    <el-empty v-if="!loading && !plugins.length" description="未发现插件（scraper/ 下没有 soroban-scraper-* 目录）" />
+    <el-empty v-if="!loading && !plugins.length" description="未发现插件（plugins/ 下没有 soroban-plugin-* 目录）" />
 
     <el-card v-for="p in plugins" :key="p.id" class="plugin" v-loading="p._busy">
       <template #header>
@@ -61,6 +61,27 @@
         </el-select>
         <el-button type="primary" size="small" :disabled="!p.installed" @click="doAddAccount(p)">添加</el-button>
         <span class="sub">平台加时确定、之后不可改（改名只改昵称）</span>
+      </div>
+
+      <!-- 权限：清单声明 ∩ 你勾选 ∩ 核心已知，三者的交集才是插件实际拿到的 -->
+      <div v-if="p.scopes.declared.length" class="sect">
+        权限（{{ p.scopes.effective.length }}/{{ p.scopes.declared.length }}）
+        <el-tag v-if="pendingGrants(p).length" size="small" :style="typeStyle('warning')"
+                title="插件更新后新要了权限，需要你确认">需要新授权</el-tag>
+      </div>
+      <div v-if="p.scopes.declared.length" class="grants">
+        <label v-for="k in p.scopes.declared" :key="k" class="grant">
+          <el-checkbox :model-value="p._form.granted.includes(k)"
+                       @change="(v) => toggleGrant(p, k, v)" />
+          <span class="g-name">{{ scopeMeta(p, k).label || k }}</span>
+          <el-tag v-if="scopeMeta(p, k).risk === 'high'" size="small" :style="typeStyle('danger')">高风险</el-tag>
+          <el-tag v-else-if="scopeMeta(p, k).risk === 'medium'" size="small" :style="typeStyle('warning')">留意</el-tag>
+          <span class="g-hint">{{ scopeMeta(p, k).hint }}</span>
+        </label>
+        <div class="sub">
+          没勾的权限插件一个都用不了（默认全拒）。插件更新后自己多写一项权限**不会**自动生效——
+          <b>`git pull` 不该悄悄扩大它能碰的范围</b>。
+        </div>
       </div>
 
       <!-- 账号列表 -->
@@ -124,6 +145,28 @@ const platformColor = computed(() => Object.fromEntries(platformTags.value.map((
 function platformTagStyle(v) { return tagStyleAt(platformColor.value[v] ?? -1, v) }
 
 const fmtTime = fmtDateTime   // 后端存 naive UTC，必须补 Z 再解析，见 utils/datetime.js
+// 权限元信息由后端随列表下发（catalog），前端不写第二份说明文案——
+// 那份必然与后端漂移，而漂移的方向通常是「界面上写的比实际权限小」。
+function scopeMeta(p, key) {
+  return (p.scopes?.catalog || []).find((x) => x.key === key) || {}
+}
+// 插件声明了、但你还没勾的那些 = 「需要新授权」。插件升级后自己多加一项时用它提示。
+function pendingGrants(p) {
+  return (p.scopes?.declared || []).filter((k) => !(p.scopes?.granted || []).includes(k))
+}
+async function toggleGrant(p, key, on) {
+  const next = on ? [...p._form.granted, key] : p._form.granted.filter((k) => k !== key)
+  p._form.granted = next
+  p._busy = true
+  try {
+    const r = await pluginsApi.saveGrants(p.id, next)
+    p.scopes.granted = r.granted
+    p.scopes.effective = r.granted            // 已授权 ∩ 已声明 ∩ 已知，后端算好回给我们
+    ElMessage.success(on ? `已授予「${scopeMeta(p, key).label || key}」`
+                         : `已收回「${scopeMeta(p, key).label || key}」`)
+  } catch (_) { p._form.granted = [...(p.scopes?.granted || [])] } finally { p._busy = false }
+}
+
 function enabledCount(p) { return p.accounts.filter((a) => a.configured && a.enabled).length }
 
 async function load() {
@@ -135,7 +178,8 @@ async function load() {
       ...p, _busy: false,
       // 刷新时保留用户勾过的选项，别让轮询把复选框弹回默认
       _withBrowser: prev[p.id]?._withBrowser ?? true,
-      _form: { enabled: p.config.enabled, schedule_minutes: p.config.schedule_minutes || 0 },
+      _form: { enabled: p.config.enabled, schedule_minutes: p.config.schedule_minutes || 0,
+               granted: [...(p.scopes?.granted || [])] },
       _add: { name: '', platform: '淘宝' },
     }))
     // 有安装在跑就继续盯着，装完自动刷新（按钮解禁、缺依赖提示消失）
@@ -371,4 +415,8 @@ onMounted(load)
 .c-plat { min-width: 64px; flex: none; display: inline-flex; }
 .c-auth { min-width: 58px; flex: none; display: inline-flex; }
 .c-state { min-width: 56px; flex: none; display: inline-flex; }
+.grants { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.grant { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+.g-name { font-weight: 600; }
+.g-hint { color: var(--txt-3); font-size: 12px; }
 </style>

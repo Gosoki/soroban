@@ -15,10 +15,12 @@ from .config import settings
 from .database import checkpoint_and_dispose, create_db_and_tables, wal_checkpoint_loop
 from .maintenance import barrier
 from .routers import (
-    auth, dashboard, dbadmin, fx, items, layout, meta, misc, orders, plugins,
+    auth, dashboard, dbadmin, fx,
+    ingest, items, layout, meta, misc, orders, plugins,
     settings as settings_router, shipment, staging, tags,
 )
 from .routers.plugins import scheduler_loop
+from .services.ingest import load_kinds
 from .services.fx import fx_loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -80,6 +82,7 @@ async def _readonly_barrier(request: Request, call_next):
 
     用中间件而不是给每个端点挂依赖：将来新增的写端点**自动**被覆盖，不会有人忘了加。
     """
+    load_kinds()          # 注册通用写入通道的 handler（重复/未知权限 → 启动即炸）
     path = request.url.path
     if request.method in _SAFE_METHODS or path.startswith(_ALLOWED_WHILE_READONLY):
         return await call_next(request)
@@ -96,6 +99,38 @@ async def _readonly_barrier(request: Request, call_next):
         barrier.end_write()
 
 
+@app.middleware("http")
+async def _plugin_gate(request: Request, call_next):
+    """插件令牌只能进它声明过、且被用户授权的那扇门。**默认拒绝。**
+
+    与只读屏障同一条理由：用中间件而不是逐端点挂依赖，将来新增的端点自动被覆盖。
+    区别是这里默认**关着**——新端点不显式挂 `x-scope`，插件就进不去，
+    不会因为谁加了个 router 而悄悄扩大插件的权限面。
+
+    注册在只读屏障之后 → 运行时在它**外层**：越权请求在 403 时就被挡掉，
+    不会先去占一个「在飞写」计数。人类登录的请求一字不改地穿过去。
+    """
+    from .plugins import scopes as _scopes
+
+    claims = _scopes.peek_claims(request)
+    if claims is None:
+        return await call_next(request)
+    if not _scopes.alive(claims.get("jti")):
+        return JSONResponse(status_code=401, content={"detail": "插件令牌已失效（任务已结束）"})
+    matched, need = _scopes.route_scope(request.app, request)
+    granted = set(claims.get("scp") or [])
+    # 通用写入通道一条路由服务多种数据，权限由 kind 决定 → 这里只验「有权限总量」，
+    # 真正的判定在 routers/ingest.py 里按 kind 做。
+    ok = matched and need is not None and (need in granted or (need == "*by-kind*" and granted))
+    if not ok:
+        log.warning("插件 %s(run=%s) 越权：%s %s 需要 %s，持有 %s",
+                    claims.get("plg"), claims.get("jti"),
+                    request.method, request.url.path, need, sorted(granted))
+        return JSONResponse(status_code=403, content={"detail": "插件无权访问该接口"})
+    request.state.plugin_scope_ok = True
+    return await call_next(request)
+
+
 # 令牌走 Authorization 头、不使用 cookie，故 allow_credentials=False（更安全）
 app.add_middleware(
     CORSMiddleware,
@@ -108,7 +143,7 @@ app.add_middleware(
 for r in (
     auth.router, orders.router, shipment.router, misc.router, items.router,
     staging.router, dashboard.router, fx.router, layout.router, tags.router, plugins.router,
-    dbadmin.router, settings_router.router, meta.router,
+    dbadmin.router, settings_router.router, meta.router, ingest.router,
 ):
     app.include_router(r)
 

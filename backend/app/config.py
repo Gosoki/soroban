@@ -38,8 +38,11 @@ class Settings(BaseSettings):
     # Frontend dev origin(s) for CORS（默认前端端口 8621；同源托管/vite 代理下其实用不到）。
     CORS_ORIGINS: list[str] = ["http://localhost:8621", "http://127.0.0.1:8621"]
 
-    # --- 爬虫插件目录（soroban 扫这里的 soroban-scraper-* 子目录作为插件）---
-    # 默认 = soroban 仓库下的 scraper/；可用环境变量覆盖到别处。
+    # --- 插件目录（soroban 扫这里的 soroban-plugin-* 子目录）---
+    # 默认 = soroban 仓库下的 plugins/；可用环境变量覆盖到别处。
+    PLUGIN_DIR: Optional[str] = None
+    # 旧名，只为兼容已有 .env。新部署用 PLUGIN_DIR——插件已经不只是爬虫了
+    # （汇率、国际快递查询都没有「爬」的语义）。两个都设时以 PLUGIN_DIR 为准。
     SCRAPER_DIR: Optional[str] = None
 
 

@@ -11,7 +11,7 @@ from ..database import get_session
 from ..schemas import FxRead
 from ..services import prefs
 from ..services.fx import (
-    JST, SOURCE_LABELS, latest_stored, refresh_and_store,
+    JST, SOURCE_LABELS, is_expired, latest_stored, rate_age_hours, refresh_and_store,
 )
 
 router = APIRouter(
@@ -35,10 +35,12 @@ def _read(session: Session, row) -> FxRead:
         source=row.source,
         source_label=SOURCE_LABELS.get(row.source, row.source),
         fallback=bool(chain) and row.source != chain[0],
+        age_hours=rate_age_hours(row),
+        expired=is_expired(session, row),
     )
 
 
-@router.get("", response_model=FxRead)
+@router.get("", response_model=FxRead, openapi_extra={"x-scope": "meta:read"})
 def get_fx(session: Session = Depends(get_session)):
     return _read(session, latest_stored(session))
 

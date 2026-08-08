@@ -36,11 +36,34 @@ class Spec(NamedTuple):
     minimum: Optional[int] = None   # int 的下界
     maximum: Optional[int] = None   # int 的上界
     validate: Optional[Callable[[Any], None]] = None
+    # 下面三项是**给前端渲染用的元信息**。设置页按它们自动生成表单，页面里不再写死
+    # 「渲染哪几个键、什么控件、归到哪张卡片」——加一项设置只改这里，不用回头动前端。
+    group: str = "通用"             # 归到哪张卡片
+    unit: str = ""                  # 输入框后面的单位（秒/小时/次…）
+    requires: Optional[str] = None  # 依赖哪个源被启用；没启用时该项置灰（目前只用于 fx.sources）
 
 
 # --- 汇率源 ---------------------------------------------------------------------
 # 键值与 services/fx.SOURCES 的键一一对应；改这里记得同步那边（tests/test_fx_source.py 钉着）。
 FX_SOURCE_CHOICES = ["boc", "google", "erapi"]
+
+
+def _check_manual_rate(v: Any) -> None:
+    """手填汇率：空串 = 没设。非空必须能解析成数、且落在与手填校验同一个区间里。"""
+    from decimal import Decimal, InvalidOperation
+
+    from ..config import FX_MAX, FX_MIN
+
+    if not isinstance(v, str):
+        raise ValueError("手填汇率要填成文本")
+    if not v.strip():
+        return
+    try:
+        d = Decimal(v.strip())
+    except InvalidOperation:
+        raise ValueError(f"手填汇率 {v!r} 不是一个数")
+    if not (FX_MIN <= d <= FX_MAX):
+        raise ValueError(f"手填汇率 {d} 不在合理区间 [{FX_MIN}, {FX_MAX}]（1元≈20円）")
 
 
 def _check_sources(v: Any) -> None:
@@ -58,23 +81,41 @@ SPECS: dict[str, Spec] = {
         default=["boc", "google", "erapi"], kind="list[str]", choices=FX_SOURCE_CHOICES,
         label="汇率源优先级",
         hint="从上往下依次尝试。上面的取到了就不会去问下面的。",
-        validate=_check_sources,
+        validate=_check_sources, group="汇率",
+    ),
+    "fx.manual_rate": Spec(
+        default="", kind="str",
+        label="手填汇率（1元 = ?円）",
+        hint="留空 = 不用。**这是系统自带的唯一汇率来源**——自动获取由汇率插件负责，"
+             "没装插件（或插件还没跑起来）时，库里一条汇率都没有，新建的订单就没有日元金额。"
+             "填上它，首次需要汇率时会按它记一条（来源标为「手填」），账本至少能自洽运转。",
+        validate=_check_manual_rate, group="汇率",
+    ),
+    "fx.stale_hours": Spec(
+        default=48, kind="int", minimum=1, maximum=8760,
+        label="汇率过期上限（小时）",
+        hint="超过这个时长没取到新汇率，就当它已过期：界面上明确标出来，新建订单时也会记一条警告。"
+             "它管的是「库里这个值还能不能信」，与下面那个「多久才换源」是两件事，别混用。",
+        group="汇率", unit="小时",
     ),
     "fx.attempts": Spec(
         default=3, kind="int", minimum=1, maximum=10,
         label="每个源重试次数",
         hint="同一个源在一轮里最多试几次。次数之间有退避，不是连打。",
+        group="汇率", unit="次",
     ),
     "fx.fallback_hours": Spec(
         default=72, kind="int", minimum=0, maximum=720,
         label="降级等待（小时）",
         hint="上面的源连续失败满这么久，才允许用下一个源；在此之前一律沿用上一次取到的值。"
              "填 0 = 一失败就立刻用下一个。",
+        group="汇率", unit="小时",
     ),
     "fx.refresh_seconds": Spec(
         default=21600, kind="int", minimum=600, maximum=86400,
         label="刷新间隔（秒）",
         hint="后台多久抓一次。默认 21600 = 6 小时；牌价一天也就更新几次，抓太勤没意义。",
+        group="汇率", unit="秒",
     ),
     "fx.boc_column": Spec(
         default="zhzjj", kind="str",
@@ -82,6 +123,7 @@ SPECS: dict[str, Spec] = {
         label="中行取价口径",
         hint="中行一行挂五个价，取哪个。五个价来自同一次请求，换口径不增加访问量。"
              "注：日元的现汇与现钞是同一个价，美元等币种才有差别。",
+        group="汇率", requires="boc",
     ),
 }
 
@@ -158,6 +200,7 @@ def describe() -> list[dict]:
     「后端允许 1..10、前端写死 1..5」这种两边各说各话，靠这个消掉。"""
     return [
         {"key": k, "kind": s.kind, "label": s.label, "hint": s.hint,
-         "choices": s.choices, "min": s.minimum, "max": s.maximum, "default": s.default}
+         "choices": s.choices, "min": s.minimum, "max": s.maximum, "default": s.default,
+         "group": s.group, "unit": s.unit, "requires": s.requires}
         for k, s in SPECS.items()
     ]

@@ -104,7 +104,7 @@ def _read(session: Session, row: OrderStaging) -> StagingRead:
     return _overlay(row, _linked_order(session, row))
 
 
-@router.get("")
+@router.get("", openapi_extra={"x-scope": "staging:read"})
 def list_staging(
     session: Session = Depends(get_session),
     import_status: Optional[str] = Query(
@@ -156,13 +156,14 @@ def list_staging(
     return {"items": _read_many(session, rows), "total": total}
 
 
-@router.post("", response_model=StagingRead)
+@router.post("", response_model=StagingRead, openapi_extra={"x-scope": "staging:write"})
 def create_staging(payload: StagingCreate, session: Session = Depends(get_session)):
     from ..services.fx import rate_for_date  # 局部导入避免循环
 
     row = OrderStaging(**payload.model_dump(exclude={"items", "price_cny"}))  # 价由物品派生
     if row.fx_rate is None:                  # 按下单日期匹配汇率；无记录则退回当前(入库当天)汇率
-        row.fx_rate = rate_for_date(session, row.order_date)
+        row.fx_rate = rate_for_date(
+            session, row.order_date, what=f"暂存行 {row.order_no or '(无单号)'}")
     # 最小单位是物品：至少 1 条。播种用「货款」= 种子价 - 邮费，避免邮费摊进单价再被 sync 重复计
     seed_goods = goods_seed(payload.price_cny, payload.postage_cny)
     row.items = [StagingItem(**d) for d in build_items(payload.items, seed_goods, payload.title)]
@@ -173,7 +174,7 @@ def create_staging(payload: StagingCreate, session: Session = Depends(get_sessio
     return _read(session, row)
 
 
-@router.patch("/{row_id}", response_model=StagingRead)
+@router.patch("/{row_id}", response_model=StagingRead, openapi_extra={"x-scope": "staging:write"})
 def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depends(get_session)):
     row = session.get(OrderStaging, row_id)
     if not row:
@@ -253,7 +254,7 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
     return _read(session, row)
 
 
-@router.delete("/{row_id}")
+@router.delete("/{row_id}", openapi_extra={"x-scope": "staging:promote"})
 def delete_staging(row_id: int, session: Session = Depends(get_session)):
     row = session.get(OrderStaging, row_id)
     if not row:
@@ -270,7 +271,7 @@ def delete_staging(row_id: int, session: Session = Depends(get_session)):
     return {"ok": True}
 
 
-@router.post("/{row_id}/ignore", response_model=StagingRead)
+@router.post("/{row_id}/ignore", response_model=StagingRead, openapi_extra={"x-scope": "staging:promote"})
 def ignore_staging(row_id: int, session: Session = Depends(get_session)):
     # 原子标记忽略：version 在 DB 层自增（而非 Python 读-改-写），避免并发忽略/爬虫写
     # 丢失 version 自增、绕过乐观锁；与 import_staging 的原子门闸同风格。
@@ -292,7 +293,7 @@ def ignore_staging(row_id: int, session: Session = Depends(get_session)):
     return _read(session, row)
 
 
-@router.post("/{row_id}/import", response_model=OrderRead)
+@router.post("/{row_id}/import", response_model=OrderRead, openapi_extra={"x-scope": "staging:promote"})
 def import_staging(row_id: int, session: Session = Depends(get_session)):
     """从暂存行生成正式淘宝订单（含全部物品），并标记暂存为已导入。"""
     from ..services.fx import rate_for_date  # 局部导入避免循环
@@ -311,7 +312,9 @@ def import_staging(row_id: int, session: Session = Depends(get_session)):
         platform=row.platform,               # 来源随单迁移到账本
         express_no=row.express_no,
         postage_cny=row.postage_cny,         # 邮费随单迁移
-        fx_rate=row.fx_rate or rate_for_date(session, row.order_date),  # 优先暂存记录的汇率；否则按下单日期匹配
+        # 优先暂存记录的汇率；否则按下单日期匹配（库里空则按手填值兜底，过期会留痕）
+        fx_rate=row.fx_rate or rate_for_date(
+            session, row.order_date, what=f"暂存导入建单 {row.order_no or '(无单号)'}"),
         purchase_status=row.purchase_status or PurchaseStatus.paid.value,   # 订单状态一同迁移
         created_via=CreatedVia.imported.value,
     )

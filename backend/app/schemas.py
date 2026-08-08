@@ -599,6 +599,9 @@ class FxRead(SQLModel):
     source: str = "boc"                     # boc=中国银行 / google=谷歌财经 / erapi=通用汇率 API
     source_label: str = ""                  # 上面那个的中文名，供前端提示显示
     fallback: bool = False                  # True = 不是优先级链上的首选源（前端显示「备用」）
+    # stale 是**日粒度**（不是今天的），1 天前和 3 个月前长得一样；下面两个才说得清「还能不能信」。
+    age_hours: Optional[float] = None       # 距上次成功取到多少小时
+    expired: bool = False                   # 超过 fx.stale_hours → 界面明确标出、建单时记警告
 
 
 # --- 淘宝抓取暂存（全部淘宝订单 → 确认导入）---------------------------------

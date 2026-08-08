@@ -75,7 +75,7 @@ def _read(session: Session, shipment: ShipmentOrder) -> ShipmentRead:
     return _read_many(session, [shipment])[0]
 
 
-@router.get("")
+@router.get("", openapi_extra={"x-scope": "shipment:read"})
 def list_orders(
     session: Session = Depends(get_session),
     date_from: Optional[dt.date] = None,
@@ -199,11 +199,11 @@ async def ocr_attach_express(
 
 @router.post("", response_model=ShipmentRead)
 def create_shipment(payload: ShipmentCreate, session: Session = Depends(get_session)):
-    from ..services.fx import current_rate  # 局部导入避免循环
+    from ..services.fx import stamp_rate  # 局部导入避免循环
 
     shipment = ShipmentOrder(**payload.model_dump())
-    if shipment.fx_rate is None:                 # 新建时写入当天汇率
-        shipment.fx_rate = current_rate(session)
+    if shipment.fx_rate is None:                 # 新建时写入当天汇率（过期会记警告，见 stamp_rate）
+        shipment.fx_rate = stamp_rate(session, f"建集运订单 {payload.shipment_no or '(无单号)'}")
     shipment.compute_money()
     session.add(shipment)
     session.commit()
@@ -219,7 +219,8 @@ def get_shipment(shipment_id: int, session: Session = Depends(get_session)):
     return _read(session, shipment)
 
 
-@router.patch("/{shipment_id}", response_model=ShipmentRead)
+@router.patch("/{shipment_id}", response_model=ShipmentRead,
+               openapi_extra={"x-scope": "shipment:update"})
 def update_shipment(shipment_id: int, payload: ShipmentUpdate, session: Session = Depends(get_session)):
     shipment = session.get(ShipmentOrder, shipment_id)
     if not shipment or shipment.is_delete:

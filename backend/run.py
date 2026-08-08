@@ -1,7 +1,7 @@
 """soroban 打包入口（PyInstaller 冻结后即 soroban.exe）。
 
 单进程：uvicorn 起 FastAPI（app.main:app），后端**同源**托管打入包内的前端 frontend/dist，
-API 与页面同端口。运行前把工作目录切到 exe 同级，使 .env、sqlite:///./soroban.db、scraper/
+API 与页面同端口。运行前把工作目录切到 exe 同级，使 .env、sqlite:///./soroban.db、plugins/
 都相对 exe 目录解析——整包可随目录一起分发。
 
 开发/源码运行不需要它，照旧用 start.bat 或 `uvicorn app.main:app`。

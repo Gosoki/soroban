@@ -38,7 +38,14 @@
         <div class="foot">
           <div class="fx" v-if="fx.rate">
             1元 = {{ fx.rate }}円
-            <el-tag v-if="fx.stale" size="small" :style="typeStyle('warning')">旧</el-tag>
+            <!-- 「旧」= 不是今天的（日粒度）；「已过期」= 超过设置里的上限、这个值已经不该信了。
+                 分两级是因为前者很常见（凌晨还没刷新），后者意味着取汇率的链路真的断了：
+                 建单会继续用它（有值好过没有，且逐行存下来可审计），但必须看得见。 -->
+            <el-tag v-if="fx.expired" size="small" :style="typeStyle('danger')"
+                    :title="`已过期 ${fx.ageText}，取汇率的链路可能断了。建单仍会用它，但金额可能不准——去设置页手填一个，或检查汇率插件`">
+              已过期 {{ fx.ageText }}
+            </el-tag>
+            <el-tag v-else-if="fx.stale" size="small" :style="typeStyle('warning')">旧</el-tag>
             <!-- 备用源：中国银行牌价连续 72h 取不到才会切过来（见 backend/app/services/fx.py）。
                  标出来是因为口径变了——中行折算价 vs 通用中间价，数值会有差别。 -->
             <el-tag v-if="fx.fallback" size="small" :style="typeStyle('info')"
@@ -116,7 +123,7 @@ try {
   userName.value = u.display_name || u.username || '用户'
 } catch (_) { /* ignore */ }
 
-const fx = reactive({ rate: null, stale: false, fallback: false })
+const fx = reactive({ rate: null, stale: false, fallback: false, expired: false, ageText: '' })
 onMounted(async () => {
   mq = window.matchMedia('(max-width: 768px)')
   syncMobile()
@@ -126,6 +133,9 @@ onMounted(async () => {
     fx.rate = r.rate
     fx.stale = r.stale
     fx.fallback = !!r.fallback
+    fx.expired = !!r.expired
+    const h = r.age_hours || 0
+    fx.ageText = h >= 48 ? `${Math.floor(h / 24)} 天` : `${Math.round(h)} 小时`
   } catch (_) { /* ignore */ }
 })
 onUnmounted(() => { mq?.removeEventListener('change', syncMobile) })

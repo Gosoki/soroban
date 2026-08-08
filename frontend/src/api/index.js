@@ -76,12 +76,15 @@ export const layoutApi = {
   save: (table, columns) => http.put(`/layout/${table}`, { columns }),
 }
 
-// 爬虫插件（soroban 扫 scraper/soroban-scraper-* 作为插件；管理层在插件管理页）
+// 插件（soroban 扫 plugins/soroban-plugin-* ；管理层在插件管理页）。
+// 插件不只是爬虫——汇率、国际快递查询都没有「爬」的语义。
 export const pluginsApi = {
   list: () => http.get('/plugins'),
   install: (id, withBrowser = true) =>
     http.post(`/plugins/${id}/install`, null, { params: { with_browser: withBrowser } }),
   saveConfig: (id, cfg) => http.put(`/plugins/${id}/config`, cfg),
+  // 授权：插件只能进它声明过、且你在这里勾选过的那些门（默认一个都不给）
+  saveGrants: (id, granted) => http.put(`/plugins/${id}/grants`, { granted }),
   login: (id, account) => http.post(`/plugins/${id}/login`, null, { params: { account } }),
   fetch: (id, account) => http.post(`/plugins/${id}/fetch`, null, { params: account ? { account } : {} }),
   addAccount: (id, name, platform) => http.post(`/plugins/${id}/account`, null, { params: { name, platform } }),

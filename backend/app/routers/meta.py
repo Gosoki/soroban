@@ -17,7 +17,7 @@ from ..models import PURCHASE_STATUS_RANK, PURCHASE_TERMINAL_STATUSES, PurchaseS
 router = APIRouter(prefix="/api/meta", tags=["meta"], dependencies=[Depends(get_current_user)])
 
 
-@router.get("/status-rules")
+@router.get("/status-rules", openapi_extra={"x-scope": "meta:read"})
 def status_rules():
     """各业务段的状态机：合法值、生命周期序、终态集合。**按段分键**。
 

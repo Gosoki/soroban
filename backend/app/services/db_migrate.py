@@ -25,6 +25,7 @@ from ..models import (
     MiscExpense,
     OrderItem,
     PluginConfig,
+    PluginRecord,
     Setting,
     ShipmentOrder,
     StagingItem,
@@ -39,7 +40,7 @@ log = logging.getLogger("soroban.db.migrate")
 # 按外键依赖排序：被引用的表在前（拷贝用正序，清空用逆序）。
 MIGRATION_ORDER = [
     User, ShipmentOrder, Order, OrderItem, OrderStaging, StagingItem,
-    MiscExpense, FxRate, Setting, ColumnLayout, TagOption, PluginConfig,
+    MiscExpense, FxRate, Setting, ColumnLayout, TagOption, PluginConfig, PluginRecord,
 ]
 
 _DB_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
@@ -55,7 +56,7 @@ _TABLE_LABELS = {
     "orders": "商品订单", "orderstaging": "暂存订单", "shipmentorder": "集运订单",
     "miscexpense": "杂项支出", "orderitem": "订单物品", "stagingitem": "暂存物品",
     "user": "用户", "fxrate": "汇率", "tagoption": "标签", "pluginconfig": "插件配置",
-    "setting": "系统设置", "columnlayout": "列布局",
+    "setting": "系统设置", "columnlayout": "列布局", "pluginrecord": "插件数据",
 }
 
 

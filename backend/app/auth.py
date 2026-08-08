@@ -3,7 +3,7 @@
 import datetime as dt
 from typing import Optional
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -51,6 +51,7 @@ def authenticate(session: Session, username: str, password: str) -> Optional[Use
 
 
 def get_current_user(
+    request: Request,
     token: str = Depends(oauth2_scheme),
     session: Session = Depends(get_session),
 ) -> User:
@@ -67,4 +68,11 @@ def get_current_user(
     user = session.get(User, user_id)
     if user is None or not user.is_active:
         raise credentials_error
+    if payload.get("typ") == "plugin":
+        # 插件令牌必须**先过 scope 闸门**才算数。这一句是兜底：万一中间件顺序被人调错、
+        # 或有人在非 HTTP 路径上复用了这个依赖，插件令牌不会因此变成全权令牌。
+        if not getattr(request.state, "plugin_scope_ok", False):
+            raise credentials_error
+        # 路由需要知道「是哪个插件、拿了哪些权限」——挂在 user 上而不是再解一次令牌。
+        user._plugin_claims = payload
     return user

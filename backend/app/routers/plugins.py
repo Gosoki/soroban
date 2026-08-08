@@ -1,8 +1,12 @@
-"""爬虫插件（soroban 做管理层）。
+"""插件（soroban 做管理层）。
 
-soroban 扫 SCRAPER_DIR 下的 `soroban-scraper-*` 目录（各含 plugin.toml）作为插件，负责：
-发现、存配置/定时、触发登录/抓取。插件本体是独立进程/venv，soroban 只按 manifest 调它的标准 CLI。
-调用为子进程；抓取时把 soroban 短期 token 下发给插件回灌，插件无需存 soroban 密码。
+soroban 扫 `PLUGIN_DIR` 下的 `soroban-plugin-*` 目录（各含 plugin.toml），负责：
+发现、存配置/定时、触发它的标准 CLI。插件本体是独立进程/venv，soroban 只按 manifest 调它。
+调用为子进程；触发时把 soroban 短期 token 下发给插件，插件无需存 soroban 密码。
+
+**插件不等于爬虫**。淘宝订单抓取只是第一个；汇率、国际快递查询都没有「爬」的语义。
+所以目录、前缀、术语一律用「插件/plugin」——旧的 `scraper/` 与 `soroban-scraper-*`
+仍会被扫描（老部署不至于突然找不到插件），但新插件一律放 `plugins/soroban-plugin-*`。
 """
 
 import asyncio
@@ -24,7 +28,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from sqlmodel import Session, select
 
-from ..auth import create_access_token, get_current_user
+from ..auth import get_current_user
+from ..plugins import scopes
 from ..config import settings
 from ..database import get_engine, get_session
 from ..models import Order, PluginConfig, User, utcnow
@@ -53,27 +58,56 @@ _SELF_URL = f"http://127.0.0.1:{os.environ.get('BACKEND_PORT', '8620')}"   # sor
 _ACCOUNT_MAX = Order.__table__.columns["platform_account"].type.length
 
 
-def scraper_dir() -> Path:
-    return Path(settings.SCRAPER_DIR) if settings.SCRAPER_DIR else (_SOROBAN_ROOT / "scraper")
+# 目录名前缀：新的在前。两个都扫是为了老部署平滑过渡，不是长期形态。
+_PREFIXES = ("soroban-plugin-*", "soroban-scraper-*")
+
+
+def plugin_dir() -> Path:
+    """插件根目录。PLUGIN_DIR > 旧的 SCRAPER_DIR > 仓库下的 plugins/。"""
+    if settings.PLUGIN_DIR:
+        return Path(settings.PLUGIN_DIR)
+    if settings.SCRAPER_DIR:                 # 老 .env 里可能还写着它
+        return Path(settings.SCRAPER_DIR)
+    return _SOROBAN_ROOT / "plugins"
+
+
+def plugin_roots() -> list[Path]:
+    """要扫的根目录：新的 plugins/ + 旧的 scraper/（若还在）。
+
+    保留旧目录是为了「升级后插件突然消失」不会发生——那种失败很吓人：
+    界面上插件列表空了，用户以为配置丢了。
+    """
+    roots = [plugin_dir()]
+    legacy = _SOROBAN_ROOT / "scraper"
+    if legacy.is_dir() and legacy not in roots:
+        roots.append(legacy)
+    return roots
 
 
 def discover() -> list[dict]:
-    """扫描插件目录，读各 plugin.toml。返回 manifest 列表（附 _dir）。坏的跳过。"""
-    base, out = scraper_dir(), []
-    if not base.is_dir():
-        return out
-    for d in sorted(base.glob("soroban-scraper-*")):
-        f = d / "plugin.toml"
-        if not (d.is_dir() and f.is_file()):
+    """扫描插件目录，读各 plugin.toml。返回 manifest 列表（附 _dir）。坏的跳过。
+
+    同一个 id 在多个根目录下出现时，**先扫到的赢**（新目录优先）——
+    搬家搬到一半时不至于出现两条同名插件。
+    """
+    out, seen = [], set()
+    for base in plugin_roots():
+        if not base.is_dir():
             continue
-        try:
-            m = tomllib.loads(f.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if "id" not in m:
-            continue
-        m["_dir"] = d
-        out.append(m)
+        for pattern in _PREFIXES:
+            for d in sorted(base.glob(pattern)):
+                f = d / "plugin.toml"
+                if not (d.is_dir() and f.is_file()):
+                    continue
+                try:
+                    m = tomllib.loads(f.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if "id" not in m or m["id"] in seen:
+                    continue
+                seen.add(m["id"])
+                m["_dir"] = d
+                out.append(m)
     return out
 
 
@@ -211,7 +245,18 @@ def _rename_state(manifest: dict, old: str, new: str) -> bool:
 
 
 def _python(manifest: dict) -> Path:
-    p = manifest["_dir"] / manifest.get("python", ".venv/bin/python")
+    """跑这个插件用哪个解释器。
+
+    `python = "inherit"` = 用 soroban 自己的解释器，**不建 venv、不用安装**。
+    只给「依赖已在 soroban 里」的轻插件用（汇率只要 httpx）。这条是刻意留的：
+    汇率是记账的必要供给方，不该让「Windows 上装不了 venv」变成「记不了账」——
+    打包版 exe 在系统没有 Python 时一个插件都装不上，那时唯一能跑的就是这类。
+    重依赖插件（浏览器、OCR）照旧走独立 venv，隔离仍然成立。
+    """
+    want = manifest.get("python", ".venv/bin/python")
+    if want == "inherit":
+        return Path(_base_python() or sys.executable)
+    p = manifest["_dir"] / want
     if not p.exists() and os.name == "nt":          # Windows 的 venv 是 Scripts/python.exe
         alt = manifest["_dir"] / ".venv" / "Scripts" / "python.exe"
         if alt.exists():
@@ -326,39 +371,84 @@ def _browser_ready(py: Path) -> bool:
         return False
 
 
-def _reap(proc: subprocess.Popen, label: str) -> None:
+def _reap(proc: subprocess.Popen, label: str, jti: Optional[str] = None) -> None:
     """后台收割子进程：读取其 stdout 单行 JSON 结果并写日志（成功计数 / 失败原因都落 soroban 日志）。
-    插件约定 stdout 只吐一行 JSON（见 taobao_scraper/run.py），量小不会撑爆管道；30min 上限防挂死。"""
+    插件约定 stdout 只吐一行 JSON（见 taobao_scraper/run.py），量小不会撑爆管道；30min 上限防挂死。
+
+    收割完必须**作废令牌**：任务结束后那枚令牌不该还能用二十几分钟，
+    而它此刻已经落在插件的日志与环境变量里了。放 finally 里——超时被 kill 的路径同样要作废。
+    """
     try:
-        out, err = proc.communicate(timeout=1800)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
-        log.warning("插件 %s 超时(30min)已终止", label)
-        return
-    except Exception as e:                                   # noqa: BLE001
-        log.warning("插件 %s 结果回收异常：%s", label, e)
-        return
-    tail = [ln for ln in (out or "").strip().splitlines() if ln.strip()]
-    result = tail[-1] if tail else "(无 stdout)"
-    if proc.returncode == 0:
-        log.info("插件 %s 完成：%s", label, result)
-    else:
-        errtail = (err or "").strip()
-        log.warning("插件 %s 失败(exit=%s)：%s%s", label, proc.returncode, result,
-                    ("｜stderr: " + errtail[-300:]) if errtail else "")
+        try:
+            out, err = proc.communicate(timeout=1800)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            log.warning("插件 %s 超时(30min)已终止", label)
+            return
+        except Exception as e:                                   # noqa: BLE001
+            log.warning("插件 %s 结果回收异常：%s", label, e)
+            return
+        tail = [ln for ln in (out or "").strip().splitlines() if ln.strip()]
+        result = tail[-1] if tail else "(无 stdout)"
+        if proc.returncode == 0:
+            log.info("插件 %s 完成：%s", label, result)
+        else:
+            errtail = (err or "").strip()
+            log.warning("插件 %s 失败(exit=%s)：%s%s", label, proc.returncode, result,
+                        ("｜stderr: " + errtail[-300:]) if errtail else "")
+    finally:
+        scopes.revoke(jti)          # 任务结束 → 令牌立即失效
 
 
-def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str] = None) -> int:
+
+def plugin_settings(session: Session, manifest: dict) -> dict:
+    """插件声明它关心哪些设置项（plugin.toml 的 `settings = [...]`），这里取出它们的当前值。
+
+    **设置项本身放在核心的注册表里**（`services/prefs.SPECS`），不放 plugin.toml。理由：
+    设置页已经能按注册表自动渲染出标签、说明、取值范围、联动禁用；搬进 plugin.toml
+    等于把这些退回成一个要手工编辑的文本文件。插件只声明「我要读哪几项」。
+
+    声明了但注册表里没有的键会被跳过并告警——插件与核心版本不匹配时，
+    宁可少给一项配置，也不该让整次触发失败。
+    """
+    from ..services import prefs
+
+    wanted = manifest.get("settings") or []
+    if not wanted:
+        return {}
+    conf = prefs.load(session)
+    out, unknown = {}, []
+    for key in wanted:
+        if key in conf:
+            out[key] = conf[key]
+        else:
+            unknown.append(key)
+    if unknown:
+        log.warning("插件 %s 声明了核心不认识的设置项 %s（版本不匹配？），已跳过",
+                    manifest.get("id", "?"), unknown)
+    return out
+
+
+def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str] = None,
+            config: Optional[dict] = None, jti: Optional[str] = None) -> int:
     """子进程调插件 CLI（fire-and-forget；返回 pid，后台线程收割其结果写日志）。
 
     token 走**环境变量** SOROBAN_TOKEN 下发，不进 argv——避免短期凭据出现在进程表(ps)/日志里。
+    config 同理走 SOROBAN_CONFIG（JSON）：设置项可能含 API key 之类，同样不该进 argv；
+    而且它是结构化的（数组/对象），塞进命令行还得各自序列化一遍。
     """
     python = _python(manifest)
     if not python.exists():
         raise HTTPException(status_code=400, detail=f"插件未安装：缺 venv（{python}）。见插件 README。")
     cmd = [str(python)] + shlex.split(manifest.get("entry", "")) + [command] + extra
-    env = {**os.environ, "SOROBAN_TOKEN": token} if token else None
+    env = None
+    if token or config:
+        env = {**os.environ}
+        if token:
+            env["SOROBAN_TOKEN"] = token
+        if config:
+            env["SOROBAN_CONFIG"] = json.dumps(config, ensure_ascii=False)
     try:
         proc = subprocess.Popen(
             cmd, cwd=str(manifest["_dir"]), env=env,
@@ -369,7 +459,9 @@ def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str]
         raise HTTPException(status_code=500, detail=f"启动插件失败：{e}")
     acct = extra[1] if len(extra) >= 2 and extra[0] == "--account" else ""
     label = f"{manifest.get('id', '?')}/{command}" + (f" [{acct}]" if acct else "")
-    threading.Thread(target=_reap, args=(proc, label), daemon=True).start()
+    # jti 传给收割线程：进程一结束就把令牌作废。否则插件跑完之后那枚令牌还能用二十几分钟，
+    # 而它此刻已经落在插件的日志/环境里了。
+    threading.Thread(target=_reap, args=(proc, label, jti), daemon=True).start()
     return proc.pid
 
 
@@ -523,8 +615,37 @@ def list_plugins(session: Session = Depends(get_session)):
                 "last_run_at": cfg.last_run_at if cfg else None,
             },
             "accounts": _display_accounts(cfg, m),
+            # 权限三件套：清单要什么、用户给了什么、实际生效的是什么。
+            # 三者分开给，前端才能把「插件升级后多要了一项」显示成「需要新授权」，
+            # 而不是悄悄按新清单放行。
+            "scopes": {
+                "declared": sorted(m.get("scopes") or []),
+                "granted": sorted(json.loads(cfg.granted_scopes or "[]")) if cfg else [],
+                "effective": sorted(scopes.token_scopes(m, cfg)),
+                "catalog": scopes.describe(),
+            },
         })
     return out
+
+
+@router.put("/{plugin_id}/grants")
+def save_grants(plugin_id: str, payload: dict, session: Session = Depends(get_session)):
+    """授予/收回插件权限。只接受清单声明过、且核心认识的项。
+
+    传进来的多余项**静默丢弃而不是报错**：插件降级或核心删了某个 scope 之后，
+    界面上那份旧勾选不该让保存整个失败——用户会以为是别的地方坏了。
+    """
+    m = _find_manifest(plugin_id)
+    want = set(payload.get("granted") or [])
+    keep = sorted(want & set(m.get("scopes") or []) & set(scopes.SCOPES))
+    cfg = session.get(PluginConfig, plugin_id) or PluginConfig(plugin_id=plugin_id)
+    cfg.granted_scopes = json.dumps(keep, ensure_ascii=False)
+    cfg.updated_at = utcnow()
+    session.add(cfg)
+    session.commit()
+    log.info("插件 %s 的授权改为：%s", plugin_id, keep or "（无）")
+    return {"plugin_id": plugin_id, "granted": keep,
+            "dropped": sorted(want - set(keep))}
 
 
 @router.put("/{plugin_id}/config")
@@ -605,13 +726,21 @@ def fetch(
         targets = [by_name.get(account) or {"name": account, "platform": "淘宝", "enabled": True}]
     else:                                                # 全部：只抓「已启用」的配置账号
         targets = [a for a in _account_list(cfg) if a["enabled"]]
-    if not targets:
+    # 无账号插件（汇率、快递查询）整体跑一次；账号型插件才要求先加账号。
+    # 与定时调度共用同一个判据，避免「定时能跑、手动点不动」这种两处不一致。
+    if m.get("accounts") and not targets:
         raise HTTPException(status_code=400, detail="没有可抓的账号：先添加账号并启用。")
-    token = create_access_token(current, dt.timedelta(minutes=30))   # 真·短期 token（30min，够抓一次），走环境变量不进 argv
-    pids = [_launch(m, "fetch",
-                    ["--account", a["name"], "--soroban-url", _SELF_URL, "--platform", a["platform"]],
-                    token=token) for a in targets]       # 平台按每个账号各自绑定的来源下发
-    return {"started": True, "accounts": [a["name"] for a in targets], "pids": pids}
+    # **限权令牌**：只带「清单声明 ∩ 用户授权 ∩ 核心已知」那几项权限，任务结束即作废。
+    # 原先发的是完整用户 JWT——插件能调任何接口，包括删订单、清账本、改数据库连接。
+    granted = scopes.token_scopes(m, cfg)
+    token, jti = scopes.issue(current, plugin_id, granted)
+    fan = ([(["--account", a["name"], "--platform", a["platform"]], a["name"]) for a in targets]
+           if m.get("accounts") else [([], "")])
+    pids = [_launch(m, "fetch", [*extra, "--soroban-url", _SELF_URL],
+                    token=token, config=plugin_settings(session, m), jti=jti)
+            for extra, _ in fan]                         # 平台按每个账号各自绑定的来源下发
+    return {"launched": True, "accounts": [w for _, w in fan if w], "pids": pids,
+            "scopes": sorted(granted)}
 
 
 @router.delete("/{plugin_id}/account")
@@ -729,6 +858,30 @@ def _due(last: Optional[dt.datetime], minutes: int, now: dt.datetime) -> bool:
     return (now - last).total_seconds() >= minutes * 60
 
 
+def _fanout(manifest: dict, cfg) -> list[tuple[list[str], str]]:
+    """一次定时触发要起几个子进程，各带什么参数。
+
+    返回 [(附加参数, 日志里的标识)]。
+
+    **两类插件**：
+      · `accounts = true`（如淘宝）——一个账号一个进程，各带自己的 cookie 与平台。
+      · 不声明（如汇率、快递查询）——**整体跑一次**，不带 --account。
+
+    以前这里只有前一种：账号列表为空 → 一个都不起 → `launched` 恒为 0 →
+    `last_run_at` 永不推进 → 这类插件**永远不会被定时触发**，而且界面上看不出异常
+    （它「已启用」、有定时周期，只是从不运行）。无账号插件是本次要支持的主要形态，
+    所以这条分支必须存在。
+    """
+    if not manifest.get("accounts"):
+        return [([], "")]
+    out = []
+    for a in _account_list(cfg):
+        if not a["enabled"]:                            # 停用的账号：定时跳过
+            continue
+        out.append((["--account", a["name"], "--platform", a["platform"]], f"/{a['name']}"))
+    return out
+
+
 def _run_due(session: Session) -> None:
     user = session.exec(select(User).where(User.is_active == True)).first()  # noqa: E712
     if not user:
@@ -741,18 +894,15 @@ def _run_due(session: Session) -> None:
         m = manifests.get(cfg.plugin_id)
         if not m or not _python(m).exists():
             continue
-        token = token or create_access_token(user, dt.timedelta(minutes=30))
         launched = 0
-        for a in _account_list(cfg):
-            if not a["enabled"]:                        # 停用的账号：定时跳过
-                continue
+        for extra, who in _fanout(m, cfg):
             try:
-                _launch(m, "fetch",
-                        ["--account", a["name"], "--soroban-url", _SELF_URL, "--platform", a["platform"]],
-                        token=token)
+                tok, jti = scopes.issue(user, cfg.plugin_id, scopes.token_scopes(m, cfg))
+                _launch(m, "fetch", [*extra, "--soroban-url", _SELF_URL],
+                        token=tok, config=plugin_settings(session, m), jti=jti)
                 launched += 1
             except HTTPException as e:
-                log.warning("定时抓取 %s/%s 启动失败：%s", cfg.plugin_id, a["name"], e.detail)
+                log.warning("定时任务 %s%s 启动失败：%s", cfg.plugin_id, who, e.detail)
         if launched:                                    # 只有真的起了进程才推进 last_run_at
             cfg.last_run_at = now                       # 空账号/全部启动失败 → 不推进，下轮重试
             session.add(cfg)

@@ -40,6 +40,7 @@ from app.models import (
     MiscExpense,
     OrderItem,
     PluginConfig,
+    PluginRecord,
     Setting,
     ShipmentOrder,
     StagingItem,
@@ -63,6 +64,7 @@ MIGRATION_ORDER = [
     ColumnLayout,
     TagOption,
     PluginConfig,
+    PluginRecord,
 ]
 
 

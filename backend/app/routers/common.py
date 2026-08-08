@@ -100,7 +100,8 @@ def stamp_fx(session: Session, obj) -> None:
     不该按今天的。staging.py 早就是这个口径，这里向既有惯例收敛。"""
     if obj.price_cny is not None and obj.fx_rate is None:
         from ..services.fx import rate_for_date          # 局部导入避免循环
-        obj.fx_rate = rate_for_date(session, obj.date)
+        obj.fx_rate = rate_for_date(
+            session, obj.date, what=f"补 {type(obj).__name__} 的汇率")
 
 
 def soft_delete(obj) -> None:

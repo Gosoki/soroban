@@ -241,5 +241,7 @@ backups/
 # pytest 缓存（测试库建在系统临时目录，见 backend/tests/conftest.py，不落仓库）
 .pytest_cache/
 
-# --- 爬虫（各平台各自成库，soroban 不跟踪其代码，只保留 scraper/README.md 说明）---
+# --- 插件（各自成库，soroban 不跟踪其代码，只保留 plugins/README.md 说明）---
+# 插件不只是爬虫：汇率、国际快递查询都没有「爬」的语义，故目录与前缀统一叫 plugin。
+/plugins/*/
 /scraper/*/

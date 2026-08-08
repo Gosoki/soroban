@@ -54,7 +54,7 @@ def _check_shipment(session: Session, shipment_id, *, lock: bool = False):
             raise HTTPException(status_code=422, detail="所属集运订单不存在或已删除")
 
 
-@router.get("")
+@router.get("", openapi_extra={"x-scope": "orders:read"})
 def list_orders(
     session: Session = Depends(get_session),
     # 对外仍叫 ?id=（前端在用）；Python 侧换个名字，别遮蔽内建 id()
@@ -149,13 +149,13 @@ async def ocr_order(file: UploadFile = File(...)):
 
 @router.post("", response_model=OrderRead)
 def create_order(payload: OrderCreate, session: Session = Depends(get_session)):
-    from ..services.fx import current_rate  # 局部导入避免循环
+    from ..services.fx import stamp_rate  # 局部导入避免循环
 
     data = payload.model_dump(exclude={"items", "price_cny"})   # 订单价由物品派生，不直接落库
     order = Order(**data)
     _check_shipment(session, order.shipment_order_id)   # 挂靠的集运单不存在/已删 → 友好 422（而非 FK 撞库转 409）
-    if order.fx_rate is None:                 # 新建时写入当天汇率
-        order.fx_rate = current_rate(session)
+    if order.fx_rate is None:                 # 新建时写入当天汇率（过期会记警告，见 stamp_rate）
+        order.fx_rate = stamp_rate(session, f"建商品订单 {order.order_no or '(无单号)'}")
     # 最小单位是物品：至少 1 条（无物品则按商品名+货款自动生成，灰显可改）。
     # 播种用「货款」= 订单价种子 - 邮费，避免把邮费也摊进物品单价（否则 sync 加邮费会重复计）。
     seed_goods = goods_seed(payload.price_cny, payload.postage_cny)
