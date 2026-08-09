@@ -265,3 +265,56 @@ def test_unknown_api_route_404(client):
 ])
 def test_wrong_method_405(client, method, path):
     assert getattr(client, method)(path).status_code in (404, 405)
+
+
+def test_residual_row_does_not_pile_up_on_every_edit(client):
+    """「金额尾差」行**不能**每改一次单就多一条。
+
+    它是派生产物，而前端保存时会把服务端返回的 items 原样回传（物品编辑器、
+    订单页展开面板都这样）。`build_items` 若不认识自己上一次生成的那行，
+    就会把它当成「一条没有单价的物品」重新折算，**再补一条新的**。
+    实测过：同一张单连改 3 次，物品从 2 条涨到 5 条（总价始终守恒，坏的是条数）。
+    """
+    o = mk_order(client, price_cny="10.00", items=[{"name": "a", "quantity": 3}])
+    assert len(o["items"]) == 2 and o["items"][-1]["name"].endswith("（金额尾差）")
+
+    for _ in range(3):
+        body = {"version": o["version"], "price_cny": "10.00",
+                "items": [{"name": i["name"], "quantity": i["quantity"],
+                           "unit_price_cny": None, "auto": True} for i in o["items"]]}
+        r = client.patch(f"/api/orders/{o['id']}", json=body)
+        assert r.status_code == 200, r.text
+        o = r.json()
+        names = [i["name"] for i in o["items"]]
+        assert names.count("a（金额尾差）") == 1, f"尾差行叠加了：{names}"
+        assert Decimal(o["price_cny"]) == Decimal("10.00")
+    assert len(o["items"]) == 2
+
+
+def test_residual_row_is_recognised_even_with_a_very_long_item_name(client):
+    """长物品名下，后缀必须仍在——否则下一次认不出它，又开始叠加。
+
+    直接 `f"{name}（金额尾差）"[:255]` 会在名字接近 255 时把后缀截掉。
+    """
+    long_name = "长" * 250
+    o = mk_order(client, price_cny="10.00", items=[{"name": long_name, "quantity": 3}])
+    resid = o["items"][-1]["name"]
+    assert resid.endswith("（金额尾差）"), f"后缀被截掉了：…{resid[-12:]}"
+
+    body = {"version": o["version"], "price_cny": "10.00",
+            "items": [{"name": i["name"], "quantity": i["quantity"],
+                       "unit_price_cny": None, "auto": True} for i in o["items"]]}
+    o2 = client.patch(f"/api/orders/{o['id']}", json=body).json()
+    assert len([i for i in o2["items"] if i["name"].endswith("（金额尾差）")]) == 1
+
+
+def test_user_named_item_ending_in_the_suffix_is_not_eaten(client):
+    """用户自己起名叫「…（金额尾差）」的**真**物品不该被剔掉。
+
+    判据要求三个条件同时成立（后缀 + auto=True + 数量 1）；用户手输的行 auto=False。
+    """
+    o = mk_order(client, items=[
+        {"name": "手写（金额尾差）", "quantity": 1, "unit_price_cny": "7.00", "auto": False},
+    ])
+    assert [i["name"] for i in o["items"]] == ["手写（金额尾差）"]
+    assert Decimal(o["price_cny"]) == Decimal("7.00")

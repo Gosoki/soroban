@@ -39,6 +39,26 @@ def goods_seed(price_cny, postage_cny):
     return None if price_cny is None else price_cny - (postage_cny or 0)
 
 
+_RESIDUAL_SUFFIX = "（金额尾差）"
+
+
+def _is_residual(it) -> bool:
+    """这一行是不是**上一次折算自己生成的**「金额尾差」占位行。
+
+    尾差行是派生产物，不是用户输入。而前端保存时会把服务端返回的 items 原样回传
+    （物品编辑器、订单页展开面板都这样），于是它会作为「一条没有单价的物品」再喂回来
+    ——`build_items` 不认识它，当成普通物品重新折算，**又补一条新的尾差行**。
+    实测：同一张单每改一次多一条，1 条能涨到 5 条（总价始终守恒，坏的是条数）。
+
+    三个条件同时满足才认，免得误伤用户自己起名叫「…（金额尾差）」的真物品：
+    名字后缀 + `auto=True`（用户一编辑就会变 False）+ 数量为 1（生成时固定是 1）。
+    即使误判，后果也只是它被重算一遍，总价仍然守恒。
+    """
+    return (bool(getattr(it, "auto", False))
+            and (it.quantity or 1) == 1
+            and (getattr(it, "name", "") or "").endswith(_RESIDUAL_SUFFIX))
+
+
 def build_items(items_in, seed_goods, fallback_name):
     """把「物品输入 + 货款种子价 + 兜底物品名」规整成 ≥1 条物品 dict(name/quantity/unit_price_cny/auto)。
 
@@ -54,6 +74,11 @@ def build_items(items_in, seed_goods, fallback_name):
     返回的 dict 同时适用 OrderItem 与 StagingItem 构造。"""
     if seed_goods is not None and seed_goods < 0:     # 邮费>总价等异常输入 → 货款夹到 0，绝不落负单价
         seed_goods = Decimal("0.00")
+    # **先剔掉上一轮自己生成的尾差行**：它是派生产物，不该作为输入参与下一次折算
+    # （前端会把服务端返回的 items 原样回传，见 _is_residual）。
+    # 放在所有分支之前：带单价的那条分支同样不该把它原样留下来——
+    # 那会在列表里留一行 0.00 的占位，越攒越多。
+    items_in = [it for it in (items_in or []) if not _is_residual(it)]
     if not items_in:
         return [{"name": (fallback_name or "未命名物品")[:255], "quantity": 1,
                  "unit_price_cny": seed_goods if seed_goods is not None else Decimal("0.00"),
@@ -82,7 +107,10 @@ def build_items(items_in, seed_goods, fallback_name):
         if residual:
             # 只在除不尽时才出现。名字带「尾差」是给人看的：这一分钱落在哪儿必须一目了然，
             # 否则复核的人会以为系统算错了。auto=True → 前端灰显，跟其余待拆分的行同待遇。
-            out.append({"name": f"{items_in[0].name}（金额尾差）"[:255],
+            # 名字先按后缀长度截断再拼，保证后缀**一定**在——直接 `f"{name}后缀"[:255]`
+            # 在长名字下会把后缀截掉，于是下一次 `_is_residual` 认不出它、又开始叠加。
+            head = (items_in[0].name or "")[:255 - len(_RESIDUAL_SUFFIX)]
+            out.append({"name": f"{head}{_RESIDUAL_SUFFIX}",
                         "quantity": 1, "unit_price_cny": residual, "auto": True})
         return out
     # 有单价的原样用；没单价的记 0 并标 auto（灰显=待补价），避免误当作真实 ¥0
