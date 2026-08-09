@@ -1234,6 +1234,19 @@ def run_command(plugin_id: str, command: str, account: Optional[str] = None,
     conf = _launch_conf(session, m, cfg)
     batch = uuid.uuid4().hex
     pids = []
+    # **「执行中」必须写在起进程之前**，而不是之后。
+    #
+    # 这是「点了抓取以后一直显示执行中」的直接原因，而且是一个**跑得越快越必中**的竞态：
+    # 子进程可能在毫秒级就结束（会话过期 → 插件打印一行「无会话，请先授权登录」当场退出，
+    # 日志里就是这种）。收割线程随即 `_write_outcome(..., "failed")` 把结果写进库；
+    # 而那时这个请求还没走到下面几行，紧接着就用 `"running"` 把它**盖掉并提交**。
+    # 批次此刻已经从 `_BATCHES` 里弹掉了 ⇒ 再没有任何人会来改它 ⇒ 卡片永久停在「执行中…」。
+    # 越是「一点就失败」的情形越稳定复现，而那恰恰是用户最想看到失败原因的时候。
+    cfg.last_outcome, cfg.last_summary = "running", f"{cmd.label} 执行中…"
+    cfg.last_finished_at = None
+    cfg.updated_at = utcnow()
+    session.add(cfg)
+    session.commit()
     try:
         for extra, who in fan:
             # **一个子进程一枚令牌**。共用一枚的话，先跑完的那个账号在 `_reap` 里
@@ -1248,11 +1261,6 @@ def run_command(plugin_id: str, command: str, account: Optional[str] = None,
         # **finally**：中途抛异常（缺 venv、令牌签发失败）时，已经起来的兄弟仍会回调，
         # 而批次还在等一个永远到不了的计划数——卡片会永久停在「执行中…」。
         seal_and_report(batch, len(pids), plugin_id, cmd.label)
-    cfg.last_outcome, cfg.last_summary = "running", f"{cmd.label} 执行中…"
-    cfg.last_finished_at = None
-    cfg.updated_at = utcnow()
-    session.add(cfg)
-    session.commit()
     return {"launched": True, "command": cmd.name, "pids": pids,
             "targets": [w for _, w in fan if w], "scopes": sorted(cmd_scopes)}
 
@@ -1366,6 +1374,13 @@ def seal_and_report(batch: str, launched: int, plugin_id: str, label: str) -> No
     **必须在 finally 里调**——中途抛异常（缺 venv、令牌签发失败）时，
     已经起来的那些兄弟仍然会回调，而批次还在等一个永远到不了的计划数。
     """
+    if launched <= 0:
+        # 一个进程都没起来（第一个账号就抛了：缺 venv、令牌签发失败…）。
+        # 此刻库里已经是「执行中」（那一行现在写在起进程**之前**），
+        # 而不会有任何回调到来 —— 不在这里交代一句，卡片就永久停在「执行中…」。
+        _write_outcome(plugin_id, "failed", f"{label}：一个任务都没能启动")
+        _batch_seal(batch, 0)
+        return
     finished, parts = _batch_seal(batch, launched)
     if finished and parts:
         _write_outcome(plugin_id, *_batch_text(label, parts, launched)[0:2])

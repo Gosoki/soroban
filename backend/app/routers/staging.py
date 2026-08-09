@@ -49,6 +49,7 @@ _SHARED_TO_ORDER = {
     "platform_account": "platform_account",
     "platform": "platform",
     "express_no": "express_no",
+    "express_company": "express_company",
     "postage_cny": "postage_cny",
     "fx_rate": "fx_rate",
     "purchase_status": "purchase_status",
@@ -333,6 +334,7 @@ def import_staging(row_id: int, session: Session = Depends(get_session)):
         platform_account=row.platform_account,
         platform=row.platform,               # 来源随单迁移到账本
         express_no=row.express_no,
+        express_company=row.express_company,   # 快递公司与单号是一对，一起迁移
         postage_cny=row.postage_cny,         # 邮费随单迁移
         # 优先暂存记录的汇率；否则按下单日期匹配（库里空则按手填值兜底，过期会留痕）
         fx_rate=row.fx_rate or rate_for_date(

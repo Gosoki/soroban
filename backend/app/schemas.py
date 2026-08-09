@@ -657,6 +657,8 @@ class StagingBase(PostageIn):
     fx_rate: Optional[Decimal] = None
     order_date: Optional[dt.date] = None
     express_no: Optional[str] = Field(default=None, max_length=_len(OrderStaging, "express_no"))
+    express_company: Optional[str] = Field(
+        default=None, max_length=_len(OrderStaging, "express_company"))
     purchase_status: Optional[str] = None    # 采购段交易状态（待发货/待收货/…），导入后与账本联动
 
     @field_validator("price_cny")

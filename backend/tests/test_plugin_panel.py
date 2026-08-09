@@ -1186,3 +1186,74 @@ def test_warn_does_not_swallow_a_real_failure():
                                          ("b", False, "登录过期", False)], 2)
     assert outcome == "failed"
     assert "登录过期" in text and "部分成功" in text, "合并摘要吞掉了其中一个号"
+
+
+# --- 「一直显示执行中」的直接原因：写「执行中」写晚了 ----------------------------
+
+def test_a_command_that_fails_instantly_does_not_get_stuck_on_running(
+        client, fake_plugin, monkeypatch, session):
+    """子进程**在请求返回之前就结束**时，卡片不能停在「执行中」。
+
+    这是一个跑得越快越必中的竞态：会话过期的插件会在毫秒级打印一行
+    「无会话，请先授权登录」就退出。收割线程随即把 failed 写进库，
+    而请求接着用 "running" 把它盖掉并提交——批次此刻已经从 `_BATCHES` 里弹掉，
+    **再没有任何人会来改它**，卡片永久停在「执行中…」。
+    越是「一点就失败」的情形越稳定复现，而那正是用户最想看到失败原因的时候。
+    """
+    from app.routers import plugins as mod
+
+    def instant_launch(manifest, command, extra, token=None, config=None, jti=None,
+                       on_done=None):
+        if on_done:                       # 同步回调 = 模拟「进程比请求还快」
+            on_done(False, "无会话，请先在 soroban「插件管理」授权登录")
+        return 4242
+
+    monkeypatch.setattr(mod, "_launch", instant_launch)
+    client.put("/api/plugins/demo/grants", json={"granted": ["fx:write"]})
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
+    assert client.post("/api/plugins/demo/run/run").status_code == 200
+
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["last_run"]
+    assert got["outcome"] == "failed", \
+        f"跑完了却还显示 {got['outcome']}——卡片会永久停在「执行中」"
+    assert "无会话" in got["summary"], "失败原因被盖掉了，用户看不到该去做什么"
+    assert got["at"], "没有结束时间，界面上仍会当成在跑"
+
+
+def test_when_nothing_could_be_launched_the_card_says_so(
+        client, fake_plugin, monkeypatch):
+    """一个进程都没起来 → 也要有交代。
+
+    「执行中」现在写在起进程**之前**，所以这条路径上库里已经是 running 了，
+    而不会有任何回调到来——不显式收尾就是又一个永久的「执行中」。
+    """
+    from app.routers import plugins as mod
+
+    def boom(*a, **k):
+        raise RuntimeError("起不来")
+
+    monkeypatch.setattr(mod, "_launch", boom)
+    client.put("/api/plugins/demo/grants", json={"granted": ["fx:write"]})
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
+    # TestClient 默认把服务端异常原样抛出来；这里只关心「卡片上留下了什么」，
+    # 所以吞掉它——请求怎么失败是另一回事，`finally` 里的收尾必须已经跑过。
+    with pytest.raises(RuntimeError):
+        client.post("/api/plugins/demo/run/run")
+
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["last_run"]
+    assert got["outcome"] == "failed", f"一个都没起来却显示 {got['outcome']}"
+
+
+def test_a_still_running_command_does_show_running(client, fake_plugin, monkeypatch):
+    """反面：真的还在跑时**必须**显示「执行中」。
+    上面两条如果用「干脆不写 running」来满足，这一条会红。"""
+    from app.routers import plugins as mod
+
+    monkeypatch.setattr(mod, "_launch",
+                        lambda *a, **k: 4243)          # 起来了，但永不回调
+    client.put("/api/plugins/demo/grants", json={"granted": ["fx:write"]})
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
+    assert client.post("/api/plugins/demo/run/run").status_code == 200
+
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["last_run"]
+    assert got["outcome"] == "running" and not got["at"]

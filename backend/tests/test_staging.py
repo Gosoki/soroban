@@ -191,3 +191,27 @@ def test_import_status_patch_is_rejected_before_anything_else_is_written(client,
     assert r.status_code == 422
     assert _fetch(client, row["id"])["title"] == "原标题", \
         "状态挡住了，但同一条请求里的别的字段被写进去了"
+
+
+def test_tracking_number_written_after_import_reaches_the_ledger(client, mk):
+    """已导入的暂存行补一个快递号 → 必须**写穿到账本订单**。
+
+    这是插件那半条链路的落点：下单时还没发货，快递号那会儿不存在；
+    等卖家发货后插件再来补一次。如果这里不写穿，账本上那一格永远是空的，
+    而集运的「内含快递」截图就永远匹配不到这张单。
+    """
+    row = mk("/api/staging", {"order_date": "2026-03-01", "title": "发货后才有单号",
+                              "order_no": "TRK-AFTER-IMPORT"})
+    imported = client.post(f"/api/staging/{row['id']}/import").json()
+    oid = imported.get("imported_order_id") or _fetch(client, row["id"])["imported_order_id"]
+    assert oid, "用例前提不成立：没导入成功"
+    assert client.get(f"/api/orders/{oid}").json()["express_no"] is None
+
+    cur = _fetch(client, row["id"])
+    r = client.patch(f"/api/staging/{row['id']}",
+                     json={"version": cur["version"], "express_no": "773435263240616"})
+    assert r.status_code == 200, r.text
+    assert client.get(f"/api/orders/{oid}").json()["express_no"] == "773435263240616", \
+        "补的快递号没写进账本——集运截图永远匹配不到这张单"
+    # 暂存页读到的也该是账本那一份（_overlay），否则插件下一轮会以为还是空的、反复推
+    assert _fetch(client, row["id"])["express_no"] == "773435263240616"

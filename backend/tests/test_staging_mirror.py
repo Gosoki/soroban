@@ -35,6 +35,7 @@ def _probe(n: int) -> dict:
         "platform_account": f"探针账号{n}",
         "platform": "闲鱼",
         "express_no": f"SFPROBE{n:06d}",
+        "express_company": f"探针快递{n}",
         "postage_cny": "7.77",
         "fx_rate": "19.99",
         "purchase_status": "已签收",
@@ -187,3 +188,88 @@ def test_shared_map_names_real_columns():
     bad_r = set(_SHARED_TO_ORDER.values()) - od_cols
     assert not bad_l, f"_SHARED_TO_ORDER 的键不是 orderstaging 的列：{sorted(bad_l)}"
     assert not bad_r, f"_SHARED_TO_ORDER 的值不是 orders 的列：{sorted(bad_r)}"
+
+
+@pytest.mark.parametrize("staging_field,order_field", sorted(_SHARED_TO_ORDER.items()))
+def test_import_carries_every_shared_field_into_the_ledger(client, staging_field, order_field):
+    """**导入**时每个共享字段都要搬进账本——`import_staging` 是手写的第四份清单。
+
+    `_overlay`（读时覆盖）与 `mirror_to_staging`（写回镜像）都从 `_SHARED_TO_ORDER` 派生，
+    加一列自动跟上；而 `import_staging` 里是一句一句手写的 `Order(...)`。
+    漏一列的表现最安静：暂存页上明明有值，导入之后账本那一格是空的，
+    而**没有任何一处会报错**——`express_company` 这一列就是这么长期缺席的
+    （它当时连暂存表都没有，所以连「漏了」都看不出来）。
+    """
+    n = next(_seq)
+    probe = _probe(n)
+    body = {"order_no": f"IMPORT-COVER-{n}", "order_date": "2026-06-02",
+            "items": [{"name": "a", "quantity": 1, "unit_price_cny": "5"}]}
+    # 探针值按**暂存侧**字段名下发；order_date/date 这一对名字不同，单独映射。
+    body[staging_field] = probe[order_field] if staging_field != "order_date" else "2026-09-09"
+    if staging_field == "order_no":
+        body["order_no"] = probe["order_no"]
+    r = client.post("/api/staging", json=body)
+    assert r.status_code == 200, r.text
+    sid = r.json()["id"]
+    assert client.post(f"/api/staging/{sid}/import").status_code == 200
+
+    row = next(x for x in client.get("/api/staging", params={"limit": 500}).json()["items"]
+               if x["id"] == sid)
+    order = client.get(f"/api/orders/{row['imported_order_id']}").json()
+    assert _same(order[order_field], body[staging_field]), \
+        f"导入时丢了 {staging_field} → {order_field}：账本是 {order[order_field]!r}"
+
+
+# 账本有、暂存**刻意**没有的列。每一条都要写清为什么，加新列时这张表会逼人做一次决定。
+_LEDGER_ONLY = {
+    # 账本记账机制，暂存行不参与记账
+    "date": "暂存用 order_date（下单日期），导入时才落成账本的记账日 date",
+    "jpy_auto": "派生日元，暂存不算钱",
+    "jpy_override": "人工覆盖金额，是账本侧的动作",
+    "jpy_settled": "同上",
+    "override_note": "同上",
+    "note": "备注是导入后才写的",
+    "created_at": "暂存用 scraped_at",
+    "created_via": "暂存行天然就是「抓来的」，这一列在账本侧才有区分意义",
+    "payer_id": "谁付的钱，导入后才定",
+    "is_delete": "暂存用 import_status=已忽略 表达「不要了」，不做软删",
+    # 关联
+    "shipment_order_id": "集运挂靠是账本侧的事，暂存行不挂集运单",
+    # ⬇️ 这两条**不是**刻意的，是还没做的：账本上是用户可填的业务列，
+    #    暂存侧没有对应列，所以插件即便哪天能抓到也没地方放。加它们要各一条迁移。
+    "category": "【待定】账本可填的分类，暂存无对应列；今天没有生产者",
+    "url": "【待定】商品链接，暂存无对应列；今天没有生产者",
+}
+
+
+def test_ledger_only_columns_are_all_accounted_for():
+    """账本比暂存多出来的每一列，都必须在 `_LEDGER_ONLY` 里写明理由。
+
+    这两张表**不是**两份相同的表（暂存有导入工作流列、账本有记账与集运列），
+    但「哪些列刻意不对齐」必须是写下来的决定，而不是没人注意到的差集。
+    `express_company` 就是这么缺了很久的：插件从同一个响应里解析出快递公司，
+    而暂存表没有这一列 ⇒ 跨表那一步静默丢掉，链路上一个字节的报错都没有。
+
+    加了新列忘了想这件事 → 这里先红，那正是要一次决定的时刻。
+    """
+    ledger = {c.name for c in Order.__table__.columns} - {"id"}
+    staging = {c.name for c in OrderStaging.__table__.columns}
+    unexplained = ledger - staging - set(_LEDGER_ONLY)
+    assert not unexplained, (
+        f"账本新增了列但暂存没有、也没说明为什么：{sorted(unexplained)}。"
+        "要么给暂存也加上（并进 _SHARED_TO_ORDER），要么在 _LEDGER_ONLY 里写清理由。")
+    stale = set(_LEDGER_ONLY) - ledger
+    assert not stale, f"_LEDGER_ONLY 里列着账本已经没有的列：{sorted(stale)}"
+    # 两边**同名**的业务列必须进共享清单，否则导入/镜像会各走各的。
+    # 用「⊆」而不是「==」：共享清单里还有一对名字不同的（暂存 order_date → 账本 date），
+    # 它当然不会出现在同名交集里。
+    both = ledger & staging
+    workflow = {"version", "updated_at", "price_cny"}   # 乐观锁/时间戳/派生价各自维护
+    assert (both - workflow) <= set(_SHARED_TO_ORDER), (
+        "两张表都有、却没进共享清单的业务列："
+        f"{sorted(both - workflow - set(_SHARED_TO_ORDER))}")
+    # 反向：共享清单里的每个键都得真是暂存表的列、值都得真是账本的列
+    assert set(_SHARED_TO_ORDER) <= staging, \
+        f"共享清单里有暂存表没有的列：{sorted(set(_SHARED_TO_ORDER) - staging)}"
+    assert set(_SHARED_TO_ORDER.values()) <= ledger | {"date"}, \
+        f"共享清单里有账本没有的列：{sorted(set(_SHARED_TO_ORDER.values()) - ledger)}"

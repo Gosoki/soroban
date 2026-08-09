@@ -38,6 +38,10 @@ class OrderStaging(SQLModel, table=True):
     fx_rate: Optional[Decimal] = Field(default=None, max_digits=10, decimal_places=4)  # 新建/抓取时记当天汇率，导入一同迁移
     order_date: Optional[dt.date] = None
     express_no: Optional[str] = Field(default=None, max_length=64)
+    # 与账本 `Order.express_company` 对齐。快递单号与快递公司是同一件事的两半，
+    # 账本两列都有；暂存少这一列时，插件从同一个响应里解析出来的公司名
+    # 在跨表那一步被静默丢掉——不是被拒绝，是根本没有地方放。
+    express_company: Optional[str] = Field(default=None, max_length=64)
     raw_json: Optional[str] = Field(default=None, sa_column=Column(Text))  # 原始留底
     # 一行上有两个「状态」，务必分清：import_status = 导入工作流（待处理/已导入/已忽略），
     # purchase_status = 淘宝那边的真实交易状态。旧名 status / order_status 看不出区别。
