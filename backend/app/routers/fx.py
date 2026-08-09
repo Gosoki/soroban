@@ -124,7 +124,9 @@ def history(days: int = Query(60, ge=1, le=730), session: Session = Depends(get_
     如果这里另算一遍，页面上显示的和账本里真正用的就会是两个数，
     而那种不一致要等到对账才发现。
     """
-    since = dt.datetime.now(JST).date() - dt.timedelta(days=days)
+    # `days - 1`：区间是**闭**的（`date >= since` 且今天也算一天）。
+    # 写 `- days` 会返回 days+1 天——「近 7 天」给出 8 天，看板按它算日均就偏低。
+    since = dt.datetime.now(JST).date() - dt.timedelta(days=days - 1)
     # 同时按 fetched_at 倒序：`pick_from` 要求「新的在前」，靠这条 ORDER BY 保证，
     # 分完组后各天的列表天然就是有序的，不用再排一次。
     rows = session.exec(

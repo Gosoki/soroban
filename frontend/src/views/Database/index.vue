@@ -237,7 +237,7 @@ async function onSourceChanged(target, name, detail) {
       // 递归重试会在爬虫逐单回灌时变成关不掉的弹窗循环。
       longToast(ElMessage, 'warning',
         (e.response?.data?.detail || '迁移与切换之间源库又有改动')
-        + '——**未切换**，当前仍连着原来的库。请等抓取/刷新结束后再试一次。')
+        + '——已取消切换，当前仍连着原来的库。请等抓取/刷新结束后再试一次。')
     }
     // 其余错误拦截器已提示
     await loadStatus()                       // 无论成败都把真实状态拉回来，别让界面停在猜测里

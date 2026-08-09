@@ -423,3 +423,56 @@ def test_item_editor_never_silently_drops_a_nameless_row():
         "saveItems 又在按名字过滤了——那是静默丢数据"
     assert "blank" in body and "warning" in body, \
         "saveItems 必须挡下空名行并提示，而不是替用户删掉"
+
+
+@pytest.mark.parametrize("page,loader", [
+    ("Dashboard", "dashboardApi.get"),
+    ("Items", "itemsApi.list"),
+])
+def test_list_pages_do_not_render_failure_as_emptiness(page, loader):
+    """请求失败**不能**渲染成「空」。
+
+    这两页原先只有 `try/finally`：接口挂了，Dashboard 保持初值全 0（「总支出 ¥0、
+    暂无数据」），Items 保持空数组（「没有符合条件的记录 / 共 0 条」）。
+    而拦截器那句 toast 3 秒后就消失——此后这一屏与「真的还没记过账」完全无法区分。
+    对一个记账工具，「你的账全没了」是最不该让人误会的一句话。
+
+    判据：加载函数必须有 catch 分支，并把失败状态留在页面上（而不是只依赖 toast）。
+    """
+    src = (_REPO / "frontend" / "src" / "views" / page / "index.vue").read_text(encoding="utf-8")
+    assert loader in src, f"{page} 的加载调用变了，这条测试要跟着更新"
+    assert "loadFailed" in src, f"{page} 没有把加载失败的状态留在页面上"
+    # 失败状态必须真的被模板用到，而不是定义了没用
+    tpl = src[:src.index("<script")]
+    assert "loadFailed" in tpl, f"{page} 定义了 loadFailed 却没在模板里用——等于没修"
+
+
+def test_user_facing_copy_has_no_bare_markdown():
+    """用户可见的文案里不写 markdown 强调符。
+
+    Element Plus 的 message/alert 都**不解析** markdown，`**不是**` 会原样显示成
+    带星号的字面量——在一句本来就紧张的提示里（「你的账本没了」「未切换」）
+    多出两对星号，读起来像是界面坏了。
+
+    口径：模板里要强调就用真的 `<b>`；纯字符串（ElMessage 的 message 参数）里
+    靠措辞和「」，因为那里连 HTML 都不解析。
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    # **只查字符串字面量**。第一版按行跳过注释，结果误报一片：行尾注释、多行注释的
+    # 中间行都被当成代码。而真正会显示给用户的文案（ElMessage 的 message、
+    # tooltip 的 content、`{{ col.help }}`）全都是字符串字面量——查那里既准又够。
+    # 代价：模板里的裸文本（不在引号内）查不到；那种星号会直接显示在页面上，
+    # 肉眼 review 时反而最容易发现。
+    lit = re.compile(r"'([^'\n]*)'|\"([^\"\n]*)\"|`([^`]*)`", re.S)
+    bad = []
+    for f in sorted(root.rglob("*.vue")) + sorted(root.rglob("*.js")):
+        text = f.read_text(encoding="utf-8")
+        for m in lit.finditer(text):
+            val = next((g for g in m.groups() if g), "")
+            if re.search(r"\*\*[^*]+\*\*", val):
+                line_no = text[:m.start()].count("\n") + 1
+                bad.append(f"{f.relative_to(root)}:{line_no}: {val.strip()[:70]}")
+    assert not bad, "用户可见文案里有裸 markdown（Element 不解析，会显示成字面星号）：\n" + "\n".join(bad)

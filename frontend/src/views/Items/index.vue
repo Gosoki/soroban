@@ -6,6 +6,7 @@
 
     <el-card>
       <NotionTable :columns="columns" :rows="rows" :loading="loading" :actions-width="60"
+                   :empty-text="loadFailed ? '加载失败——请检查网络或后端，然后重试' : '没有符合条件的记录'"
                    table-name="items" hide-id :addable="false" :deletable="false" @reload="load">
         <template #toolbar>
           <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="reload" />
@@ -130,6 +131,7 @@ async function loadAcctColors() {
 
 // 请求序号：筛选/翻页可以在上一次响应回来前再发一次，慢的那次后到会把新数据整个覆盖掉
 // （表现为「清了筛选却只剩一部分」「内容是第2页、页码高亮第3页」）。只认最后一次发出的请求。
+const loadFailed = ref(false)   // 上一次加载是否失败：空态文案据此说实话
 let loadSeq = 0
 async function load() {
   const my = ++loadSeq
@@ -145,6 +147,12 @@ async function load() {
     if (my !== loadSeq) return          // 已有更新的请求发出，丢弃这次的结果
     rows.value = res.items
     total.value = res.total
+    loadFailed.value = false
+  } catch (_) {
+    // **失败不能长得像空**。原先这里只有 try/finally：请求挂了 rows 保持空数组，
+    // 页面渲染成「没有符合条件的记录 / 共 0 条」——而拦截器那句 toast 3 秒后就没了，
+    // 此后这一屏与「真的一件物品都没有」完全无法区分，用户会以为数据没了。
+    if (my === loadSeq) loadFailed.value = true
   } finally {
     if (my === loadSeq) loading.value = false
   }

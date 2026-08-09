@@ -1,5 +1,14 @@
 <template>
   <div>
+    <!-- **失败不能长得像「这个账本是空的」**。原先 load() 只有 try/finally：
+         接口挂了 data 保持初值全 0，整屏渲染成「总支出 ¥0、0 单、暂无数据」，
+         而拦截器那句 toast 3 秒后就没了——此后与「真的还没记过账」完全无法区分。
+         对一个记账工具，「你的账全没了」是最不该让人误会的一句话。 -->
+    <el-alert v-if="loadFailed" type="error" show-icon :closable="false" class="load-failed">
+      <template #title>看板数据加载失败</template>
+      下面显示的<b>不是</b>你的账本，只是初值。请检查网络或后端后重试。
+      <el-button link type="primary" @click="load">重试</el-button>
+    </el-alert>
     <el-row :gutter="16" v-loading="loading">
       <el-col :xs="12" :sm="12" :md="6" v-for="c in cards" :key="c.label">
         <div class="stat" :style="{ borderTopColor: c.color }">
@@ -81,10 +90,15 @@ const cards = computed(() => [
   { label: '杂项', value: data.misc_jpy, color: 'var(--danger)', sub: `${data.misc_count} 项` },
 ])
 
+const loadFailed = ref(false)   // 上一次加载是否失败：整屏据此说实话，见模板顶部
+
 async function load() {
   loading.value = true
   try {
     Object.assign(data, await dashboardApi.get())
+    loadFailed.value = false
+  } catch (_) {
+    loadFailed.value = true     // 拦截器已弹过 toast；这里负责让**页面本身**留下痕迹
   } finally {
     loading.value = false
   }
@@ -106,6 +120,7 @@ onMounted(load)
 .dot.tb { background: var(--ok); }
 .dot.sp { background: var(--warn); }
 .dot.mc { background: var(--danger); }
+.load-failed { margin-bottom: 12px; }
 .m-empty { color: var(--txt-3); text-align: center; padding: 24px; font-size: 13px; }
 
 .mrow {

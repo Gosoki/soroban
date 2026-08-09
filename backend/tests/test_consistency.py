@@ -430,3 +430,76 @@ def test_router_has_a_catch_all_so_bad_urls_are_not_a_blank_page():
     """
     src = (_REPO / "frontend" / "src" / "router" / "index.js").read_text(encoding="utf-8")
     assert "pathMatch" in src, "router 没有兜底路由，写错的地址会渲染成整页空白"
+
+
+def test_sidebar_order_covers_every_page():
+    """侧栏菜单的 `ORDER` 数组必须覆盖**全部**页面路由。
+
+    菜单本身是从路由表生成的（加页面只要写路由，菜单会自己长出来），但**顺序**
+    仍靠这个手写数组；没列进去的自动排到最后（`ia < 0 ? 999`）。
+    于是「加了新页面、忘了加进 ORDER」的表现是它悄悄躺在「设置」后面——
+    `/fx`（日元汇率）就这么待过一阵子，而这种错位没有任何报错。
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    layout = (root / "components" / "Layout.vue").read_text(encoding="utf-8")
+    m = re.search(r"const ORDER = \[(.*?)\]", layout, re.S)
+    assert m, "Layout.vue 里找不到 ORDER 数组"
+    ordered = set(re.findall(r"'(/[a-z-]+)'", m.group(1)))
+
+    router = (root / "router" / "index.js").read_text(encoding="utf-8")
+    # 带 meta.title 的子路由就是会出现在菜单里的页面。
+    # **逐行匹配**，不要写「花括号内无嵌套」的正则：路由是单行写的且内含 `meta: { ... }`，
+    # 那种正则一个都匹配不到 —— 于是 `missing` 恒为空集，这条测试变成装饰品。
+    # （第一版就是这么写的，删掉 `/fx` 之后它照样绿。）
+    pages = set()
+    for line in router.splitlines():
+        m = re.search(r"path:\s*'([a-z-]+)'", line)
+        if m and "title:" in line:
+            pages.add("/" + m.group(1))
+    assert len(pages) >= 8, f"路由解析失败（只认出 {sorted(pages)}）——空集合上的断言永远成立"
+    missing = pages - ordered
+    assert not missing, (
+        f"这些页面没列进侧栏 ORDER，会被排到最后：{sorted(missing)}。"
+        f"加页面时请一并决定它在菜单里的位置。"
+    )
+
+
+def test_fx_history_window_is_inclusive():
+    """「近 N 天」就该是 N 天，不是 N+1 天。
+
+    区间是闭的（`date >= since` 且今天也算），所以 `since` 必须是 `today - (N-1)`。
+    写成 `today - N` 会多返回一天——看板按它算日均就偏低，而这种偏差没人会察觉。
+    """
+    import datetime as dt
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "app" / "routers" / "fx.py").read_text(
+        encoding="utf-8")
+    assert re.search(r"dt\.timedelta\(days=days - 1\)", src), \
+        "fx.py 的历史窗口又变回 `days`（会多返回一天）"
+
+
+def test_fx_history_returns_exactly_n_days(client, session):
+    """行为侧：造 10 天的汇率，问「近 7 天」必须正好回 7 天。"""
+    import datetime as dt
+    from decimal import Decimal
+
+    from sqlmodel import delete
+
+    from app.models import FxRate
+    from app.services.fx import JST
+
+    session.exec(delete(FxRate))
+    session.commit()
+    today = dt.datetime.now(JST).date()
+    for i in range(10):
+        session.add(FxRate(date=today - dt.timedelta(days=i),
+                           rate=Decimal("20.0000"), source="boc"))
+    session.commit()
+
+    got = client.get("/api/fx/history", params={"days": 7}).json()
+    assert len(got["items"]) == 7, f"「近 7 天」返回了 {len(got['items'])} 天"

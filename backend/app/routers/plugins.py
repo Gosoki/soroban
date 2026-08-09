@@ -483,6 +483,16 @@ def _summarize(line: str, returncode: int, errtail: str = "") -> str:
 
 _MAX_CAPTURE = 256 * 1024        # 每路输出最多留末尾 256KB
 
+# 在飞的插件子进程：pid → (Popen, 标签)。进程关停时要连它们一起收掉。
+#
+# 为什么必须有：`_launch` 用 `start_new_session=True` 起进程（新会话，见 _kill_tree），
+# 而收割线程是 daemon —— 主进程一退出，收割线程立刻消失，子进程却还活着，
+# 变成 PPID=1 的孤儿，且**再没有任何人执行那个 30 分钟超时**。
+# 对浏览器类插件这意味着一个 chromium 永久留在后台：用户「关掉了 soroban」，
+# 内存里却还躺着几百 MB，而任务管理器里那个进程与 soroban 已经毫无关联，没人猜得到。
+_ALIVE_PROCS: dict[int, tuple] = {}
+_PROCS_LOCK = threading.Lock()
+
 
 def _drain(stream, sink: list) -> None:
     """把一路输出读到 EOF，内存里**只留末尾 _MAX_CAPTURE 字节**。
@@ -609,6 +619,8 @@ def _reap(proc: subprocess.Popen, label: str, jti: Optional[str] = None, on_done
                         line or "(无 stdout)",
                         ("｜stderr: " + errtail[-300:]) if errtail else "")
     finally:
+        with _PROCS_LOCK:
+            _ALIVE_PROCS.pop(proc.pid, None)
         scopes.revoke(jti)          # 任务结束 → 令牌立即失效
         if on_done:
             on_done(ok, result or "已完成")
@@ -674,6 +686,8 @@ def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str]
     label = f"{manifest.get('id', '?')}/{command}" + (f" [{acct}]" if acct else "")
     # jti 传给收割线程：进程一结束就把令牌作废。否则插件跑完之后那枚令牌还能用二十几分钟，
     # 而它此刻已经落在插件的日志/环境里了。
+    with _PROCS_LOCK:
+        _ALIVE_PROCS[proc.pid] = (proc, label)
     threading.Thread(target=_reap, args=(proc, label, jti, on_done), daemon=True).start()
     return proc.pid
 
@@ -1470,3 +1484,38 @@ async def scheduler_loop(interval: int = 60) -> None:
         except Exception as e:                          # 单轮异常不结束循环
             log.warning("插件定时循环异常：%s", e)
         await asyncio.sleep(interval)
+
+
+def shutdown_plugins(grace: float = 3.0) -> int:
+    """进程关停时收掉所有在飞的插件子进程。返回终止了几个。
+
+    放在 lifespan 的 finally 里。不做这件事的话，子进程会变成 PPID=1 的孤儿：
+    收割线程是 daemon（随主进程消失），于是那个 30 分钟超时**再没有人执行**，
+    浏览器类插件的 chromium 会一直留在后台——用户以为关掉了 soroban，
+    而任务管理器里那个进程与 soroban 已经毫无关联，没人猜得到该去杀谁。
+
+    先 SIGTERM 给一点体面退出的时间（插件可能正在写 .state 会话文件），
+    过了 grace 再走 `_kill_tree`（连孙进程一起，见其中的三重保险）。
+    """
+    with _PROCS_LOCK:
+        alive = list(_ALIVE_PROCS.values())
+        _ALIVE_PROCS.clear()
+    if not alive:
+        return 0
+    log.info("关停：正在收掉 %d 个在飞的插件子进程", len(alive))
+    for proc, label in alive:
+        try:
+            proc.terminate()                    # SIGTERM：给它自己收尾的机会
+        except Exception:                       # noqa: BLE001  可能刚好自己退了
+            pass
+    deadline = time.monotonic() + grace
+    for proc, label in alive:
+        try:
+            proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except Exception:                       # noqa: BLE001  超时/已回收
+            pass
+    for proc, label in alive:
+        if proc.poll() is None:
+            log.warning("插件 %s 未在 %.1fs 内退出，强制终止其进程组", label, grace)
+            _kill_tree(proc, label)
+    return len(alive)

@@ -536,3 +536,67 @@ def test_token_scopes_and_issue_agree_on_baseline():
     scp = set(jwt.decode(tok, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])["scp"])
     assert set(scopes._BASELINE) <= effective, "token_scopes 漏了 baseline → 按钮会永久变灰"
     assert set(scopes._BASELINE) <= scp, "issue 漏了 baseline"
+
+
+# --- 关停时收掉在飞的子进程 ---------------------------------------------------
+
+def test_shutdown_reaps_inflight_plugin_processes():
+    """进程关停必须收掉在飞的插件子进程，否则它们变成 PPID=1 的孤儿。
+
+    `_launch` 用 `start_new_session=True` 起进程（新会话），而收割线程是 daemon
+    ——主进程一退出收割线程立刻消失，子进程却还活着，且**再没有任何人执行那个
+    30 分钟超时**。对浏览器类插件这意味着一个 chromium 永久留在后台：
+    用户「关掉了 soroban」，内存里还躺着几百 MB，而任务管理器里那个进程
+    与 soroban 已经毫无关联，没人猜得到该去杀谁。
+    """
+    import subprocess
+    import sys
+    import time
+
+    from app.routers import plugins as mod
+
+    # 起一个真的、会赖着不走的子进程（睡 300 秒），走与 _launch 相同的创建参数
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        text=True,
+    )
+    try:
+        with mod._PROCS_LOCK:
+            mod._ALIVE_PROCS[proc.pid] = (proc, "test/sleeper")
+        assert proc.poll() is None, "子进程没起来，这条测试什么都没验"
+
+        n = mod.shutdown_plugins(grace=2.0)
+        assert n == 1, f"shutdown_plugins 说收了 {n} 个"
+
+        deadline = time.monotonic() + 5
+        while proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert proc.poll() is not None, "关停之后子进程还活着——它会变成孤儿"
+        with mod._PROCS_LOCK:
+            assert proc.pid not in mod._ALIVE_PROCS, "注册表没清干净"
+    finally:
+        if proc.poll() is None:                 # 兜底：只动我自己起的这一个 pid
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_shutdown_is_a_noop_when_nothing_is_running():
+    """没有在飞进程时不该做任何事（也不该抛）。"""
+    from app.routers import plugins as mod
+
+    with mod._PROCS_LOCK:
+        mod._ALIVE_PROCS.clear()
+    assert mod.shutdown_plugins() == 0
+
+
+def test_lifespan_reaps_before_disposing_the_pool():
+    """顺序：先收子进程、再关连接池。
+
+    插件可能正在通过 HTTP 回灌，而回灌走的是同一个连接池——顺序反了的话
+    那些请求会撞上一个已经 dispose 的池，日志里刷一片无意义的异常。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "app" / "main.py").read_text(encoding="utf-8")
+    assert src.index("shutdown_plugins()") < src.index("checkpoint_and_dispose()")

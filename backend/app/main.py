@@ -21,7 +21,7 @@ from .routers import (
     ingest, items, layout, meta, misc, orders, plugins,
     settings as settings_router, shipment, staging, tags,
 )
-from .routers.plugins import scheduler_loop
+from .routers.plugins import scheduler_loop, shutdown_plugins
 from .services.ingest import load_kinds
 
 # 通用写入通道的 handler 在**模块级**注册：重复注册 / 未知权限 → 导入即炸，
@@ -75,6 +75,9 @@ async def lifespan(app: FastAPI):
     finally:
         for t in tasks:
             t.cancel()
+        # **先收子进程再关库**：插件可能正在通过 HTTP 回灌，而回灌走的是同一个连接池。
+        # 顺序反了的话，那些请求会撞上一个已经 dispose 的池，日志里刷一片无意义的异常。
+        shutdown_plugins()              # 不做这件事，浏览器会变成 PPID=1 的孤儿永久留着
         checkpoint_and_dispose()        # 合并并截断 WAL、关连接池 → 回收 -wal/-shm
 
 

@@ -95,8 +95,11 @@ const route = useRoute()
 // 而路由 meta 里本来就写着 title/icon，抄第二遍纯属自找漏。
 // 顺序按 ORDER 排（业务上的先后≠路由声明顺序）；没列进 ORDER 的新页面自动排在最后，
 // 也就是说以后加页面只要写路由，菜单自己会长出来。
+// 顺序：账目页 → 支撑数据 → 工具页。**漏一个就排到最后**（下面的 999 兜底），
+// `/fx` 就这么在「设置」后面待过一阵子——菜单是从路由表生成的，加页面时很容易
+// 只记得写路由。`tests/test_consistency.py` 有一条守卫钉住「ORDER 必须覆盖全部页面」。
 const ORDER = ['/dashboard', '/orders', '/items', '/shipment', '/misc',
-               '/staging', '/plugins', '/database', '/settings']
+               '/staging', '/fx', '/plugins', '/database', '/settings']
 const nav = router.getRoutes()
   .filter((r) => r.meta?.title && r.path.startsWith('/') && r.path !== '/login')
   .map((r) => ({ path: r.path, title: r.meta.title, icon: r.meta.icon || 'Document' }))
