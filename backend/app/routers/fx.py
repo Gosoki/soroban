@@ -95,9 +95,25 @@ def _read(session: Session, row) -> FxRead:
     )
 
 
+def _current_row(session: Session):
+    """「当前汇率」= **现在建一张今天的单会用的那一条**。
+
+    不能用 `latest_stored()`：它取的是全库最新（按 date desc, fetched_at desc），
+    而建单走的是 `pick_on()`（当天**手填优先**，其次当天最后一条）。
+    两者在一个很常见的场景下会分叉：用户今天手填了一条，之后汇率插件又抓了一条
+    ——`latest_stored` 给插件那条，建单用手填那条。于是侧栏、看板、设置页显示的数字
+    和账本里真正用的不是同一个，而用户手填的**本意**恰恰是「用我这个值」。
+    显示层无视手填，是这套「手填优先」规则里唯一说话不算数的地方。
+
+    当天一条都没有（凌晨还没抓、或很久没跑）→ 回退全库最新，与 `rate_for_date`
+    在「那天没记录」时的兜底口径一致。
+    """
+    return pick_on(session, dt.datetime.now(JST).date()) or latest_stored(session)
+
+
 @router.get("", response_model=FxRead, openapi_extra={"x-scope": "fx:read"})
 def get_fx(session: Session = Depends(get_session)):
-    return _read(session, latest_stored(session))
+    return _read(session, _current_row(session))
 
 
 @router.get("/history", openapi_extra={"x-scope": "fx:read"})

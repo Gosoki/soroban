@@ -266,7 +266,9 @@ onMounted(loadStatus)
 .title { margin: 0 0 16px; font-size: 20px; }
 .card { margin-bottom: 16px; }
 .card-hd { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-weight: 600; margin-bottom: 10px; }
-.degraded { margin: 8px 0; }
+/* 与插件页的 .needs 同一档间距：三处 el-alert 都是「要人处理的异常态」，
+   同一种组件不该有两种排版。 */
+.degraded { margin-bottom: 12px; }
 .hint { color: var(--txt-3); font-size: 12px; }
 .dash { color: var(--txt-2); }
 .row-ic { margin-right: 4px; vertical-align: -2px; }

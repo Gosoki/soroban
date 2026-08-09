@@ -107,9 +107,20 @@ function isTitleItem(it) { return !!it.name && (it.name || '').trim() === (props
 function ensureItems() { if (!props.order.items) props.order.items = []; return props.order.items }
 
 async function saveItems() {
-  const items = (props.order.items || []).filter((it) => it.name && it.name.trim())
-    .map((it) => ({ name: it.name.trim(), quantity: Number(it.quantity) || 1,
-                    unit_price_cny: itemPrice(it.unit_price_cny), auto: !!it.auto }))
+  const all = props.order.items || []
+  // **绝不静默丢弃没名字的行**。原先这里是 `.filter(有名字)`，于是「清空名字准备重打」
+  // 期间的任何一次保存（改数量、改单价、改另一条物品）都会把那条连同它的钱一起删掉，
+  // 订单金额随之缩水——无确认、无撤销、无提示。
+  // `onItemEdit` 里那道守卫只挡住了「改这一条本身」，挡不住「改别的东西时顺带整体保存」。
+  // 守卫必须放在**所有入口的必经之路**上，也就是这里。
+  // 真正的删除只走 removeItem（有二次确认）。
+  const blank = all.filter((it) => !it.name || !it.name.trim())
+  if (blank.length) {
+    ElMessage.warning(`有 ${blank.length} 条物品还没填名字——先填上，或点右侧 🗑 删掉`)
+    return false
+  }
+  const items = all.map((it) => ({ name: it.name.trim(), quantity: Number(it.quantity) || 1,
+                                   unit_price_cny: itemPrice(it.unit_price_cny), auto: !!it.auto }))
   try {
     // 整个「读 version→PATCH→回写」入队串行，避免与同订单的其它保存并发撞 version 互相 409
     await queueOrderWrite(props.order.id, async () => {

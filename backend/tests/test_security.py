@@ -65,10 +65,28 @@ def test_run_py_generated_secrets_differ(tmp_path):
     assert (a / ".env").read_text() != (b / ".env").read_text()
 
 
-def test_run_py_defaults_to_loopback():
-    """默认监听必须是 127.0.0.1；要暴露到局域网得显式设 HOST。"""
+def test_run_py_defaults_to_loopback(tmp_path, monkeypatch):
+    """默认监听必须是 127.0.0.1；要暴露到局域网得**显式**设 HOST。
+
+    这条钉的是**行为**，不是某一行代码长什么样。原先它用正则匹配
+    `os.environ.get("HOST", ...)`，于是「HOST 改成也能从 .env 读」这个纯增强
+    让它当场变红——而安全属性一点没变。钉实现的测试会把正确的改动也拦下来，
+    久了就会被人一改了之，反而丢掉真正的保护。
+    """
+    import sys
+
+    sys.path.insert(0, str(_RUN_PY.parent))
+    import run
+
+    monkeypatch.delenv("HOST", raising=False)
+    # 什么都没配 → 环回
+    assert run._runtime_setting(tmp_path, "HOST", "127.0.0.1") == "127.0.0.1"
+    # .env 里没写 HOST → 仍然环回
+    (tmp_path / ".env").write_text("SECRET_KEY=x\n", encoding="utf-8")
+    assert run._runtime_setting(tmp_path, "HOST", "127.0.0.1") == "127.0.0.1"
+    # 调用点传的默认值本身也必须是环回（防止有人把默认改成 0.0.0.0）
     src = _RUN_PY.read_text(encoding="utf-8")
-    m = re.search(r'os\.environ\.get\("HOST",\s*"([^"]+)"\)', src)
+    m = re.search(r'_runtime_setting\(rt,\s*"HOST",\s*"([^"]+)"\)', src)
     assert m and m.group(1) == "127.0.0.1", "run.py 的 HOST 默认值必须是 127.0.0.1"
 
 

@@ -817,3 +817,45 @@ def test_forgetting_a_plugin_also_wipes_its_private_storage(client, tmp_path, mo
     with Session(get_engine()) as s:
         left = s.exec(select(PluginRecord).where(PluginRecord.plugin_id == "ghostp")).all()
     assert left == [], f"私有存储没删干净，同 id 的新插件会静默继承：{left}"
+
+
+def test_token_from_the_real_run_path_can_open_the_doors_the_plugin_needs(
+        client, fake_plugin, monkeypatch):
+    """**端到端**：走 `run_command` 真实签发的那枚令牌，去敲插件真正要敲的门。
+
+    为什么必须这么测：`tests/test_plugin_paths.py::_plugin_client` 把最终 scope 集合
+    **当参数直接传给** `scopes.issue()`，于是它绕过了链路中段的推导——
+        run_command → token_scopes(清单 ∩ 授权) → & cmd.needs → issue()
+    而「令牌按 needs 收窄」这个回归恰恰发生在推导里：所有守卫照旧全绿，
+    真实插件却连 `/api/plugins/contract`（自我投影的地基）都进不去。
+
+    这条测试守的是「用户在界面上做完全套操作之后，插件**实际**能干什么」。
+    """
+    from app.routers import plugins as mod
+
+    captured = {}
+
+    def fake_launch(manifest, command, extra, token=None, config=None, jti=None, on_done=None):
+        captured["token"] = token
+        return 4242
+
+    monkeypatch.setattr(mod, "_launch", fake_launch)
+
+    client.put("/api/plugins/demo/grants", json={"granted": ["fx:write"]})
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
+    assert client.post("/api/plugins/demo/run/run").status_code == 200
+    tok = captured.get("token")
+    assert tok, "run_command 没把令牌交给 _launch"
+
+    h = {"Authorization": f"Bearer {tok}"}
+    # 1) 自我投影的地基：任何插件都必须进得去（baseline）
+    assert client.get("/api/plugins/contract", headers=h).status_code == 200, \
+        "真实签发的令牌读不到 ingest 契约——插件自我投影这个设计跑不起来"
+    # 2) 状态机规则：淘宝插件靠它同步已导入订单的状态
+    assert client.get("/api/meta/status-rules", headers=h).status_code == 200
+    # 3) 声明过、也授权了的那扇门开着
+    assert client.post("/api/plugins/ingest", headers=h, json={
+        "kind": "fx.rate", "items": [{"rate": "21.25", "source": "boc"}]}).status_code == 200
+    # 4) 没声明的门仍然关着——收窄本身不能被 baseline 顺手放开
+    assert client.get("/api/fx", headers=h).status_code == 403, \
+        "命令没声明 fx:read，令牌却能读汇率"

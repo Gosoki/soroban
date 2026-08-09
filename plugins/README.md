@@ -14,6 +14,22 @@ soroban 扫本目录下的 `soroban-plugin-*`（各含 `plugin.toml`）作为插
 | `soroban-plugin-taobao` | 抓淘宝/闲鱼订单 → 暂存表 | 要（Playwright + Chromium，约 400MB） |
 | `soroban-plugin-fx` | 取汇率 → 账本 | **不用装**（只依赖 httpx，跑 soroban 自己的解释器） |
 
+## ⚠️ 把插件发给别人之前
+
+插件目录里有**你自己的凭据**，`.gitignore` 管不着分发（分发是文件拷贝，与 git 无关）：
+
+| 要删掉 | 是什么 |
+|---|---|
+| `.state/*.json` | 你的**浏览器登录会话**（淘宝 cookie）。拿到它的人就是你 |
+| `.env` | 你的 soroban 账号密码 / API key |
+| `*.log` | 抓取日志，含订单号、账号昵称 |
+| `.venv/` | 机器相关，拷过去也跑不了，纯占几百 MB |
+
+`pyinstaller.bat` 打包时会检测这些实物并醒目提示，但**它不会替你删**
+——删错了没法撤销，这一步必须是你自己按的。
+
+---
+
 ## 什么该做成插件，什么该留在核心
 
 **判据先于形态。** 这套机制只有一种形态——「fire-and-forget 子进程 + 一次性令牌 +

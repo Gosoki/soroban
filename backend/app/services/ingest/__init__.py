@@ -14,7 +14,8 @@ per-route scope 已经能精确约束它）。通道存在是为了新种类不�
    这条不成立会**静默写入已被拒绝的数据**：handler 内部一 commit 就击穿外层 savepoint，
    `Outcome("rejected")` 照常回给插件，而那一行其实已经落库——回执与事实相反，最难查。
    （`fx` 早年那个自己 commit 的写入函数正是这个形状，已拆成 `store()` + 显式提交，
-   要连提交一起的走 `store_and_commit()`——名字里就写着它会提交。）
+   handler 一律不 commit：外层给每一项包了 savepoint，被击穿就会「回执说 rejected、
+   数据却已落库」。）
 2. **handler 必须落在与人手 API 同一套模型方法上**（`fx.store` / `sync_from_items` /
    `compute_money` / `_q_fx`），不另写一份 SQL。两份写入逻辑必然漂移，
    而漂移的表现是「同一笔钱经不同入口算出两个数」。

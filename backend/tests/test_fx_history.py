@@ -184,3 +184,99 @@ def test_both_branches_of_read_return_the_same_fields(client, session):
     _add(session, dt.date.today(), "23.5")
     filled = set(client.get("/api/fx").json())
     assert empty == filled, f"两条分支字段不一致，无行时少了：{sorted(filled - empty)}"
+
+
+def test_pick_from_does_not_depend_on_the_callers_ordering(session):
+    """`pick_from` 自己排序——**乱序传进去也要挑对**。
+
+    原先的契约是「要求 rows 已按 fetched_at 倒序」，而契约两端在不同文件
+    （`rows_on` 与 `routers/fx.py` 的按天汇总各自写 ORDER BY）。
+    谁哪天改了那句 ORDER BY，建单就会安静地用上当天**第一条**汇率而不是最后一条，
+    而所有 `pick_from` 的单元测试仍然全绿——因为它们自己传的是有序的 rows。
+    这是金额相关的隐患，所以不变量必须由函数自己保证。
+    """
+    import datetime as dt
+    from decimal import Decimal
+
+    from app.models import FxRate
+    from app.services.fx import pick_from
+
+    d = dt.date(2026, 5, 1)
+    base = dt.datetime(2026, 5, 1, 0, 0, tzinfo=dt.timezone.utc)
+    rows = [
+        FxRate(id=1, date=d, rate=Decimal("20.00"), source="boc", fetched_at=base),
+        FxRate(id=3, date=d, rate=Decimal("22.00"), source="boc",
+               fetched_at=base + dt.timedelta(hours=6)),          # 当天最后一条
+        FxRate(id=2, date=d, rate=Decimal("21.00"), source="boc",
+               fetched_at=base + dt.timedelta(hours=3)),
+    ]
+    assert pick_from(rows).rate == Decimal("22.00")               # 乱序也挑最后一条
+    assert pick_from(list(reversed(rows))).rate == Decimal("22.00")
+
+    # 手填仍然最优先，且同样不看传入顺序
+    manual = FxRate(id=0, date=d, rate=Decimal("19.00"), source="manual", fetched_at=base)
+    assert pick_from([*rows, manual]).rate == Decimal("19.00")
+    assert pick_from([manual, *rows]).rate == Decimal("19.00")
+
+
+def test_pick_from_breaks_ties_deterministically(session):
+    """同一时刻抓到两条时，结果必须是确定的（原先取决于数据库实现）。"""
+    import datetime as dt
+    from decimal import Decimal
+
+    from app.models import FxRate
+    from app.services.fx import pick_from
+
+    d = dt.date(2026, 5, 2)
+    t = dt.datetime(2026, 5, 2, 1, 0, tzinfo=dt.timezone.utc)
+    a = FxRate(id=10, date=d, rate=Decimal("20.00"), source="boc", fetched_at=t)
+    b = FxRate(id=11, date=d, rate=Decimal("21.00"), source="boc", fetched_at=t)
+    assert pick_from([a, b]).rate == pick_from([b, a]).rate == Decimal("21.00")
+
+
+def test_pick_from_survives_naive_timestamps(session):
+    """SQLite 取回的时间戳可能是 naive；与 aware 混排会 TypeError。"""
+    import datetime as dt
+    from decimal import Decimal
+
+    from app.models import FxRate
+    from app.services.fx import pick_from
+
+    d = dt.date(2026, 5, 3)
+    naive = FxRate(id=1, date=d, rate=Decimal("20.00"), source="boc",
+                   fetched_at=dt.datetime(2026, 5, 3, 1, 0))
+    aware = FxRate(id=2, date=d, rate=Decimal("21.00"), source="boc",
+                   fetched_at=dt.datetime(2026, 5, 3, 2, 0, tzinfo=dt.timezone.utc))
+    assert pick_from([naive, aware]).rate == Decimal("21.00")
+
+
+def test_displayed_rate_is_the_one_a_new_order_would_use(client, session):
+    """侧栏/看板/设置页显示的「当前汇率」必须**就是**建单会用的那一条。
+
+    典型分叉：用户今天手填 21.00，之后汇率插件抓了一条 20.50（fetched_at 更晚）。
+    `latest_stored` 给 20.50（全库最新），而建单走 `pick_on` 拿 21.00（手填优先）。
+    显示 20.50、实际用 21.00 —— 用户手填的本意恰恰是「用我这个值」，
+    显示层无视手填是这套规则里唯一说话不算数的地方。
+    """
+    import datetime as dt
+    from decimal import Decimal
+
+    from sqlmodel import delete
+
+    from app.models import FxRate
+    from app.services.fx import JST, rate_for_date
+
+    session.exec(delete(FxRate))
+    session.commit()
+    today = dt.datetime.now(JST).date()
+    now = dt.datetime.now(dt.timezone.utc)
+    session.add(FxRate(date=today, rate=Decimal("21.0000"), source="manual",
+                       fetched_at=now - dt.timedelta(hours=2)))
+    session.add(FxRate(date=today, rate=Decimal("20.5000"), source="boc",
+                       fetched_at=now))                       # 更晚抓到，但不是手填
+    session.commit()
+
+    shown = Decimal(client.get("/api/fx").json()["rate"])
+    used = rate_for_date(session, today)
+    assert used == Decimal("21.0000"), "建单没走手填优先——前提变了，这条测试要重写"
+    assert shown == used, f"界面显示 {shown}，建单实际用 {used}——两个数"

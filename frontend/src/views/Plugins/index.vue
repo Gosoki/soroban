@@ -46,7 +46,7 @@
       </template>
 
       <!-- 缺依赖：说清缺什么 + 一键补齐。不列出来的话，用户只看到一片灰按钮而无从下手 -->
-      <el-alert v-if="p.needs && p.needs.length" type="warning" :closable="false" class="needs">
+      <el-alert v-if="p.needs && p.needs.length" type="warning" show-icon :closable="false" class="needs">
         <template #title>
           <span v-if="p.install && p.install.running">正在安装：{{ p.install.step }}…</span>
           <span v-else>插件还缺以下依赖，装好后才能添加账号与抓取</span>
@@ -67,7 +67,7 @@
       </el-alert>
 
       <!-- 清单坏了也要列出来并说明原因，而不是让插件从界面上消失 -->
-      <el-alert v-if="p.manifest_error" :type="p.missing ? 'warning' : 'error'" :closable="false" class="needs"
+      <el-alert v-if="p.manifest_error" :type="p.missing ? 'warning' : 'error'" show-icon :closable="false" class="needs"
                 :title="p.missing
                   ? `插件目录已不在，库里还留着它的配置${p.scopes.granted.length ? '（含授权：' + p.scopes.granted.join('、') + '）' : ''}`
                   : `plugin.toml 有问题：${p.manifest_error}`" />

@@ -549,33 +549,41 @@ def _run_engine(engine, arr):
     return result
 
 
-def recognize_order(image_bytes: bytes) -> dict:
-    """对上传的截图跑 OCR 并解析出订单字段。抛 OcrUnavailable 表示引擎不可用。"""
-    engine = _get_engine()
-    # `arr` 必须留着：下面判「拿错截图」时要用它跑卡通卡车模板匹配（_truck_present）。
-    # 曾经把这行写成 `_run_engine(engine, _decode_image(...))` 一步到位——解码结果没了名字，
-    # 而 60 行之外那处 `_truck_present(arr)` 静静地变成 NameError：
-    # 只要上传一张含京东/淘宝强标记的截图就必崩 500，而闲鱼截图（占绝大多数）走 else 分支、
-    # 一切正常，所以本地怎么点都试不出来。
-    arr = _decode_image(image_bytes)
-    result = _run_engine(engine, arr)
-    fields = parse_order_fields(result)
+def _stamp_platform(fields: dict, full_text: str, arr) -> None:
+    """判「是不是拿错了截图」，写进 `fields` 的 platform / reject_reason。
 
-    # OCR 只产出闲鱼数据：来源恒为「闲鱼」。仅当截图有明确淘宝/京东强标记、且无任何闲鱼信号
-    # （文案线索或卡通卡车）时，判为拿错截图 → 拒识并提示改用爬虫（reject_reason 非空）。
-    full = "\n".join(item[1] for item in (result or []))
-    other = _detect_other_platform(full)
-    # 只有真看到淘宝/京东强标记、需要判「拿错截图」时才求闲鱼信号：卡车是全图 8 尺度
-    # matchTemplate，一张 1080×2400 就是 1 秒量级、长截图更久，而绝大多数闲鱼截图 other 为
-    # None，这笔钱纯属白付。
-    # ⚠️ **不要**再把它提成 `is_xianyu = ...` 变量提前算——这里最初就是短路写法，
-    # 是一次「改成拒识语义」的重构顺手提成变量才把短路弄丢的。短路必须留在分支里。
-    if other and not (_is_xianyu(full) or _truck_present(arr)):
+    OCR 只产出闲鱼数据：来源恒为「闲鱼」。仅当截图有明确淘宝/京东强标记、且无任何闲鱼信号
+    （文案线索或卡通卡车）时，判为拿错截图 → 拒识并提示改用爬虫（reject_reason 非空）。
+
+    **`arr`（解码后的图像）是显式参数，这一点是刻意的。**
+    它原先是调用方的一个局部变量，被这段代码隔着几十行引用；
+    一次「把解码抽成函数」的重构顺手消掉了那个名字，于是这里静静变成 NameError——
+    而它只在冷分支（含京东/淘宝标记的截图）触发，闲鱼截图一切正常，本地试不出来。
+    做成参数之后，同样的疏忽会在**调用点**变成 TypeError，立刻炸、人人可见。
+
+    ⚠️ **不要**把 `_is_xianyu(...) or _truck_present(arr)` 提成变量提前算——
+    这里最初就是短路写法，是一次「改成拒识语义」的重构顺手提成变量才把短路弄丢的。
+    卡车是全图 8 尺度 matchTemplate，一张 1080×2400 就是 1 秒量级、长截图更久，
+    而绝大多数闲鱼截图 `other` 为 None，这笔钱纯属白付。短路必须留在分支里。
+    """
+    other = _detect_other_platform(full_text)
+    if other and not (_is_xianyu(full_text) or _truck_present(arr)):
         fields["platform"] = None
         fields["reject_reason"] = f"疑似{other}订单截图；OCR 仅支持闲鱼，淘宝/京东请用爬虫抓取"
     else:
         fields["platform"] = "闲鱼"
         fields["reject_reason"] = None
+
+
+def recognize_order(image_bytes: bytes) -> dict:
+    """对上传的截图跑 OCR 并解析出订单字段。抛 OcrUnavailable 表示引擎不可用。"""
+    engine = _get_engine()
+    arr = _decode_image(image_bytes)
+    result = _run_engine(engine, arr)
+    fields = parse_order_fields(result)
+
+    full = "\n".join(item[1] for item in (result or []))
+    _stamp_platform(fields, full, arr)
     # 交易状态：有快递单号（已发货）→ 待收货，否则待发货（另按头部状态语细分终态）
     fields["purchase_status"] = _detect_purchase_status(full, bool(fields.get("express_no")))
     # 注：旧版在「交易成功」时会清空快递公司/快递号（认为已完成的单不需要物流信息）。现在快递号

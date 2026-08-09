@@ -1105,15 +1105,20 @@ def run_command(plugin_id: str, command: str, account: Optional[str] = None,
     conf = _launch_conf(session, m, cfg)
     batch = uuid.uuid4().hex
     pids = []
-    for extra, who in fan:
-        # **一个子进程一枚令牌**。共用一枚的话，先跑完的那个账号在 `_reap` 里
-        # `revoke(jti)`，还在跑的兄弟当场全部 401——它们已经抓到的订单再也回灌不进来，
-        # 而且是静默的：插件那边只看到「soroban 拒绝了我」，用户只看到少了几单。
-        token, jti = scopes.issue(current, plugin_id, cmd_scopes, timeout_s=_REAP_TIMEOUT)
-        pids.append(_launch(m, cmd.name, [*extra, "--soroban-url", _SELF_URL],
-                            token=token, config=conf, jti=jti,
-                            on_done=_result_writer(plugin_id, cmd.label,
-                                                   who=who, batch=batch, total=len(fan))))
+    try:
+        for extra, who in fan:
+            # **一个子进程一枚令牌**。共用一枚的话，先跑完的那个账号在 `_reap` 里
+            # `revoke(jti)`，还在跑的兄弟当场全部 401——它们已经抓到的订单再也回灌不进来，
+            # 而且是静默的：插件那边只看到「soroban 拒绝了我」，用户只看到少了几单。
+            token, jti = scopes.issue(current, plugin_id, cmd_scopes, timeout_s=_REAP_TIMEOUT)
+            pids.append(_launch(m, cmd.name, [*extra, "--soroban-url", _SELF_URL],
+                                token=token, config=conf, jti=jti,
+                                on_done=_result_writer(plugin_id, cmd.label,
+                                                       who=who, batch=batch)))
+    finally:
+        # **finally**：中途抛异常（缺 venv、令牌签发失败）时，已经起来的兄弟仍会回调，
+        # 而批次还在等一个永远到不了的计划数——卡片会永久停在「执行中…」。
+        seal_and_report(batch, len(pids), plugin_id, cmd.label)
     cfg.last_outcome, cfg.last_summary = "running", f"{cmd.label} 执行中…"
     cfg.last_finished_at = None
     cfg.updated_at = utcnow()
@@ -1123,12 +1128,71 @@ def run_command(plugin_id: str, command: str, account: Optional[str] = None,
             "targets": [w for _, w in fan if w], "scopes": sorted(cmd_scopes)}
 
 
-_BATCHES: dict[str, list[tuple[str, bool, str]]] = {}      # batch_id -> [(账号, ok, 摘要)]
+# batch_id -> {"done": [(账号, ok, 摘要)], "total": 最终子进程数 or None（还没封口）}
+#
+# **total 必须是「实际起来的」数量，不是计划数。** 原先直接传 `len(fan)`：
+# 扇出中途有账号启动失败（缺 venv、令牌签发异常）时，实际只有 k 个子进程会回调，
+# 而这里在等 N 个 —— 永远凑不齐 ⇒ 卡片永久停在「执行中…」、这条记录也永不回收。
+# 所以改成两段式：子进程各自 `_batch_add` 登记，扇出循环结束后 `_batch_seal` 告知最终数量。
+# 两边都要判「是不是已经齐了」：子进程可能在封口**之前**就全跑完了。
+_BATCHES: dict[str, dict] = {}
 _BATCH_LOCK = threading.Lock()
 
 
+def _batch_add(batch: str, who: str, ok: bool, summary: str) -> tuple[bool, list, Optional[int]]:
+    """登记一个子进程的结果。返回 (是否已全部完成, 当前全部结果, 最终数量或 None)。"""
+    with _BATCH_LOCK:
+        b = _BATCHES.setdefault(batch, {"done": [], "total": None})
+        b["done"].append((who, ok, summary))
+        total, parts = b["total"], list(b["done"])
+        finished = total is not None and len(parts) >= total
+        if finished:
+            _BATCHES.pop(batch, None)
+    return finished, parts, total
+
+
+def _batch_seal(batch: str, total: int) -> tuple[bool, list]:
+    """扇出结束，告知最终有几个子进程。返回 (此刻是否已全部完成, 全部结果)。"""
+    with _BATCH_LOCK:
+        b = _BATCHES.get(batch)
+        if b is None:
+            return total <= 0, []           # 一个都没起来，或子进程已全部跑完并清理过
+        b["total"] = total
+        parts = list(b["done"])
+        finished = len(parts) >= total
+        if finished:
+            _BATCHES.pop(batch, None)
+    return finished, parts
+
+
+def _batch_text(label: str, parts: list, total: Optional[int]) -> tuple[str, str]:
+    """把一批结果拼成卡片上的一行。返回 (outcome, summary)。"""
+    body = "；".join(f"{w or '本次'} {'✓' if o else '✗'} {s}" for w, o, s in parts)
+    if total is not None and len(parts) >= total:
+        return ("ok" if all(o for _, o, _ in parts) else "failed"), f"{label}：{body}"
+    n = f"{len(parts)}/{total}" if total else f"{len(parts)}"
+    return "running", f"{label}（{n}）：{body}"
+
+
+def _write_outcome(plugin_id: str, outcome: str, text: str) -> None:
+    """把一次执行的结果写回 PluginConfig 供卡片显示。**开自己的 Session**：
+    调用方可能是收割线程（没有请求作用域的 session）。写失败只记日志。"""
+    try:
+        with Session(get_engine()) as s:
+            cfg = s.get(PluginConfig, plugin_id)
+            if cfg is None:
+                return
+            cfg.last_outcome = outcome
+            cfg.last_summary = text[:512]
+            cfg.last_finished_at = None if outcome == "running" else utcnow()
+            s.add(cfg)
+            s.commit()
+    except Exception as e:                              # noqa: BLE001
+        log.warning("写回插件 %s 的运行结果失败：%s", plugin_id, e)
+
+
 def _result_writer(plugin_id: str, label: str, who: str = "",
-                   batch: Optional[str] = None, total: int = 1):
+                   batch: Optional[str] = None):
     """子进程收割完之后把结果写回 PluginConfig，供插件卡片显示。
 
     **开自己的 Session**：收割跑在 daemon 线程里，没有请求作用域的 session 可用。
@@ -1142,33 +1206,24 @@ def _result_writer(plugin_id: str, label: str, who: str = "",
     只要有一个失败整批就记 failed。
     """
     def done(ok: bool, summary: str) -> None:
-        outcome, text = ("ok" if ok else "failed"), f"{label}：{summary}"
-        if batch and total > 1:
-            with _BATCH_LOCK:
-                acc = _BATCHES.setdefault(batch, [])
-                acc.append((who, ok, summary))
-                parts, finished = list(acc), len(acc)
-                if finished >= total:
-                    _BATCHES.pop(batch, None)
-            body = "；".join(f"{w or '本次'} {'✓' if o else '✗'} {s}" for w, o, s in parts)
-            if finished < total:
-                outcome, text = "running", f"{label}（{finished}/{total}）：{body}"
-            else:
-                outcome = "ok" if all(o for _, o, _ in parts) else "failed"
-                text = f"{label}：{body}"
-        try:
-            with Session(get_engine()) as s:
-                cfg = s.get(PluginConfig, plugin_id)
-                if cfg is None:
-                    return
-                cfg.last_outcome = outcome
-                cfg.last_summary = text[:512]
-                cfg.last_finished_at = None if outcome == "running" else utcnow()
-                s.add(cfg)
-                s.commit()
-        except Exception as e:                              # noqa: BLE001
-            log.warning("写回插件 %s 的运行结果失败：%s", plugin_id, e)
+        if not batch:
+            _write_outcome(plugin_id, "ok" if ok else "failed", f"{label}：{summary}")
+            return
+        _, parts, total = _batch_add(batch, who, ok, summary)
+        outcome, text = _batch_text(label, parts, total)
+        _write_outcome(plugin_id, outcome, text)
     return done
+
+
+def seal_and_report(batch: str, launched: int, plugin_id: str, label: str) -> None:
+    """扇出循环结束后必调：告知批次最终有几个子进程起来了。
+
+    **必须在 finally 里调**——中途抛异常（缺 venv、令牌签发失败）时，
+    已经起来的那些兄弟仍然会回调，而批次还在等一个永远到不了的计划数。
+    """
+    finished, parts = _batch_seal(batch, launched)
+    if finished and parts:
+        _write_outcome(plugin_id, *_batch_text(label, parts, launched)[0:2])
 
 
 @router.delete("/{plugin_id}/account")
@@ -1374,10 +1429,13 @@ def _run_due(session: Session) -> None:
                         # 那一次，而「上次触发」时间一直在走——定时失败在界面上完全不可见。
                         # 汇率取不到恰恰是账本会悄悄用兜底值的那类故障，最需要痕迹。
                         on_done=_result_writer(cfg.plugin_id, f"定时·{cmd.label}",
-                                               who=who, batch=batch, total=len(targets)))
+                                               who=who, batch=batch))
                 launched += 1
             except HTTPException as e:
                 log.warning("定时任务 %s/%s 启动失败：%s", cfg.plugin_id, who or "-", e.detail)
+        # 按**实际起来的**数量封口。这条路径最容易命中：它自己吞掉单个账号的启动失败，
+        # 于是「计划 2 个、只起来 1 个」是常态，而按计划数等就永远等不齐。
+        seal_and_report(batch, launched, cfg.plugin_id, f"定时·{cmd.label}")
         if launched:                                    # 只有真的起了进程才推进 last_run_at
             cfg.last_run_at = now                       # 空账号/全部启动失败 → 不推进，下轮重试
             session.add(cfg)

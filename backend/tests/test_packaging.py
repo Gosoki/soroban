@@ -217,3 +217,84 @@ def test_mysql_down_hint_covers_the_packaged_build():
     """MySQL 连不上时的自救指引必须同时给出打包版能执行的那条。"""
     src = (_REPO / "backend" / "app" / "database.py").read_text(encoding="utf-8")
     assert "soroban.exe --use-local-db" in src, "指引只写了源码运行那条，打包版用户照做不了"
+
+
+def test_launcher_settings_can_come_from_the_env_file(tmp_path, monkeypatch):
+    """`BACKEND_PORT` / `HOST` 必须能从**运行目录的 .env** 读到，不能只认环境变量。
+
+    双击 exe 的用户没有终端，他唯一能编辑的就是 exe 旁边那个 `.env`。
+    原先这两项只读 `os.environ`，于是「端口被占用了怎么办」这个最常见的问题，
+    照着提示改 .env 是**无效**的——而提示还理直气壮地写着「设环境变量 BACKEND_PORT」。
+    这两项刻意不进 `app.config.Settings`（那是应用的配置，监听地址是启动器的事），
+    所以必须由启动器自己读，也就必须由这条测试守住。
+    """
+    import sys
+
+    sys.path.insert(0, str(_REPO / "backend"))
+    import run
+
+    monkeypatch.delenv("BACKEND_PORT", raising=False)
+    monkeypatch.delenv("HOST", raising=False)
+    (tmp_path / ".env").write_text(
+        "# 注释行\nSECRET_KEY=x\n\nBACKEND_PORT=8931\nHOST='0.0.0.0'\n", encoding="utf-8")
+
+    assert run._runtime_setting(tmp_path, "BACKEND_PORT", "8620") == "8931"
+    assert run._runtime_setting(tmp_path, "HOST", "127.0.0.1") == "0.0.0.0"   # 去引号
+    assert run._runtime_setting(tmp_path, "NOT_THERE", "fallback") == "fallback"
+
+    monkeypatch.setenv("BACKEND_PORT", "9999")
+    assert run._runtime_setting(tmp_path, "BACKEND_PORT", "8620") == "9999", "环境变量该优先"
+
+    # 目录里没有 .env / 读不了 → 回落默认，绝不能因此起不来
+    assert run._runtime_setting(tmp_path / "nope", "HOST", "127.0.0.1") == "127.0.0.1"
+
+
+def test_env_template_documents_the_launcher_settings():
+    """首启生成的 .env 模板里必须写着这两项——写不出来的配置项等于不存在。"""
+    import sys
+
+    sys.path.insert(0, str(_REPO / "backend"))
+    import run
+
+    tpl = run._ENV_TEMPLATE
+    assert "BACKEND_PORT=" in tpl and "HOST=" in tpl
+    assert "0.0.0.0" in tpl, "模板没告诉用户怎么开局域网访问"
+    assert "密码" in tpl, "开局域网前必须提醒改默认密码"
+
+
+def test_port_hint_tells_the_user_something_they_can_actually_do():
+    """端口占用的提示要指向 `.env`，不能指向「设环境变量」——双击用户做不到。
+
+    只看**代码行**：注释里出现这句话是在描述被修掉的旧行为，那是文档不是提示。
+    （第一版这条测试 grep 了整个文件，于是被自己写的说明性注释判成违规。）
+    """
+    src = (_REPO / "backend" / "run.py").read_text(encoding="utf-8")
+    code = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
+    bad = [ln.strip() for ln in code if "设环境变量 BACKEND_PORT" in ln]
+    assert not bad, f"提示还在让双击用户去设环境变量：{bad}"
+    hints = [ln for ln in code if "BACKEND_PORT" in ln and ".env" in ln]
+    assert hints, "端口相关的提示里一句都没提到 .env"
+
+
+def test_build_script_warns_before_shipping_plugin_credentials():
+    """分发指引说「把 plugins 文件夹拷到 exe 旁边」，而打包者手边唯一的 plugins
+    就是仓库里那个开发用的——里面有 `.state/*.json`（他自己的淘宝登录会话）和 `.env`。
+
+    `.gitignore` 覆盖了它们，但**分发是文件拷贝，git 没有发言权**。
+    照着说明发一次版，就等于把自己的登录态发出去了。
+    """
+    bat = (_REPO / "pyinstaller.bat").read_text(encoding="utf-8", errors="replace")
+    assert "DO NOT SHIP plugins" in bat, "缺少「别原样分发 plugins」的警告"
+    for token in (".state", ".env", ".log", ".venv"):
+        assert token in bat, f"警告里没列出要删的 {token}"
+    # 那句「ship a plugins folder」本身也得带上告诫，别让人只看见前半句
+    ship = [ln for ln in bat.splitlines() if "Ship a" in ln and "plugins" in ln]
+    assert ship and any("delete" in ln.lower() for ln in ship), \
+        "「拷 plugins 过去」这句话必须自带「先删掉凭据」"
+
+
+def test_plugin_readme_documents_what_to_strip_before_sharing():
+    readme = (_REPO / "plugins" / "README.md").read_text(encoding="utf-8")
+    assert "发给别人之前" in readme
+    for token in (".state/", ".env", "*.log", ".venv/"):
+        assert token in readme, f"插件 README 没说要删 {token}"

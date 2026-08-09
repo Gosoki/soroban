@@ -30,6 +30,12 @@ DATABASE_URL=sqlite:///./soroban.db
 
 # 登录有效期（天）
 TOKEN_EXPIRE_DAYS=90
+
+# 监听地址与端口。改完保存、重新双击即可生效（环境变量优先级更高）。
+# HOST 保持 127.0.0.1 = 只有本机能访问。改成 0.0.0.0 会把账本暴露给整个局域网，
+# **改之前务必先改掉默认密码**。
+BACKEND_PORT=8620
+HOST=127.0.0.1
 """
 
 
@@ -89,6 +95,31 @@ def ensure_env(rt: Path) -> bool:
     return True
 
 
+def _runtime_setting(rt: Path, key: str, default: str) -> str:
+    """启动器自己的配置项：环境变量 > 运行目录的 `.env` > 默认值。
+
+    只做最朴素的 `KEY=VALUE` 解析（去引号、跳过注释与空行）：这几行必须跑在
+    `import app.*` **之前**，不能依赖应用的配置体系；而 `.env` 是我们自己生成的，
+    格式可控，不值得为它引入解析库。读不出来就当没写——启动器不该因为配置文件里
+    有一行怪东西就起不来。
+    """
+    v = os.environ.get(key)
+    if v:
+        return v
+    f = rt / ".env"
+    try:
+        for raw in f.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, val = line.partition("=")
+            if k.strip() == key:
+                return val.strip().strip("'\"") or default
+    except OSError:
+        pass
+    return default
+
+
 def _check_port_free(host: str, port: int) -> None:
     """端口占用 → **启动前**就说清楚，而不是让 uvicorn 抛异常后窗口一闪而过。
 
@@ -105,7 +136,8 @@ def _check_port_free(host: str, port: int) -> None:
             _fatal(
                 f"端口 {port} 已被占用——多半是 soroban 已经在跑了。",
                 hint=f"先去看看是不是已经开着（浏览器打开 http://{probe_host}:{port}）。"
-                     f"确实要再开一个的话，换个端口：设环境变量 BACKEND_PORT=8621 再启动。",
+                     f"确实要再开一个的话，用记事本打开旁边的 .env，"
+                     f"把 BACKEND_PORT 改成别的（如 8621）再双击。",
             )
 
 
@@ -139,8 +171,16 @@ def main() -> None:
 
     # 默认只监听环回：要暴露到局域网得**显式**设 HOST=0.0.0.0。
     # 之前默认 0.0.0.0，配上「无 .env → 默认 SECRET_KEY」就是开箱即用的认证绕过。
-    host = os.environ.get("HOST", "127.0.0.1")
-    port = int(os.environ.get("BACKEND_PORT", "8620"))
+    #
+    # 优先级：环境变量 > .env > 默认值。
+    # **`.env` 这一档是打包版唯一可用的入口**：双击 exe 的用户没有终端，
+    # 他能编辑的只有 exe 旁边那个 .env。原先这两项只读环境变量，
+    # 于是「端口被占用了怎么办」这个最常见的问题，用户照着提示改 .env 是**无效**的
+    # ——而提示本身还理直气壮地写着「设环境变量 BACKEND_PORT」。
+    # 这两项刻意不进 app.config 的 Settings：那是**应用**的配置，
+    # 而监听地址是**启动器**的事，冻结版与源码版的启动器不是同一个。
+    host = _runtime_setting(rt, "HOST", "127.0.0.1")
+    port = int(_runtime_setting(rt, "BACKEND_PORT", "8620"))
 
     _check_port_free(host, port)           # 占用 → 现在就说清楚，别等 uvicorn 抛异常
 
@@ -172,7 +212,7 @@ def main() -> None:
         pass
     except OSError as e:
         _fatal(f"无法监听 {host}:{port}（{e}）。",
-               hint="换个端口：设环境变量 BACKEND_PORT=8621 再启动。")
+               hint="用记事本打开旁边的 .env，把 BACKEND_PORT 改成别的（如 8621）再双击。")
 
 
 if __name__ == "__main__":

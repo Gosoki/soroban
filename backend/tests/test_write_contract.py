@@ -402,3 +402,24 @@ def test_no_style_block_reintroduces_a_tokenized_color():
             if lit in text:
                 bad.append(f"{path.relative_to(_REPO)}: {lit}  {hint}")
     assert not bad, "这些颜色已经有 token 了，别再写字面量：\n  " + "\n  ".join(sorted(set(bad)))
+
+
+def test_item_editor_never_silently_drops_a_nameless_row():
+    """物品编辑器**不许**把没名字的行连同它的钱一起静默丢掉。
+
+    原先 `saveItems` 第一行是 `.filter(有名字)`。于是「Ctrl+A 清掉名字准备重打」期间，
+    任何一次其它保存（改数量、改单价、改另一条物品）都会把那条删掉，订单金额随之缩水
+    ——无确认、无撤销、无提示，用户只看到「我改了个数量，另一行怎么没了」。
+    `onItemEdit` 里那道守卫只挡住「改这一条本身」，挡不住「改别的东西时顺带整体保存」，
+    所以守卫必须在 `saveItems` 这条所有入口的必经之路上。
+
+    真正的删除只走 `removeItem`（有二次确认）。
+    """
+    src = (_REPO / "frontend" / "src" / "components" / "OrderItemsEditor.vue").read_text(
+        encoding="utf-8")
+    body = src[src.index("async function saveItems"):]
+    body = body[:body.index("\n}\n")]
+    assert ".filter((it) => it.name" not in body, \
+        "saveItems 又在按名字过滤了——那是静默丢数据"
+    assert "blank" in body and "warning" in body, \
+        "saveItems 必须挡下空名行并提示，而不是替用户删掉"

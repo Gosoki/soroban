@@ -121,6 +121,31 @@ rem next to soroban.exe to have them discovered (each plugin runs in its own ven
 rem ===== Clean build intermediates =====
 if exist "%ROOT%build" rmdir /s /q "%ROOT%build"
 
+rem ===== Warn about shipping YOUR OWN plugin credentials =====
+rem The line further down says "ship a plugins folder next to the exe". The only plugins
+rem folder the packager has at hand is the repo's development one -- which contains
+rem .state\*.json (the packager's own Taobao LOGIN SESSION), .env, and scrape.log.
+rem .gitignore covers them, but shipping is a file copy: git has no say in it.
+rem So check for the real artefacts and say it loudly, right before the ship instructions.
+set "PLUGSECRET="
+if exist "%ROOT%plugins" for /d %%P in ("%ROOT%plugins\*") do (
+    if exist "%%P\.state" set "PLUGSECRET=1"
+    if exist "%%P\.env" set "PLUGSECRET=1"
+)
+if not defined PLUGSECRET goto plugsecret_ok
+echo.
+echo ========================================
+echo   [!] DO NOT SHIP plugins\ AS-IS
+echo   Your plugins folder contains YOUR OWN credentials:
+echo       .state\*.json   = your logged-in browser session (Taobao cookies)
+echo       .env            = your own soroban account / API keys
+echo   Anyone you send the release to could use them as you.
+echo   Copy the plugin folders, then DELETE from each copy:
+echo       .state\   .env   *.log   .venv\   __pycache__\
+echo   (.venv is also machine-specific and will not work on their box anyway.)
+echo ========================================
+:plugsecret_ok
+
 rem ===== Warn when the ledger is left behind in an older release folder =====
 rem VERSION is a hand-edited constant and %RELEASE% doubles as the RUNTIME data dir.
 rem Bumping VERSION therefore produces a BRAND-NEW EMPTY folder: the new exe would create
@@ -156,7 +181,8 @@ echo   seeds an admin, then serves API + frontend on one port.
 echo   This dir is also the DATA dir: soroban.db / .env / plugins\ live here and are
 echo   preserved across rebuilds. Back them up before moving or deleting it.
 echo   Open http://127.0.0.1:8620 in your browser (set BACKEND_PORT to change the port).
-echo   Ship a "plugins" folder next to the exe if you use plugins.
+echo   Ship a "plugins" folder next to the exe if you use plugins -- but FIRST delete
+echo   .state\ .env *.log .venv\ from each plugin copy (they hold YOUR credentials).
 echo ========================================
 pause
 exit /b 0

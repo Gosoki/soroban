@@ -7,7 +7,8 @@
     **理由是变更频率**：抓网页的代码天然跟着别人改版走（中行的 `<tr data-currency>`、
     谷歌嵌在 JS 里的报价点，各错过一次），不该和账本核心同一个发布节奏。
   · **本模块只做四件事**，都是账本自洽必需的：
-      1. 存 —— `store()` 追加一行（一天可以有多条）/ `store_and_commit()` 顺带提交。
+      1. 存 —— `store()` 追加一行（一天可以有多条）。**只 add/flush，提交由调用方决定**
+         ——它常被夹在别的写事务中间，自己 commit 会让那笔事务无法回滚。
          `store` 只 add/flush **不 commit**：
          提交权归调用方（通用写入通道给每一项包了 savepoint，被击穿会让回执与事实相反）。
       2. 盖 —— `rate_for_date()`，各条入账路径统一走 `_rate_with_freshness_warning()`。
@@ -77,10 +78,29 @@ def rows_on(session: Session, d: dt.date) -> list[FxRate]:
     ).all())
 
 
+def _recency_key(r: FxRate):
+    """「多新」的排序键：抓取时刻优先，同一时刻用 id 打破平局。
+
+    naive/aware 统一按 UTC 解读——SQLite 取回的时间戳可能是 naive，
+    直接和 aware 比会 TypeError。
+    """
+    t = r.fetched_at
+    if t is not None and t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    return (t or dt.datetime.min.replace(tzinfo=dt.timezone.utc), r.id or 0)
+
+
 def pick_from(rows: list[FxRate]) -> Optional[FxRate]:
     """从**已经取出来的**某一天的多条里挑该用的那条：手填优先，其次该日最后一条。
 
-    要求 `rows` 已按 `fetched_at` 倒序（`rows_on` 就是这么给的）。
+    **自己排序，不依赖调用方**。原先的契约是「要求 rows 已按 fetched_at 倒序」，
+    而契约的两端在不同文件（`rows_on` / `routers/fx.py` 的按天汇总）——这种隐式约定
+    必然漂移，且漂移时**没有任何测试会红**：`pick_from` 的单元测试自己传有序的 rows，
+    照样全绿，而建单会安静地用上当天**第一条**汇率而不是最后一条。
+    一天几条数据，排一次的成本可以忽略；换来的是不变量由函数自己保证。
+
+    顺带消掉一个不确定性：同一秒抓到两条时，原先返回哪条取决于数据库的实现
+    （SQL 的 ORDER BY 对相等键不保证稳定）。现在用 id 打破平局，结果是确定的。
 
     单独抽出来是为了给汇率页按天汇总用：那里已经把整段时间的行一次查了出来，
     再对每天调一次 `pick_on` 就是每天多查一次库（730 天上限 = 730 次）。
@@ -89,8 +109,9 @@ def pick_from(rows: list[FxRate]) -> Optional[FxRate]:
     """
     if not rows:
         return None
-    manual = [r for r in rows if r.source == SOURCE_MANUAL]
-    return (manual or rows)[0]
+    ordered = sorted(rows, key=_recency_key, reverse=True)
+    manual = [r for r in ordered if r.source == SOURCE_MANUAL]
+    return (manual or ordered)[0]
 
 
 def pick_on(session: Session, d: dt.date) -> Optional[FxRate]:
@@ -122,14 +143,6 @@ def store(session: Session, rate: Decimal, source: str,
     session.add(row)
     session.flush()
     return row, True
-
-
-def store_and_commit(session: Session, rate: Decimal, source: str) -> FxRate:
-    """核心自己写汇率时用的便捷包装：写完就提交。"""
-    row, _ = store(session, rate, source)
-    session.commit()
-    session.refresh(row)
-    return row
 
 
 
@@ -213,7 +226,14 @@ def ensure_manual_rate(session: Session) -> Optional[FxRate]:
     except (InvalidOperation, ValueError) as e:
         log.warning("手填汇率 %r 不可用（%s），忽略", raw, e)
         return None
-    row = store_and_commit(session, rate, SOURCE_MANUAL)
+    # **不 commit**：这个函数是从 `rate_for_date` 里被调用的，而 `rate_for_date` 又被
+    # `stamp_fx` 在**订单写事务的中间**调用。中途 commit 一次，后面任何一步校验失败
+    # （compute_money 的金额上限之类 → 422）都已经**无法回滚**：用户收到 422，
+    # 而这张单前半截的改动已经落库，订单价与物品从此不自洽。
+    # 这正是 `store()` 文档串里写过的那个陷阱（击穿外层 savepoint），
+    # 只是当时只堵了通用写入通道那条路，这条路径上又重现了一次。
+    # 跟着外层事务走也更合理：外层回滚 = 那张单没建成 = 这条兜底汇率行也不必留。
+    row, _ = store(session, rate, SOURCE_MANUAL)
     log.info("库里还没有汇率，已按设置里的手填值记一条：1 %s = %s %s",
              settings.FX_BASE, rate, settings.FX_QUOTE)
     return row
