@@ -28,6 +28,11 @@ class FxRateIn(SQLModel):
         import re
         if not re.fullmatch(r"[a-z0-9._-]{1,16}", v or ""):
             raise ValueError(f"汇率源标识 {v!r} 只能是小写字母/数字/.-_，长度 1..16")
+        if v == fx.SOURCE_MANUAL:
+            # `manual` 在核心里是**语义关键字**而不是普通标识：当天取值优先它、
+            # 界面显示成「手填」、写侧还靠它挡自动源。插件用了它，就等于既能压过
+            # 当天所有真实源、又冒充成用户亲手填的，而用户在界面上分辨不出来。
+            raise ValueError(f"{fx.SOURCE_MANUAL!r} 是核心保留给用户手填的源名，插件请换一个")
         return v
 
     @field_validator("rate")
@@ -39,7 +44,12 @@ class FxRateIn(SQLModel):
 
 
 @register(kind="fx.rate", label="汇率", scope="fx:write", schema=FxRateIn,
-          key=lambda it: str(it.date or "today"), max_batch=32)
+          # 同轮去重键 = **日期 + 源**，两半都不能少：
+          #   少了 source → 一批里同一天的第 2、3 个源被判「本轮已提交过」且永不落库；
+          #   date 用 `or "today"` → 不填日期和显式填今天算成两个键，同一天同源反而不去重。
+          # 两个方向都错，且都表现为静默丢数据。对照 plugin_record 用的是天然复合键。
+          key=lambda it: f"{it.date or dt.datetime.now(fx.JST).date()}|{it.source}",
+          max_batch=32)
 def apply_fx_rate(session: Session, item: FxRateIn, ctx: Ctx) -> Outcome:
     today = dt.datetime.now(fx.JST).date()
     d = item.date or today
@@ -54,9 +64,12 @@ def apply_fx_rate(session: Session, item: FxRateIn, ctx: Ctx) -> Outcome:
     except (ValueError, InvalidOperation) as e:
         return Outcome("rejected", code="validation", message=str(e))
 
-    existing = fx.latest_stored(session)
-    if existing is not None and existing.date == d and existing.source == fx.SOURCE_MANUAL \
-            and item.source != fx.SOURCE_MANUAL:
+    # 问的必须是「**那一天**有没有手填」，不是「全库最新那条是不是手填」。
+    # 用 latest_stored 的话，补录到过去某天时 `existing.date == d` 不成立，保护静默失效——
+    # 读侧 pick_from 兜住了值所以不出错账，但写侧与读侧用了两把钥匙开同一把锁。
+    manual = next((r for r in fx.rows_on(session, d) if r.source == fx.SOURCE_MANUAL), None)
+    if manual is not None and item.source != fx.SOURCE_MANUAL:
+        existing = manual
         # 人 > 机器，与 `can_advance_purchase` 同一条原则：用户当天亲手填过的汇率，
         # 插件不该悄悄覆盖掉。（用户改主意时自己去设置页改。）
         return Outcome("unchanged", id=existing.id,

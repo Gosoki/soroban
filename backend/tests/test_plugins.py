@@ -68,7 +68,7 @@ def test_path_traversal_account_names_rejected(client, fake_plugin, bad):
     """账号名会变成 <state_dir>/<name>.json，必须挡住跳出目录。"""
     for ep, params in (
         (f"/api/plugins/{PLUGIN_ID}/account", {"name": bad}),
-        (f"/api/plugins/{PLUGIN_ID}/login", {"account": bad}),
+        (f"/api/plugins/{PLUGIN_ID}/run/login", {"account": bad}),
     ):
         r = client.post(ep, params=params)
         assert r.status_code == 400, f"{bad!r} @ {ep} → {r.status_code} {r.text[:120]}"
@@ -176,12 +176,14 @@ def test_delete_account_orders_resets_imported_staging(client, fake_plugin):
 
 def test_fetch_without_venv_is_400(client, fake_plugin):
     client.post(f"/api/plugins/{PLUGIN_ID}/account", params={"name": "novenv"})
-    r = client.post(f"/api/plugins/{PLUGIN_ID}/fetch", params={"account": "novenv"})
+    client.put(f"/api/plugins/{PLUGIN_ID}/config", json={"enabled": True, "schedule_minutes": 0})
+    r = client.post(f"/api/plugins/{PLUGIN_ID}/run/fetch", params={"account": "novenv"})
     assert r.status_code == 400 and "venv" in r.json()["detail"]
 
 
 def test_fetch_with_no_accounts_is_400(client, fake_plugin):
-    r = client.post(f"/api/plugins/{PLUGIN_ID}/fetch")
+    client.put(f"/api/plugins/{PLUGIN_ID}/config", json={"enabled": True, "schedule_minutes": 0})
+    r = client.post(f"/api/plugins/{PLUGIN_ID}/run/fetch")
     assert r.status_code == 400
 
 

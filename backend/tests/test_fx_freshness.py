@@ -80,12 +80,12 @@ def test_expired_rate_is_still_served(session):
     prefs.save(session, {"fx.stale_hours": 48})
 
 
-def test_stamp_rate_warns_when_expired(session, caplog):
+def test_rate_lookup_warns_when_expired(session, caplog):
     """核心：用了过期汇率必须留痕。没有这条，链路断掉时账本会安静地一路记错。"""
     prefs.save(session, {"fx.stale_hours": 1})
     _put_rate(session, hours_ago=100, rate="18.0")
     with caplog.at_level("WARNING"):
-        got = fx.stamp_rate(session, "建商品订单 TEST-1")
+        got = fx.rate_for_date(session, None, "建商品订单 TEST-1")
     assert got == Decimal("18.0000") or got == Decimal("18.0")
     # 用 getMessage()：日志是 %-风格惰性格式化，直接对 r.message 做 % r.args 会在
     # 参数个数对不上时抛 TypeError（第一版就是这么炸的），而且 r.message 本身是模板不是成品。
@@ -93,12 +93,12 @@ def test_stamp_rate_warns_when_expired(session, caplog):
     prefs.save(session, {"fx.stale_hours": 48})
 
 
-def test_stamp_rate_is_quiet_when_fresh(session, caplog):
+def test_rate_lookup_is_quiet_when_fresh(session, caplog):
     """反面：新鲜时不该刷警告——狼来了喊多了就没人看了。"""
     prefs.save(session, {"fx.stale_hours": 48})
     _put_rate(session, hours_ago=1, rate="20.5")
     with caplog.at_level("WARNING"):
-        fx.stamp_rate(session, "建商品订单 TEST-2")
+        fx.rate_for_date(session, None, "建商品订单 TEST-2")
     assert not [r for r in caplog.records if "过期" in r.getMessage()], "汇率还新鲜却报了过期"
 
 
@@ -116,7 +116,7 @@ def test_api_exposes_age_and_expired(client, session):
 def test_every_rate_stamping_path_can_warn():
     """**所有**给账本行盖汇率的地方都必须走带 `what` 的告警版本。
 
-    原先只有建商品订单/建集运订单两处走 `stamp_rate`，另外四条（杂项建单、三张表 PATCH
+    原先只有建商品订单/建集运订单两处走告警版本，另外四条（杂项建单、三张表 PATCH
     补价、暂存自身补价、暂存导入建订单）直接 `rate_for_date(session, date)` —— 不触发手填
     兜底、不告警。于是「没装插件也自洽」在**插件的主入账路径上根本不成立**：
     暂存导入是爬虫抓完之后的必经之路，恰恰是最需要兜底的那条。
@@ -141,9 +141,6 @@ def test_every_rate_stamping_path_can_warn():
             elif fn == "rate_for_date":
                 if not any(k.arg == "what" for k in node.keywords):
                     bad.append(f"{mod.__name__}:{node.lineno} rate_for_date 没传 what（不兜底也不告警）")
-            elif fn == "stamp_rate":
-                if len(node.args) < 2:
-                    bad.append(f"{mod.__name__}:{node.lineno} stamp_rate 少了 what")
     assert not bad, "这些盖汇率的路径不会喊：\n  " + "\n  ".join(bad)
 
 
@@ -308,3 +305,156 @@ def test_saving_manual_rate_takes_effect_immediately(client, session):
     assert got["rate"] and Decimal(got["rate"]) == Decimal("20.5"), "保存后界面上仍看不到汇率"
     assert got["source"] == "manual"
     client.put("/api/settings", json={"values": {"fx.manual_rate": ""}})
+
+
+def test_history_page_agrees_with_what_orders_actually_use(client, session):
+    """汇率页每天显示的「采用」必须等于建单时真会用的那条。
+
+    两边各写一遍取舍规则的话，页面显示的和账本里算的会是两个数，
+    而那种不一致要等到对账才发现。所以这条比起「页面能打开」重要得多。
+    """
+    import datetime as dt
+
+    from app.models import FxRate
+    from app.services import fx as fxsvc
+
+    base = dt.date(2026, 3, 1)
+    for i in range(4):                                  # 四天，每天两条，其中一天有手填
+        d = base + dt.timedelta(days=i)
+        session.add(FxRate(date=d, rate=Decimal("20.0") + i, source="a",
+                           fetched_at=dt.datetime(2026, 3, 1, 1, 0) + dt.timedelta(days=i)))
+        session.add(FxRate(date=d, rate=Decimal("21.0") + i, source="b",
+                           fetched_at=dt.datetime(2026, 3, 1, 9, 0) + dt.timedelta(days=i)))
+    session.add(FxRate(date=base, rate=Decimal("99.5"), source=fxsvc.SOURCE_MANUAL,
+                       fetched_at=dt.datetime(2026, 3, 1, 2, 0)))
+    session.commit()
+
+    days = (dt.datetime.now(fxsvc.JST).date() - base).days + 1
+    got = {r["date"]: r["used"] for r in client.get(f"/api/fx/history?days={days}").json()["items"]}
+    for i in range(4):
+        d = base + dt.timedelta(days=i)
+        assert Decimal(str(got[d.isoformat()])) == fxsvc.pick_on(session, d).rate, \
+            f"{d} 页面显示的采用值与建单实际用的不一致"
+    assert Decimal(str(got[base.isoformat()])) == Decimal("99.5"), "手填那天没优先取手填"
+
+
+def test_history_does_not_query_once_per_day(client, session):
+    """按天汇总不许随天数线性增加查询数——上限 730 天就是 730 次往返。"""
+    import datetime as dt
+
+    from sqlalchemy import event
+
+    from app.database import get_engine
+    from app.models import FxRate
+
+    base = dt.date(2026, 4, 1)
+    for i in range(12):
+        session.add(FxRate(date=base + dt.timedelta(days=i), rate=Decimal("22.0"), source="a"))
+    session.commit()
+
+    n = 0
+
+    def count(conn, cursor, statement, params, ctx, many):
+        nonlocal n
+        if "fxrate" in statement.lower():
+            n += 1
+
+    engine = get_engine()
+    event.listen(engine, "before_cursor_execute", count)
+    try:
+        days = (dt.datetime.now(__import__("app.services.fx", fromlist=["JST"]).JST).date() - base).days + 1
+        client.get(f"/api/fx/history?days={days}")
+    finally:
+        event.remove(engine, "before_cursor_execute", count)
+
+    assert n <= 2, f"按天各查一次：12 天打了 {n} 条 fxrate 查询"
+
+
+def test_staging_write_through_restamps_a_missing_rate(client, mk, session):
+    """在暂存页改一条**已导入**的行，缺汇率要被补上。
+
+    暂存页的汇率格可编辑且可清空（`clearable` 没关），清一下 PATCH 过去就是
+    `fx_rate = null`。若这条路径不补汇率，jpy_auto/jpy_settled 一起变 NULL：
+    看板的 SUM 跳过它、笔数照数——「笔数 +1、金额 +0」，一条已导入的账本单
+    悄悄变成不计钱的行。orders / misc / shipment 三处都有这一刀，只有这里漏了。
+    """
+    import datetime as dt
+
+    from app.models import FxRate
+
+    session.add(FxRate(date=dt.date(2027, 2, 10), rate=Decimal("20.5"), source="a"))
+    session.commit()
+
+    s = mk("/api/staging", {"order_date": "2027-02-10", "title": "补汇率", "price_cny": 100,
+                            "order_no": "STG-FX-1", "platform": "淘宝"})
+    imported = client.post(f"/api/staging/{s['id']}/import")
+    assert imported.status_code == 200, imported.text
+
+    row = next(x for x in client.get("/api/staging", params={"limit": 200}).json()["items"]
+               if x["id"] == s["id"])
+    cleared = client.patch(f"/api/staging/{s['id']}",
+                           json={"version": row["version"], "fx_rate": None})
+    assert cleared.status_code == 200, cleared.text
+
+    oid = row["imported_order_id"]
+    order = next(o for o in client.get("/api/orders", params={"limit": 200}).json()["items"]
+                 if o["id"] == oid)
+    assert order["fx_rate"] is not None, "汇率被清空后没补回来"
+    assert order["jpy_settled"], f"结算日元被清成了 {order['jpy_settled']}——这笔钱看板会漏掉"
+
+
+def test_backfilling_an_old_order_does_not_cry_wolf(client, session, caplog, mk):
+    """补录几天前的订单**不该**报「汇率已过期」——那条汇率正是唯一正确的历史汇率。
+
+    这条警告原先在暂存导入（补录的必经路径）上恒真。一条永远在喊狼来了的告警，
+    比没有告警更糟：真出事时没人信。
+
+    但「那天没有记录、退回了更旧的一条」仍然要喊——见下一条测试。
+    """
+    import datetime as dt
+
+    from sqlmodel import delete
+
+    from app.models import FxRate
+    from app.services import fx as fxsvc
+
+    # 必须是**真正的过去**：写未来日期的话 rate_age_hours 会被 max(0, …) 夹成 0、
+    # is_expired 恒 False，这条测试就永远不走过期分支——假绿。
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=10)).date()
+    session.exec(delete(FxRate))
+    session.add(FxRate(date=old, rate=Decimal("21.0"), source="a",
+                       fetched_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=10)))
+    session.commit()
+    assert fxsvc.is_expired(session, fxsvc.pick_on(session, old)), \
+        "前置没成立：这条汇率还没到过期线，下面的断言测不出东西"
+    with caplog.at_level("WARNING"):
+        got = fxsvc.rate_for_date(session, old, "暂存导入建单 TEST-BACKFILL")
+    assert got == Decimal("21.0000"), got
+    assert not [r for r in caplog.records if "已过期" in r.getMessage()], \
+        "取到的就是那天的汇率，却报了「已过期」——假警报"
+
+
+def test_falling_back_to_an_older_rate_still_warns(client, session, caplog):
+    """那天没有记录、退回了更旧的一条 → 这才是真问题，必须喊。
+
+    意味着取汇率的链路可能断了，而金额确实按一个不属于这笔账的汇率算了。
+    """
+    import datetime as dt
+
+    from sqlmodel import delete
+
+    from app.models import FxRate
+    from app.services import fx as fxsvc
+
+    # 自己建立前置：整个会话共用一个库，别的用例留下的**较新**汇率会成为 latest_stored 的
+    # 返回值，那条不过期，于是这里什么都不会喊——测试静默变成「测了个寂寞」。
+    session.exec(delete(FxRate))
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=19)).date()
+    session.add(FxRate(date=old, rate=Decimal("22.0"), source="a",
+                       fetched_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=19)))
+    session.commit()
+    with caplog.at_level("WARNING"):
+        # 问今天的汇率 → 那天没有 → 退回 19 天前那条
+        fxsvc.rate_for_date(session, dt.datetime.now(fxsvc.JST).date(), "建商品订单 TEST-FALLBACK")
+    assert [r for r in caplog.records if "已过期" in r.getMessage()], \
+        "退回了 19 天前的汇率却一声不吭"

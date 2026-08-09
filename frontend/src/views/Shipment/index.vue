@@ -41,7 +41,7 @@
           <div class="expand">
             <div class="ex-title">关联商品订单（在此点选增删；商品页「集运(点选)」列也能改；
               也可把「内含快递」截图拖到本行的「绑定快递单」格自动关联）</div>
-            <el-table v-if="row.orders && row.orders.length" :data="row.orders" size="small">
+            <el-table v-if="row.orders && row.orders.length" :data="row.orders">
               <el-table-column label="下单日期" width="110">
                 <template #default="{ row: t }"><span :class="t.date ? '' : 'ph'">{{ t.date || '—' }}</span></template>
               </el-table-column>
@@ -63,14 +63,13 @@
               </el-table-column>
               <el-table-column label="" width="72">
                 <template #default="{ row: t }">
-                  <el-button link type="danger" size="small" @click="detach(row, t)">移除</el-button>
+                  <el-button link type="danger" @click="detach(row, t)">移除</el-button>
                 </template>
               </el-table-column>
             </el-table>
             <div v-else class="ph">暂无关联商品订单</div>
             <div class="add-line">
-              <el-select :model-value="null" filterable placeholder="＋ 添加商品订单（未挂靠）"
-                         size="small" class="tb-pick" @change="(id) => attach(row, id)">
+              <el-select :model-value="null" filterable placeholder="＋ 添加商品订单（未挂靠）" class="tb-pick" @change="(id) => attach(row, id)">
                 <el-option v-for="t in unassignedOptions" :key="t.id" :label="t.order_no || ('#' + t.id)" :value="t.id">
                   <div class="tb-opt">
                     <b>{{ t.order_no || ('#' + t.id) }}</b>
@@ -410,7 +409,7 @@ onBeforeUnmount(() => {
 .ocr-up :deep(.el-upload) { display: inline-flex; }
 .ocr-drop {
   display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 14px;
-  border: 1px dashed var(--border-strong); border-radius: 4px; color: #7f9cff; font-size: 13px;
+  border: 1px dashed var(--border-strong); border-radius: 4px; color: var(--brand-soft); font-size: 13px;
   white-space: nowrap; cursor: pointer;
 }
 .ocr-drop:hover { border-color: var(--brand); background: var(--brand-weak); }
@@ -424,11 +423,13 @@ onBeforeUnmount(() => {
   color: #6b7a99; font-size: 12px; white-space: nowrap; cursor: pointer;
   transition: border-color .15s, background .15s, color .15s;
 }
-.bind-drop:hover { border-color: var(--brand); color: #7f9cff; }
-.bind-drop.armed { border-color: #5a7cc0; color: #7f9cff; background: rgba(64, 158, 255, 0.06); }
+.bind-drop:hover { border-color: var(--brand); color: var(--brand-soft); }
+.bind-drop.armed { border-color: var(--brand-line-strong); color: var(--brand-soft); background: var(--brand-faint); }
 .bind-drop.over {
-  border-color: var(--ok); color: #9ae06a; background: rgba(103, 194, 58, 0.14);
-  box-shadow: 0 0 0 2px rgba(103, 194, 58, 0.25);
+  /* 这条规则里原本有三种绿：前景一种、底色与外环是 Element 旧绿、边框才是 token 的
+     --ok。三种绿并排出现在同一个投放区上。收敛成一套。 */
+  border-color: var(--ok); color: var(--ok); background: var(--ok-weak);
+  box-shadow: 0 0 0 2px var(--ok-ring);
 }
 .bind-drop.busy { color: var(--txt-3); cursor: default; }
 /* 子元素不接收拖拽事件，否则 dragleave 会在图标/文字间来回误触发导致高亮闪烁 */

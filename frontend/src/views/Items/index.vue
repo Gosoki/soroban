@@ -31,11 +31,11 @@
 
         <!-- 彩色标签（只读），配色与订单列表一致：账号用持久化色序、来源/状态用语义色 -->
         <template #cell-platform_account="{ row }">
-          <el-tag v-if="row.platform_account" size="small" :style="tagStyleAt(acctColor[row.platform_account] ?? -1, row.platform_account)">{{ row.platform_account }}</el-tag>
+          <el-tag v-if="row.platform_account" :style="tagStyleAt(acctColor[row.platform_account] ?? -1, row.platform_account)">{{ row.platform_account }}</el-tag>
           <span v-else class="ph">—</span>
         </template>
         <template #cell-platform="{ row }">
-          <el-tag v-if="row.platform" size="small" :style="platformSemanticStyle(row.platform)">{{ row.platform }}</el-tag>
+          <el-tag v-if="row.platform" :style="platformSemanticStyle(row.platform)">{{ row.platform }}</el-tag>
           <span v-else class="ph">—</span>
         </template>
         <!-- 与商品订单页同一口径：挂了集运单就显示继承来的集运状态。
@@ -43,7 +43,7 @@
              （NotionTable 的插槽分支优先于 GotionCell，而 display 只在 GotionCell 里被调用），
              曾因此让两个页面对同一张单显示不同状态、tooltip 还说着反话。 -->
         <template #cell-purchase_status="{ row }">
-          <el-tag size="small" :style="statusStyle(row.fulfillment_status)">
+          <el-tag :style="statusStyle(row.fulfillment_status)">
             {{ row.fulfillment_status }}
           </el-tag>
         </template>
@@ -53,7 +53,7 @@
         </template>
         <!-- 编辑：打开该物品所属订单的编辑弹窗（复用商品订单同一套物品编辑，不跳转） -->
         <template #actions="{ row }">
-          <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
+          <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
         </template>
       </NotionTable>
 
@@ -66,7 +66,7 @@
       <div v-if="editingOrder">
         <div class="edit-ctx">
           <span class="ec-shop">{{ editingOrder.title || '（无标题）' }}</span>
-          <el-tag size="small" :style="statusStyle(editingOrder.purchase_status)">{{ editingOrder.purchase_status }}</el-tag>
+          <el-tag :style="statusStyle(editingOrder.purchase_status)">{{ editingOrder.purchase_status }}</el-tag>
           <span v-if="editingOrder.platform_account" class="ec-dim">账号 {{ editingOrder.platform_account }}</span>
           <span class="ec-dim">下单 {{ editingOrder.date }}</span>
           <span v-if="editingOrder.order_no" class="ec-dim">订单号 {{ editingOrder.order_no }}</span>

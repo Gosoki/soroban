@@ -13,9 +13,9 @@
       <tbody>
         <tr v-for="(it, i) in (order.items || [])" :key="i" :class="{ 'item-auto': isTitleItem(it) }"
             :title="isTitleItem(it) ? '物品名与商品标题相同（无独立物品详情）；改成真实物品名即变正常色' : ''">
-          <td><el-input v-model="it.name" size="small" placeholder="物品名" @change="onItemEdit(it)" /></td>
-          <td><el-input-number v-model="it.quantity" :min="1" :controls="false" size="small" @change="onItemEdit(it)" /></td>
-          <td><el-input-number v-model="it.unit_price_cny" :min="0" :precision="2" :controls="false" size="small"
+          <td><el-input v-model="it.name" placeholder="物品名" @change="onItemEdit(it)" /></td>
+          <td><el-input-number v-model="it.quantity" :min="1" :controls="false" @change="onItemEdit(it)" /></td>
+          <td><el-input-number v-model="it.unit_price_cny" :min="0" :precision="2" :controls="false"
                                placeholder="单价" @change="onItemEdit(it)" /></td>
           <td class="c-act"><el-button link type="danger" :icon="Delete" tabindex="-1" @click="removeItem(i)" /></td>
         </tr>
@@ -24,10 +24,9 @@
              （名 → 数量 → 单价）时，刚离开名字框就已经以「数量 1、无单价」提交并清空草稿，
              随后填的数量与单价留在孤儿 draft 里，永远进不了库。与 NotionTable 的幽灵新建行同一范式。 -->
         <tr class="draft-row" @keyup.enter="commitDraft">
-          <td><el-input v-model="draft.name" size="small" placeholder="+ 新物品名，填完按回车" /></td>
-          <td><el-input-number v-model="draft.quantity" :min="1" :controls="false" size="small" /></td>
-          <td><el-input-number v-model="draft.price" :min="0" :precision="2" :controls="false"
-                               size="small" placeholder="单价" /></td>
+          <td><el-input v-model="draft.name" placeholder="+ 新物品名，填完按回车" /></td>
+          <td><el-input-number v-model="draft.quantity" :min="1" :controls="false" /></td>
+          <td><el-input-number v-model="draft.price" :min="0" :precision="2" :controls="false" placeholder="单价" /></td>
           <td class="c-act">
             <el-button link :type="draftReady ? 'success' : 'info'" :icon="draftReady ? Check : Plus"
                        :disabled="!draftReady || committingDraft" tabindex="-1"
@@ -39,14 +38,14 @@
     </table>
     <div class="postage-row">
       <span class="postage-lb">货款（元）</span>
-      <el-input-number v-model="goodsInput" :min="0" :precision="2" :controls="false" size="small"
+      <el-input-number v-model="goodsInput" :min="0" :precision="2" :controls="false"
                        :disabled="!isSingleUnitItem" :placeholder="isSingleUnitItem ? '直接填金额' : '由明细算出'"
                        style="width: 130px" @change="applyGoods" />
       <el-tooltip placement="top" :content="GOODS_HINT" popper-class="wrap-tip">
         <el-icon class="lb-help"><QuestionFilled /></el-icon>
       </el-tooltip>
       <span class="postage-lb pl">邮费（元）</span>
-      <el-input-number v-model="order.postage_cny" :min="0" :precision="2" :controls="false" size="small"
+      <el-input-number v-model="order.postage_cny" :min="0" :precision="2" :controls="false"
                        placeholder="包邮" style="width: 130px" @change="savePostage" />
       <span class="postage-hint">不填 = 包邮</span>
     </div>
@@ -121,8 +120,10 @@ async function saveItems() {
     })
     return true
   } catch (e) {
+    // 分工固定：**组件只管 409**（拦截器刻意放行它），其余一律交给拦截器。
+    // 这里再弹一次的话会出现两条提示，而且 detail 是 FastAPI 的校验数组时，
+    // 这条会把 JSON 原样打进提示框（拦截器那边是展平过的）。
     if (e.response?.status === 409) { ElMessage.warning('数据已变，已刷新'); emit('conflict') }
-    else ElMessage.error(e.response?.data?.detail || '保存失败')
     return false
   }
 }
@@ -148,8 +149,10 @@ async function savePostage() {
     })
     return true
   } catch (e) {
+    // 分工固定：**组件只管 409**（拦截器刻意放行它），其余一律交给拦截器。
+    // 这里再弹一次的话会出现两条提示，而且 detail 是 FastAPI 的校验数组时，
+    // 这条会把 JSON 原样打进提示框（拦截器那边是展平过的）。
     if (e.response?.status === 409) { ElMessage.warning('数据已变，已刷新'); emit('conflict') }
-    else ElMessage.error(e.response?.data?.detail || '保存失败')
     return false
   }
 }
@@ -160,8 +163,12 @@ async function removeItem(i) {
   try {
     await ElMessageBox.confirm(`删除物品「${it?.name || '未命名'}」？`, '确认', { type: 'warning' })
   } catch (_) { return }
-  props.order.items.splice(i, 1)
-  saveItems()
+  // **先删本地、失败要放回去**。不放回去的话本地数组已经少了这条，
+  // 下一次任何成功的保存都会把「不含它的 items」整体覆盖上去——
+  // 这条物品和它的钱就被静默删掉了，而用户看到的只是「刚才那次删除失败了」。
+  // 同一个文件里的 commitDraft 已经这么做了，这里漏了。
+  const removed = props.order.items.splice(i, 1)
+  if (!(await saveItems())) props.order.items.splice(i, 0, ...removed)
 }
 
 // 末尾草稿录入完成：转为正式物品(auto=false)、写库、**成功后**才清空草稿

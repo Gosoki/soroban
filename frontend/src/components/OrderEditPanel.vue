@@ -10,23 +10,23 @@
 
     <div class="oep-fields">
       <label class="f"><span>下单日期</span>
-        <el-date-picker v-model="order.date" type="date" value-format="YYYY-MM-DD" size="small"
+        <el-date-picker v-model="order.date" type="date" value-format="YYYY-MM-DD"
                         :clearable="false" @change="saveField('date', order.date)" /></label>
       <label class="f"><span>状态</span>
-        <el-select v-model="order.purchase_status" size="small" @change="saveField('purchase_status', order.purchase_status)">
+        <el-select v-model="order.purchase_status" @change="saveField('purchase_status', order.purchase_status)">
           <el-option v-for="s in PURCHASE_STATUS" :key="s" :label="s" :value="s" />
         </el-select></label>
       <label class="f"><span>来源</span>
-        <el-select v-model="order.platform" size="small" clearable placeholder="来源" @change="saveField('platform', order.platform)">
+        <el-select v-model="order.platform" clearable placeholder="来源" @change="saveField('platform', order.platform)">
           <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
         </el-select></label>
       <label class="f"><span>账号昵称</span>
-        <el-select v-model="order.platform_account" size="small" clearable filterable allow-create default-first-option
+        <el-select v-model="order.platform_account" clearable filterable allow-create default-first-option
                    placeholder="账号昵称" @change="saveField('platform_account', order.platform_account)">
           <el-option v-for="a in accounts" :key="a" :label="a" :value="a" />
         </el-select></label>
       <label class="f"><span>所属集运</span>
-        <el-select :persistent="false" v-model="order.shipment_order_id" size="small" clearable filterable placeholder="未集运"
+        <el-select :persistent="false" v-model="order.shipment_order_id" clearable filterable placeholder="未集运"
                    remote :remote-method="searchShipment" :loading="shipSearching"
                    remote-show-suffix reserve-keyword
                    no-data-text="没有匹配的集运单"
@@ -40,24 +40,24 @@
                      :label="(j.shipment_no || ('#' + j.id)) + ' · ' + j.shipment_status" :value="j.id" />
         </el-select></label>
       <label class="f"><span>订单号</span>
-        <el-input v-model="order.order_no" size="small" placeholder="订单号" @change="saveField('order_no', order.order_no)" /></label>
+        <el-input v-model="order.order_no" placeholder="订单号" @change="saveField('order_no', order.order_no)" /></label>
       <label class="f"><span>快递公司</span>
-        <el-input v-model="order.express_company" size="small" placeholder="快递公司" @change="saveField('express_company', order.express_company)" /></label>
+        <el-input v-model="order.express_company" placeholder="快递公司" @change="saveField('express_company', order.express_company)" /></label>
       <label class="f"><span>快递号</span>
-        <el-input v-model="order.express_no" size="small" placeholder="快递号" @change="saveField('express_no', order.express_no)" /></label>
+        <el-input v-model="order.express_no" placeholder="快递号" @change="saveField('express_no', order.express_no)" /></label>
       <label class="f"><span>汇率</span>
-        <el-input v-model="order.fx_rate" size="small" placeholder="当天汇率" @change="saveField('fx_rate', order.fx_rate)" /></label>
+        <el-input v-model="order.fx_rate" placeholder="当天汇率" @change="saveField('fx_rate', order.fx_rate)" /></label>
       <label class="f"><span>覆盖日元（円）</span>
-        <el-input-number v-model="order.jpy_override" :controls="false" size="small" placeholder="实付日元"
+        <el-input-number v-model="order.jpy_override" :controls="false" placeholder="实付日元"
                          class="fnum" @change="saveField('jpy_override', order.jpy_override)" /></label>
       <label class="f"><span>分类</span>
-        <el-input v-model="order.category" size="small" placeholder="分类" @change="saveField('category', order.category)" /></label>
+        <el-input v-model="order.category" placeholder="分类" @change="saveField('category', order.category)" /></label>
       <label class="f"><span>商品标题</span>
-        <el-input v-model="order.title" size="small" placeholder="商品标题" @change="saveField('title', order.title)" /></label>
+        <el-input v-model="order.title" placeholder="商品标题" @change="saveField('title', order.title)" /></label>
       <label class="f f-wide"><span>商品链接</span>
-        <el-input v-model="order.url" size="small" placeholder="商品链接" @change="saveField('url', order.url)" /></label>
+        <el-input v-model="order.url" placeholder="商品链接" @change="saveField('url', order.url)" /></label>
       <label class="f f-wide"><span>备注</span>
-        <el-input v-model="order.note" type="textarea" :rows="2" size="small" placeholder="备注" @change="saveField('note', order.note)" /></label>
+        <el-input v-model="order.note" type="textarea" :rows="2" placeholder="备注" @change="saveField('note', order.note)" /></label>
     </div>
 
     <div class="oep-subtitle">物品明细 · 单价×数量 + 邮费</div>

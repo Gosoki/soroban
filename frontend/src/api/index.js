@@ -94,8 +94,11 @@ export const pluginsApi = {
   // 通用命令端点：动词由清单声明，加插件/加动词都不用再往这里加方法
   run: (id, command, account) =>
     http.post(`/plugins/${id}/run/${command}`, null, { params: account ? { account } : {} }),
-  login: (id, account) => http.post(`/plugins/${id}/login`, null, { params: { account } }),
-  fetch: (id, account) => http.post(`/plugins/${id}/fetch`, null, { params: account ? { account } : {} }),
+  // login / fetch 不再是独立端点：它们就是清单里的两条命令，统一走 run。
+  // 各开一个端点的下场是校验各写一套——遗留的 /fetch 绕过了「停用」总开关、
+  // 不校验命令 needs、不下发插件参数、扇出还共用同一枚令牌。
+  login: (id, account) => http.post(`/plugins/${id}/run/login`, null, { params: { account } }),
+  fetch: (id, account) => http.post(`/plugins/${id}/run/fetch`, null, { params: account ? { account } : {} }),
   addAccount: (id, name, platform) => http.post(`/plugins/${id}/account`, null, { params: { name, platform } }),
   setAccountEnabled: (id, account, enabled) => http.patch(`/plugins/${id}/account`, null, { params: { account, enabled } }),
   deleteAccount: (id, account) => http.delete(`/plugins/${id}/account`, { params: { account } }),

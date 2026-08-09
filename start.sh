@@ -66,6 +66,9 @@ fi
 if [ ! -f "$BACKEND/.env" ]; then
   SECRET="$("$PY_BIN" -c 'import secrets; print(secrets.token_hex(32))')"
   sed "s|^SECRET_KEY=.*|SECRET_KEY=$SECRET|" "$BACKEND/.env.example" > "$BACKEND/.env"
+  # 0600：里面有 SECRET_KEY（能伪造管理员令牌）与数据库口令。run.py 生成 .env 时已经
+  # chmod 600 了，这条路径漏了——同一个文件由谁生成决定它是不是全机可读，是最难注意到的那种不一致。
+  chmod 600 "$BACKEND/.env" 2>/dev/null || true
   green "已生成 backend/.env（含随机 SECRET_KEY）。"
 fi
 

@@ -41,6 +41,10 @@ def upgrade() -> None:
         sa.Column("data", sa.Text(), nullable=False),
         sa.Column("created_at", UtcDateTime(), nullable=False),
         sa.Column("updated_at", UtcDateTime(), nullable=False),
+        # 与全库其余 13 张表一致：引擎与字符集**钉死**，不取「库的默认」。
+        # 漏了这一行的话，这张表的默认排序规则会跟着目标库走，而全库其余表不会——
+        # 同一个库里两套默认，是最难注意到的那种不一致。
+        mysql_engine="InnoDB", mysql_charset="utf8mb4",
     )
     op.create_index("ix_pluginrecord_owner", "pluginrecord",
                     ["plugin_id", "kind", "key"], unique=True)

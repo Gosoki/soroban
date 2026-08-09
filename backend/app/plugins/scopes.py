@@ -62,7 +62,10 @@ SCOPES: dict[str, ScopeSpec] = {
 # 重启即全清，是 fail-closed 的那一侧，符合本项目取向。
 _ALIVE: dict[str, float] = {}
 _ALIVE_LOCK = threading.Lock()
-_HARD_TTL = dt.timedelta(minutes=30)     # 硬上限：清单只能调低，不能调高
+# 硬上限：清单只能调低，不能调高。**必须严格大于子进程的收割超时**
+# （routers/plugins.py 的 _REAP_TIMEOUT，今天是 30 分钟）——取 30 分钟的话，
+# 令牌与进程同一刻到期，跑满时长的那次抓取最后一笔回灌照样 401。
+_HARD_TTL = dt.timedelta(minutes=40)
 
 
 def issue(user, plugin_id: str, granted: set[str], timeout_s: int = 600) -> tuple[str, str]:
@@ -147,7 +150,7 @@ def _iter_routes(app) -> list:
     **没有 `.routes`**，子路由挂在 `.original_router` 上。只看 `app.routes` 只能拿到
     `/api/health` 那一条——那会让整个闸门要么全拒（插件什么都干不了）、
     要么全放行（权限形同虚设），取决于默认分支怎么写。两种都很难在测试里看出来，
-    所以 `tests/test_plugin_scopes.py` 有一条断言「展平出来的路由数 > 40」。
+    所以 `tests/test_plugin_paths.py` 有一条断言「展平出来的路由数 > 40」。
     """
     key = id(app)
     if key not in _ROUTES_CACHE:

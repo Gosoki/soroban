@@ -7,8 +7,21 @@
 进程内计数就是全局计数。重启会清空——可接受：重启需要本机权限，那时攻击者已经赢了。
 
 策略：前 FREE_TRIES 次失败不惩罚（手滑打错不该被锁），之后按 2 的幂退避并封顶；
-成功登录立即清零。按 (用户名, 来源 IP) 计数，避免一个 IP 猜多个用户名时互相稀释、
-也避免同一用户名从不同 IP 尝试时互相牵连。
+成功登录立即清零。
+
+**同时按两个键计数**，取两者中更严的那个：
+  · `(用户名, 来源 IP)` —— 一个 IP 猜多个用户名时互不稀释、同一用户名从不同 IP 尝试时互不牵连；
+  · `(用户名, "*")`     —— 与来源 IP 无关的兜底。
+
+第二个键不是冗余，它挡的是一个**实测可行**的绕过：uvicorn 默认信任来自 loopback 的
+`X-Forwarded-For`（`forwarded_allow_ips="127.0.0.1"`），而前端开发代理、以及任何同机反向代理
+都会让后端把每个请求都看成来自 127.0.0.1。于是 `request.client.host` 变成攻击者可控的字符串，
+每次换一个值就是一个全新的键。实测：固定 XFF 打 12 次在第 7 次开始 429；
+每次换 XFF 打 12 次，**一次 429 都没有**。
+
+另外，「先查退避、再记失败」是两次独立取锁，中间有窗口：并发一发，一个退避窗口能塞进
+几十次口令尝试。所以对外只暴露一个 `begin()`——在**同一把锁里**判定并计数，
+失败与否事后由 `record_success()` 决定要不要清零。宁可把一次成功登录也先记上一笔。
 """
 from __future__ import annotations
 
@@ -30,6 +43,12 @@ class LoginThrottle:
     @staticmethod
     def key(username: str, client_ip: str | None) -> tuple[str, str]:
         return ((username or "").strip().lower(), client_ip or "?")
+
+    @staticmethod
+    def _keys(username: str, client_ip: str | None) -> tuple[tuple[str, str], ...]:
+        """这次尝试要计到哪几个键上：按 IP 的那个，以及与 IP 无关的兜底。"""
+        u = (username or "").strip().lower()
+        return ((u, client_ip or "?"), (u, "*"))
 
     def _prune(self, now: float) -> None:
         """调用方必须持锁。清掉过期项；仍然超量则按「谁最该被丢」淘汰。
@@ -56,19 +75,41 @@ class LoginThrottle:
                 del self._fails[k]
 
     def retry_after(self, key: tuple[str, str]) -> int:
-        """还需等待的秒数；0 = 现在可以试。"""
+        """还需等待的秒数；0 = 现在可以试。（只读，不计数——给测试与诊断用。）"""
         now = time.monotonic()
         with self._lock:
             self._prune(now)
-            entry = self._fails.get(key)
-            if entry is None:
-                return 0
-            count, last = entry
-            if count <= FREE_TRIES:
-                return 0
-            delay = min(BASE_DELAY * (2 ** (count - FREE_TRIES - 1)), MAX_DELAY)
-            remaining = delay - (now - last)
-            return max(0, int(remaining) + 1) if remaining > 0 else 0
+            return self._wait_locked(key, now)
+
+    def begin(self, username: str, client_ip: str | None) -> int:
+        """开始一次登录尝试。返回还需等待的秒数；0 = 放行（并且**已经记上一笔**）。
+
+        判定与计数必须在同一把锁里：分成 `retry_after()` + `record_failure()` 两次取锁的话，
+        并发请求会全部在任何一次计数落地之前通过检查——一个退避窗口能塞进几十次尝试。
+        """
+        now = time.monotonic()
+        with self._lock:
+            self._prune(now)
+            keys = self._keys(username, client_ip)
+            wait = max(self._wait_locked(k, now) for k in keys)
+            if wait:
+                return wait
+            for k in keys:                      # 先记后验：成功了再由 record_success 清零
+                count = self._fails.get(k, (0, now))[0]
+                self._fails[k] = (count + 1, now)
+            return 0
+
+    def _wait_locked(self, key: tuple[str, str], now: float) -> int:
+        """调用方必须持锁。"""
+        entry = self._fails.get(key)
+        if entry is None:
+            return 0
+        count, last = entry
+        if count <= FREE_TRIES:
+            return 0
+        delay = min(BASE_DELAY * (2 ** (count - FREE_TRIES - 1)), MAX_DELAY)
+        remaining = delay - (now - last)
+        return max(0, int(remaining) + 1) if remaining > 0 else 0
 
     def record_failure(self, key: tuple[str, str]) -> None:
         now = time.monotonic()
@@ -77,9 +118,11 @@ class LoginThrottle:
             self._fails[key] = (count + 1, now)
             self._prune(now)
 
-    def record_success(self, key: tuple[str, str]) -> None:
+    def record_success(self, username: str, client_ip: str | None) -> None:
+        """登录成功：把这次尝试涉及的两个键都清零。"""
         with self._lock:
-            self._fails.pop(key, None)
+            for k in self._keys(username, client_ip):
+                self._fails.pop(k, None)
 
     def reset(self) -> None:
         """仅供测试：清空全部计数。"""

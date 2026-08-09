@@ -26,7 +26,7 @@ from ..models import (
     utcnow,
 )
 from ..schemas import StagingCreate, StagingItemRead, StagingRead, StagingUpdate, OrderRead
-from .common import build_items, goods_seed, guarded_bump, raise_conflict, raise_not_found
+from .common import build_items, goods_seed, guarded_bump, raise_conflict, raise_not_found, stamp_fx
 
 router = APIRouter(
     prefix="/api/staging", tags=["staging"], dependencies=[Depends(get_current_user)]
@@ -232,6 +232,12 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
             built = build_items(payload.items, seed_goods, order.title)
             order.items = [OrderItem(**d) for d in built]
             row.items = [StagingItem(**d) for d in built]
+        # 缺汇率就补一条——与 orders.update_order:220、misc、shipment 三处同一刀。
+        # 漏掉这里的后果不是报错：jpy_auto/jpy_settled 一起是 NULL，看板 SUM 跳过它、
+        # 笔数照数，「笔数 +1、金额 +0」。而汇率格在暂存页是可编辑且可清空的，
+        # 清一下就能让一条已导入的账本单悄悄变成不计钱的行。
+        stamp_fx(session, order)
+        row.fx_rate = order.fx_rate                     # 暂存镜像跟着走，免得两页显示不同汇率
         order.sync_from_items()                         # 账本价+日元由物品派生（fx 变也重算）
         row.sync_from_items()                           # 暂存价镜像
         session.add(order)

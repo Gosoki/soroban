@@ -57,6 +57,11 @@ class Manifest(NamedTuple):
     # 那些操作要把账号名迁到账本行上，核心得知道迁到哪一列。
     # 原先核心里写死的是 `if manifest["platform"] != "taobao"`，把一个插件的名字焊进了核心。
     ledger_field: str = ""
+    # 插件**建议**的定时间隔（分钟）。只在这个插件还没有配置行时当默认值用；
+    # 用户存过一次之后，以库里的为准（哪怕存的是 0 = 不定时）。
+    # 没有它的话，装上汇率插件、开了开关、然后什么也不会发生——
+    # 定时间隔默认 0，而「0 = 不定时」这件事只写在字段注释里，界面上看不出来。
+    default_schedule_minutes: int = 0
     error: str = ""                      # 解析/校验失败时的原因（仍然进列表，不静默消失）
 
     def command(self, name: str) -> Optional[Command]:
@@ -124,6 +129,14 @@ def _command(raw: dict, plugin_id: str, has_accounts: bool) -> Optional[Command]
     )
 
 
+def _positive_int(v) -> int:
+    """清单里的数字字段：写错了当没写，不让一份手写 toml 把插件页打崩。"""
+    try:
+        return max(0, int(v))
+    except (TypeError, ValueError):
+        return 0
+
+
 def parse(raw: dict, directory) -> Manifest:
     """把 tomllib 读出来的 dict 变成强类型清单。
 
@@ -165,6 +178,7 @@ def parse(raw: dict, directory) -> Manifest:
         commands=cmds,
         state_dir=str(raw.get("state_dir") or ".state"),
         ledger_field=str(raw.get("accounts_ledger_field") or ""),
+        default_schedule_minutes=_positive_int(raw.get("default_schedule_minutes")),
         error=err,
     )
 

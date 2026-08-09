@@ -344,3 +344,72 @@ def test_handlers_never_commit():
             if isinstance(node, ast.Attribute) and node.attr in ("commit", "rollback", "delete"):
                 bad.append(f"{h.kind}: session.{node.attr}()（第 {node.lineno} 行）")
     assert not bad, "handler 里不许自己提交/回滚/删除：\n  " + "\n  ".join(bad)
+
+
+# --- 三条启动路径不许各自漂移 --------------------------------------------------
+
+def test_every_launch_path_sends_plugin_params():
+    """凡是 spawn 子进程的路径，下发的 config 必须含 `params`。
+
+    本轮审计里 (A2)(A6)(A7) 全是同一个形状：手动 / 定时 两条路径各自组装、各自漂移。
+    最贵的一条是定时不带 params——用户在卡片上设的汇率源对定时**完全无效**，
+    而账本采用的恰恰是定时写进来的那条。安静地写错数据。
+
+    这条守的是漂移本身：谁再加第三条启动路径、又忘了带 params，当场红。
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "app" / "routers" / "plugins.py")
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+
+    def _is_conf(expr, fn) -> bool:
+        """expr 是不是 `_launch_conf(...)` 的返回值——直接调用，或先赋给局部变量再传。
+        （把调用提到循环外是**更好**的写法，守卫不该逼人写差。）"""
+        if isinstance(expr, ast.Call):
+            return getattr(expr.func, "id", "") == "_launch_conf"
+        if isinstance(expr, ast.Name) and fn is not None:
+            for a in ast.walk(fn):
+                if (isinstance(a, ast.Assign) and any(
+                        isinstance(t, ast.Name) and t.id == expr.id for t in a.targets)):
+                    return _is_conf(a.value, None)
+        return False
+
+    bad = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(fn):
+            if not (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_launch"):
+                continue
+            conf = next((k.value for k in node.keywords if k.arg == "config"), None)
+            if conf is None:
+                continue                  # 不带 config 的（如纯登录）不在此列
+            if not _is_conf(conf, fn):
+                bad.append(f"plugins.py:{node.lineno}")
+    assert not bad, ("这些 _launch 的 config 不是 _launch_conf() 组装的，插件参数不会下发：\n  "
+                     + "\n  ".join(bad))
+
+
+def test_plugin_token_ttl_is_derived_from_the_reap_timeout():
+    """令牌活得必须比子进程久。
+
+    原先 `scopes.issue` 三个调用点全用默认 timeout_s=600 → TTL 12 分钟，
+    而收割器 `communicate(timeout=1800)` 等 30 分钟。超过 12 分钟的抓取，
+    最后那次回灌必然 401，整批订单静默丢失。
+    """
+    import datetime as dt
+
+    from app.plugins import scopes
+    from app.routers import plugins as mod
+
+    class _U:
+        id, username = 1, "u"
+
+    _, jti = scopes.issue(_U(), "demo", set(), timeout_s=mod._REAP_TIMEOUT)
+    try:
+        left = scopes._ALIVE[jti] - __import__("time").monotonic()
+        assert left > mod._REAP_TIMEOUT, \
+            f"令牌只活 {left:.0f} 秒，比子进程允许跑的 {mod._REAP_TIMEOUT} 秒还短"
+    finally:
+        scopes.revoke(jti)

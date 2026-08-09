@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -407,3 +408,301 @@ def test_long_hints_are_shown_in_a_wrapping_tooltip():
             if "popper-class" not in tag:
                 bad.append(f"{f.name}: {tag[:60]}")
     assert not bad, "这些 tooltip 没带 popper-class（长内容会不换行）：\n  " + "\n  ".join(bad)
+
+
+# --- 清单建议的定时间隔 --------------------------------------------------------
+
+def _with_default_schedule(session, fake_plugin, minutes="360"):
+    """给 demo 插件的清单加上 default_schedule_minutes，并**清掉库里的残留配置行**。
+
+    清这一步是必须的：整个测试会话共用一个库，同文件前面的用例已经给 demo
+    存过配置了。不清的话这几条测的是「上一个用例留下的值」，而不是清单建议值——
+    而且会以「通过」的形式骗过去（残留恰好是 0 时）。
+    """
+    f = fake_plugin / "plugin.toml"
+    # 必须插在**最前面**：_FAKE_TOML 末尾是 [[params]]，追加的顶层键会被 TOML
+    # 归到那张表里，插件的建议间隔就永远读不出来（而且不报错）。
+    f.write_text(f'default_schedule_minutes = {minutes}\n{_FAKE_TOML}', encoding="utf-8")
+    row = session.get(PluginConfig, "demo")
+    if row is not None:
+        session.delete(row)
+        session.commit()
+    return fake_plugin
+
+
+def test_manifest_can_suggest_a_schedule_so_enabling_actually_fetches(client, session, fake_plugin):
+    """清单声明了建议间隔 → 还没配置过的插件，页面上读到的就是它。
+
+    没有这条的话，装上插件、打开开关，然后**什么也不会发生**——
+    schedule_minutes 默认 0 而「0=不定时」只写在字段注释里，界面上看不出来。
+    """
+    _with_default_schedule(session, fake_plugin)
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}
+    assert got["demo"]["config"]["schedule_minutes"] == 360
+
+
+def test_user_saved_zero_beats_the_manifest_suggestion(client, session, fake_plugin):
+    """用户明确存了 0（=不要定时），建议值不许把它顶回去。"""
+    _with_default_schedule(session, fake_plugin)
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}
+    assert got["demo"]["config"]["schedule_minutes"] == 0, "用户的选择被清单建议覆盖了"
+
+
+def test_granting_first_does_not_swallow_the_suggested_schedule(client, session, fake_plugin):
+    """先点授权（会先建出配置行）再看间隔，仍应是清单建议的值。
+
+    这是真实的点击顺序：装好插件 → 勾权限 → 打开开关。
+    配置行如果在授权那步被建成 schedule_minutes=0，建议值就再没机会生效了。
+    """
+    _with_default_schedule(session, fake_plugin)
+    client.put("/api/plugins/demo/grants", json={"granted": ["fx:write"]})
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}
+    assert got["demo"]["config"]["schedule_minutes"] == 360, "授权那步把建议间隔吃掉了"
+
+
+def test_garbage_schedule_in_manifest_does_not_break_the_page(client, session, fake_plugin):
+    """手写 toml 把间隔写成字符串/负数，插件页照常打开，按 0 处理。"""
+    _with_default_schedule(session, fake_plugin, minutes='"六小时"')
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}
+    assert got["demo"]["config"]["schedule_minutes"] == 0
+
+
+# --- 账号落在账本的哪一列，由清单说了算 ------------------------------------------
+
+_ACCT_TOML = """
+id = "demo"
+name = "演示插件"
+python = "inherit"
+entry = "-m demo"
+accounts = true
+accounts_ledger_field = "platform"
+"""
+
+
+def test_account_delete_uses_the_column_the_manifest_declared(client, mk, tmp_path, monkeypatch):
+    """插件声明 `accounts_ledger_field = "platform"` → 按账号删单必须按 **platform** 那一列删。
+
+    改之前 `ledger_field` 只被当成「有没有声明」的开关用，真正查的列在下游写死成
+    `platform_account`。声明成别的列的插件会顺利通过校验，然后删掉**另一列**同名的行——
+    半截抽象比没抽象更危险，因为它看起来是通用的。
+
+    造数刻意把两列的值交叉写：按对的列删会命中 A，按写死的列删会命中 B。
+    """
+    from app.routers import plugins as mod
+
+    d = tmp_path / "plugins" / "soroban-plugin-demo"
+    d.mkdir(parents=True)
+    (d / "plugin.toml").write_text(_ACCT_TOML, encoding="utf-8")
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "plugins"))
+    monkeypatch.setattr(mod, "_SOROBAN_ROOT", tmp_path)
+    mod._needs_cache.clear()
+
+    a = mk("/api/orders", {"date": "2026-05-01", "title": "按 platform 命中",
+                           "platform": "甲", "platform_account": "乙", "price_cny": 1})
+    b = mk("/api/orders", {"date": "2026-05-01", "title": "按 platform_account 命中",
+                           "platform": "乙", "platform_account": "甲", "price_cny": 1})
+
+    r = client.delete("/api/plugins/demo/account/orders", params={"account": "甲"})
+    assert r.status_code == 200, r.text
+
+    alive = {o["id"] for o in client.get("/api/orders", params={"limit": 200}).json()["items"]}
+    assert a["id"] not in alive, "声明的列是 platform，platform=甲 的那单没被删"
+    assert b["id"] in alive, "删的是写死的 platform_account 那一列，清单声明没生效"
+
+
+def test_dependency_probe_uses_distribution_names_not_import_names(tmp_path):
+    """依赖探测按 requirements.txt 里的**发行包名**判，不去猜 import 名。
+
+    `beautifulsoup4` 要 `import bs4`、`Pillow` 要 `import PIL`、`PyYAML` 要 `import yaml`。
+    按「名字里的 - 换成 _」当模块名去 import 的话，这类包**装好了也永远报「缺依赖」**：
+    插件页一直显示未就绪，点安装又装不出变化，等于这个插件是块砖。
+
+    用 pytest 自己（一定装了、且 import 名与包名恰好一致的对照）+ 一个肯定不存在的包
+    来验证探测的方向是对的，再用一个 import 名不同的真包验证关键场景。
+    """
+    import sys
+
+    from app.routers import plugins as mod
+
+    py = Path(sys.executable)
+    # 对照组：装了的不该被报缺；没装的必须被报缺。
+    assert mod._missing_dists(py, ["pytest"]) == []
+    assert mod._missing_dists(py, ["definitely-not-a-real-package-xyz"]) == \
+        ["definitely-not-a-real-package-xyz"]
+    # 关键场景：这几个都**装着**，但 import 名和发行包名对不上
+    # （PyYAML→yaml、PyMySQL→pymysql、MarkupSafe→markupsafe）。
+    # 旧规则会把它们统统报成「缺依赖」，插件因此永远装不完。
+    for dist in ("PyYAML", "PyMySQL", "MarkupSafe"):
+        assert mod._missing_dists(py, [dist]) == [], f"{dist} 装着却被报成缺依赖"
+
+    req = tmp_path / "requirements.txt"
+    req.write_text("SQLAlchemy>=2.0\n# 注释\n\n-e .\nhttpx[http2]\n", encoding="utf-8")
+    assert mod._declared_dists(req) == ["SQLAlchemy", "httpx"], "解析出的应是发行包名，不是 import 名"
+
+
+def test_each_account_gets_its_own_token(client, session, tmp_path, monkeypatch):
+    """多账号扇出必须**一个子进程一枚令牌**。
+
+    共用一枚的话，先跑完的那个账号在 `_reap` 里 `revoke(jti)`，还在跑的兄弟当场全部 401——
+    它们已经抓到的订单再也回灌不进来，而且是静默的：用户只看到少了几单。
+    """
+    from app.plugins import scopes
+    from app.routers import plugins as mod
+
+    d = tmp_path / "plugins" / "soroban-plugin-demo"
+    d.mkdir(parents=True)
+    (d / "plugin.toml").write_text(_ACCT_TOML + '\nscopes = ["staging:write"]\n', encoding="utf-8")
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "plugins"))
+    monkeypatch.setattr(mod, "_SOROBAN_ROOT", tmp_path)
+    monkeypatch.setattr(mod, "_python", lambda m: Path(sys.executable))
+    mod._needs_cache.clear()
+
+    seen = []
+    monkeypatch.setattr(mod, "_launch",
+                        lambda *a, **kw: seen.append((kw.get("token"), kw.get("jti"))) or 1234)
+
+    for name in ("甲号", "乙号"):
+        assert client.post("/api/plugins/demo/account", params={"name": name}).status_code == 200
+    client.put("/api/plugins/demo/grants", json={"granted": ["staging:write"]})
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
+
+    r = client.post("/api/plugins/demo/run/fetch")
+    assert r.status_code == 200, r.text
+    assert len(seen) == 2, f"两个账号应该起两个进程，实际 {len(seen)}"
+    jtis = [j for _, j in seen]
+    assert len(set(jtis)) == 2, "两个账号共用了同一枚令牌"
+    # 收割掉第一个（模拟它先跑完）——第二个必须还活着
+    scopes.revoke(jtis[0])
+    assert not scopes.alive(jtis[0]) and scopes.alive(jtis[1]), \
+        "先跑完的账号把还在跑的兄弟的令牌一起吊销了"
+
+
+def test_command_needs_are_exposed_so_the_panel_can_re_enable_buttons(client, session, fake_plugin):
+    """命令要带上 `needs`：前端勾完授权得就地重算 blocked，否则按钮停在禁用态。"""
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}
+    cmd = got["demo"]["commands"][0]
+    assert "needs" in cmd, "命令没给 needs，前端无法在勾授权后重算 blocked"
+    assert set(cmd["blocked"]) <= set(cmd["needs"])
+
+
+def test_button_disabled_state_uses_the_same_set_as_the_execution_gate(client, session, tmp_path, monkeypatch):
+    """按钮的「缺权限」判据必须与实际执行闸同源。
+
+    命令声明了一个**没在顶层 scopes 里声明**的 need 时：执行闸用
+    token_scopes（声明 ∩ 授权 ∩ 已知）算得它缺，按钮也必须显示缺。
+    若按钮用裸 granted 判，勾上授权后按钮会变可点，点下去照收 409——
+    更糟的是反过来：勾选框只列 declared，那一项根本无从勾，按钮却永远灰着。
+    """
+    from app.routers import plugins as mod
+
+    d = tmp_path / "plugins" / "soroban-plugin-demo"
+    d.mkdir(parents=True)
+    (d / "plugin.toml").write_text('''
+id = "demo"
+name = "演示插件"
+python = "inherit"
+entry = "-m demo"
+scopes = ["fx:write"]
+
+[[commands]]
+name = "run"
+label = "跑一下"
+needs = ["fx:write", "orders:read"]
+''', encoding="utf-8")
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "plugins"))
+    monkeypatch.setattr(mod, "_SOROBAN_ROOT", tmp_path)
+    mod._needs_cache.clear()
+
+    # 把 orders:read 也「授权」上——它没在清单顶层声明，token_scopes 会滤掉
+    client.put("/api/plugins/demo/grants", json={"granted": ["fx:write", "orders:read"]})
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}
+    cmd = next(c for c in got["demo"]["commands"] if c["name"] == "run")
+    assert "orders:read" in cmd["blocked"], \
+        "按钮判据用了裸 granted：显示可点，实际执行闸会 409"
+
+
+def _sched_plugin(tmp_path, monkeypatch, toml_body):
+    from app.routers import plugins as mod
+
+    d = tmp_path / "plugins" / "soroban-plugin-demo"
+    d.mkdir(parents=True)
+    (d / "plugin.toml").write_text(toml_body, encoding="utf-8")
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "plugins"))
+    monkeypatch.setattr(mod, "_SOROBAN_ROOT", tmp_path)
+    monkeypatch.setattr(mod, "_python", lambda m: Path(sys.executable))
+    mod._needs_cache.clear()
+    return mod
+
+
+def test_scheduler_takes_the_verb_from_the_manifest(client, session, tmp_path, monkeypatch):
+    """定时跑哪条命令由**清单**决定，不是核心里写死的 "fetch"。
+
+    写死的话，没声明 fetch 的插件会被一遍遍拉起来跑一个它不认识的动词，
+    而 `launched` 只数「进程起没起来」→ last_run_at 照常推进，
+    每个周期白跑一次，卡片上还显示「已触发」。
+    """
+    from app.models import PluginConfig
+
+    mod = _sched_plugin(tmp_path, monkeypatch, '''
+id = "demo"
+name = "演示插件"
+python = "inherit"
+entry = "-m demo"
+scopes = ["fx:write"]
+
+[[commands]]
+name = "refresh"
+label = "刷新"
+primary = true
+needs = ["fx:write"]
+''')
+    seen = []
+    monkeypatch.setattr(mod, "_launch", lambda m, command, *a, **kw: seen.append(command) or 1)
+
+    client.put("/api/plugins/demo/grants", json={"granted": ["fx:write"]})
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 1})
+    row = session.get(PluginConfig, "demo")
+    row.last_run_at = None
+    session.add(row)
+    session.commit()
+
+    mod._run_due(session)
+    assert seen == ["refresh"], f"定时跑的动词是 {seen}，没按清单声明来"
+
+
+def test_scheduler_skips_when_permissions_are_missing(client, session, tmp_path, monkeypatch):
+    """缺权限就别起进程，也别推进 last_run_at。
+
+    不拦的话子进程跑起来收一串 403，用户在卡片上只看到「失败」，
+    看不出是**没勾授权**——而且 last_run_at 一直在走，看起来像在正常跑。
+    """
+    from app.models import PluginConfig
+
+    mod = _sched_plugin(tmp_path, monkeypatch, '''
+id = "demo"
+name = "演示插件"
+python = "inherit"
+entry = "-m demo"
+scopes = ["fx:write"]
+
+[[commands]]
+name = "fetch"
+label = "抓取"
+needs = ["fx:write"]
+''')
+    seen = []
+    monkeypatch.setattr(mod, "_launch", lambda m, command, *a, **kw: seen.append(command) or 1)
+
+    client.put("/api/plugins/demo/grants", json={"granted": []})     # 明确不授权
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 1})
+    row = session.get(PluginConfig, "demo")
+    row.last_run_at = None
+    session.add(row)
+    session.commit()
+
+    mod._run_due(session)
+    assert seen == [], "缺权限还是把子进程拉起来了"
+    session.expire_all()
+    assert session.get(PluginConfig, "demo").last_run_at is None, \
+        "没真的跑却推进了 last_run_at，看起来像在正常跑"

@@ -5,10 +5,11 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import ConfigDict, ValidationError
 from sqlmodel import Field, Session, SQLModel
 
@@ -125,7 +126,10 @@ def _first_error(e: ValidationError) -> str:
 
 
 @router.get("/records/{kind}", openapi_extra={"x-scope": "data:own"})
-def list_records(kind: str, limit: int = 200, offset: int = 0,
+def list_records(kind: str,
+                 # 必须有下界：`?limit=-1` 在 SQLite 上等于「不限」，在 MySQL 上是语法错 500。
+                 # 零消费者的现在改最便宜——一旦有第一个真消费者，这些边界就再也改不动了。
+                 limit: int = Query(200, ge=1, le=1000), offset: int = Query(0, ge=0),
                  session: Session = Depends(get_session),
                  current=Depends(get_current_user)):
     """读本插件自己存的数据。**只回自己的**——命名空间隔离在这里落实。"""
@@ -140,6 +144,14 @@ def list_records(kind: str, limit: int = 200, offset: int = 0,
     rows = session.exec(
         select(PluginRecord)
         .where(PluginRecord.plugin_id == plugin_id, PluginRecord.kind == kind)
-        .order_by(PluginRecord.key).offset(offset).limit(min(limit, 1000))
+        .order_by(PluginRecord.key).offset(offset).limit(limit)
     ).all()
-    return {"items": [{"key": r.key, "data": r.data, "updated_at": r.updated_at} for r in rows]}
+    # 写侧收的是 dict、落库是 JSON 字符串，读侧就该还原成 dict——
+    # 原样回字符串的话，同一个字段在写/存/读三处是三种类型，插件那边还得自己再解一次。
+    def _data(raw):
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return raw                      # 手改坏了也别让整个列表打不开
+    return {"items": [{"key": r.key, "data": _data(r.data), "updated_at": r.updated_at}
+                      for r in rows]}

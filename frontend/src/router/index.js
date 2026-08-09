@@ -24,6 +24,11 @@ const routes = [
       { path: 'settings', name: 'Settings', component: () => import('@/views/Settings/index.vue'), meta: { title: '设置', icon: 'Setting' } },
     ],
   },
+  // 兜底：地址写错/旧书签一律回看板。
+  // 没有这条时，`#/scrapers`（插件改名前的旧地址）这类 URL 会渲染成**整页空白**——
+  // 连左边导航都没有，用户在界面里找不到任何退回去的办法，只能手改地址栏。
+  // 放在最后，`beforeEach` 的登录判断照常先跑（没 token 还是去登录页）。
+  { path: '/:pathMatch(.*)*', redirect: '/dashboard' },
 ]
 
 const router = createRouter({ history: createWebHashHistory(), routes })

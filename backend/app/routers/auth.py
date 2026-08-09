@@ -21,8 +21,11 @@ def login(
 ):
     # 失败退避：账号名长期固定、默认口令公开、令牌 90 天有效——不限速等于把字典爆破的门开着。
     # 按 (用户名, 来源 IP) 计数，前几次手滑不惩罚，之后指数退避（见 ratelimit.py）。
-    key = login_throttle.key(form.username, request.client.host if request.client else None)
-    wait = login_throttle.retry_after(key)
+    # 注意 `request.client.host` **不可信**：uvicorn 默认信任来自 loopback 的
+    # X-Forwarded-For，而同机反向代理/前端开发代理会让所有请求都长得像 127.0.0.1。
+    # 所以退避内部同时按「与 IP 无关」的键计一份（见 ratelimit 模块 docstring）。
+    ip = request.client.host if request.client else None
+    wait = login_throttle.begin(form.username, ip)      # 判定 + 计数，同一把锁
     if wait:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -31,12 +34,11 @@ def login(
         )
     user = authenticate(session, form.username, form.password)
     if not user:
-        login_throttle.record_failure(key)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="用户名或密码错误",
         )
-    login_throttle.record_success(key)
+    login_throttle.record_success(form.username, ip)
     return LoginResponse(access_token=create_access_token(user), user=UserRead.model_validate(user))
 
 

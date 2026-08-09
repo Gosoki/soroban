@@ -64,6 +64,12 @@ _ACCOUNT_MAX = Order.__table__.columns["platform_account"].type.length
 # 目录名前缀：新的在前。两个都扫是为了老部署平滑过渡，不是长期形态。
 _PREFIXES = ("soroban-plugin-*", "soroban-scraper-*")
 
+# 子进程最长跑多久。**令牌 TTL 必须由它推导**（见每个 scopes.issue 的 timeout_s）：
+# 原先 issue 全部走默认 600s → TTL 恒为 12 分钟，而这里等 30 分钟。
+# 任何超过 12 分钟的抓取，最后那次回灌必然 401，整批订单静默丢失——单账号也中。
+# 两个数字分别写在两个文件里，就是这么长出来的。
+_REAP_TIMEOUT = 1800
+
 
 def plugin_dir() -> Path:
     """插件根目录。PLUGIN_DIR > 旧的 SCRAPER_DIR > 仓库下的 plugins/。"""
@@ -319,7 +325,7 @@ def probe_needs(manifest: dict) -> list[dict]:
         return out                                   # venv 都不能用，后两项无从谈起
     req = d / "requirements.txt"
     if req.exists():
-        missing = [m for m in _declared_modules(req) if not _importable(py, m)]
+        missing = _missing_dists(py, _declared_dists(req))
         if missing:
             out.append({"key": "deps", "label": "Python 依赖",
                         "hint": "缺少：" + "、".join(missing)})
@@ -329,17 +335,23 @@ def probe_needs(manifest: dict) -> list[dict]:
     return out
 
 
-def _declared_modules(req: Path) -> list[str]:
-    """requirements.txt 的行 → 可 import 的模块名。只做最直白的解析，够本项目用。"""
-    mods = []
+def _declared_dists(req: Path) -> list[str]:
+    """requirements.txt 的行 → **发行包名**（不是 import 名）。只做最直白的解析，够本项目用。
+
+    刻意不去猜 import 名：`beautifulsoup4` 要 `import bs4`、`Pillow` 要 `import PIL`、
+    `PyYAML` 要 `import yaml`。原先按 `名字.replace("-", "_")` 当模块名去 import，
+    这类包**装好了也永远报「缺依赖」**——插件页一直显示未就绪，点安装又装不出变化，
+    等于这个插件是块砖。requirements.txt 里写的本来就是发行包名，照着查就行。
+    """
+    out = []
     for line in req.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith(("#", "-")):
             continue
         name = re.split(r"[<>=!~\[; ]", line, maxsplit=1)[0].strip()
         if name:
-            mods.append(name.replace("-", "_"))
-    return mods
+            out.append(name)
+    return out
 
 
 def _runs(py: Path) -> bool:
@@ -358,13 +370,39 @@ def _has_pip(py: Path) -> bool:
         return False
 
 
-def _importable(py: Path, module: str) -> bool:
-    """在**插件自己的解释器**里试 import。不能用 soroban 的解释器判断——两个环境是隔离的。"""
+# 在插件自己的解释器里问「这些发行包装了没」。一次问完所有的：
+# 原先每个依赖一个子进程，而 GET /api/plugins 是前端轮询的接口。
+_PROBE_DISTS = """
+import sys
+from importlib.metadata import PackageNotFoundError, distribution
+miss = []
+for name in sys.argv[1:]:
     try:
-        return subprocess.run([str(py), "-c", f"import {module}"],
-                              capture_output=True, timeout=30).returncode == 0
+        distribution(name)
+    except PackageNotFoundError:
+        miss.append(name)
+    except Exception:
+        pass                      # 元数据坏了不算缺，别把用户卡在「装不完」的循环里
+print("\\n".join(miss))
+"""
+
+
+def _missing_dists(py: Path, names: list[str]) -> list[str]:
+    """这些发行包在**插件自己的解释器**里哪些没装。不能用 soroban 的解释器判断——两个环境是隔离的。
+
+    探测本身失败（解释器挂了/超时）时返回空：报「缺依赖」会让用户去点安装，
+    而问题根本不在依赖上，点了也不会变——那比不报更让人摸不着头脑。
+    """
+    if not names:
+        return []
+    try:
+        r = subprocess.run([str(py), "-c", _PROBE_DISTS, *names],
+                           capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
-        return False
+        return []
+    if r.returncode != 0:
+        return []
+    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
 
 def _wants_browser(d: Path) -> bool:
@@ -426,11 +464,11 @@ def _reap(proc: subprocess.Popen, label: str, jti: Optional[str] = None, on_done
     result, ok = "", False
     try:
         try:
-            out, err = proc.communicate(timeout=1800)
+            out, err = proc.communicate(timeout=_REAP_TIMEOUT)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
-            log.warning("插件 %s 超时(30min)已终止", label)
+            log.warning("插件 %s 超时(%d 秒)已终止", label, _REAP_TIMEOUT)
             result = "超时（30 分钟）已终止"
             return
         except Exception as e:                                   # noqa: BLE001
@@ -657,6 +695,9 @@ def list_plugins(session: Session = Depends(get_session)):
         need = needs_cached(m)
         with _install_lock:
             st = dict(_install_state.get(m["_m"].id) or {})
+        # 真正生效的那组权限：声明 ∩ 授权 ∩ 核心已知。命令的 blocked 与下面的
+        # scopes.effective 都用它，保证界面上的禁用判据与执行闸是同一个集合。
+        effective = scopes.token_scopes(m, cfg)
         out.append({
             "id": m["_m"].id, "name": m["_m"].name, "version": m["_m"].version,
             "installed": not need,                  # 「装好了」= 一样不缺，而非只看 venv 在不在
@@ -665,7 +706,9 @@ def list_plugins(session: Session = Depends(get_session)):
             "python": str(_python(m)),
             "config": {
                 "enabled": bool(cfg.enabled) if cfg else False,
-                "schedule_minutes": cfg.schedule_minutes if cfg else 0,
+                # 还没配置过 → 用清单建议的间隔（插件自己最清楚多久抓一次合适）；
+                # 配置过 → 一律以库里的为准，用户存的 0 就是「明确不要定时」。
+                "schedule_minutes": cfg.schedule_minutes if cfg else m["_m"].default_schedule_minutes,
                 "last_run_at": cfg.last_run_at if cfg else None,
             },
             "missing": False,
@@ -678,8 +721,16 @@ def list_plugins(session: Session = Depends(get_session)):
             "commands": [
                 {"name": c.name, "label": c.label, "hint": c.hint, "per": c.per,
                  "confirm": c.confirm, "primary": c.primary,
-                 # 缺权限的命令直接禁用并说明，而不是让用户点了收 403
-                 "blocked": sorted(set(c.needs) - set(json.loads(cfg.granted_scopes or "[]") if cfg else []))}
+                 # needs 也给出去：前端在卡片上勾授权之后要就地重算 blocked。
+                 # 只给 blocked 的话，勾完权限按钮仍停在「缺权限」禁用态，
+                 # 得手动刷新整页才活过来——用户会以为授权没生效。
+                 "needs": sorted(c.needs),
+                 # 缺权限的命令直接禁用并说明，而不是让用户点了收 403。
+                 # 判据必须与执行闸（run_command 的 `set(cmd.needs) - granted`）**同源**：
+                 # 那边用的是 token_scopes = 声明 ∩ 授权 ∩ 核心已知，这里若用裸 granted，
+                 # 作者把 needs 写成没在顶层 scopes 声明的项时，按钮永远灰、
+                 # 勾选框（来自 declared）里又没那项可勾——用户没有任何操作能解锁。
+                 "blocked": sorted(set(c.needs) - effective)}
                 for c in m["_m"].commands
             ],
             "manifest_error": m["_m"].error,
@@ -694,7 +745,7 @@ def list_plugins(session: Session = Depends(get_session)):
             "scopes": {
                 "declared": sorted(m.get("scopes") or []),
                 "granted": sorted(json.loads(cfg.granted_scopes or "[]")) if cfg else [],
-                "effective": sorted(scopes.token_scopes(m, cfg)),
+                "effective": sorted(effective),
                 "catalog": scopes.describe(),
             },
         })
@@ -741,6 +792,48 @@ def forget_plugin(plugin_id: str, session: Session = Depends(get_session)):
     return {"plugin_id": plugin_id, "removed": True}
 
 
+def _launch_conf(session: Session, m: dict, cfg: Optional[PluginConfig]) -> dict:
+    """下发给子进程的 SOROBAN_CONFIG：核心设置 + **插件自己的参数**。
+
+    手动与定时必须用同一份。原先只有手动路径带 `params`，定时那条只发 `plugin_settings()`——
+    而 fx 的清单写的是 `settings = []`，于是 `plugin_settings()` 返回 `{}`、`_launch` 里
+    `if config:` 判假、`SOROBAN_CONFIG` 干脆不设置，插件全部回落内置默认。
+
+    后果不是报错而是**账本落错口径**：fx 默认 6 小时一轮，而当天取「手填优先、其次最后一条」，
+    用户手点的那条几乎必然被后面的定时条盖掉——卡片上明明白白显示着用户设的源，
+    实际写进账本的是默认源。安静地错，是本轮唯一会写坏账本数据的一条。
+    """
+    return {**plugin_settings(session, m), "params": plugin_params.load(m["_m"], cfg)}
+
+
+def _ledger_field(m: dict) -> str:
+    """插件清单声明的「账号名落在账本的哪一列」。
+
+    单独一个函数是为了让 `m["_m"].ledger_field` 只出现在一处：调用点原先各自
+    写死字符串 `"platform_account"`，清单里的声明只被当成「有没有」的开关用——
+    以后哪个插件声明成别的列，会顺利通过校验然后操作**另一列**的数据。
+    """
+    return m["_m"].ledger_field
+
+
+def _config_row(session: Session, plugin_id: str) -> PluginConfig:
+    """取插件的配置行，没有就新建一行——**新建时带上清单建议的定时间隔**。
+
+    不在这里统一建的话，谁先写谁定调：先点「授权」会建出一行 schedule_minutes=0，
+    之后插件页读到的就是 0，清单里的建议值再也没机会生效，
+    表现为「开关打开了但永远不抓」——而且看不出是哪一步弄丢的。
+    """
+    cfg = session.get(PluginConfig, plugin_id)
+    if cfg:
+        return cfg
+    cfg = PluginConfig(plugin_id=plugin_id)
+    try:
+        cfg.schedule_minutes = _find_manifest(plugin_id)["_m"].default_schedule_minutes
+    except HTTPException:
+        pass                                  # 插件不在了也能建残留行的清理入口，不该在这儿炸
+    return cfg
+
+
 @router.put("/{plugin_id}/grants")
 def save_grants(plugin_id: str, payload: dict, session: Session = Depends(get_session)):
     """授予/收回插件权限。只接受清单声明过、且核心认识的项。
@@ -751,7 +844,7 @@ def save_grants(plugin_id: str, payload: dict, session: Session = Depends(get_se
     m = _find_manifest(plugin_id)
     want = set(payload.get("granted") or [])
     keep = sorted(want & set(m.get("scopes") or []) & set(scopes.SCOPES))
-    cfg = session.get(PluginConfig, plugin_id) or PluginConfig(plugin_id=plugin_id)
+    cfg = _config_row(session, plugin_id)
     cfg.granted_scopes = json.dumps(keep, ensure_ascii=False)
     cfg.updated_at = utcnow()
     session.add(cfg)
@@ -765,7 +858,7 @@ def save_grants(plugin_id: str, payload: dict, session: Session = Depends(get_se
 def save_config(plugin_id: str, payload: PluginConfigIn, session: Session = Depends(get_session)):
     """只存插件级设置：启用定时 + 定时间隔。账号（昵称/平台/启用）走专用增删改端点，这里不碰。"""
     _find_manifest(plugin_id)                                    # 确认插件存在
-    cfg = session.get(PluginConfig, plugin_id) or PluginConfig(plugin_id=plugin_id)
+    cfg = _config_row(session, plugin_id)
     cfg.enabled = payload.enabled
     cfg.schedule_minutes = max(0, payload.schedule_minutes)
     cfg.updated_at = utcnow()
@@ -786,7 +879,7 @@ def add_account(
     m = _find_manifest(plugin_id)
     name = name.strip()
     _check_account_name(m, name)                        # 非空+无逗号+合法文件名（会话文件按此名存）
-    cfg = session.get(PluginConfig, plugin_id) or PluginConfig(plugin_id=plugin_id)
+    cfg = _config_row(session, plugin_id)
     accs = _account_list(cfg)
     if any(a["name"] == name for a in accs):
         raise HTTPException(status_code=409, detail=f"账号已存在：{name}")
@@ -817,18 +910,11 @@ def set_account_enabled(
     return {"ok": True, "enabled": enabled}
 
 
-@router.post("/{plugin_id}/login")
-def login(plugin_id: str, account: str = Query(..., description="要授权登录的账号")):
-    m = _find_manifest(plugin_id)
-    _check_account_name(m, account)   # 非空+无逗号+目录穿越校验——与 add 同一把尺子，别让 login 收下非法名产生孤儿会话
-    return {"started": True, "pid": _launch(m, "login", ["--account", account])}
-
-
 @router.put("/{plugin_id}/params")
 def save_params(plugin_id: str, payload: dict, session: Session = Depends(get_session)):
     """保存插件私有参数。清单里没声明的键丢弃（插件降级时不该让保存整体失败）。"""
     m = _find_manifest(plugin_id)
-    cfg = session.get(PluginConfig, plugin_id) or PluginConfig(plugin_id=plugin_id)
+    cfg = _config_row(session, plugin_id)
     try:
         values = plugin_params.save(m["_m"], cfg, payload.get("params") or {})
     except ValueError as e:
@@ -859,7 +945,7 @@ def run_command(plugin_id: str, command: str, account: Optional[str] = None,
     if not _python(m).exists():
         raise HTTPException(status_code=400, detail=f"插件未安装：缺 venv（{_python(m)}）")
 
-    cfg = session.get(PluginConfig, plugin_id) or PluginConfig(plugin_id=plugin_id)
+    cfg = _config_row(session, plugin_id)
     if not cfg.enabled:
         # 「启用」是这个插件的**总开关**：停用后定时不跑、手动也执行不了。
         # 界面上按钮已经禁用，但接口不能只靠界面把关——那样别的调用方（或手滑的 curl）
@@ -873,21 +959,31 @@ def run_command(plugin_id: str, command: str, account: Optional[str] = None,
             f"「{cmd.label}」需要权限 {sorted(missing)}，请先在插件卡片上勾选授权"))
 
     if cmd.per == "account":
-        pool = [a for a in _account_list(cfg) if a["enabled"]]
+        known = _account_list(cfg)
         if account:
-            pool = [a for a in pool if a["name"] == account]
+            # **点名某个账号时不看「启用」**：账号级的启用只决定「批量跑的时候带不带它」，
+            # 手动点某个号（补抓、重新登录）是用户当下的明确意图，不该被它挡住。
+            # 这是原先 POST /{id}/fetch 的语义，端点合并到这里时必须一起搬过来，
+            # 否则「停用的号点『抓这个号』没反应」——而按钮还亮着。
+            named = next((a for a in known if a["name"] == account), None)
+            # 磁盘上有会话、但配置里没登记的孤儿账号也允许点（换机/重置库之后就剩它了）
+            _check_account_name(m, account)
+            pool = [named or {"name": account, "platform": "淘宝", "enabled": True}]
+        else:
+            pool = [a for a in known if a["enabled"]]
             if not pool:
-                raise HTTPException(status_code=404, detail=f"没有启用的账号 {account}")
-        if not pool:
-            raise HTTPException(status_code=400, detail="没有可用账号：先添加账号并启用。")
+                raise HTTPException(status_code=400, detail="没有可用账号：先添加账号并启用。")
         fan = [(["--account", a["name"], "--platform", a["platform"]], a["name"]) for a in pool]
     else:
         fan = [([], "")]
 
-    token, jti = scopes.issue(current, plugin_id, granted)
-    conf = {**plugin_settings(session, m), "params": plugin_params.load(mf, cfg)}
+    conf = _launch_conf(session, m, cfg)
     pids = []
     for extra, who in fan:
+        # **一个子进程一枚令牌**。共用一枚的话，先跑完的那个账号在 `_reap` 里
+        # `revoke(jti)`，还在跑的兄弟当场全部 401——它们已经抓到的订单再也回灌不进来，
+        # 而且是静默的：插件那边只看到「soroban 拒绝了我」，用户只看到少了几单。
+        token, jti = scopes.issue(current, plugin_id, granted, timeout_s=_REAP_TIMEOUT)
         pids.append(_launch(m, cmd.name, [*extra, "--soroban-url", _SELF_URL],
                             token=token, config=conf, jti=jti,
                             on_done=_result_writer(plugin_id, cmd.label)))
@@ -920,38 +1016,6 @@ def _result_writer(plugin_id: str, label: str):
         except Exception as e:                              # noqa: BLE001
             log.warning("写回插件 %s 的运行结果失败：%s", plugin_id, e)
     return done
-
-
-@router.post("/{plugin_id}/fetch")
-def fetch(
-    plugin_id: str,
-    account: Optional[str] = Query(None, description="仅抓该账号；不填=配置里的全部账号"),
-    current: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-):
-    m = _find_manifest(plugin_id)
-    cfg = session.get(PluginConfig, plugin_id)
-    by_name = {a["name"]: a for a in _account_list(cfg)}
-    if account:                                          # 单账号：手动抓，忽略「启用」；孤儿(磁盘授权未配置)按缺省淘宝
-        _check_account_name(m, account)                  # 非空+无逗号+目录穿越校验——与 add/login 一致
-        targets = [by_name.get(account) or {"name": account, "platform": "淘宝", "enabled": True}]
-    else:                                                # 全部：只抓「已启用」的配置账号
-        targets = [a for a in _account_list(cfg) if a["enabled"]]
-    # 无账号插件（汇率、快递查询）整体跑一次；账号型插件才要求先加账号。
-    # 与定时调度共用同一个判据，避免「定时能跑、手动点不动」这种两处不一致。
-    if m.get("accounts") and not targets:
-        raise HTTPException(status_code=400, detail="没有可抓的账号：先添加账号并启用。")
-    # **限权令牌**：只带「清单声明 ∩ 用户授权 ∩ 核心已知」那几项权限，任务结束即作废。
-    # 原先发的是完整用户 JWT——插件能调任何接口，包括删订单、清账本、改数据库连接。
-    granted = scopes.token_scopes(m, cfg)
-    token, jti = scopes.issue(current, plugin_id, granted)
-    fan = ([(["--account", a["name"], "--platform", a["platform"]], a["name"]) for a in targets]
-           if m.get("accounts") else [([], "")])
-    pids = [_launch(m, "fetch", [*extra, "--soroban-url", _SELF_URL],
-                    token=token, config=plugin_settings(session, m), jti=jti)
-            for extra, _ in fan]                         # 平台按每个账号各自绑定的来源下发
-    return {"launched": True, "accounts": [w for _, w in fan if w], "pids": pids,
-            "scopes": sorted(granted)}
 
 
 @router.delete("/{plugin_id}/account")
@@ -987,20 +1051,21 @@ def rename_account(
         # 该操作要把账号名迁到账本的某一列上，清单没声明 accounts_ledger_field
         # 就说明这个插件的账号与账本无关（如汇率），不支持这类操作。
         raise HTTPException(status_code=400, detail="该插件不支持账号改名。")
+    field = _ledger_field(m)            # 账号名落在账本的哪一列，由清单说了算
     new = new.strip()
     if not new or "," in new:
         raise HTTPException(status_code=400, detail="新账号名不能为空、且不能含逗号（逗号是账号分隔符）。")
     _state_file(m, new)                                     # 校验 new 是合法文件名（目录穿越/非法名 → 400）
     cfg = session.get(PluginConfig, plugin_id)
     # old 有效 = 配置/磁盘里的账号，或历史数据/标签里出现过（列头改名可能改一个只存在于旧订单的账号）
-    if old not in _known_names(cfg, m) and not tag_value_in_use(session, "platform_account", old):
+    if old not in _known_names(cfg, m) and not tag_value_in_use(session, field, old):
         raise HTTPException(status_code=404, detail=f"没有这个账号：{old}")
     if new == old:
         return {"ok": True, "unchanged": True}
-    if new in _known_names(cfg, m) or tag_value_in_use(session, "platform_account", new):
+    if new in _known_names(cfg, m) or tag_value_in_use(session, field, new):
         raise HTTPException(status_code=409, detail=f"新名字已被占用（已有账号/数据/授权）：{new}")
     # 1) 一个事务：数据 + 标签 + 配置一起改（只改昵称，平台/启用保留）
-    raw = rename_tag_value(session, "platform_account", old, new)
+    raw = rename_tag_value(session, field, old, new)
     counts = {"staging": raw.get("OrderStaging", 0), "orders": raw.get("Order", 0)}
     accs = _account_list(cfg)
     if cfg and any(a["name"] == old for a in accs):
@@ -1027,8 +1092,9 @@ def _require_platform_account(m: dict, session: Session, account: str) -> None:
         # 同上：清单没声明 accounts_ledger_field 就说明这个插件的账号与账本无关，
         # 「按账号删单」无从谈起。核心不该知道任何具体插件的 id。
         raise HTTPException(status_code=400, detail="该插件不支持按账号删除订单。")
+    field = _ledger_field(m)
     cfg = session.get(PluginConfig, m["id"])
-    if account not in _known_names(cfg, m) and not tag_value_in_use(session, "platform_account", account):
+    if account not in _known_names(cfg, m) and not tag_value_in_use(session, field, account):
         raise HTTPException(status_code=404, detail=f"没有这个账号：{account}")
 
 
@@ -1044,7 +1110,7 @@ def delete_account_staging_ep(
     tags.delete_account_staging），跳过数在 skipped 里回报，供前端提示用户先去删账本单。"""
     m = _find_manifest(plugin_id)
     _require_platform_account(m, session, account)
-    deleted, skipped = delete_account_staging(session, account)
+    deleted, skipped = delete_account_staging(session, _ledger_field(m), account)
     session.commit()
     return {"ok": True, "deleted": deleted, "skipped": skipped}
 
@@ -1058,7 +1124,7 @@ def delete_account_orders_ep(
     """软删该账号名下的所有账本正式淘宝订单（从账本移除、可在数据库层恢复）。不动暂存。"""
     m = _find_manifest(plugin_id)
     _require_platform_account(m, session, account)
-    n = soft_delete_account_orders(session, account)
+    n = soft_delete_account_orders(session, _ledger_field(m), account)
     session.commit()
     return {"ok": True, "deleted": n}
 
@@ -1097,6 +1163,18 @@ def _fanout(manifest: dict, cfg) -> list[tuple[list[str], str]]:
     return out
 
 
+def _scheduled_command(m: dict):
+    """定时该跑哪条命令：清单里的 `fetch`，没有就取标了 `primary` 的那条。
+
+    定时是**无人值守**的，所以判据必须来自清单而不是核心里的一个字符串常量：
+    写死 "fetch" 的话，没声明它的插件会被一遍遍拉起来跑一个它不认识的动词。
+    （`per="account"` 的命令由 `_fanout` 负责展开，这里只挑动词。）
+    """
+    cmds = m["_m"].commands
+    return (next((c for c in cmds if c.name == "fetch"), None)
+            or next((c for c in cmds if c.primary), None))
+
+
 def _run_due(session: Session) -> None:
     user = session.exec(select(User).where(User.is_active == True)).first()  # noqa: E712
     if not user:
@@ -1109,12 +1187,33 @@ def _run_due(session: Session) -> None:
         m = manifests.get(cfg.plugin_id)
         if not m or not _python(m).exists():
             continue
+        # 动词从**清单**里取，不写死。写死 "fetch" 的话：清单里没声明它的插件会被
+        # 一遍遍拉起来跑一个它不认识的动词，而 `launched` 只数「进程起没起来」，
+        # 于是 last_run_at 照常推进——每个周期白跑一次，卡片上还显示「已触发」。
+        cmd = _scheduled_command(m)
+        if cmd is None:
+            log.warning("插件 %s 没有可定时执行的命令，跳过（清单里得声明一条 fetch 或 primary 命令）",
+                        cfg.plugin_id)
+            continue
+        granted = scopes.token_scopes(m, cfg)
+        missing = set(cmd.needs) - granted
+        if missing:
+            # 与手动路径同一条闸：缺权限就别起进程。不拦的话子进程跑起来收一串 403，
+            # 用户在卡片上只看到「失败」，看不出是**没勾授权**。
+            log.warning("插件 %s 的定时任务缺权限 %s，跳过（去插件卡片上勾选授权）",
+                        cfg.plugin_id, sorted(missing))
+            continue
         launched = 0
         for extra, who in _fanout(m, cfg):
             try:
-                tok, jti = scopes.issue(user, cfg.plugin_id, scopes.token_scopes(m, cfg))
-                _launch(m, "fetch", [*extra, "--soroban-url", _SELF_URL],
-                        token=tok, config=plugin_settings(session, m), jti=jti)
+                tok, jti = scopes.issue(user, cfg.plugin_id, granted,
+                                        timeout_s=_REAP_TIMEOUT)
+                _launch(m, cmd.name, [*extra, "--soroban-url", _SELF_URL],
+                        token=tok, config=_launch_conf(session, m, cfg), jti=jti,
+                        # 定时也要写回结果。不写的话卡片上的「上次结果」永远停在上一次**手动**
+                        # 那一次，而「上次触发」时间一直在走——定时失败在界面上完全不可见。
+                        # 汇率取不到恰恰是账本会悄悄用兜底值的那类故障，最需要痕迹。
+                        on_done=_result_writer(cfg.plugin_id, f"定时·{cmd.label}"))
                 launched += 1
             except HTTPException as e:
                 log.warning("定时任务 %s%s 启动失败：%s", cfg.plugin_id, who, e.detail)

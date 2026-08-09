@@ -29,7 +29,7 @@
           <span :class="{ ph: !(row.items && row.items.length), 'auto-txt': allTitleItems(row) }">{{ itemSummary(row) }}</span>
         </template>
         <template #cell-import_status="{ row }">
-          <el-tag :style="importStatusStyle(row.import_status)" size="small">{{ row.import_status }}</el-tag>
+          <el-tag :style="importStatusStyle(row.import_status)">{{ row.import_status }}</el-tag>
         </template>
 
         <template #expand="{ row }">
@@ -37,19 +37,19 @@
             <div class="ex-title">物品明细（一单多物）· 单价×数量汇总为订单价</div>
             <div v-for="(it, i) in row.items" :key="i" class="item-row" :class="{ 'item-auto': isTitleItem(row, it) }"
                  :title="isTitleItem(row, it) ? '物品名与商品标题相同（无独立物品详情）；改成真实物品名即正常' : ''">
-              <el-input v-model="it.name" size="small" placeholder="物品名" style="width: 180px" @change="it.auto = false" />
-              <el-input-number v-model="it.quantity" :min="1" :controls="false" size="small" style="width: 80px" @change="it.auto = false" />
-              <el-input-number v-model="it.unit_price_cny" :min="0" :precision="2" :controls="false" size="small"
+              <el-input v-model="it.name" placeholder="物品名" style="width: 180px" @change="it.auto = false" />
+              <el-input-number v-model="it.quantity" :min="1" :controls="false" style="width: 80px" @change="it.auto = false" />
+              <el-input-number v-model="it.unit_price_cny" :min="0" :precision="2" :controls="false"
                                style="width: 110px" placeholder="单价" @change="it.auto = false" />
               <el-button link type="danger" :icon="Delete" @click="row.items.splice(i, 1)" />
             </div>
             <div>
-              <el-button size="small" :icon="Plus" @click="ensureItems(row).push({ name: '', quantity: 1, unit_price_cny: null, auto: false })">加物品</el-button>
-              <el-button size="small" type="primary" @click="saveItems(row)">保存物品</el-button>
+              <el-button :icon="Plus" @click="ensureItems(row).push({ name: '', quantity: 1, unit_price_cny: null, auto: false })">加物品</el-button>
+              <el-button type="primary" @click="saveItems(row)">保存物品</el-button>
             </div>
             <div class="postage-row">
               <span class="postage-lb">邮费（元）</span>
-              <el-input-number v-model="row.postage_cny" :min="0" :precision="2" :controls="false" size="small"
+              <el-input-number v-model="row.postage_cny" :min="0" :precision="2" :controls="false"
                                placeholder="包邮" style="width: 130px" @change="savePostage(row)" />
               <span class="postage-hint">不填 = 包邮（订单价 = Σ单价×数量 + 邮费）</span>
             </div>
@@ -58,11 +58,11 @@
 
         <template #actions="{ row }">
           <template v-if="row.imported_order_id">
-            <el-tag :style="importStatusStyle('已导入')" size="small">已导入 #{{ row.imported_order_id }}</el-tag>
+            <el-tag :style="importStatusStyle('已导入')">已导入 #{{ row.imported_order_id }}</el-tag>
           </template>
           <template v-else>
-            <el-button size="small" type="primary" @click="doImport(row)">导入</el-button>
-            <el-button v-if="row.import_status !== '已忽略'" size="small" link @click="doIgnore(row)">忽略</el-button>
+            <el-button type="primary" @click="doImport(row)">导入</el-button>
+            <el-button v-if="row.import_status !== '已忽略'" link @click="doIgnore(row)">忽略</el-button>
           </template>
         </template>
       </NotionTable>

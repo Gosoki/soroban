@@ -213,3 +213,19 @@ def test_key_columns_actually_have_binary_collation(mysql_engine):
     # 生成列同样得带 —— 唯一性是它说了算
     gen = {(t, c) for t, c, coll in rows if c.endswith("_active_key")}
     assert gen <= actual, f"生成列没带二进制排序规则：{sorted(gen - actual)}"
+
+
+def test_binstr_search_stays_case_insensitive_on_mysql(on_mysql):
+    """BinStr 列的**模糊搜索**在 MySQL 上必须与 SQLite 一样大小写不敏感。
+
+    BinStr 让 `=` 逐字节（唯一性、等值批改要的就是这个），副作用是同列的 `LIKE`
+    也跟着敏感——而 SQLite 的 LIKE 对 ASCII 本来就不敏感。`ci_contains` 就是为了
+    把搜索口径拉回来，但它此前恒走非 MySQL 分支（`_name()` 认不出 Session），
+    等于这层补偿从来没生效过。这条测的是结果，不是「代码里有没有调 ci_contains」。
+    """
+    assert on_mysql.post("/api/orders", json={
+        "date": "2029-06-01", "title": "大小写探针", "order_no": "ABCdef123", "price_cny": 1,
+    }).status_code == 200
+    got = on_mysql.get("/api/orders", params={"q": "abcDEF", "limit": 50}).json()["items"]
+    assert any(o["order_no"] == "ABCdef123" for o in got), \
+        "MySQL 上按小写搜不到大写单号——ci_contains 没生效，与 SQLite 结果不一致"

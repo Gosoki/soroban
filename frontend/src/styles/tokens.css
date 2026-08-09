@@ -45,8 +45,21 @@
   --ok: #10b981;
   --warn: #f59e0b;
   --danger: #ef4444;
-  --ok-weak: rgba(16, 185, 129, 0.14);
+  /* 弱底色**两档**，不是一档：悬停(faint) 必须比 选中/就绪(weak) 轻，
+     否则鼠标划过和真的选中长得一样，用户分不出自己选没选上。
+     收敛这些颜色时最容易犯的错就是把两档一起换成 --ok-weak。 */
+  --ok-faint: rgba(16, 185, 129, 0.09);     /* 悬停底 */
+  --ok-weak: rgba(16, 185, 129, 0.14);      /* 选中 / 就绪底 */
+  --ok-ring: rgba(16, 185, 129, 0.28);      /* 落点高亮的外环 */
+  --brand-faint: rgba(24, 144, 255, 0.06);  /* 比 --brand-weak 再轻一档 */
+  --brand-soft: #7f9cff;                    /* 蓝底上的浅蓝前景（拖拽落点文字） */
+  --brand-line-strong: #5a7cc0;             /* 待落点的实线边 */
   --danger-weak: rgba(239, 68, 68, 0.12);
+
+  /* 侧栏：el-menu 的三个颜色 prop 会被 Element 写成自身的 CSS 变量，
+     值里可以再套 var()，所以侧栏也能吃 token，不必写死十六进制。 */
+  --bg-side: #0f1728;
+  --txt-on-active: #ffffff;
 
   /* --- 圆角三档 ------------------------------------------------------------ */
   --r-sm: 4px;                 /* 控件 / 单元格 */
@@ -102,7 +115,7 @@ html.dark {
  */
 .pager { margin-top: 12px; display: flex; justify-content: flex-end; }
 .ph { color: var(--txt-3); }                     /* 空值占位符 */
-.hint { color: var(--txt-3); font-size: 13px; }  /* 页首说明 */
+.hint { color: var(--txt-3); font-size: 12px; }  /* 页首说明 */
 .sub { color: var(--txt-3); font-size: 12px; }   /* 次要说明 */
 
 /* 金额必须等宽：记账应用的核心视图是一列一列的钱，比例数字下 1 和 8 不等宽，

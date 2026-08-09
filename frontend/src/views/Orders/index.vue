@@ -11,7 +11,7 @@
               <span>{{ ocrPending ? `后台识别中 ${ocrPending} 张…` : '点击选图 OCR识别（或拖图到页面）' }}</span>
             </div>
           </el-upload>
-          <el-tag v-if="focusId" type="warning" closable disable-transitions class="focus-chip" @close="clearFocus">
+          <el-tag v-if="focusId" :style="typeStyle('warning')" closable disable-transitions class="focus-chip" @close="clearFocus">
             定位订单 #{{ focusId }} · 点 × 看全部
           </el-tag>
           <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="reload" />
@@ -36,8 +36,7 @@
         </template>
 
         <template #cell-shipment_order_id="{ row }">
-          <el-select :model-value="row.shipment_order_id" filterable placeholder="未集运"
-                     size="small" class="ship-pick" popper-class="ship-pop"
+          <el-select :model-value="row.shipment_order_id" filterable placeholder="未集运" class="ship-pick" popper-class="ship-pop"
                      :persistent="false"
                      remote :remote-method="searchShipment" :loading="shipSearching"
                      remote-show-suffix reserve-keyword
@@ -47,7 +46,7 @@
             <template #label="{ value }">
               <span class="ship-sel">
                 <b>{{ shipNo(value, row) }}</b>
-                <el-tag v-if="row.fulfillment_status && row.shipment_order_id" size="small"
+                <el-tag v-if="row.fulfillment_status && row.shipment_order_id"
                         :style="statusStyle(row.fulfillment_status)">{{ row.fulfillment_status }}</el-tag>
               </span>
             </template>
@@ -60,7 +59,7 @@
               <div class="ship-opt">
                 <div class="ship-opt-top">
                   <b>{{ j.shipment_no || ('#' + j.id) }}</b>
-                  <el-tag size="small" :style="statusStyle(j.shipment_status)">{{ j.shipment_status }}</el-tag>
+                  <el-tag :style="statusStyle(j.shipment_status)">{{ j.shipment_status }}</el-tag>
                   <el-icon v-if="j.id === row.shipment_order_id" class="ship-ck"><Check /></el-icon>
                 </div>
                 <span class="ship-meta">{{ j.date }} · 运费 {{ j.jpy_settled != null ? fmtJPY(j.jpy_settled) : '待定' }}</span>
@@ -107,7 +106,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Camera, Check } from '@element-plus/icons-vue'
 import { shipmentApi, ordersApi, tagsApi } from '@/api'
-import { ORDER_SOURCES, PRICE_HELP, PURCHASE_STATUS, SHIPMENT_STATUS, canAdvancePurchase, statusStyle } from '@/constants'
+import { ORDER_SOURCES, PRICE_HELP, PURCHASE_STATUS, SHIPMENT_STATUS, canAdvancePurchase, statusStyle, typeStyle } from '@/constants'
 import { fmtJPY } from '@/utils/money'
 import { applyRowUpdate, queueOrderWrite } from '@/utils/orderWrites'
 import { today } from '@/utils/datetime'
@@ -342,7 +341,6 @@ async function processOcr(file) {
     const created = await addRow(data)
     if (!created) return   // 新建失败（如订单号+来源重复），addRow 已给提示，不再报成功
     ElMessage.success(`已识别并新建订单 · ${ocrSummary(data)}`)
-    if (focusId.value) clearFocus()   // 若正处于「定位单条」隔离视图：新单不属于该过滤，跳回全部列表免得成幽灵行
   } catch (_) {
     // 依赖未装(503)/图片错误(400)/超时 等由 http 拦截器统一提示；不抛出，避免中断队列
   }
@@ -473,6 +471,16 @@ async function addRow(data = {}, done) {
   try {
     // status 不写死：后端 OrderBase 默认「待发货」，避免枚举改名后前端残留非法值（曾用'已付'→422）
     const created = await ordersApi.create({ date: today(), ...data })
+    // 处于 ?focus= 隔离视图时，新建的单**不属于**这个过滤条件。
+    // 直接 unshift 进去的话：列表里混进一行不该在这儿的记录、total 从 1 变 2，
+    // 而刷新一下它又凭空消失——用户会以为刚才那单没存上。
+    // 原先只有 OCR 那条路径清了隔离态，幽灵行手工新建这条漏了；
+    // 放进 addRow 里，两条路径（以及以后任何新入口）自动都对。
+    if (focusId.value) {
+      clearFocus()             // 会触发 load()，新单自然出现在全量列表里
+      done?.(true)
+      return created
+    }
     rows.value.unshift(created)
     sortRows()                 // 按下单日期归位（OCR 可能录入历史日期，勿留在顶部）
     total.value++
@@ -536,7 +544,7 @@ onBeforeUnmount(() => {
 .ocr-up :deep(.el-upload) { display: inline-flex; }
 .ocr-drop {
   display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 14px;
-  border: 1px dashed var(--border-strong); border-radius: 4px; color: #7f9cff; font-size: 13px;
+  border: 1px dashed var(--border-strong); border-radius: 4px; color: var(--brand-soft); font-size: 13px;
   white-space: nowrap; cursor: pointer;
 }
 .ocr-drop:hover { border-color: var(--brand); background: var(--brand-weak); }

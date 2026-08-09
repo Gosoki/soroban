@@ -131,7 +131,15 @@ function calc(input) {
     }
   }
   if (st.length !== 1 || !isFinite(st[0])) return ''
-  return String(Math.round((st[0] + Number.EPSILON) * 1e10) / 1e10)   // 去浮点尾巴
+  // 去浮点尾巴（0.1+0.2 → 0.3）。**不能用 `Math.round(x * 1e10) / 1e10`**：
+  //   · x 稍大一点，`x * 1e10` 就超出双精度能精确表示整数的范围，除回来反而**凭空长出小数尾巴**
+  //     ——本来是想去尾巴的那一步，自己制造了尾巴；
+  //   · x 再大一点，`x * 1e10` 直接溢出成 Infinity，而 isFinite 是在**放大之前**查的，
+  //     于是结果框里会出现字符串 "Infinity"。
+  // toFixed(10) 保留原来的显示口径（小数最多 10 位），但它是在**十进制字符串**上截断，
+  // 不做任何放大，所以既不会溢出也不会引入精度误差。
+  const v = Number(st[0].toFixed(10))
+  return isFinite(v) ? String(v) : ''
 }
 </script>
 
@@ -167,7 +175,7 @@ function calc(input) {
 }
 .k:hover { background: var(--bg-row-hover); }
 .k:active { background: #22314c; }
-.k.op { color: #7f9cff; }
+.k.op { color: var(--brand-soft); }
 .k.fn { color: var(--txt-2); }
 .k.eq { background: var(--brand); border-color: var(--brand); color: #fff; }
 .k.eq:hover { background: #2b9bff; }

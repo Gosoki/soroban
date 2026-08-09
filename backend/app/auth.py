@@ -43,9 +43,24 @@ def create_access_token(user: User, expires_delta: Optional[dt.timedelta] = None
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
+# 用户名不存在时拿来「陪跑」一次 bcrypt 的哈希。值本身无所谓（永远不会有人猜中它对应的口令），
+# 要的只是让两条分支花掉同样的时间。模块加载时算一次，不进每次请求的开销。
+_DUMMY_HASH = hash_password("soroban-timing-equalizer")
+
+
 def authenticate(session: Session, username: str, password: str) -> Optional[User]:
+    """校验用户名口令。**用户名存在与否要花同样的时间。**
+
+    原先不存在的用户名直接短路返回、根本不跑 bcrypt，而 bcrypt 是几十毫秒量级——
+    响应时间差一个数量级，等于把「哪些用户名是真的」100% 可判别地告诉外面。
+    对本项目还有第二重代价：`ratelimit._prune` 的注释里写着，猜不存在的用户名
+    「几乎零成本」正是挤兑退避表的手段。让它也付一次 bcrypt 的钱，那条路一起变贵。
+    """
     user = session.exec(select(User).where(User.username == username)).first()
-    if not user or not user.is_active or not verify_password(password, user.password_hash):
+    if not user or not user.is_active:
+        verify_password(password, _DUMMY_HASH)      # 陪跑：与命中分支等时
+        return None
+    if not verify_password(password, user.password_hash):
         return None
     return user
 

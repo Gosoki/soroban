@@ -378,7 +378,7 @@ def test_design_tokens_exist():
 
 
 def test_no_style_block_reintroduces_a_tokenized_color():
-    """`.vue` 的 <style> 里不许再写已经有 token 的颜色字面量。
+    """`.vue` 里不许再写已经有 token 的颜色字面量——**模板属性与 script 字面量一样查**。
 
     审计基线：全仓 222 处硬编码 hex / 54 个不同值，同一语义角色最多分裂成 4 套；
     其中 Settings/Database 两页是照 Element **亮色**默认值写的，而应用恒暗色——
@@ -386,11 +386,19 @@ def test_no_style_block_reintroduces_a_tokenized_color():
     """
     import re
 
+    def _rgb_to_hex(m):
+        """把 rgb(24, 144, 255) 归一成 #1890ff——否则换个记法就绕过整条守卫。"""
+        r, g, b = (int(x) for x in m.groups())
+        return f"#{r:02x}{g:02x}{b:02x}"
+
     bad = []
     for path in sorted((_REPO / "frontend" / "src").rglob("*.vue")):
         src = path.read_text(encoding="utf-8")
-        for block in re.findall(r"<style[^>]*>.*?</style>", src, re.S):
-            for lit, hint in _TOKENIZED.items():
-                if lit in block.lower():
-                    bad.append(f"{path.relative_to(_REPO)}: {lit}  {hint}")
+        # **整份文件**都查，不只 <style>：`Layout.vue` 的 `text-color="#9ba8bf"`
+        # 与 `Dashboard/index.vue` 的 `color: '#1890ff'` 用的正是名单内的值，
+        # 却因为写在模板属性 / script 字面量里而合法通过——守卫只盖了三分之一。
+        text = re.sub(r"rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", _rgb_to_hex, src.lower())
+        for lit, hint in _TOKENIZED.items():
+            if lit in text:
+                bad.append(f"{path.relative_to(_REPO)}: {lit}  {hint}")
     assert not bad, "这些颜色已经有 token 了，别再写字面量：\n  " + "\n  ".join(sorted(set(bad)))

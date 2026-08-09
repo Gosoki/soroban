@@ -2,7 +2,7 @@
   <div>
     <div class="bar">
       <span class="hint">soroban 扫 plugins/ 下 soroban-plugin-* 目录作为插件。这里加账号、授权、启停、定时。抓取类插件抓到的单进「暂存订单」待处理。</span>
-      <el-button size="small" :icon="Refresh" :loading="loading" @click="load">刷新</el-button>
+      <el-button :icon="Refresh" :loading="loading" @click="load">刷新</el-button>
     </div>
 
     <el-empty v-if="!loading && !plugins.length" description="未发现插件（plugins/ 下没有 soroban-plugin-* 目录）" />
@@ -17,18 +17,18 @@
                      :title="p._form.enabled ? '已启用（定时与手动执行都可用）' : '已停用（定时不跑，命令也点不动）'" />
           <span class="pname" :class="{ off: !p._form.enabled }">{{ p.name }}</span>
           <span class="pver">v{{ p.version || '?' }}</span>
-          <el-tag size="small" :style="typeStyle(installTagType(p))">{{ installTagText(p) }}</el-tag>
-          <el-tag v-if="p.last_run.outcome" size="small" :style="typeStyle(runTagType(p.last_run.outcome))"
+          <el-tag :style="typeStyle(installTagType(p))">{{ installTagText(p) }}</el-tag>
+          <el-tag v-if="p.last_run.outcome" :style="typeStyle(runTagType(p.last_run.outcome))"
                   :title="p.last_run.summary + (p.last_run.at ? ' · ' + fmtTime(p.last_run.at) : '')">
             {{ { ok: '成功', failed: '失败', running: '执行中' }[p.last_run.outcome] || p.last_run.outcome }}
           </el-tag>
-          <el-tag v-if="pendingGrants(p).length" size="small" :style="typeStyle('warning')"
+          <el-tag v-if="pendingGrants(p).length" :style="typeStyle('warning')"
                   :title="`还没授权：${pendingGrants(p).join('、')}——展开卡片勾选`">需要授权</el-tag>
           <span v-if="p.last_run.summary" class="lastsum">{{ p.last_run.summary }}</span>
 
           <div class="grow" />
           <!-- 命令按钮留在卡片头：它们是每天要点的，不该藏进折叠里 -->
-          <el-button v-for="c in (p.missing ? [] : p.commands)" :key="c.name" size="small"
+          <el-button v-for="c in (p.missing ? [] : p.commands)" :key="c.name"
                      :type="c.primary ? 'primary' : 'default'"
                      :disabled="!p.installed || !p._form.enabled || !!c.blocked.length
                                 || (c.per === 'account' && !enabledCount(p))"
@@ -37,7 +37,7 @@
           </el-button>
           <!-- 目录已不在、库里还留着配置的插件：不给开关与命令，只给一个清理入口。
                它带着用户当初给的授权——不显示的话，以后放一个同 id 的插件进来会静默继承。 -->
-          <el-button v-if="p.missing" size="small" type="danger" plain @click="doForget(p)">
+          <el-button v-if="p.missing" type="danger" plain @click="doForget(p)">
             清理残留配置
           </el-button>
           <el-button v-else link :icon="p._open ? ArrowUp : ArrowDown"
@@ -55,11 +55,11 @@
           <li v-for="n in p.needs" :key="n.key"><b>{{ n.label }}</b> —— {{ n.hint }}</li>
         </ul>
         <div class="needact">
-          <el-button type="primary" size="small" :loading="!!(p.install && p.install.running)"
+          <el-button type="primary" :loading="!!(p.install && p.install.running)"
                      @click="doInstall(p)">
             {{ p.install && p.install.running ? '安装中…' : '一键安装' }}
           </el-button>
-          <el-checkbox v-model="p._withBrowser" :disabled="!!(p.install && p.install.running)" size="small">
+          <el-checkbox v-model="p._withBrowser" :disabled="!!(p.install && p.install.running)">
             一并下载浏览器内核（约 150MB，仅首次）
           </el-checkbox>
         </div>
@@ -78,8 +78,8 @@
       <div v-show="p._open" class="body">
       <div class="field">
         <label class="flabel">定时执行（分钟，0=关闭）</label>
-        <el-input-number v-model="p._form.schedule_minutes" :min="0" :step="30" size="small" />
-        <el-button type="primary" size="small" @click="saveConfig(p)">保存</el-button>
+        <el-input-number v-model="p._form.schedule_minutes" :min="0" :step="30" />
+        <el-button type="primary" @click="saveConfig(p)">保存</el-button>
         <span class="sub">{{ p.config.last_run_at ? '上次触发 ' + fmtTime(p.config.last_run_at) : '尚未执行' }}</span>
       </div>
 
@@ -93,19 +93,18 @@
               <el-icon class="help"><QuestionFilled /></el-icon>
             </el-tooltip>
           </label>
-          <el-switch v-if="pa.type === 'bool'" v-model="p._form.params[pa.key]" size="small" />
+          <el-switch v-if="pa.type === 'bool'" v-model="p._form.params[pa.key]" />
           <el-input-number v-else-if="pa.type === 'int'" v-model="p._form.params[pa.key]"
-                           :min="pa.min" :max="pa.max" :controls="false" size="small" style="width: 120px" />
-          <el-select v-else-if="pa.type === 'select'" v-model="p._form.params[pa.key]"
-                     size="small" style="width: 160px">
+                           :min="pa.min" :max="pa.max" :controls="false" style="width: 120px" />
+          <el-select v-else-if="pa.type === 'select'" v-model="p._form.params[pa.key]" style="width: 160px">
             <el-option v-for="o in pa.choices" :key="o" :label="o" :value="o" />
           </el-select>
-          <el-input v-else v-model="p._form.params[pa.key]" size="small" style="width: 220px"
+          <el-input v-else v-model="p._form.params[pa.key]" style="width: 220px"
                     :type="pa.secret ? 'password' : 'text'" :show-password="pa.secret"
                     :placeholder="pa.secret && pa.value === '__set__' ? '已设置（留空保持不变）' : String(pa.default ?? '')" />
         </div>
         <div class="field">
-          <el-button type="primary" size="small" @click="saveParams(p)">保存参数</el-button>
+          <el-button type="primary" @click="saveParams(p)">保存参数</el-button>
           <span class="sub">保存后下一次执行即按新值跑</span>
         </div>
       </template>
@@ -113,7 +112,7 @@
            有「需要新授权」时**自动展开**——那是要人处理的事，藏起来就等于没提示。 -->
       <div class="sect">
         权限（{{ p.scopes.effective.length }}/{{ p.scopes.declared.length }}）
-        <el-tag v-if="pendingGrants(p).length" size="small" :style="typeStyle('warning')"
+        <el-tag v-if="pendingGrants(p).length" :style="typeStyle('warning')"
                 title="插件更新后新要了权限，需要你确认">需要新授权</el-tag>
       </div>
       <div class="grants">
@@ -123,8 +122,8 @@
           <el-checkbox :model-value="p._form.granted.includes(k)"
                        @change="(v) => toggleGrant(p, k, v)" />
           <span class="g-name">{{ scopeMeta(p, k).label || k }}</span>
-          <el-tag v-if="scopeMeta(p, k).risk === 'high'" size="small" :style="typeStyle('danger')">高风险</el-tag>
-          <el-tag v-else-if="scopeMeta(p, k).risk === 'medium'" size="small" :style="typeStyle('warning')">留意</el-tag>
+          <el-tag v-if="scopeMeta(p, k).risk === 'high'" :style="typeStyle('danger')">高风险</el-tag>
+          <el-tag v-else-if="scopeMeta(p, k).risk === 'medium'" :style="typeStyle('warning')">留意</el-tag>
           <el-tooltip v-if="scopeMeta(p, k).hint" :content="scopeMeta(p, k).hint"
                       placement="top" popper-class="wrap-tip">
             <el-icon class="help"><QuestionFilled /></el-icon>
@@ -137,51 +136,51 @@
         </div>
       </div>
 
+      <div v-if="p.accounts_enabled" class="sect">账号（{{ enabledCount(p) }} 启用 / {{ p.accounts.length }}）</div>
       <!-- 账号列表 -->
-      <div v-if="p.accounts_enabled && !p.accounts.length" class="sub">还没有账号——用上面「添加账号」加一个。</div>
+      <div v-if="p.accounts_enabled && !p.accounts.length" class="sub">还没有账号——用下面「添加账号」加一个。</div>
       <div v-for="a in (p.accounts_enabled ? p.accounts : [])" :key="a.account" class="acct" :class="{ dim: !a.enabled }">
         <span class="c-sw">
-          <el-switch v-if="a.configured" v-model="a.enabled" size="small" :disabled="!p.installed"
+          <el-switch v-if="a.configured" v-model="a.enabled" :disabled="!p.installed"
                      title="停用后定时与「抓取全部账号」都跳过它" @change="(v) => doToggle(p, a, v)" />
         </span>
         <span class="aname" :title="a.account">{{ a.account }}</span>
         <span class="c-plat">
-          <el-tag v-if="a.platform" size="small" :style="platformTagStyle(a.platform)">{{ a.platform }}</el-tag>
+          <el-tag v-if="a.platform" :style="platformTagStyle(a.platform)">{{ a.platform }}</el-tag>
         </span>
         <span class="c-auth">
-          <el-tag size="small" :style="typeStyle(a.authorized ? 'success' : 'warning')">
+          <el-tag :style="typeStyle(a.authorized ? 'success' : 'warning')">
             {{ a.authorized ? '已授权' : '未授权' }}
           </el-tag>
         </span>
         <span class="c-state">
-          <el-tag v-if="!a.configured" size="small" :style="typeStyle('info')"
+          <el-tag v-if="!a.configured" :style="typeStyle('info')"
                   title="磁盘上有此账号的登录会话，但没作为账号添加。想纳管就用上面「添加账号」加同名账号。">未添加</el-tag>
-          <el-tag v-else-if="!a.enabled" size="small" :style="typeStyle('info')">未启用</el-tag>
+          <el-tag v-else-if="!a.enabled" :style="typeStyle('info')">未启用</el-tag>
         </span>
 
-        <el-button size="small" link type="primary" :disabled="!p.installed" @click="doLogin(p, a.account)">
+        <el-button link type="primary" :disabled="!p.installed" @click="doLogin(p, a.account)">
           {{ a.authorized ? '重新授权' : '授权登录' }}
         </el-button>
-        <el-button size="small" link :disabled="!p.installed || !a.authorized" @click="doFetch(p, a.account)">抓这个号</el-button>
-        <el-button size="small" link @click="doRenameAccount(p, a.account)">改名</el-button>
-        <el-button size="small" link type="danger" @click="doDeleteAccountStaging(p, a.account)">删暂存单</el-button>
-        <el-button size="small" link type="danger" @click="doDeleteAccountOrders(p, a.account)">删账本单</el-button>
+        <el-button link :disabled="!p.installed || !a.authorized" @click="doFetch(p, a.account)">抓这个号</el-button>
+        <el-button link @click="doRenameAccount(p, a.account)">改名</el-button>
+        <el-button link type="danger" @click="doDeleteAccountStaging(p, a.account)">删暂存单</el-button>
+        <el-button link type="danger" @click="doDeleteAccountOrders(p, a.account)">删账本单</el-button>
         <div class="grow" />
-        <el-button size="small" link type="danger" @click="doDeleteAccount(p, a.account)">删除</el-button>
+        <el-button link type="danger" @click="doDeleteAccount(p, a.account)">删除</el-button>
       </div>
       <!-- 账号：只有清单声明了 accounts 的插件才有这个维度。
            汇率、快递查询这类插件卡片上不该出现「添加账号」——那是纯噪音，
            而且会让人以为是自己漏配了什么。 -->
-      <div v-if="p.accounts_enabled" class="sect">账号（{{ enabledCount(p) }} 启用 / {{ p.accounts.length }}）</div>
-      <div class="subsect">添加账号</div>
+      <div v-if="p.accounts_enabled" class="subsect">添加账号</div>
       <div v-if="p.accounts_enabled" class="field">
-        <el-input v-model="p._add.name" size="small" placeholder="账号昵称" style="width: 160px"
+        <el-input v-model="p._add.name" placeholder="账号昵称" style="width: 160px"
                   @keyup.enter="doAddAccount(p)" />
-        <el-select v-model="p._add.platform" size="small" filterable allow-create default-first-option
+        <el-select v-model="p._add.platform" filterable allow-create default-first-option
                    placeholder="导入平台" style="width: 140px">
           <el-option v-for="o in platformOpts" :key="o" :label="o" :value="o" />
         </el-select>
-        <el-button type="primary" size="small" :disabled="!p.installed" @click="doAddAccount(p)">添加</el-button>
+        <el-button type="primary" :disabled="!p.installed" @click="doAddAccount(p)">添加</el-button>
         <span class="sub">平台加时确定、之后不可改（改名只改昵称）</span>
       </div>
 
@@ -237,8 +236,12 @@ async function doRun(p, c) {
   try {
     const r = await pluginsApi.run(p.id, c.name)
     ElMessage.success(`已触发「${c.label}」${r.targets?.length ? '：' + r.targets.join('、') : ''}`)
-    setTimeout(load, 3000)          // 稍后刷一次，把「上次结果」拉回来
-  } catch (_) { /* 拦截器已提示 */ } finally { p._busy = false }
+    resultTimer = setTimeout(load, 3000)   // 稍后刷一次，把「上次结果」拉回来
+  } catch (e) {
+    // 不能空 catch：409（插件已停用 / 缺权限）被 http 拦截器刻意放行不弹提示，
+    // 吞掉之后按钮点下去**完全没反应**——最难排查的那种「没坏但也不动」。
+    ElMessage.warning(e.response?.data?.detail || `「${c.label}」没能启动`)
+  } finally { p._busy = false }
 }
 async function saveParams(p) {
   p._busy = true
@@ -271,6 +274,9 @@ async function toggleGrant(p, key, on) {
     const r = await pluginsApi.saveGrants(p.id, next)
     p.scopes.granted = r.granted
     p.scopes.effective = r.granted            // 已授权 ∩ 已声明 ∩ 已知，后端算好回给我们
+    // 就地重算每条命令还缺哪些权限。不重算的话按钮仍停在「缺权限」禁用态，
+    // 要手动刷新整页才活过来——用户会以为刚才那一勾没生效。
+    for (const c of p.commands) c.blocked = (c.needs || []).filter((k) => !r.granted.includes(k))
     ElMessage.success(on ? `已授予「${scopeMeta(p, key).label || key}」`
                          : `已收回「${scopeMeta(p, key).label || key}」`)
   } catch (_) { p._form.granted = [...(p.scopes?.granted || [])] } finally { p._busy = false }
@@ -289,7 +295,11 @@ async function load() {
       // 反而比不折叠还乱。要人处理的事改成在卡片头挂一个标签——不展开也看得见。
       // 轮询刷新时沿用上一次的展开状态，别把用户展开的合上。
       _open: prev[p.id]?._open ?? false,
-      // 刷新时保留用户勾过的选项，别让轮询把复选框弹回默认
+      // 刷新时保留用户勾过的选项与输了一半的账号昵称——
+      // 安装轮询那段(scheduleInstallPoll)的注释早就写着「否则用户正在输入的账号名会被冲掉」，
+      // 但整体刷新这条路径上它一直是被硬编码重置的。
+      // `_form.params` 刻意**不**沿用：参数以服务端为权威，沿用会造出
+      // 「插件升级改了默认值但表单显示旧值且看不出来」的新失败面。
       _withBrowser: prev[p.id]?._withBrowser ?? true,
       _form: { enabled: p.config.enabled, schedule_minutes: p.config.schedule_minutes || 0,
                granted: [...(p.scopes?.granted || [])],
@@ -297,7 +307,7 @@ async function load() {
                // 那样一保存就会把密钥真的改成 '__set__' 这个字符串。
                params: Object.fromEntries((p.params || []).map(
                  (x) => [x.key, x.value === '__set__' ? '' : x.value])) },
-      _add: { name: '', platform: '淘宝' },
+      _add: prev[p.id]?._add ?? { name: '', platform: '淘宝' },
     }))
     // 有安装在跑就继续盯着，装完自动刷新（按钮解禁、缺依赖提示消失）
     if (list.some((p) => p.install && p.install.running)) scheduleInstallPoll()
@@ -321,6 +331,9 @@ function installTagText(p) {
 }
 
 let installTimer = null
+// 离页后这次延时刷新仍会跑：届时若有插件在装，它还会新建一个
+// onBeforeUnmount 管不到的 2 秒轮询。存句柄，卸载时一起清掉。
+let resultTimer = null
 function scheduleInstallPoll() {
   if (installTimer) return                    // 单例：多张卡同时装也只有一个轮询
   installTimer = setInterval(async () => {
@@ -339,7 +352,10 @@ function scheduleInstallPoll() {
     } catch (_) { clearInterval(installTimer); installTimer = null }
   }, 2000)
 }
-onBeforeUnmount(() => { if (installTimer) { clearInterval(installTimer); installTimer = null } })
+onBeforeUnmount(() => {
+  if (installTimer) { clearInterval(installTimer); installTimer = null }
+  if (resultTimer) { clearTimeout(resultTimer); resultTimer = null }
+})
 
 async function doInstall(p) {
   const browserPart = p._withBrowser ? '，并下载 Playwright 浏览器内核（约 150MB）' : ''
@@ -373,7 +389,11 @@ async function saveConfig(p) {
     await pluginsApi.saveConfig(p.id, { enabled: p._form.enabled, params: {}, schedule_minutes: p._form.schedule_minutes })
     ElMessage.success('已保存')
     await load()
-  } catch (_) { /* 拦截器已提示 */ } finally {
+  } catch (_) {
+    // 保存失败要把开关拨回去。停在用户拨的位置上，卡片说「已启用」而库里是停用，
+    // 定时不跑、命令点不动，而界面上看不出任何异常。
+    p._form.enabled = p.config.enabled
+  } finally {
     p._busy = false
   }
 }

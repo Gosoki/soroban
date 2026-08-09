@@ -203,16 +203,65 @@ def test_unattached_order_fulfillment_status_equals_own(client):
     assert got["purchase_status"] == got["fulfillment_status"] == "待收货"
 
 
-def test_ocr_auto_attach_does_not_write_status():
-    """自动挂靠（「内含快递」截图）曾把「集运中」写进订单 status——那会污染国内段状态，
-    一旦释放，回落到的是被覆盖过的值。现在两条挂靠路径都只写外键、不动状态。"""
-    import inspect
+def test_ocr_auto_attach_does_not_write_status(client, mk, monkeypatch):
+    """自动挂靠（「内含快递」截图）曾把「集运中」写进订单状态——那会污染国内段状态，
+    一旦释放，回落到的是被覆盖过的值。现在两条挂靠路径都只写外键、不动状态。
 
+    **这条原先是假绿**：它 grep 源码里有没有 `'"status"'`（带引号）。
+    列名改成 `purchase_status` 之后，`"purchase_status"` 里根本不含 `"status"` 这个带引号的串，
+    断言永远不可能触发。改成实际跑一次挂靠、比对状态。
+    """
     from app.routers import shipment as mod
 
-    src = inspect.getsource(mod.ocr_attach_express)
-    assert '"status"' not in src and "PurchaseStatus" not in src, \
-        "自动挂靠又开始写订单状态了"
+    j = mk("/api/shipment", {"date": "2028-03-01", "recipient": "OCR状态"})
+    o = mk("/api/orders", {"date": "2028-03-01", "title": "被挂的单",
+                           "express_no": "SF9001234567", "price_cny": 10,
+                           "purchase_status": "已签收"})
+
+    async def fake_ocr(file, fn):
+        return {"express_nos": ["SF9001234567"]}
+
+    monkeypatch.setattr(mod, "run_ocr", fake_ocr)
+    r = client.post(f"/api/shipment/{j['id']}/ocr-express",
+                    files={"file": ("x.png", b"not-a-real-png", "image/png")})
+    assert r.status_code == 200, r.text
+    assert r.json()["attached"], "没挂上，下面的断言测不出东西"
+
+    got = next(x for x in client.get("/api/orders", params={"limit": 200}).json()["items"]
+               if x["id"] == o["id"])
+    assert got["shipment_order_id"] == j["id"], "外键没写上"
+    assert got["purchase_status"] == "已签收", \
+        f"自动挂靠动了国内段状态：已签收 → {got['purchase_status']}"
+
+
+def test_ocr_auto_attach_is_idempotent_for_the_optimistic_lock_too(client, mk, monkeypatch):
+    """同一张截图重传，**已经挂在本单上的订单一个字节都不写**。
+
+    原先 WHERE 里放行了「已挂本单」以求幂等，但 SET 里带着 `version + 1`——
+    于是幂等只对挂靠关系成立、对乐观锁不成立：重传一次，这些订单的 version 就 +1，
+    正在编辑其中某单的人下一次保存直接 409，而他什么都没做错。
+    """
+    from app.routers import shipment as mod
+
+    j = mk("/api/shipment", {"date": "2028-03-02", "recipient": "重传"})
+    o = mk("/api/orders", {"date": "2028-03-02", "title": "重传的单",
+                           "express_no": "SF9007654321", "price_cny": 10})
+
+    async def fake_ocr(file, fn):
+        return {"express_nos": ["SF9007654321"]}
+
+    monkeypatch.setattr(mod, "run_ocr", fake_ocr)
+    url = f"/api/shipment/{j['id']}/ocr-express"
+    files = {"file": ("x.png", b"not-a-real-png", "image/png")}
+    assert client.post(url, files=files).status_code == 200
+
+    def ver():
+        return next(x for x in client.get("/api/orders", params={"limit": 200}).json()["items"]
+                    if x["id"] == o["id"])["version"]
+
+    v1 = ver()
+    assert client.post(url, files={"file": ("x.png", b"not-a-real-png", "image/png")}).status_code == 200
+    assert ver() == v1, "重传同一张截图把 version 顶高了，正在编辑这单的人会莫名 409"
 
 
 def test_order_status_enum_is_domestic_only():

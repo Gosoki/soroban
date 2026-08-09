@@ -1,5 +1,6 @@
 """soroban FastAPI app entrypoint."""
 
+import os
 import asyncio
 import logging
 import sys
@@ -21,6 +22,17 @@ from .routers import (
 )
 from .routers.plugins import scheduler_loop
 from .services.ingest import load_kinds
+
+# 通用写入通道的 handler 在**模块级**注册：重复注册 / 未知权限 → 导入即炸，
+# 与 `services/ingest/__init__.py` 承诺的「启动即炸」一致。
+#
+# 原先这行挂在只读屏障中间件的第一句（连 GET 和静态资源都走）。注册失败时，
+# 失败的 import 不会进 sys.modules → **每个请求都重试、每个请求都 500**，
+# 而栈顶是屏障不是注册点，表现成「服务起来了，然后全站 500」。
+#
+# 也**不放 lifespan**：conftest 的 client 夹具明写不进 lifespan，
+# 放那儿会让 KINDS 只在测试里手动 load 过的地方存在，新测试忘了就收 400 unknown_kind。
+load_kinds()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("soroban")
@@ -65,7 +77,21 @@ async def lifespan(app: FastAPI):
         checkpoint_and_dispose()        # 合并并截断 WAL、关连接池 → 回收 -wal/-shm
 
 
-app = FastAPI(title="soroban", version="0.1.0", lifespan=lifespan)
+# 交互式文档：**只在只监听环回时默认开**。
+# /docs、/redoc、/openapi.json 都不需要登录，把完整 API 面（含每条路由的插件 scope 标注）
+# 摆出来；绑到 0.0.0.0 时那就是给整个局域网看的一张地图。
+# 环回下没有这个问题，而它平时很有用，所以不是一刀切关掉。
+# 想在局域网上也开，显式设 SOROBAN_DOCS=1。
+_LAN = os.environ.get("HOST", "127.0.0.1") not in ("127.0.0.1", "localhost", "::1")
+_DOCS = os.environ.get("SOROBAN_DOCS", "").strip().lower() in ("1", "true", "yes") or not _LAN
+
+app = FastAPI(title="soroban", version="0.1.0", lifespan=lifespan,
+              docs_url="/docs" if _DOCS else None,
+              redoc_url="/redoc" if _DOCS else None,
+              openapi_url="/openapi.json" if _DOCS else None)
+if not _DOCS:
+    log.info("HOST=%s（非环回）→ 已关闭 /docs 与 /openapi.json。要开：SOROBAN_DOCS=1",
+             os.environ.get("HOST"))
 
 # 数据库迁移期间只读：拷贝没有读快照，期间写入会产生撕裂的拷贝（详见 app/maintenance.py）。
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -80,7 +106,6 @@ async def _readonly_barrier(request: Request, call_next):
 
     用中间件而不是给每个端点挂依赖：将来新增的写端点**自动**被覆盖，不会有人忘了加。
     """
-    load_kinds()          # 注册通用写入通道的 handler（重复/未知权限 → 启动即炸）
     path = request.url.path
     if request.method in _SAFE_METHODS or path.startswith(_ALLOWED_WHILE_READONLY):
         return await call_next(request)

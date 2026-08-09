@@ -15,5 +15,9 @@ for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
   app.component(key, component)
 }
 app.use(router)
-app.use(ElementPlus, { locale: zhCn })
+// size: 'small' 是**全站默认控件尺寸**。
+// 之前没设，于是页面里 55 处显式写 size="small"、另外 32 处什么都不写（走 Element 的
+// default，比 small 高一档）——同一行筛选栏里输入框和按钮不一样高，就是这么来的。
+// 定在这里之后：新写的控件天生就对，不用记得加；登录页那种要刻意放大的仍可显式覆盖。
+app.use(ElementPlus, { locale: zhCn, size: 'small' })
 app.mount('#app')

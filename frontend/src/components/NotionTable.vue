@@ -43,7 +43,7 @@
                     <div class="gtn-tagmgr-title">{{ col.label }} · 标签（列头管理）</div>
                     <div class="gtn-tag-list">
                       <span v-for="v in (tagOptions[col.field] || [])" :key="v" class="gtn-tag-item">
-                        <el-tag size="small"
+                        <el-tag
                                 :style="tagStyleAt(tagMeta[col.field]?.[v]?.color ?? -1, v)"
                                 :closable="!(tagMeta[col.field]?.[v]?.in_use)"
                                 :title="tagMeta[col.field]?.[v]?.in_use ? '使用中，不可删除' : ''"
@@ -64,8 +64,8 @@
                       使用中的标签不可删除
                     </div>
                     <div class="gtn-tag-add">
-                      <el-input v-model="newTag[col.field]" size="small" placeholder="新标签名" @keyup.enter="addTag(col.field)" />
-                      <el-button size="small" type="primary" @click="addTag(col.field)">添加</el-button>
+                      <el-input v-model="newTag[col.field]" placeholder="新标签名" @keyup.enter="addTag(col.field)" />
+                      <el-button type="primary" @click="addTag(col.field)">添加</el-button>
                     </div>
                   </div>
                 </el-popover>
@@ -102,6 +102,12 @@
             </td>
           </tr>
 
+          <!-- 零结果：给一行文案，而不是一个带边框、有列头、里面什么都没有的方块。
+               「加载中 / 没有数据 / 筛没了」三种状态在界面上得分得开——
+               Items 页 `addable=false`，筛空时 tbody 会完全为空，最像坏了。 -->
+          <tr v-if="!loading && !rows.length" class="gtn-empty">
+            <td :colspan="emptyColspan">{{ emptyText }}</td>
+          </tr>
           <template v-for="row in rows" :key="row.id">
             <tr class="gtn-row">
               <td class="gtn-td-id">
@@ -150,9 +156,14 @@ const props = defineProps({
   tableName: { type: String, default: '' },   // 有则启用列拖拽/拖宽 + 后端持久化
   openId: { type: [Number, String], default: null },   // 设置后自动展开该 id 的行（供跨页跳转定位）
   hideId: { type: Boolean, default: false },   // 隐藏最左「ID」列的编号与表头（仍保留该窄列的新建/删除操作）
+  emptyText: { type: String, default: '没有符合条件的记录' },   // 零结果时的一行文案
 })
 const emit = defineEmits(['save', 'add', 'delete', 'reload'])
 const slots = useSlots()
+
+// 空态那一行要横跨整表。列数 = ID 列 + 可选展开列 + 数据列 + 操作列，
+// 少算一列的话空态文案会挤在左边、右边留一段空表格，比没有还难看。
+const emptyColspan = computed(() => 1 + (props.expandable ? 1 : 0) + props.columns.length + 1)
 
 const DEFAULT_COL_W = 160   // 无显式 width 的列默认宽
 const ID_COL_W = 56         // 最左 ID/删除/新建 列
@@ -378,7 +389,11 @@ function stopResize() {
 
 <style scoped>
 .gtn { display: flex; flex-direction: column; }
-.gtn-toolbar { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+/* align-items: center 是**必需的**，不是审美：flex 默认 stretch，会把每个控件拉到
+   与本行最高者等高。工具栏里混着输入框(24px)和日期范围选择器(32px)，于是搜索框被
+   悄悄拉成 32px——同一行里两种高度，而且只在带日期筛选的页面上出现，很难联想到原因。 */
+.gtn-empty td { padding: 22px 12px; text-align: center; color: var(--txt-3); font-size: 13px; }
+.gtn-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
 .gtn-scroll { overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
 .gtn-table { border-collapse: collapse; font-size: 13px; color: var(--txt-body); table-layout: fixed; }
 
@@ -417,9 +432,9 @@ function stopResize() {
 .gtn-exp-row > td { background: #10192c; border-bottom: 1px solid var(--border); }
 .gtn-new td { background: #10192c; border-bottom: 1px solid var(--border-soft); border-right: 1px solid var(--border); }
 .gtn-new-num { color: #5c6b85; cursor: pointer; }
-.gtn-new-num:hover { color: var(--ok); background: rgba(103, 194, 58, 0.1); }
+.gtn-new-num:hover { color: var(--ok); background: var(--ok-faint); }
 /* 草稿已有内容 → ✓ 亮起，提示「可以提交了」 */
-.gtn-new-num.ready { color: var(--ok); background: rgba(103, 194, 58, 0.12); }
+.gtn-new-num.ready { color: var(--ok); background: var(--ok-weak); }
 /* 提交在途：点不动 + 转圈。在途零反馈正是用户第二次点击、建出重复单的成因 */
 .gtn-new-num.busy { color: var(--txt-3); background: transparent; pointer-events: none; cursor: progress; }
 .gtn-new-num .spin { animation: gtn-spin 1s linear infinite; }

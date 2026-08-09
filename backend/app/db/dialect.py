@@ -27,7 +27,14 @@ from sqlalchemy.engine import Connection, Dialect, Engine
 
 
 def _name(bind=None) -> str:
-    """取当前方言名。bind 可传 Connection/Engine/Dialect；不传则用 Alembic 的 op.get_bind()。"""
+    """取当前方言名。bind 可传 Session/Connection/Engine/Dialect；不传则用 Alembic 的 op.get_bind()。
+
+    **必须认 Session**：路由层手里只有 Session，`ci_contains(col, q, session)` 全是这么调的。
+    原先兜底那一支是 `getattr(getattr(bind, "dialect", None), "name", str(bind))`，
+    而 Session 没有 `.dialect` 属性 → 返回的是 Session 的 repr → `is_mysql()` 恒 False。
+    后果不是报错而是**静默降级**：MySQL 上 BinStr 列的模糊搜索退回大小写敏感，
+    同一份数据、同一个搜索词，SQLite 和 MySQL 给出不同结果——正是引入 BinStr 那版要消灭的发散。
+    """
     if bind is None:
         from alembic import op  # 延迟导入：非迁移场景（database.py）不依赖 alembic 上下文
         bind = op.get_bind()
@@ -35,7 +42,19 @@ def _name(bind=None) -> str:
         return bind.name
     if isinstance(bind, (Connection, Engine)):
         return bind.dialect.name
-    return getattr(getattr(bind, "dialect", None), "name", str(bind))
+    # Session（以及任何能给出 bind 的对象）：问它连的是谁，再递归判一次。
+    get_bind = getattr(bind, "get_bind", None)
+    if callable(get_bind):
+        try:
+            return _name(get_bind())
+        except Exception:                        # noqa: BLE001  取不到就走下面的兜底
+            pass
+    dialect = getattr(bind, "dialect", None)
+    if dialect is not None:
+        return dialect.name
+    # 走到这里说明传进来的东西认不出来。**不能静默当成非 MySQL**——那正是这个函数
+    # 出过的事故：错得没有任何声响，只是搜索结果悄悄变了。
+    raise TypeError(f"认不出这个 bind 的方言：{type(bind).__name__}")
 
 
 def is_sqlite(bind=None) -> bool:
@@ -100,9 +119,15 @@ def ci_contains(col, q: str, bind=None):
 
 
 def _ci_collation(bind=None) -> str:
+    """问这台 MySQL 认不认 `CI_COLLATION`，不认就退到保守值。
+
+    原先写的是 `bind.connection if hasattr(bind, "connection") else bind`——
+    Session 的 `connection` 是**方法**不是属性，取到的是绑定方法，`.execute` 当场 AttributeError，
+    被 except 吞掉后**永远**返回保守值。也就是说探测这段代码从来没真正跑过。
+    """
     try:
         from sqlalchemy import text as _text
-        conn = bind.connection if hasattr(bind, "connection") else bind
+        conn = bind.connection() if callable(getattr(bind, "connection", None)) else bind
         found = conn.execute(_text("SHOW COLLATION LIKE :c"), {"c": CI_COLLATION}).first()
         return CI_COLLATION if found else CI_COLLATION_FALLBACK
     except Exception:                            # noqa: BLE001  探测失败就用保守值

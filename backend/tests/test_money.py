@@ -127,3 +127,47 @@ def test_order_sync_adds_postage():
     o.sync_from_items()
     assert o.price_cny == Decimal("28.00")
     assert o.jpy_auto == 560
+
+
+def test_freight_without_fx_is_not_masked_by_the_special_fee(client, mk):
+    """集运单缺汇率时不许拿特殊费冒充结算额。
+
+    集运的 `price_cny` 是**运费**、`special_fee_jpy` 是特殊费。缺汇率时若落到
+    「auto = 特殊费」那一支，界面会显示一个看起来完整的金额，运费部分永久缺失
+    并被看板加总——而商品订单同场景显示「—」，一眼看得出缺口。两者必须同口径。
+    """
+    from sqlmodel import Session, delete, select
+
+    from app.database import get_engine
+    from app.models import FxRate
+
+    with Session(get_engine()) as s:            # 制造「一条汇率都没有」的前置条件
+        s.exec(delete(FxRate))
+        s.commit()
+    try:
+        j = mk("/api/shipment", {"date": "2027-01-05", "recipient": "缺汇率",
+                                 "price_cny": 500, "special_fee_jpy": 3000})
+        assert j["fx_rate"] is None, "前置没成立：库里还有汇率"
+        assert j["jpy_settled"] is None, \
+            f"运费被吞掉了，只剩特殊费冒充结算额：jpy_settled={j['jpy_settled']}"
+    finally:
+        pass
+
+
+def test_zero_freight_plus_special_fee_still_settles(client, mk):
+    """运费显式填 0（预付/包邮）+ 特殊费，是一笔算得出的账，不许被打成 None。
+
+    这是上一条的边界：判据若写成 `price_cny is not None` 会把这种情况一起打掉，
+    修一个丢钱的 bug 反而新造一个丢钱的 bug。
+    """
+    from sqlmodel import Session, delete
+
+    from app.database import get_engine
+    from app.models import FxRate
+
+    with Session(get_engine()) as s:
+        s.exec(delete(FxRate))
+        s.commit()
+    j = mk("/api/shipment", {"date": "2027-01-06", "recipient": "包邮",
+                             "price_cny": 0, "special_fee_jpy": 700})
+    assert j["jpy_settled"] == 700, f"运费 0 + 特殊费 700 应结算 700，实际 {j['jpy_settled']}"

@@ -15,10 +15,10 @@
         <span class="cur" v-if="g.name === '汇率'">
           <template v-if="fx.rate">
             当前：1元 = {{ fx.rate }}円
-            <el-tag size="small" :style="typeStyle(fx.expired ? 'danger' : fx.source === 'manual' ? 'info' : 'success')">
+            <el-tag :style="typeStyle(fx.expired ? 'danger' : fx.source === 'manual' ? 'info' : 'success')">
               {{ fxSourceName(fx) }}
             </el-tag>
-            <el-tag v-if="fx.expired" size="small" :style="typeStyle('danger')">已过期 {{ ageText }}</el-tag>
+            <el-tag v-if="fx.expired" :style="typeStyle('danger')">已过期 {{ ageText }}</el-tag>
           </template>
           <span v-else class="sub">库里还没有汇率</span>
           <!-- 这条**必须在 v-if="fx.rate" 之外**：一条汇率都没有的时候，恰恰最需要告诉用户
@@ -42,15 +42,15 @@
         </label>
 
         <el-input-number v-if="sp.kind === 'int'" v-model="draft[sp.key]"
-                         :min="sp.min" :max="sp.max" :controls="false" size="small"
+                         :min="sp.min" :max="sp.max" :controls="false"
                          style="width: 130px" />
 
-        <el-select v-else-if="sp.choices" v-model="draft[sp.key]" size="small"
+        <el-select v-else-if="sp.choices" v-model="draft[sp.key]"
                    style="width: 160px">
           <el-option v-for="c in sp.choices" :key="c" :label="c" :value="c" />
         </el-select>
 
-        <el-input v-else v-model="draft[sp.key]" size="small" style="width: 160px"
+        <el-input v-else v-model="draft[sp.key]" style="width: 160px"
                   :placeholder="String(sp.default || '')" />
 
         <span class="sub">{{ extraHint(sp) }}</span>
@@ -150,5 +150,5 @@ onMounted(load)
 .help { color: var(--txt-3); cursor: help; font-size: 13px; }
 .sub { color: var(--txt-3); font-size: 12px; }
 .sub.warn { color: var(--el-color-warning); }
-.chain-row + .acts { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+.acts { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
 </style>

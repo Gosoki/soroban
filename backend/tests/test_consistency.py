@@ -368,3 +368,65 @@ def test_nav_is_generated_from_routes():
     必须从路由表生成。"""
     layout = (_REPO / "frontend" / "src" / "components" / "Layout.vue").read_text(encoding="utf-8")
     assert "router.getRoutes()" in layout, "侧栏又变回手写数组了"
+
+
+# --- 设计语言：控件尺寸统一 ----------------------------------------------------
+
+def test_control_size_is_set_globally_not_per_widget():
+    """控件尺寸定在 `main.js` 的全局配置里，页面里不再逐个写 `size=`。
+
+    改之前：55 处显式 `size="small"`、另外 32 处什么都不写（走 Element 的 default，
+    比 small 高一档）。同一行筛选栏里输入框和按钮不一样高，就是这么来的——
+    而且**新写的控件默认是错的**，得靠人记得加。
+
+    登录页刻意用 `large`（独立页面、大输入框），是唯一的例外。
+    """
+    import re
+
+    main_js = (_REPO / "frontend" / "src" / "main.js").read_text(encoding="utf-8")
+    assert re.search(r"size:\s*['\"]small['\"]", main_js), \
+        "main.js 里没设全局控件尺寸，新控件会各自走默认值"
+
+    bad = []
+    for f in sorted((_REPO / "frontend" / "src").rglob("*.vue")):
+        if "Login" in str(f):
+            continue                     # 登录页刻意放大
+        # 只认 Element 的三档尺寸。别的 size=（图标像素 size="18"、分页 :size="pageSize"、
+        # el-image 的 size="none"）与控件尺寸无关，一起查会产生假红——
+        # 而假红的下场是有人把断言改松，等于没有守卫。
+        for m in re.finditer(r'\bsize="(large|default|small)"', f.read_text(encoding="utf-8")):
+            bad.append(f"{f.relative_to(_REPO)}: size=\"{m.group(1)}\"")
+    assert not bad, (
+        "这些地方又逐个写死了控件尺寸，会和全局默认打架：\n  " + "\n  ".join(bad)
+        + "\n尺寸统一定在 main.js；确实要破例的（如登录页）请在本测试里显式豁免。")
+
+
+def test_shared_toolbar_does_not_stretch_its_controls():
+    """列表页共用的 `.gtn-toolbar` 必须显式写 `align-items`。
+
+    flex 的默认值是 `stretch`：工具栏里混着输入框(24px)和日期范围选择器(32px)时，
+    搜索框会被悄悄拉到 32px。同一行里两种高度，而且只在带日期筛选的页面上出现，
+    很难联想到是 flex 干的——实测就是这么找出来的（浏览器里量到 wrapper 32px，
+    但没有任何一条 CSS 规则匹配到它）。
+
+    诚实说明：这是「防这行被删掉」的守卫，不是行为测试。真要验高度得开浏览器量，
+    那不在 pytest 的射程内。所以断言只做一件事，不假装做更多。
+    """
+    import re
+
+    css = (_REPO / "frontend" / "src" / "components" / "NotionTable.vue").read_text(encoding="utf-8")
+    rule = re.search(r"\.gtn-toolbar\s*\{([^}]*)\}", css)
+    assert rule, "NotionTable.vue 里找不到 .gtn-toolbar 的样式规则"
+    assert "align-items" in rule.group(1), \
+        "`.gtn-toolbar` 没写 align-items，flex 默认 stretch 会把控件拉成不同高度"
+
+
+def test_router_has_a_catch_all_so_bad_urls_are_not_a_blank_page():
+    """未知路由必须有兜底。
+
+    没有兜底时 vue-router 什么都不渲染——**连左侧导航都没有**，用户在界面里
+    找不到任何退回去的办法。这不是假想：插件从 `scraper` 改名成 `plugin` 之后，
+    旧书签 `#/scrapers` 就是整页空白（浏览器里实测过）。
+    """
+    src = (_REPO / "frontend" / "src" / "router" / "index.js").read_text(encoding="utf-8")
+    assert "pathMatch" in src, "router 没有兜底路由，写错的地址会渲染成整页空白"

@@ -165,15 +165,22 @@ async def ocr_attach_express(
             # 一旦释放出来，回落到的就是被覆盖过的值而不是真实的「已签收」。
             values = {"shipment_order_id": shipment_id,
                       "version": Order.version + 1, "updated_at": utcnow()}
-            # 原子挂靠，守卫与 attach_order 同款：仍未挂靠（或已挂本单，幂等）、未软删、
+            if od.shipment_order_id == shipment_id:
+                # **已经挂在本单上了 → 一个字节都不写**。
+                # 原先这里也照发 UPDATE（WHERE 里放行了「已挂本单」以求幂等），
+                # 可 SET 里带着 `version + 1`——于是「幂等」只对挂靠关系成立，
+                # 对乐观锁不成立：同一张截图重传一次，这些订单的 version 就 +1，
+                # 正在编辑其中某单的人下一次保存直接 409，而他什么都没做错。
+                attached.append(od)
+                continue
+            # 原子挂靠，守卫与 attach_order 同款：仍未挂靠、未软删、
             # 且集运单在极小竞态窗内没被并发软删。靠 rowcount 判定，避免「读-判断-写」双挂。
             res = session.execute(
                 sa_update(Order)
                 .where(
                     Order.id == od.id,
                     Order.is_delete.is_(False),
-                    or_(Order.shipment_order_id.is_(None),
-                        Order.shipment_order_id == shipment_id),
+                    Order.shipment_order_id.is_(None),
                     select(ShipmentOrder.id)
                     .where(ShipmentOrder.id == shipment_id, ShipmentOrder.is_delete.is_(False))
                     .exists(),

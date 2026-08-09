@@ -24,8 +24,7 @@
           </el-button>
         </div>
 
-        <el-menu router :default-active="$route.path" class="menu" background-color="#0f1728"
-                 text-color="#9ba8bf" active-text-color="#ffffff" @select="onSelect">
+        <el-menu router :default-active="$route.path" class="menu" @select="onSelect">
           <el-menu-item v-for="m in nav" :key="m.path" :index="m.path">
             <el-icon><component :is="m.icon" /></el-icon>
             <span>{{ m.title }}</span>
@@ -36,28 +35,28 @@
         <SidebarCalc v-if="!isMobile" />
 
         <div class="foot">
-          <div class="fx" v-if="fx.rate">
+          <div class="fx" v-if="fx.rate" @click="loadFx" title="点一下刷新汇率">
             1元 = {{ fx.rate }}円
             <!-- 「旧」= 不是今天的（日粒度）；「已过期」= 超过设置里的上限、这个值已经不该信了。
                  分两级是因为前者很常见（凌晨还没刷新），后者意味着取汇率的链路真的断了：
                  建单会继续用它（有值好过没有，且逐行存下来可审计），但必须看得见。 -->
-            <el-tag v-if="fx.expired" size="small" :style="typeStyle('danger')"
+            <el-tag v-if="fx.expired" :style="typeStyle('danger')"
                     :title="`已过期 ${fx.ageText}，取汇率的链路可能断了。建单仍会用它，但金额可能不准——去设置页手填一个，或检查汇率插件`">
               已过期 {{ fx.ageText }}
             </el-tag>
-            <el-tag v-else-if="fx.stale" size="small" :style="typeStyle('warning')">旧</el-tag>
+            <el-tag v-else-if="fx.stale" :style="typeStyle('warning')">旧</el-tag>
             <!-- 「手填」= 这条汇率是你在设置页填的，不是自动取到的。
                  原先这里是「备用」（不是链上首选源），但「谁是首选」现在是插件的私有参数，
                  核心看不到——留一个恒 False 的标签等于持续输出假信息。 -->
-            <el-tag v-if="fx.source === 'manual'" size="small" :style="typeStyle('info')"
+            <el-tag v-if="fx.source === 'manual'" :style="typeStyle('info')"
                     title="这是你在设置页手填的汇率，不是自动取到的。装上汇率插件并授权后会自动更新">手填</el-tag>
           </div>
           <div class="user">
             <el-icon><User /></el-icon><span>{{ userName }}</span>
           </div>
           <div class="foot-btns">
-            <el-button size="small" text bg @click="pwd.open = true">改密码</el-button>
-            <el-button size="small" text bg @click="logout">退出登录</el-button>
+            <el-button text bg @click="pwd.open = true">改密码</el-button>
+            <el-button text bg @click="logout">退出登录</el-button>
           </div>
         </div>
       </aside>
@@ -125,10 +124,12 @@ try {
 } catch (_) { /* ignore */ }
 
 const fx = reactive({ rate: null, stale: false, source: '', expired: false, ageText: '' })
-onMounted(async () => {
-  mq = window.matchMedia('(max-width: 768px)')
-  syncMobile()
-  mq.addEventListener('change', syncMobile)
+
+// 侧栏汇率原先只在 onMounted 取一次。Layout 是父级路由组件、切页不卸载，
+// 于是那一行是**登录那一刻的快照**：红色的「已过期」标签正劝用户去设置页手填一个，
+// 照做之后标签却不会消失——用户会以为手填没生效。
+// 给它一个点击重取（最廉价的形态；为这个引事件总线/provide-inject 不划算）。
+async function loadFx() {
   try {
     const r = await fxApi.get()
     fx.rate = r.rate
@@ -137,7 +138,14 @@ onMounted(async () => {
     fx.expired = !!r.expired
     const h = r.age_hours || 0
     fx.ageText = h >= 48 ? `${Math.floor(h / 24)} 天` : `${Math.round(h)} 小时`
-  } catch (_) { /* ignore */ }
+  } catch (_) { /* 拦截器已提示 */ }
+}
+
+onMounted(async () => {
+  mq = window.matchMedia('(max-width: 768px)')
+  syncMobile()
+  mq.addEventListener('change', syncMobile)
+  await loadFx()
 })
 onUnmounted(() => { mq?.removeEventListener('change', syncMobile) })
 
@@ -182,7 +190,16 @@ async function submitPwd() {
 .brand-title { font-size: 15px; color: var(--txt-1); font-weight: 600; }
 .brand-sub { font-size: 12px; color: var(--txt-3); }
 .brand-close { flex-shrink: 0; margin-left: auto; color: #a6adb4 !important; padding: 4px !important; }
-.menu { flex: 1; border-right: none; overflow-y: auto; }
+.menu {
+  /* 不用 background-color/text-color/active-text-color 三个 prop：Element 会去解析
+     它们的颜色值来推导悬停色，喂 var() 会让它算不出来——实测菜单文字直接变成 active
+     色，控制台还刷 `Maximum call stack size exceeded`。直接写它的 CSS 变量则安全。 */
+  --el-menu-bg-color: var(--bg-side);
+  --el-menu-text-color: var(--txt-2);
+  --el-menu-active-color: var(--txt-on-active);
+  --el-menu-hover-bg-color: var(--bg-hover);
+  flex: 1; border-right: none; overflow-y: auto;
+}
 .menu :deep(.el-menu-item) { margin: 4px 8px; border-radius: 6px; }
 .menu :deep(.el-menu-item.is-active) { background: var(--brand); }
 .foot { padding: 12px 16px; border-top: 1px solid var(--border-dim); display: flex; flex-direction: column; gap: 8px; }

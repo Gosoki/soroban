@@ -227,7 +227,15 @@ class LedgerBase(SQLModel):
         ValueError（main 里统一转 422），防止 Numeric(12,2)/有符号 INT 溢出与双引擎发散。"""
         if self.price_cny is not None:
             guard_cny(self.price_cny)               # 与 OrderStaging.sync_from_items 同一把卡口
-        if self.price_cny is not None and self.fx_rate is not None:
+        if self.price_cny and self.fx_rate is None:
+            # **算不出就是算不出**，不许拿 extra_jpy 冒充一个完整的结算额。
+            # 集运单的 price_cny 是「运费」、extra_jpy 是「特殊费」：缺汇率时落到下面那支的话，
+            # 界面上会显示一个看起来完整的金额（只有特殊费），运费部分永久缺失并被看板加总——
+            # 商品订单同场景显示的是「—」，一眼看得出缺口。两者必须同一个口径。
+            # 判据用真值不用 `is not None`：运费显式填 0（预付/包邮）+ 特殊费，
+            # 那是一笔算得出的账，不该被打成 None 反而丢钱。
+            auto = None
+        elif self.price_cny is not None and self.fx_rate is not None:
             cny = Decimal(self.price_cny).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             rate = Decimal(self.fx_rate).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
             auto = int((cny * rate).quantize(Decimal("1"), rounding=ROUND_HALF_UP)) + extra_jpy

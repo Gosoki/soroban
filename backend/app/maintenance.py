@@ -19,7 +19,7 @@
 
 汇率**原本是第 2 条**：`fx_loop` 直接用 Session 写 FxRate。把取汇率整个搬进插件后，
 汇率写入改走 `POST /api/plugins/ingest`，被第 1 条的 HTTP 中间件覆盖；核心里唯一还会
-自己写 FxRate 的是 `ensure_manual_rate`，它只在请求作用域内被 stamp_rate/rate_for_date
+自己写 FxRate 的是 `ensure_manual_rate`，它只在请求作用域内被 rate_for_date
 调到，而那些调用点全在 POST/PATCH 端点上——中间件已经挡在前面了。
 
 **绝不能泄漏**：屏障一旦忘了撤，整个应用就永久只读。所以除了 try/finally，还带一道**硬超时**

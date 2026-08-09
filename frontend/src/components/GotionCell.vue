@@ -11,13 +11,13 @@
               placement="bottom-start" @update:visible="(v) => !v && (editing = false)">
     <template #reference>
       <div class="gtn-disp sel" :class="{ locked }" @click="!locked && (editing = !editing)">
-        <el-tag v-if="modelValue" v-bind="tagAttrs(modelValue)" size="small">{{ modelValue }}</el-tag>
+        <el-tag v-if="modelValue" v-bind="tagAttrs(modelValue)">{{ modelValue }}</el-tag>
         <span v-else class="ph">{{ emptyText }}</span>
       </div>
     </template>
     <div class="gtn-opts">
       <div v-for="o in col.options" :key="o" class="gtn-opt" :class="{ active: modelValue === o }" @click="choose(o)">
-        <el-tag v-bind="tagAttrs(o)" size="small">{{ o }}</el-tag>
+        <el-tag v-bind="tagAttrs(o)">{{ o }}</el-tag>
         <el-icon v-if="modelValue === o" class="gtn-ck"><Check /></el-icon>
       </div>
       <div v-if="modelValue && col.clearable !== false" class="gtn-opt clear" @click="choose(null)">清除</div>
@@ -29,8 +29,7 @@
     <!-- clearable 必须显式透传：el-date-picker 默认 true，编辑态一悬停就出 ✕，点下去发
          date=null 撞 NOT NULL 列 → 409「数据完整性冲突」→ 前端当成乐观锁冲突弹「数据已变」。 -->
     <el-date-picker v-if="editing" ref="inp" v-model="editVal" type="date" value-format="YYYY-MM-DD"
-                    :clearable="col.clearable !== false"
-                    size="small" class="gtn-in" @change="commit()" @visible-change="(v) => !v && close()" />
+                    :clearable="col.clearable !== false" class="gtn-in" @change="commit()" @visible-change="(v) => !v && close()" />
     <template v-else>
       <span v-if="disp !== null">{{ disp }}</span>
       <span v-else class="ph">{{ emptyText }}</span>
@@ -54,9 +53,8 @@
 
   <!-- text / decimal / int -->
   <div v-else class="gtn-disp" @click="!editing && start()">
-    <el-input-number v-if="editing && col.type === 'int'" ref="inp" v-model="editVal" :controls="false"
-                     size="small" class="gtn-in" @blur="commit()" @keydown.enter="commit(true)" @keydown.esc="close" />
-    <el-input v-else-if="editing" ref="inp" v-model="editVal" size="small" class="gtn-in"
+    <el-input-number v-if="editing && col.type === 'int'" ref="inp" v-model="editVal" :controls="false" class="gtn-in" @blur="commit()" @keydown.enter="commit(true)" @keydown.esc="close" />
+    <el-input v-else-if="editing" ref="inp" v-model="editVal" class="gtn-in"
               @blur="commit()" @keydown.enter="commit(true)" @keydown.esc="close" />
     <template v-else>
       <span v-if="disp !== null" :class="col.format ? 'derived' : ''">{{ disp }}</span>

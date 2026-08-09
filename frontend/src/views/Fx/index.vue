@@ -8,7 +8,7 @@
     </p>
 
     <div class="bar">
-      <el-radio-group v-model="days" size="small" @change="load">
+      <el-radio-group v-model="days" @change="load">
         <el-radio-button v-for="d in [7, 30, 90, 365]" :key="d" :value="d">近 {{ d }} 天</el-radio-button>
       </el-radio-group>
       <span class="sub">共 {{ rows.length }} 天有记录</span>
@@ -38,7 +38,7 @@
             </td>
             <td class="num">{{ r.used ?? '—' }}</td>
             <td>
-              <el-tag size="small" :style="typeStyle(r.used_source === 'manual' ? 'info' : 'success')">
+              <el-tag :style="typeStyle(r.used_source === 'manual' ? 'info' : 'success')">
                 {{ FX_SOURCE_NAMES[r.used_source] || r.used_source }}
               </el-tag>
             </td>
@@ -55,10 +55,10 @@
                      两者不同源的话，非 JST 机器上会出现「8-07 那天写着 8/6 22:00」 -->
                 <span class="t">{{ x.at || '—' }}</span>
                 <span class="v">{{ x.rate }}</span>
-                <el-tag size="small" :style="typeStyle(x.source === 'manual' ? 'info' : 'success')">
+                <el-tag :style="typeStyle(x.source === 'manual' ? 'info' : 'success')">
                   {{ FX_SOURCE_NAMES[x.source] || x.source }}
                 </el-tag>
-                <el-tag v-if="x.used" size="small" :style="typeStyle('warning')"
+                <el-tag v-if="x.used" :style="typeStyle('warning')"
                         title="当天按这一条折算（手填优先，其次最后抓到的）">采用</el-tag>
               </div>
             </td>
@@ -81,21 +81,36 @@ const rows = ref([])
 const openDay = ref('')
 const detail = ref([])
 
+// 请求序号门：迟到的响应不许覆盖新结果。与 Orders/Items/Shipment/Staging/Misc
+// 六处同一个写法。少了它，连点「近 7 天/近 30 天」或快速换行展开时，
+// A 天的明细会画在 B 天下面——没有任何提示，看上去就是数据错了。
+let loadSeq = 0
+let daySeq = 0
+
 async function load() {
+  const my = ++loadSeq
   loading.value = true
   openDay.value = ''
   try {
-    rows.value = (await fxApi.history(days.value)).items
-  } catch (_) { /* 拦截器已提示 */ } finally { loading.value = false }
+    const res = await fxApi.history(days.value)
+    if (my === loadSeq) rows.value = res.items
+  } catch (_) { /* 拦截器已提示 */ } finally {
+    if (my === loadSeq) loading.value = false
+  }
 }
 
 async function toggle(r) {
-  if (openDay.value === r.date) { openDay.value = ''; return }
+  if (openDay.value === r.date) { openDay.value = ''; daySeq++; return }
+  const my = ++daySeq
   openDay.value = r.date
   detail.value = []
   try {
-    detail.value = (await fxApi.historyDay(r.date)).items
-  } catch (_) { openDay.value = '' }
+    const res = await fxApi.historyDay(r.date)
+    if (my === daySeq) detail.value = res.items
+  } catch (_) {
+    // 只收自己那一次的展开态：否则 A 的失败响应会把用户刚展开的 B 收掉
+    if (my === daySeq) openDay.value = ''
+  }
 }
 
 onMounted(load)

@@ -21,7 +21,7 @@
           <div class="mrow-left">
             <el-icon class="chev" :class="{ open: open.has(m.month) }"><ArrowRight /></el-icon>
             <span class="mrow-month">{{ m.month }}</span>
-            <el-tag v-if="m.month === curMonth" size="small" effect="plain" round>本月</el-tag>
+            <el-tag v-if="m.month === curMonth" :style="typeStyle('info')" round>本月</el-tag>
           </div>
           <div class="mrow-total">{{ fmtJPY(m.jpy) }}</div>
         </div>
@@ -49,6 +49,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ArrowRight } from '@element-plus/icons-vue'
 import { dashboardApi } from '@/api'
 import { fmtJPY } from '@/utils/money'
+import { typeStyle } from '@/constants'
 
 const loading = ref(false)
 const data = reactive({
@@ -74,7 +75,7 @@ function donutStyle(m) {
 }
 
 const cards = computed(() => [
-  { label: '总支出', value: data.total_jpy, color: '#1890ff', sub: `汇率 1元≈${data.fx_rate ?? '—'}円` },
+  { label: '总支出', value: data.total_jpy, color: 'var(--brand)', sub: `汇率 1元≈${data.fx_rate ?? '—'}円` },
   { label: '商品（含快递）', value: data.order_jpy, color: 'var(--ok)', sub: `${data.order_count} 单` },
   { label: '集运运费', value: data.shipment_jpy, color: 'var(--warn)', sub: `${data.shipment_count} 单` },
   { label: '杂项', value: data.misc_jpy, color: 'var(--danger)', sub: `${data.misc_count} 项` },

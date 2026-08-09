@@ -178,6 +178,18 @@ def set_tag_color(
 
 # --- 标签值改名：跨表迁移（数据 + 标签），供本路由的 /rename 与 plugins 路由在同一事务里复用 -------
 
+def _column_of(model, field: str):
+    """取 `model` 上名为 `field` 的那一列——**只认 `_FIELD_SOURCES` 里登记过的字段**。
+
+    不查白名单直接 `getattr(model, field)` 的话，插件清单里写什么就查什么列，
+    等于把「查/删哪一列」的决定权交给了一份手写 toml。
+    """
+    for m, col in _FIELD_SOURCES.get(field, ()):
+        if m is model:
+            return col
+    raise HTTPException(status_code=400, detail=f"不支持的账号字段：{field}")
+
+
 def tag_value_in_use(session: Session, field: str, name: str) -> bool:
     """name 是否已被该标签字段占用：对应数据表（见 _FIELD_SOURCES）里有此值的行，或已登记为标签。改名前防重名用。
 
@@ -245,8 +257,13 @@ def rename_tag_value(session: Session, field: str, old: str, new: str) -> dict:
     return counts
 
 
-def delete_account_staging(session: Session, account: str) -> tuple[int, int]:
+def delete_account_staging(session: Session, field: str, account: str) -> tuple[int, int]:
     """硬删某账号名下的暂存行（OrderStaging）连同其物品（StagingItem）。返回 (删除数, 跳过数)。
+
+    `field` = 账号名落在暂存表的哪一列，由插件清单的 `accounts_ledger_field` 决定。
+    原先这里写死 `platform_account`，而上游只拿 `ledger_field` 当「有没有声明」的开关用——
+    以后哪个插件声明成别的列，会顺利通过校验，然后删掉**另一列**同名的行。
+    半截抽象比没抽象更危险：它看起来是通用的。
     先删子表再删父表以满足外键；**不提交**，由调用方在同一事务里 commit。
 
     **跳过「已导入且账本单仍在」的行**——与单条删除（routers/staging.delete_staging 的 409）
@@ -255,7 +272,7 @@ def delete_account_staging(session: Session, account: str) -> tuple[int, int]:
     用户点「导入」就撞唯一约束、再也导不进来。要真删得先在「商品订单」页删掉账本单。"""
     rows = session.exec(
         select(OrderStaging.id, OrderStaging.imported_order_id)
-        .where(OrderStaging.platform_account == account)
+        .where(_column_of(OrderStaging, field) == account)
     ).all()
     linked_ids = [r[1] for r in rows if r[1] is not None]
     alive = set()
@@ -270,8 +287,8 @@ def delete_account_staging(session: Session, account: str) -> tuple[int, int]:
     return len(ids), len(rows) - len(ids)
 
 
-def soft_delete_account_orders(session: Session, account: str) -> int:
-    """软删某淘宝账号名下的全部账本订单（Order）：is_delete=True、version/updated_at 自增
+def soft_delete_account_orders(session: Session, field: str, account: str) -> int:
+    """软删某账号名下的全部账本订单（Order）：is_delete=True、version/updated_at 自增
     （与单条删除同语义、守乐观锁纪律）。已软删的跳过。**不提交**。返回受影响行数。
 
     对齐单条 delete_order：软删后把「由这些订单导入而来」的暂存行挂靠清掉、状态回「待处理」，
@@ -279,7 +296,7 @@ def soft_delete_account_orders(session: Session, account: str) -> int:
     now = utcnow()
     ids = session.exec(
         select(Order.id).where(
-            Order.platform_account == account, Order.is_delete.is_(False)
+            _column_of(Order, field) == account, Order.is_delete.is_(False)
         )
     ).all()
     if not ids:

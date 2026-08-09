@@ -1,12 +1,13 @@
 <template>
-  <div class="db-page">
+  <div class="db-page" v-loading="loadingStatus">
     <h2 class="title">数据库</h2>
 
     <!-- 当前后端 -->
     <el-card shadow="never" class="card">
       <div class="card-hd">
         <span>当前使用</span>
-        <el-tag :type="status.active.backend === 'mysql' ? 'success' : 'info'" effect="dark">
+        <el-tag v-if="status.active.backend"
+                :style="typeStyle(status.active.backend === 'mysql' ? 'success' : 'info')">
           {{ activeLabel }}
         </el-tag>
       </div>
@@ -18,7 +19,7 @@
     <!-- 已保存 / 连接过的数据库 -->
     <el-card shadow="never" class="card">
       <div class="card-hd"><span>连接过的数据库</span></div>
-      <el-table :data="rows" size="small" style="width: 100%">
+      <el-table :data="rows" style="width: 100%">
         <el-table-column label="数据库" min-width="150">
           <template #default="{ row }">
             <el-icon class="row-ic"><Coin v-if="row.kind === 'mysql'" /><Files v-else /></el-icon>
@@ -28,7 +29,7 @@
         <el-table-column prop="desc" label="地址" min-width="200" />
         <el-table-column label="状态" width="76" align="center">
           <template #default="{ row }">
-            <el-tag v-if="isActive(row)" type="success" size="small">当前</el-tag>
+            <el-tag v-if="isActive(row)" :style="typeStyle('success')">当前</el-tag>
             <span v-else class="dash">—</span>
           </template>
         </el-table-column>
@@ -74,8 +75,8 @@
 
     <!-- 迁移结果 -->
     <el-card v-if="result" shadow="never" class="card">
-      <div class="card-hd"><span>迁移完成</span><el-tag type="success">共 {{ result.total }} 行</el-tag></div>
-      <el-table :data="resultRows" size="small" style="width: 100%">
+      <div class="card-hd"><span>迁移完成</span><el-tag :style="typeStyle('success')">共 {{ result.total }} 行</el-tag></div>
+      <el-table :data="resultRows" style="width: 100%">
         <el-table-column prop="table" label="表" />
         <el-table-column prop="rows" label="行数" width="120" />
       </el-table>
@@ -88,8 +89,13 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Coin, Files } from '@element-plus/icons-vue'
 import { dbApi } from '@/api'
+import { typeStyle } from '@/constants'
 
-const status = reactive({ active: { backend: 'sqlite' }, connections: [] })
+// active 初值刻意留空：给 `{ backend: 'sqlite' }` 的话，首帧必然渲染成
+// 「SQLite（本地文件）」并给本地那行挂上「当前」标签——实际连着 MySQL 时，
+// 用户先看到一个**错误的结论**再被纠正。宁可空一瞬，也不要先说错话。
+const status = reactive({ active: {}, connections: [] })
+const loadingStatus = ref(false)
 const form = reactive({ host: '', port: 3306, user: '', password: '', database: 'soroban' })
 // 初始 readonly，聚焦解除 → 阻止浏览器自动填充登录账号
 const ro = reactive({ user: true, pass: true })
@@ -129,11 +135,12 @@ function formTarget() {
 }
 
 async function loadStatus() {
+  loadingStatus.value = true
   try {
     const s = await dbApi.status()
-    status.active = s.active || { backend: 'sqlite' }
+    status.active = s.active || {}
     status.connections = s.connections || []
-  } catch (_) { /* 拦截器已提示 */ }
+  } catch (_) { /* 拦截器已提示 */ } finally { loadingStatus.value = false }
 }
 
 async function onTest() {

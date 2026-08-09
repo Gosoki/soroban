@@ -170,3 +170,30 @@ def test_control_tables_do_not_trigger_legacy_adoption(tmp_path):
         assert "orders" in set(inspect(e).get_table_names())
     finally:
         e.dispose()
+
+
+def test_every_create_table_pins_engine_and_charset():
+    """每个 `op.create_table` 都必须带 `mysql_engine` + `mysql_charset`。
+
+    现有迁移测试全跑在 SQLite 上，这类**MySQL-only 的缺失一条都拦不住**——
+    `b0c1d2e3f4a5` 就是全链 14 处里唯一漏掉的，本地怎么跑都绿。
+    这条是纯静态的，不需要连 MySQL 也能守住。
+    """
+    import ast
+    from pathlib import Path
+
+    bad = []
+    for f in sorted((Path(__file__).resolve().parents[1] / "alembic" / "versions").glob("*.py")):
+        tree = ast.parse(f.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "create_table"):
+                continue
+            kw = {k.arg for k in node.keywords if k.arg}
+            starred = any(k.arg is None for k in node.keywords)   # **_MYSQL 这种展开
+            if starred:
+                continue
+            missing = {"mysql_engine", "mysql_charset"} - kw
+            if missing:
+                bad.append(f"{f.name}:{node.lineno} 缺 {sorted(missing)}")
+    assert not bad, ("这些建表没钉死引擎/字符集，表的默认排序规则会跟着目标库走：\n  "
+                     + "\n  ".join(bad))

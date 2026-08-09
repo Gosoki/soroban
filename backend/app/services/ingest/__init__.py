@@ -7,13 +7,14 @@
 per-route scope 已经能精确约束它）。通道存在是为了新种类不必新开路由，
 以及让「核心自己落库」与「插件落库」走同一把尺子。
 
-三条铁律（各有守卫，见 tests/test_ingest.py）：
+三条铁律（各有守卫，见 tests/test_plugin_paths.py）：
 
 1. **handler 只能 add/flush，禁止 commit / delete / 裸 SQL。**
    路由层统一提交，每一项包一个 `begin_nested()` savepoint。
    这条不成立会**静默写入已被拒绝的数据**：handler 内部一 commit 就击穿外层 savepoint，
    `Outcome("rejected")` 照常回给插件，而那一行其实已经落库——回执与事实相反，最难查。
-   （`fx._store()` 原本正是这个形状，已先拆成 `fx.store()` + 显式提交。）
+   （`fx` 早年那个自己 commit 的写入函数正是这个形状，已拆成 `store()` + 显式提交，
+   要连提交一起的走 `store_and_commit()`——名字里就写着它会提交。）
 2. **handler 必须落在与人手 API 同一套模型方法上**（`fx.store` / `sync_from_items` /
    `compute_money` / `_q_fx`），不另写一份 SQL。两份写入逻辑必然漂移，
    而漂移的表现是「同一笔钱经不同入口算出两个数」。

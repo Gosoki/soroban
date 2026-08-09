@@ -12,7 +12,8 @@ from ..database import get_session
 from ..models import FxRate
 from ..schemas import FxRead
 from ..services.fx import (
-    JST, SOURCE_LABELS, is_expired, latest_stored, pick_on, rate_age_hours, rows_on,
+    JST, SOURCE_LABELS, is_expired, latest_stored, pick_from, pick_on, rate_age_hours,
+    rows_on,
 )
 
 router = APIRouter(
@@ -85,8 +86,11 @@ def history(days: int = Query(60, ge=1, le=730), session: Session = Depends(get_
     而那种不一致要等到对账才发现。
     """
     since = dt.datetime.now(JST).date() - dt.timedelta(days=days)
+    # 同时按 fetched_at 倒序：`pick_from` 要求「新的在前」，靠这条 ORDER BY 保证，
+    # 分完组后各天的列表天然就是有序的，不用再排一次。
     rows = session.exec(
-        select(FxRate).where(FxRate.date >= since).order_by(col(FxRate.date).desc())
+        select(FxRate).where(FxRate.date >= since)
+        .order_by(col(FxRate.date).desc(), col(FxRate.fetched_at).desc())
     ).all()
     by_day: dict[dt.date, list] = {}
     for r in rows:
@@ -94,7 +98,7 @@ def history(days: int = Query(60, ge=1, le=730), session: Session = Depends(get_
     out = []
     for d in sorted(by_day, reverse=True):
         same = by_day[d]
-        used = pick_on(session, d)
+        used = pick_from(same)          # 与建单同一个规则，但不再每天多查一次库
         vals = [x.rate for x in same]
         out.append({
             "date": d, "count": len(same),

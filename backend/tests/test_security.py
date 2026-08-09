@@ -304,3 +304,79 @@ def test_start_scripts_do_not_print_default_password(script):
     """
     assert "admin123" not in script.read_text(encoding="utf-8"), \
         f"{script.name} 不许回显默认口令"
+
+
+# --- 登录退避：不能靠换 IP 绕过，也不能靠并发溜过去 --------------------------------
+
+def test_throttle_survives_a_forged_client_ip():
+    """每次换一个来源 IP 也必须被挡住。
+
+    `request.client.host` **不可信**：uvicorn 默认信任来自 loopback 的 X-Forwarded-For，
+    而同机反向代理与前端开发代理会让所有请求都长得像 127.0.0.1。
+    真机实测过：修之前轮换 XFF 打 12 次一个 429 都没有，修之后第 7 次开始 429。
+
+    **刻意不走 TestClient**：它的 `request.client.host` 恒为 "testclient"，
+    XFF 头根本不参与，于是有没有「与 IP 无关」的兜底键这条测试都会绿——
+    第一版就是这么写的，是一条假绿。直接驱动退避器才测得到那个键。
+    """
+    from app.ratelimit import FREE_TRIES, LoginThrottle
+
+    t = LoginThrottle()
+    waits = [t.begin("admin", f"10.7.7.{i}") for i in range(FREE_TRIES + 3)]
+    assert any(w > 0 for w in waits), f"每次换 IP 就绕过了退避：{waits}"
+    # 对照：换用户名**应该**互不牵连（不然一个人手滑能把别人锁出去）
+    assert t.begin("someone-else", "10.7.7.0") == 0, "不同用户名之间不该互相牵连"
+
+
+def test_throttle_counts_before_verifying_so_bursts_cannot_slip_through():
+    """判定与计数必须在同一把锁里。
+
+    分成「先查退避、再记失败」两次取锁的话，并发请求会全部在任何一次计数落地之前
+    通过检查——一个退避窗口能塞进几十次口令尝试。
+    """
+    import threading
+
+    from app.ratelimit import FREE_TRIES, LoginThrottle
+
+    t = LoginThrottle()
+    allowed = []
+    lock = threading.Lock()
+
+    def hit():
+        w = t.begin("admin", "1.2.3.4")
+        if w == 0:
+            with lock:
+                allowed.append(1)
+
+    threads = [threading.Thread(target=hit) for _ in range(60)]
+    for x in threads:
+        x.start()
+    for x in threads:
+        x.join()
+    assert len(allowed) <= FREE_TRIES + 1, \
+        f"并发放行了 {len(allowed)} 次，退避形同虚设（上限应为 {FREE_TRIES + 1}）"
+
+
+def test_unknown_username_costs_the_same_as_a_known_one(session):
+    """用户名存在与否要花同样的时间。
+
+    原先不存在的用户名直接短路、根本不跑 bcrypt，而 bcrypt 是几十到几百毫秒量级——
+    响应时间差一个数量级，等于把「哪些用户名是真的」100% 可判别地告诉外面。
+    """
+    import time
+
+    from app.auth import authenticate
+
+    def cost(u):
+        xs = []
+        for _ in range(3):
+            s = time.perf_counter()
+            authenticate(session, u, "definitely-wrong")
+            xs.append(time.perf_counter() - s)
+        return sorted(xs)[1]
+
+    known = cost("admin")
+    unknown = cost("zz-no-such-user-zz")
+    # 只要求同一量级：绝对值随机器差别很大，差 5 倍以上才算可判别的信道
+    assert 0.2 < unknown / max(known, 1e-6) < 5, \
+        f"不存在的用户名 {unknown*1000:.0f}ms vs 存在的 {known*1000:.0f}ms —— 时序可判别"

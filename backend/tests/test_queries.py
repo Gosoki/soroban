@@ -210,3 +210,31 @@ def test_binstr_columns_use_ci_contains_for_search():
                      + "\n  ".join(bad) + "\n改用 db.dialect.ci_contains(col, q, session)。")
 
 
+
+
+def test_dialect_is_detected_from_a_session_not_silently_defaulted(session):
+    """路由层手里只有 Session，方言判定必须认它。
+
+    这条测的是**行为**而不是「源码里有没有 ci_contains 这个词」：
+    `_name()` 原先兜底走 `getattr(bind, "dialect", None)`，Session 没有这个属性，
+    于是返回 Session 的 repr、`is_mysql()` 恒 False。错得没有任何声响——
+    只是 MySQL 上 BinStr 列的模糊搜索悄悄变回大小写敏感。
+    """
+    from app.db.dialect import _name, is_mysql, is_sqlite
+
+    assert _name(session) == "sqlite", f"从 Session 判方言失败，拿到的是 {_name(session)!r}"
+    assert is_sqlite(session) and not is_mysql(session)
+
+
+def test_unknown_bind_raises_instead_of_pretending_to_be_sqlite():
+    """认不出来的 bind 必须报错，不许静默当成非 MySQL。
+
+    静默兜底正是上一个 bug 的形状：`is_mysql()` 返回 False，一切照常运行，
+    只有 MySQL 上的搜索结果不对——而那要等用户搜不到东西才会发现。
+    """
+    import pytest
+
+    from app.db.dialect import is_mysql
+
+    with pytest.raises(TypeError):
+        is_mysql(object())

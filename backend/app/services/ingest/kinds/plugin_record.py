@@ -19,7 +19,11 @@ from sqlmodel import Field, Session, SQLModel, select
 from ....models import PluginRecord, utcnow
 from .. import Ctx, Outcome, register
 
-_MAX_BYTES = 64 * 1024      # 单条上限：核心不解释内容，但要防一条记录把库撑爆
+# 单条上限：核心不解释内容，但要防一条记录把库撑爆。
+# 取 65535 而不是 64*1024（=65536）：MySQL 的 TEXT 容量就是 65535 字节，
+# 多放行的那 1 个取值会在 SQLite 上收下、在 MySQL 上被拒——正好是这个项目
+# 最难查的那类双方言分叉，而且只在恰好 65536 字节时发生。
+_MAX_BYTES = 65535
 
 
 class PluginRecordIn(SQLModel):
