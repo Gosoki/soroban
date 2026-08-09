@@ -340,48 +340,56 @@ def test_needs_is_cached(client, fake_plugin, monkeypatch):
 
 # --- 定时调度：两类插件都得跑得起来 -------------------------------------------
 
-def test_account_based_plugin_fans_out_per_account():
-    """声明了 accounts=true 的插件（淘宝）：一个账号一个子进程，各带自己的平台。"""
-    from app.routers.plugins import _fanout
+class _Cmd:
+    """最小命令替身：_fan_targets 只看 per。"""
+    def __init__(self, per=None):
+        self.per = per
+
+
+def test_account_based_command_fans_out_per_account():
+    """`per = "account"` 的命令：一个启用账号一个子进程，各带自己的平台。"""
+    from app.routers.plugins import _fan_targets
 
     class _Cfg:
-        params_json = '{"accounts": [{"name": "acctA", "platform": "淘宝", "enabled": true},'\
-                      ' {"name": "acctB", "platform": "闲鱼", "enabled": true},'\
-                      ' {"name": "acctC", "platform": "淘宝", "enabled": false}]}'.replace("true", "true")
+        params_json = ('{"accounts": [{"name": "acctA", "platform": "淘宝", "enabled": true},'
+                       ' {"name": "acctB", "platform": "闲鱼", "enabled": true},'
+                       ' {"name": "acctC", "platform": "淘宝", "enabled": false}]}')
 
-    got = _fanout({"accounts": True}, _Cfg())
-    names = [e[1] for e in got]
-    assert names == ["/acctA", "/acctB"], f"停用的账号不该展开：{names}"
+    got = _fan_targets({"accounts": True, "id": "tb"}, _Cfg(), _Cmd("account"))
+    assert [e[1] for e in got] == ["acctA", "acctB"], "停用的账号不该展开"
     assert got[0][0] == ["--account", "acctA", "--platform", "淘宝"]
 
 
-def test_accountless_plugin_still_runs_once():
+def test_accountless_command_still_runs_once():
     """**本次要支持的主要形态**：汇率、快递查询这类插件没有账号概念。
 
     以前 `_run_due` 只按账号展开 → 账号为空则一个都不起 → `launched` 恒为 0 →
     `last_run_at` 永不推进 → 这类插件**永远不会被定时触发**，而界面上完全看不出异常
     （显示「已启用」、有定时周期，只是从不运行）。
     """
-    from app.routers.plugins import _fanout
+    from app.routers.plugins import _fan_targets
 
     class _Cfg:
         params_json = "{}"
 
-    got = _fanout({"id": "fx"}, _Cfg())
-    assert len(got) == 1, "无账号插件必须整体跑一次"
-    assert got[0][0] == [], "不该给它带 --account"
+    got = _fan_targets({"id": "fx"}, _Cfg(), _Cmd())
+    assert got == [([], "")], "无账号命令必须整体跑一次，且不带 --account"
 
 
-def test_accountless_plugin_does_not_get_account_flag():
-    """就算配置里意外留了账号，没声明 accounts=true 的插件也不按账号展开——
-    否则给一个不认识 --account 的插件传了这个参数，它会直接报错退出。"""
-    from app.routers.plugins import _fanout
+def test_fanout_follows_the_command_not_the_plugin():
+    """判据是**命令**的 per，不是插件的 accounts。
+
+    这两者曾经在两条路径上各用一个：手动看 cmd.per、定时看 manifest.accounts。
+    于是同一条 `per` 未声明的命令，手动跑一次、定时按账号跑 N 次并多带 `--account X`
+    ——插件收到一个它在手动路径下从未见过的参数组合，而差异只出现在无人值守那条路上。
+    """
+    from app.routers.plugins import _fan_targets
 
     class _Cfg:
         params_json = '{"accounts": [{"name": "x", "platform": "淘宝", "enabled": true}]}'
 
-    got = _fanout({"id": "fx"}, _Cfg())
-    assert got == [([], "")]
+    # 插件有账号维度，但这条命令没声明 per → 整体跑一次
+    assert _fan_targets({"accounts": True, "id": "tb"}, _Cfg(), _Cmd()) == [([], "")]
 
 
 # --- 目录与命名：插件不只是爬虫 -------------------------------------------------

@@ -31,7 +31,7 @@ cd backend
 | `test_plugins.py` | 插件发现、账号增删改名、**目录穿越防护**、按账号清理 |
 | `test_ocr_parse.py` | OCR 纯解析层（不跑引擎、不需要 rapidocr） |
 | `test_dbadmin.py` | 迁移表清单完整性、整库拷贝、DSN 加解密、方言助手 |
-| `test_consistency.py` | **跨层一致性**：后端枚举 ↔ 前端常量 ↔ 爬虫映射 ↔ 前端调用的 API 路径 |
+| `test_consistency.py` | **跨层一致性**：后端枚举 ↔ 前端常量 ↔ 插件映射 ↔ 前端调用的 API 路径 |
 | `test_migrations.py` | Alembic 链路：单 head、线性、从零建全表、幂等、降级往返、历史数据订正 |
 | `test_code_normalization.py` | 单号类列的归一口径（`norm_code` 转大写、`norm_id` 只去空格） |
 | `test_naming.py` | 命名歧义统一后的列名/状态值不许回退 |
@@ -42,6 +42,14 @@ cd backend
 | `test_requirements.py` | 依赖清单与实际 import 不许脱节 |
 | `test_tools.py` | `tools/` 下的一次性脚本（回填不得改动金额）+ **模型构造不许传错字段名** |
 | `test_mysql_contract.py` | **双引擎契约**：同一请求在真 MySQL 上跑一遍，比对可观测结果（默认跳过，见下） |
+| `test_fx_freshness.py` | 汇率新鲜度：`stale`（不是今天）/ `expired`（超过设置上限）两级、按下单日期取值 |
+| `test_fx_history.py` | 汇率历史：一天多条、`pick_from` 的「手填优先其次最后一条」 |
+| `test_plugin_panel.py` | 插件面板全由 `plugin.toml` 驱动：命令/参数/授权/结果摘要/坏清单 |
+| `test_plugin_paths.py` | scope 挂在**路由**上而不是路径前缀上；路由表展平不许漏 |
+| `test_shipment_pick.py` | 集运单下拉选择（远程搜索、清除、状态继承） |
+| `test_staging_mirror.py` | 已导入暂存行的写穿与镜像：两页显示必须一致 |
+| `test_status_taxonomy.py` | 状态分段命名公理：`<业务段>_status`，同名 ⟺ 同概念 |
+| `test_write_contract.py` | 通用写入通道 `POST /api/plugins/ingest`：按 kind 判权、逐条 savepoint |
 
 ## 两类值得留意的测试
 
@@ -51,8 +59,13 @@ cd backend
 本次审计的最高危 bug（爬虫推「交易成功」被后端 422 整批丢弃）就是它抓到的。
 
 **`test_edge_cases.py`** 里有几条注释以「⚠️ 已知行为」开头：那不是 bug，是当前刻意/已知的
-取舍（如「清空全部单价会把旧总价折到第一条」）。它们被钉在这里是为了**改动时不会无声漂移**；
-若哪天决定改语义，请连带更新这些断言。
+取舍。它们被钉在这里是为了**改动时不会无声漂移**；若哪天决定改语义，请连带更新这些断言。
+
+⚠️ 但「已知行为」不等于「可以一直是这样」。原先钉在这里的
+`test_seed_split_rounding_may_shift_cents`（种子价除不尽 → 总价差几分）就被当成已知取舍
+钉了很久，实际它在数量大时会把整单金额**翻倍或归零**。现在的口径是
+`test_seed_split_never_inflates_or_zeroes_the_order`：**总价守恒是硬约束**。
+往这一类里加断言之前，先问一句「它的最坏情况有多坏」。
 
 
 ## `test_mysql_contract.py`：默认跳过的那一组

@@ -25,11 +25,31 @@ def test_seed_split_across_quantity(client):
     assert all(i["auto"] for i in o["items"])          # 全部标 auto，待人工拆分
 
 
-def test_seed_split_rounding_may_shift_cents(client):
-    """数量除不尽时单价取整到分，总价会差几分——已知且被 backfill 工具文档化的行为。"""
+def test_seed_split_is_exact_even_when_quantity_does_not_divide(client):
+    """数量除不尽时：单价**向下**取整到分，余数单独成一条「金额尾差」，总价分毫不差。
+
+    旧行为是 HALF_UP 取整、总价差几分，还被当成「已知行为」钉在这条测试里。它不是可接受的
+    近似——订单价是 Σ(单价×数量) 派生的，单价一被舍入，账本金额就和爬虫抓到的实付金额对不上。
+    量级也不止「几分」：ROUND_HALF_UP 在 ¥5.00/1000 件时会把单价舍成 0.01 → 总价 ¥10.00
+    （**翻一倍**），¥0.40/1000 件时舍成 0.00 → 总价 **¥0**。见 test_seed_split_never_inflates。
+    """
     o = mk_order(client, price_cny="10.00", items=[{"name": "a", "quantity": 3}])
     assert Decimal(o["items"][0]["unit_price_cny"]) == Decimal("3.33")
-    assert Decimal(o["price_cny"]) == Decimal("9.99")
+    assert o["items"][-1]["name"].endswith("（金额尾差）")
+    assert Decimal(o["items"][-1]["unit_price_cny"]) == Decimal("0.01")
+    assert Decimal(o["price_cny"]) == Decimal("10.00")
+
+
+@pytest.mark.parametrize("price,qty", [("5.00", 1000), ("0.40", 1000), ("100.00", 7), ("0.01", 3)])
+def test_seed_split_never_inflates_or_zeroes_the_order(client, price, qty):
+    """**总价守恒**是硬约束：无论数量多大、除得尽除不尽，Σ(单价×数量) 必须等于种子价。
+
+    这几组是旧的 HALF_UP 实现会崩掉的地方——5.00/1000 曾变成 10.00，0.40/1000 曾变成 0.00。
+    """
+    o = mk_order(client, price_cny=price, items=[{"name": "a", "quantity": qty}])
+    assert Decimal(o["price_cny"]) == Decimal(price)
+    recomputed = sum((Decimal(i["unit_price_cny"]) * i["quantity"] for i in o["items"]), Decimal("0"))
+    assert recomputed == Decimal(price)
 
 
 def test_partially_priced_items_zero_the_rest(client):

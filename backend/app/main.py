@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import TimeoutError as SATimeoutError
 
 from . import models  # noqa: F401  确保建表前所有模型已注册
 from .config import settings
@@ -189,6 +190,21 @@ async def _value_error_handler(request: Request, exc: ValueError):
     # 逃逸到 ASGI 层的 ValueError。仍记日志，避免把真正的代码 bug 悄悄伪装成「输入错误」。
     log.warning("ValueError on %s %s: %s", request.method, request.url.path, exc)
     return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+@app.exception_handler(SATimeoutError)
+async def _pool_timeout_handler(request: Request, exc: SATimeoutError):
+    """连接池被榨干 → 503 + Retry-After，而不是裸 500。
+
+    池满是**过载**（一堆慢请求同时攥着连接，见 database.py 的 _POOL_SIZE），不是 bug。
+    漏成 500 的话前端只会说「服务器错误」，用户会以为数据坏了而不是「等一会儿再试」。
+    """
+    log.warning("数据库连接池耗尽 on %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "服务器繁忙（数据库连接已满），请稍后重试"},
+        headers={"Retry-After": "5"},
+    )
 
 
 @app.get("/api/health", tags=["health"])

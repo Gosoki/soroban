@@ -57,9 +57,16 @@ def latest_stored(session: Session) -> Optional[FxRate]:
 
     只按 date 排的话，同一天的多条里返回哪一条取决于数据库的实现，
     表现是「刷新一下汇率就变了」——最难查的那种不确定性。
+
+    `.limit(1)` 是**必需的**，不是优化：`.first()` 只是「取结果集的第一行」，
+    它不会往 SQL 里加 LIMIT——整张 fxrate 会先被排序、传输、构造成 ORM 对象，
+    然后丢掉除第一条以外的全部。而 fxrate 是**只增不删**的（一天多条，见 `pick_from`），
+    且侧栏、看板、每一次建单都要走这里，代价随使用时长线性增长。
     """
     return session.exec(
-        select(FxRate).order_by(col(FxRate.date).desc(), col(FxRate.fetched_at).desc())
+        select(FxRate)
+        .order_by(col(FxRate.date).desc(), col(FxRate.fetched_at).desc())
+        .limit(1)
     ).first()
 
 

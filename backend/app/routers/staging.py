@@ -247,6 +247,18 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
         return _read(session, row)
 
     # 未导入：编辑暂存自身副本
+    #
+    # `import_status` 同样不接受直接改——这里和上面「已导入」那支是**同一条规则**：
+    # 导入状态只由 /import、/ignore、删除来推进。原先只在已导入分支挡，未导入行
+    # 就能被 PATCH 成「已导入」而 `imported_order_id` 仍是 NULL：列表按状态筛选时
+    # 它算已导入（用户以为账已经记了），`/import` 却照样能再导一次（那里判的是
+    # imported_order_id），于是同一笔货可以进账本两遍。
+    if data.get("import_status") not in (None, row.import_status):
+        raise HTTPException(
+            status_code=422,
+            detail="导入状态不能直接修改：请用「导入账本」或「忽略」来推进",
+        )
+    data.pop("import_status", None)
     for key, value in data.items():
         setattr(row, key, value)
     if payload.items is not None:                       # 给了 items 就整体替换（[] → 自动补 1 条占位）
@@ -302,7 +314,7 @@ def ignore_staging(row_id: int, session: Session = Depends(get_session)):
 @router.post("/{row_id}/import", response_model=OrderRead, openapi_extra={"x-scope": "staging:promote"})
 def import_staging(row_id: int, session: Session = Depends(get_session)):
     """从暂存行生成正式淘宝订单（含全部物品），并标记暂存为已导入。"""
-    from ..services.fx import rate_for_date  # 局部导入避免循环
+    from ..services.fx import JST, rate_for_date  # 局部导入避免循环
 
     row = session.get(OrderStaging, row_id)
     if not row:
@@ -311,7 +323,11 @@ def import_staging(row_id: int, session: Session = Depends(get_session)):
         raise HTTPException(status_code=409, detail="该记录已导入")
 
     order = Order(
-        date=row.order_date or dt.date.today(),
+        # 兜底日期用 **JST 今天**：全仓的「今天」都是 JST（fx.JST、fx_rate ingest、
+        # 暂存页「入库日期」显示），只有这里用服务器本地时区。部署在 UTC 机器上时，
+        # JST 的 00:00–09:00 之间导入的单会被记成**前一天**，与同一批次里 order_date
+        # 有值的单错开一天，看板按日汇总时对不上。
+        date=row.order_date or dt.datetime.now(JST).date(),
         order_no=row.order_no,
         title=row.title,
         platform_account=row.platform_account,

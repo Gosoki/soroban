@@ -238,3 +238,32 @@ def test_unknown_bind_raises_instead_of_pretending_to_be_sqlite():
 
     with pytest.raises(TypeError):
         is_mysql(object())
+
+
+def test_engine_pool_is_explicit_for_file_backed_sqlite():
+    """连接池必须**显式**配，别吃 SQLAlchemy 的默认 5+10=15。
+
+    15 条连接 + anyio 的 40 个线程令牌 = 25 个线程堵在 `get_current_user` 里等池。
+    实测并发 40 路 OCR 时响应从 7ms 涨到 6220ms（174 倍），30 秒后抛 TimeoutError。
+    这条钉的是「有人把配置删掉就变红」，不是性能本身。
+    """
+    from app.database import _MAX_OVERFLOW, _POOL_SIZE, build_engine
+
+    e = build_engine("sqlite:///./_pool_probe.db")
+    try:
+        assert e.pool.size() == _POOL_SIZE
+        assert e.pool._max_overflow == _MAX_OVERFLOW
+        assert _POOL_SIZE + _MAX_OVERFLOW >= 40, "池要对齐 anyio 的 40 个线程令牌"
+    finally:
+        e.dispose()
+        import pathlib
+        pathlib.Path("_pool_probe.db").unlink(missing_ok=True)
+
+
+def test_in_memory_sqlite_still_builds():
+    """内存库走 SingletonThreadPool，它不接受 max_overflow/pool_timeout ——
+    池参数一刀切地传下去会让 `DATABASE_URL=sqlite://` 在 create_engine 就 TypeError。"""
+    from app.database import build_engine
+
+    for url in ("sqlite://", "sqlite:///:memory:"):
+        build_engine(url).dispose()

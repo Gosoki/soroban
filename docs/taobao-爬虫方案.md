@@ -85,14 +85,25 @@
 | `price_cny` | 实付款 | Decimal，别用 float |
 | `order_date` | 下单时间 / gmtCreate | 转 date |
 | `express_no` | 运单号 | 列表里常没有，可能要**订单详情**接口补；没有就先空 |
-| `order_status` | 交易状态 | **要映射到 soroban 枚举**（下表） |
-| items[] | 宝贝标题 + 数量 | 一单多物；soroban `StagingItem`（name/quantity，无单价） |
+| `purchase_status` | 交易状态 | **要映射到 soroban 枚举**（下表） |
+| items[] | 宝贝标题 + 数量 + **单价** | 一单多物；soroban `StagingItem`（name/quantity/unit_price_cny/auto） |
 | `raw_json` | 整条订单原始 JSON | soroban 留了 `raw_json` 字段留底，强烈建议存 |
 
-**状态映射**（淘宝交易状态 → soroban `TaobaoStatus`，soroban 已对齐淘宝措辞，基本一一对应）：
-`待付款→待付款`、`待发货/等待卖家发货→待发货`、`待收货/卖家已发货→待收货`、`交易成功→交易成功`、`退款中/退款成功→退款`、`交易关闭→交易关闭`。抓到的原始态名若不同，做一张小映射表兜底。
+⚠️ 列名与枚举都变过，**以代码为准**：状态列叫 `purchase_status`（不是 `order_status`），
+枚举是 `PurchaseStatus`（不是 `TaobaoStatus`），映射表的唯一真身是插件里的
+`taobao_scraper/normalize.py::PURCHASE_STATUS_MAP`，由 `tests/test_consistency.py` 钉住。
 
-> soroban 侧「未付款/退款/交易关闭」本就不计入看板合计，所以爬到这些状态照存无妨。
+**状态映射**（淘宝交易状态 → soroban `PurchaseStatus`）：
+`待付款/等待买家付款→待付款`、`待发货/等待卖家发货/买家已付款/待快递上门→待发货`、
+`待收货/卖家已发货/等待买家确认收货→待收货`、**`交易成功/待评价→已签收`**、
+`退款中/退款成功→退款`、`交易关闭/已关闭→交易关闭`。
+
+> **「交易成功」不是 soroban 的合法状态值**，别照抄成 `交易成功→交易成功`——推过去会被
+> 后端枚举校验 422 整批拒掉。soroban 的 `已签收` 指的就是**国内**快递签收那一刻，
+> 也就是淘宝页面上的「交易成功」；国际段（集运中/送达）由所挂集运单表达，不进这一列。
+> 认不出的原始态名一律返回 `None`（`map_purchase_status`），**不硬塞非法值**。
+
+> soroban 侧「待付款/退款/交易关闭」本就不计入看板合计，所以爬到这些状态照存无妨。
 
 ---
 

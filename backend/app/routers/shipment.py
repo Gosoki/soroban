@@ -201,6 +201,7 @@ async def ocr_attach_express(
         skipped=[_brief(o) for o in skipped],
         unmatched=unmatched,
         express_nos=express_nos,
+        unreadable=int(fields.get("unreadable") or 0),
     )
 
 

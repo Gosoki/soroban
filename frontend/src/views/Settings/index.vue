@@ -27,6 +27,13 @@
           <router-link v-if="fx.auto_provider" to="/plugins" class="sub">
             自动获取由「{{ fx.auto_provider }}」插件负责 →
           </router-link>
+          <!-- 第三态：装了汇率插件、但它跑不起来（停用 / 没授权 / 缺环境）。
+               原先这种情况显示的是上面那句「由它负责」——而它永远不会跑，
+               汇率停更时账本会继续用兜底值建单，用户却以为一切正常。
+               也不能退回下面那句「没有能自动取汇率的插件」：对「明明装了」的用户同样是假话。 -->
+          <router-link v-else-if="fx.auto_blocked" to="/plugins" class="sub warn">
+            {{ fx.auto_blocked }}，汇率不会自动更新 →
+          </router-link>
           <router-link v-else to="/plugins" class="sub warn">
             没有能自动取汇率的插件，现在只用手填值 →
           </router-link>

@@ -5,12 +5,17 @@
 ## 功能
 
 - **看板**：总支出、按月趋势、各类占比（淘宝商品／集运运费／杂项）
-- **淘宝订单**：可编辑表格，手动录入 + 加行 + 改行；列可拖动改序/改宽（持久化）
-- **集运订单**：一个集运单关联多个淘宝订单（合包），展开可看/增删关联单
+- **商品订单**：可编辑表格，手动录入 + 加行 + 改行；列可拖动改序/改宽（持久化）
+- **物品**：以「物品」为最小单位（一单多物，各带单价×数量），单独一页可按物品检索/改价
+- **集运订单**：一个集运单关联多个商品订单（合包），展开可看/增删关联单；
+  拖入「内含快递」截图即 OCR 自动关联
 - **杂项支出**
 - **双币结算**：填人民币按下单日期匹配当日汇率折算日元，可手动覆盖实付日元
-- **全部订单（暂存区）**：待处理的淘宝订单，逐单「导入」进账本
-- **爬虫插件**：`scraper/` 下的淘宝订单爬虫，soroban 自动发现、在「插件管理」页做授权/参数/定时（各插件独立 venv+Playwright，被 soroban git 排除）
+- **日元汇率**：单独一页看汇率历史与来源；一天可有多条（每次抓取追加），手填的那条优先
+- **暂存**：插件抓回来的待处理订单，逐单「导入」进账本
+- **插件**：`plugins/soroban-plugin-*/` 下的外部数据插件（今天是淘宝订单爬虫与汇率），
+  soroban 自动发现，在「插件」页做授权/参数/定时。**能力按 `plugin.toml` 声明授权**，
+  核心默认拒绝（详见 `docs/README.md` 的插件章）
 - **登录**：多人共用一本账，登录状态长期保持（默认 90 天）
 
 ## 技术栈
@@ -21,7 +26,8 @@
 | 后端 | FastAPI + SQLModel |
 | 数据库 | **SQLite（WAL 模式）/ MySQL 可运行期热切换**——同一套代码自动适配方言；切换入口在应用内「数据库」页，**不是** `.env`（见「数据库」章） |
 | 迁移 | **Alembic**（启动自动 `upgrade head`；旧库首启自动接管；改 model 后 `alembic revision --autogenerate`，见「更新」章） |
-| 汇率 | open.er-api.com（CNY→JPY，免费无 key） |
+| 汇率 | **由插件提供**（`plugins/soroban-plugin-fx`）。核心自己不抓汇率，只存与用；
+  没装插件时可在设置页手填一条 |
 
 ## 目录结构
 
@@ -33,15 +39,17 @@ soroban/
 │   │   ├── database.py     engine（按方言构造）+ WAL（仅 SQLite）+ 启动跑 Alembic 迁移
 │   │   ├── models/         数据模型（按页面功能解耦到子目录，见「数据库」章）
 │   │   │   ├── base.py     共通基类/枚举/金额计算
-│   │   │   ├── user/ taobao/ shipment/ misc/ fx/ config/   各页/各功能的表
+│   │   │   ├── user/ order/ shipment/ misc/ fx/ config/   各页/各功能的表
 │   │   │   └── __init__.py 统一 re-export（`from app.models import X` 保持不变）
 │   │   ├── db/dialect.py   方言翻译层（SQLite 部分索引 ↔ MySQL 生成列）
 │   │   ├── schemas.py      请求/响应模型
 │   │   ├── auth.py         登录/JWT/密码哈希/改密码
 │   │   ├── seed.py         建 admin（CLI）
 │   │   ├── demo.py         灌演示数据（CLI）
-│   │   ├── routers/        REST 接口（auth/taobao/shipment/misc/staging/dashboard/fx/layout/tags/plugins）
-│   │   └── services/       汇率等
+│   │   ├── routers/        REST 接口（auth/orders/items/shipment/misc/staging/dashboard/
+│   │   │                   fx/layout/tags/plugins/dbadmin/settings/meta/ingest）
+│   │   ├── services/       汇率、OCR、插件写入通道（ingest）
+│   │   └── plugins/        插件清单解析与权限（manifest/scopes/params）
 │   ├── alembic/            数据库迁移脚本（versions/ 里每个改动一个版本，需提交；迁移方言无关）
 │   ├── alembic.ini         Alembic 配置
 │   ├── scripts/            历史脚本（migrate_sqlite_to_mysql.py：已被「数据库」页取代）
@@ -51,8 +59,9 @@ soroban/
 │   ├── requirements.txt        直接依赖（宽松版本）
 │   └── requirements.lock.txt   锁定版本（可复现安装）
 ├── frontend/               Vue 3 + Element Plus + Vite
-├── scraper/                爬虫插件（各自成库/venv，soroban git 排除，仅留 README）
-│   └── soroban-scraper-taobao/   淘宝订单爬虫（Playwright + H5/桌面 mtop 抓包）
+├── plugins/                插件（各自成库/venv，soroban git 排除，仅留 README）
+│   ├── soroban-plugin-taobao/    淘宝订单爬虫（Playwright + H5/桌面 mtop 抓包）
+│   └── soroban-plugin-fx/        汇率（核心已不含抓取逻辑）
 ├── docs/                   开发记录、设计决策、抓包实测记录、审计报告
 ├── start.sh                一键启动（开发）
 ├── pyinstaller.bat         打包 soroban.exe
@@ -108,8 +117,8 @@ SOROBAN_ADMIN_PASS='你的强密码' ./start.sh     # 首次即设定管理员�
   ```
 
   ⚠️ 开放前**务必改掉默认密码**（见下）。不要只给前端加 `--host`：dev server 把 `/api` 反代到后端，前端单边对外等于后端也一起对外，而后端那句 `--host 127.0.0.1` 看着还在、其实已经不设防。同源代理下 `CORS_ORIGINS` 不起作用，不用配。
-- **爬虫插件（可选）**：soroban 只发现插件、不含其代码。把插件目录放进 `scraper/` 之后，
-  打开「插件管理」页——缺依赖会直接列出缺什么（Python 环境 / Python 依赖 / 浏览器内核），
+- **插件（可选，但汇率靠它）**：soroban 只发现插件、不含其代码。把插件目录放进 `plugins/` 之后，
+  打开「插件」页——缺依赖会直接列出缺什么（Python 环境 / Python 依赖 / 浏览器内核），
   点**「一键安装」**即可，装完按钮自动解禁，不用开终端。
 
   soroban 会用自己的解释器建插件的 `.venv`、装 `requirements.txt`、按需下载 Chromium。
@@ -118,11 +127,14 @@ SOROBAN_ADMIN_PASS='你的强密码' ./start.sh     # 首次即设定管理员�
 
   也可以手动装（想脱离面板单独用命令行时）：
   ```bash
-  cd scraper/soroban-scraper-taobao
+  cd plugins/soroban-plugin-taobao
   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
   .venv/bin/python -m playwright install chromium
   ```
-  装好后在「插件管理」页扫码授权、设账号/定时。详见 `scraper/soroban-scraper-taobao/README.md`。
+  装好后在「插件」页勾选授权、设账号/定时。详见 `plugins/soroban-plugin-taobao/README.md`。
+
+  ⚠️ **汇率现在也是插件**（`plugins/soroban-plugin-fx`）：核心不再自带任何抓取逻辑。
+  不装它就没有自动汇率，只能在设置页手填一条；侧栏会把「手填」和「已过期」都标出来。
 
   > ⚠️ **扫码登录必须有图形界面**（`session.py` 硬编码有头浏览器）。无头服务器上装得了、抓得了，
   > 但授权那一步得在有屏幕的机器上做，再把 `.state/<账号>.json` 拷过去。
@@ -272,6 +284,7 @@ SOROBAN_TEST_MYSQL_URL='mysql+pymysql://user:pass@host:3306/db?charset=utf8mb4' 
 
 ## 状态
 
-稳定迭代中（详见 [docs/README.md](docs/README.md) 的版本记录）。已完成：登录、看板、淘宝/集运/杂项三页、双币结算与汇率、全部订单暂存与导入、列布局持久化、淘宝爬虫插件（已可用）。
+稳定迭代中（详见 [docs/README.md](docs/README.md) 的版本记录）。已完成：登录、看板、商品/物品/集运/杂项四页、双币结算与汇率（汇率页）、暂存与导入、
+列布局持久化、截图 OCR 录单、按能力授权的插件机制（淘宝爬虫与汇率两个插件均可用）。
 预留项：收入/利润（卖出侧打通）、导出 CSV/Excel、i18n。
 </content>

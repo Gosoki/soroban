@@ -277,3 +277,31 @@ def test_mysql_variants_compile():
     s2 = upsert(d, ColumnLayout, {"table_name": "orders", "columns_json": "[]"},
                 ["table_name"], {"columns_json": "[]"})
     assert "ON DUPLICATE KEY UPDATE" in str(s2.compile(dialect=d))
+
+
+def test_undecryptable_mysql_url_degrades_visibly(tmp_path, monkeypatch):
+    """SECRET_KEY 变了 → MySQL 连接串解不开 → 退回本地 SQLite。**这件事必须可见。**
+
+    用户看到的现象是打开应用「账本全空了」，而数据好端端在 MySQL 里。
+    最容易踩到的路径正是升级：`Releases\\<VERSION>` 换了目录、exe 搬过去了、
+    `.env` 忘了搬 → SECRET_KEY 变 → Fernet 解不开 → 静默退回空的本地库。
+    原先这条路上只有一行 `log.error`，而分发版的用户不会去看日志。
+    """
+    from sqlmodel import create_engine
+
+    from app.config import settings
+    from app.db import control
+
+    eng = create_engine(f"sqlite:///{tmp_path}/ctl.db")
+    control.ensure_schema(eng)
+    control.write_config(eng, "mysql", "mysql+pymysql://u:pw@10.9.9.9:3306/ledger")
+
+    good = control.read_config(eng)
+    assert good["backend"] == "mysql" and good["degraded"] == ""
+
+    monkeypatch.setattr(settings, "SECRET_KEY", "another-key-" + "x" * 40)
+    bad = control.read_config(eng)
+    assert bad["backend"] == "sqlite", "解不开就该退回本地库（不能让应用起不来）"
+    assert bad["mysql_url"] is None
+    assert bad["degraded"], "降级了却一声不吭——用户只会看到「账本全空了」"
+    assert "SECRET_KEY" in bad["degraded"] and "没丢" in bad["degraded"]

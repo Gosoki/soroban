@@ -1,10 +1,14 @@
 """一次性回填：把「物品为最小单位」落到既有数据（幂等，可重复跑）。
 
-规则（对齐 routers/common.build_items）：
+规则**直接调用** `routers/common.build_items`，不在这里重写一份：
 - 订单/暂存 0 物品 → 自动生成 1 条（name=商品名、数量1、单价=订单价、auto=True 灰显待复核）。
-- 有物品但全部无单价（老数据）→ 把订单价折成第一条单价(订单价/数量)、其余 0，全部 auto=True。
-  数量>1 时单价取整到分，订单价按 Σ(单价×数量) 重算，可能与原值差几分（会在报告里列出）。
+- 有物品但全部无单价（老数据）→ 把订单价折成第一条单价(订单价/数量)、其余 0，全部 auto=True；
+  除不尽的余数单独成一条「（金额尾差）」，保证 Σ(单价×数量) 与原订单价**分毫不差**。
 - 已有带单价的物品 → 跳过（幂等）。
+
+这里曾经抄过一份同规则的实现，靠注释「对齐」。抄本与正本必然发散——`build_items`
+把取整方式从 HALF_UP 改成 ROUND_DOWN+尾差行的那天，抄本还在按老规则回填，
+同一批数据经两条路径会得到不同的总价。规则只能有一份。
 
 用法：
     cd backend && .venv/bin/python -m tools.backfill_item_price          # 回填当前生效后端
@@ -14,11 +18,12 @@
 from __future__ import annotations
 
 import sys
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import Decimal
 
 from sqlmodel import Session, select
 
 from app.models import OrderItem, StagingItem, Order, OrderStaging
+from app.routers.common import build_items
 
 _Q = Decimal("0.01")
 
@@ -34,24 +39,16 @@ def _backfill_row(obj, item_cls) -> dict:
     if not items:
         # price 用 0.00 而非 None（订单价 NULL 时）→ 二次运行时该物品已有价，走 skip，保证幂等
         seed = goods if obj.price_cny is not None else Decimal("0.00")
-        obj.items = [item_cls(name=(obj.title or "未命名物品")[:255], quantity=1,
-                              unit_price_cny=seed, auto=True)]
+        obj.items = [item_cls(**d) for d in build_items([], seed, obj.title)]
         action = "auto_item"
-        tolerance = Decimal("0")            # 数量=1、单价=货款原值 → 总价应当分毫不差
     elif all(it.unit_price_cny is None for it in items):
-        total = goods
-        for i, it in enumerate(items):
-            if i == 0:
-                q = it.quantity or 1
-                it.unit_price_cny = (total / q).quantize(_Q, rounding=ROUND_HALF_UP)
-            else:
-                it.unit_price_cny = Decimal("0.00")
-            it.auto = True
+        obj.items = [item_cls(**d) for d in build_items(items, goods, obj.title)]
         action = "priced_items"
-        # 只有首件承担折算：单价量化到分的误差 ≤ 半分，乘回数量后 ≤ 0.005×q，取 0.01×q 留余量。
-        tolerance = _Q * (items[0].quantity or 1)
     else:
         return {"action": "skip", "shift": Decimal("0")}   # 已迁移，幂等跳过
+    # 两条路径都**精确**保总价：数量=1 时单价即货款原值；数量>1 时 build_items 用
+    # ROUND_DOWN + 尾差行把余数补回去。所以容差是 0，任何偏移都说明有 bug。
+    tolerance = Decimal("0")
 
     old = Decimal(obj.price_cny or 0)
     obj.sync_from_items()                                   # 订单同时重算日元；暂存只重算 price_cny

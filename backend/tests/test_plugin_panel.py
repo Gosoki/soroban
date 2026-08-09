@@ -131,6 +131,10 @@ label = "跑一下"
 primary = true
 needs = ["fx:write"]
 
+[[commands]]
+name = "probe"
+label = "只测试"
+
 [[params]]
 key = "n"
 label = "次数"
@@ -303,6 +307,32 @@ def test_enabled_plugin_passes_the_switch(client, fake_plugin):
     assert r.status_code != 409 or "停用" not in str(r.json().get("detail", ""))
 
 
+def test_token_carries_only_the_scopes_the_command_declared(client, fake_plugin, monkeypatch):
+    """令牌只带**这条命令**声明的 needs，不是插件的全部授权。
+
+    `needs` 原先只用来禁按钮，令牌照发全量：于是 `needs = []` 的「只测试、不写入」
+    命令拿到的是能写汇率的完整令牌。卡片上写着这条命令不需要任何权限，
+    实际下发的却是插件的全部能力——授权说明与真实能力对不上，
+    而这个字段的字面意思正是「我要用哪些权限」。
+    """
+    from app.routers import plugins as mod
+
+    issued = []
+    monkeypatch.setattr(mod.scopes, "issue",
+                        lambda user, pid, scps, **kw: (issued.append(set(scps)), ("tok", "jti"))[1])
+    monkeypatch.setattr(mod, "_launch", lambda *a, **kw: 4242)
+
+    client.put("/api/plugins/demo/grants", json={"granted": ["fx:write"]})
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
+
+    assert client.post("/api/plugins/demo/run/probe").status_code == 200
+    assert issued == [set()], f"needs=[] 的命令拿到了 {issued}"
+
+    issued.clear()
+    assert client.post("/api/plugins/demo/run/run").status_code == 200
+    assert issued == [{"fx:write"}], f"声明了 fx:write 的命令拿到了 {issued}"
+
+
 # --- 插件被删掉之后 -------------------------------------------------------------
 
 def test_deleted_plugin_leaves_a_visible_leftover(client, fake_plugin, tmp_path, monkeypatch):
@@ -346,19 +376,41 @@ def test_installed_plugin_config_cannot_be_wiped_by_accident(client, fake_plugin
 
 
 def test_fx_card_tells_the_truth_about_who_provides_rates(client, fake_plugin, tmp_path, monkeypatch):
-    """`GET /api/fx` 要如实说「现在有没有插件能自动取汇率」。
+    """`GET /api/fx` 要如实说「汇率现在**真的会不会**自动更新」——三态，不是两态。
 
-    没有插件却还写着「自动获取由插件负责」的话，用户点过去是个空页面——
-    而这恰好是最需要他去填手填汇率的时刻。
+    「声明了 fx:write」只是第一关。原先判到这里就返回插件名，于是把插件**停用**之后，
+    设置页仍写着「自动获取由『X』负责」，而它永远不会再跑。
+    这条假话很贵：汇率停更时账本会继续用兜底值建单，而用户以为一切正常。
+
+    三态：能跑 → auto_provider=名字；装了但跑不起来 → auto_blocked=原因；
+    压根没装 → 两个都空。
     """
     from app.routers import plugins as mod
 
-    # fake_plugin 声明的是 fx:write，正好算「能提供汇率的插件」
-    assert client.get("/api/fx").json()["auto_provider"] == "演示插件"
+    # (1) 装了、但没授权 fx:write → 不能说「由它负责」
+    client.put("/api/plugins/demo/grants", json={"granted": []})
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
+    got = client.get("/api/fx").json()
+    assert got["auto_provider"] == "", "没授权也说在自动取汇率"
+    assert "授权" in got["auto_blocked"], got["auto_blocked"]
 
+    # (2) 授权了、但总开关关着 → 同样不算
+    client.put("/api/plugins/demo/grants", json={"granted": ["fx:write"]})
+    client.put("/api/plugins/demo/config", json={"enabled": False, "schedule_minutes": 0})
+    got = client.get("/api/fx").json()
+    assert got["auto_provider"] == "", "停用了也说在自动取汇率"
+    assert "停用" in got["auto_blocked"], got["auto_blocked"]
+
+    # (3) 授权 + 启用 → 这才是真的
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
+    got = client.get("/api/fx").json()
+    assert got["auto_provider"] == "演示插件" and got["auto_blocked"] == ""
+
+    # (4) 插件目录没了 → 两个都空，界面回到「没有能自动取汇率的插件」
     monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "gone"))
     mod._needs_cache.clear()
-    assert client.get("/api/fx").json()["auto_provider"] == "", "插件没了却还说有人在自动取汇率"
+    got = client.get("/api/fx").json()
+    assert got["auto_provider"] == "" and got["auto_blocked"] == "", "插件没了却还有话说"
 
 
 # --- 文案：标签要短，说明进提示 ------------------------------------------------
@@ -706,3 +758,62 @@ needs = ["fx:write"]
     session.expire_all()
     assert session.get(PluginConfig, "demo").last_run_at is None, \
         "没真的跑却推进了 last_run_at，看起来像在正常跑"
+
+
+def test_broken_toml_still_shows_up_with_its_error(client, tmp_path, monkeypatch):
+    """`plugin.toml` 语法写坏 → 插件**不能**从列表里消失。
+
+    静默 continue 的后果有三层：插件凭空不见（零日志）；它的库内配置被当成孤儿、
+    卡片上写「插件目录已不在」而目录还在；最要命的是 `forget_plugin` 的护栏正是
+    「discover() 里还有没有它」——于是一个只是打错了个引号的插件，
+    它的授权和账号可以被一键清掉。
+    """
+    from app.routers import plugins as mod
+
+    d = tmp_path / "plugins" / "soroban-plugin-brokenx"
+    d.mkdir(parents=True)
+    (d / "plugin.toml").write_text('id = "brokenx"\nname = "坏的\n', encoding="utf-8")  # 引号没闭合
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "plugins"))
+    monkeypatch.setattr(mod, "_SOROBAN_ROOT", tmp_path)
+    mod._needs_cache.clear()
+
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}
+    assert "brokenx" in got, "清单写坏的插件从列表里消失了"
+    assert "plugin.toml" in got["brokenx"]["manifest_error"]
+
+    # 护栏：还装着的插件不许清配置，哪怕它的清单是坏的
+    client.put("/api/plugins/brokenx/config", json={"enabled": False, "schedule_minutes": 0})
+    r = client.delete("/api/plugins/brokenx/config")
+    assert r.status_code == 409, "清单坏掉就绕过了「还装着不许清」的护栏"
+
+
+def test_forgetting_a_plugin_also_wipes_its_private_storage(client, tmp_path, monkeypatch):
+    """「清理残留配置」必须连**私有存储**一起删。
+
+    `pluginrecord` 原先没有任何删除入口。卸载插件之后那些行会永久留着，
+    而以后往 plugins/ 里放一个**同 id** 的插件（别人写的、或被改过的版本），
+    它一上来就能读到前一个插件攒下的全部私有数据——用户从没批准过，界面上也看不见。
+    """
+    from sqlmodel import Session, select
+
+    from app.database import get_engine
+    from app.models import PluginRecord
+    from app.routers import plugins as mod
+
+    with Session(get_engine()) as s:
+        for k in ("a", "b"):
+            s.add(PluginRecord(plugin_id="ghostp", kind="note", key=k, data="{}"))
+        s.commit()
+
+    # 目录里没有这个插件 → 允许清理
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "empty"))
+    monkeypatch.setattr(mod, "_SOROBAN_ROOT", tmp_path)
+    mod._needs_cache.clear()
+
+    r = client.delete("/api/plugins/ghostp/config")
+    assert r.status_code == 200, r.text
+    assert r.json()["records_removed"] == 2
+
+    with Session(get_engine()) as s:
+        left = s.exec(select(PluginRecord).where(PluginRecord.plugin_id == "ghostp")).all()
+    assert left == [], f"私有存储没删干净，同 id 的新插件会静默继承：{left}"

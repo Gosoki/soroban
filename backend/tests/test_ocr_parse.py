@@ -153,6 +153,49 @@ def test_parse_shipment_express_list_page():
     assert f["express_nos"] == ["SF1111111111", "YT2222222222"]
 
 
+def test_below_fallback_will_not_reach_across_the_page():
+    """本行取不到号时，往下兜底**最多跨 2 行**——不能一路扫到页脚。
+
+    没有这条上限时：`快递单号 YT2222 333344` 被 OCR 断成两截（各 6 位，都不满足
+    min_len=8）→ 同行无候选 → 兜底扫到页面最下方的客服电话 `13800138000`，
+    而 11 位纯数字正好落在中通/韵达单号的长度区间，`Order.express_no == no`
+    会精确命中，把货挂到一张毫不相干的订单上。
+    """
+    result = [
+        *row(200, "快递单号", "YT2222", "333344"),
+        *row(2400, "客服电话", "13800138000"),          # 隔了 2200px 的页脚
+    ]
+    f = ocr.parse_shipment_fields(result)
+    assert f["express_nos"] == []                       # 宁可不取，也不能取错
+    assert f["unreadable"] == 1                          # 但必须留下「我漏了一行」的记号
+
+
+def test_below_fallback_still_works_for_header_over_value_layout():
+    """兜底本身不能禁掉：真实截图存在「列头在上、号在紧邻下一行」的表格版式。"""
+    result = [
+        *row(200, "快递单号"),
+        *row(216, "SF1111111111"),                       # 下一行（row_tol≈16）
+    ]
+    f = ocr.parse_shipment_fields(result)
+    assert f["express_nos"] == ["SF1111111111"] and f["unreadable"] == 0
+
+
+def test_unreadable_counts_rows_whose_number_could_not_be_read():
+    """看得见「快递单号」标签、却没取到号 → 计入 unreadable。
+
+    这个计数是「少挂了一单」在响应里的**唯一**出口：没有它，3 行里坏 1 行的截图
+    只会得到 2 个号，前端照样弹绿色的「已关联 2 单」。
+    """
+    result = [
+        *row(200, "快递单号", "SF1111111111"),
+        *row(300, "快递单号", "坏掉的一行"),            # 取不到
+        *row(400, "快递单号", "YT2222222222"),
+    ]
+    f = ocr.parse_shipment_fields(result)
+    assert f["express_nos"] == ["SF1111111111", "YT2222222222"]
+    assert f["unreadable"] == 1
+
+
 def test_parse_shipment_empty():
     f = ocr.parse_shipment_fields([])
     assert f["kind"] == "unknown" and f["express_nos"] == []
@@ -280,3 +323,85 @@ def test_xianyu_order_shipped_by_jd_courier_is_not_rejected():
     assert out["express_company"] == "京东物流"
     full = "".join(t[1] for t in page)
     assert ocr._detect_other_platform(full) is None, "京东快递被当成了京东平台标记"
+
+
+@pytest.mark.parametrize("text,want", [
+    # 被 OCR 断成两截 → 判为读不出，**不能**把半截号交出去
+    ("快递单号 SF1234 56789012", None),      # 后半截更长
+    ("快递单号 SF123456 789012", None),      # 前半截更长
+    # 不该误伤的
+    ("快递单号 SF1111111111", "SF1111111111"),
+    ("快递单号 SF1111111111 2026-08-01 已签收", "SF1111111111"),   # 日期用连字符，不是断号
+    ("快递单号 12345678", "12345678"),        # 孤立的短号：可疑但没有断开的证据，照取
+    ("快递单号 4312345678901", "4312345678901"),
+    ("收件地址 ATPTSTKH", None),              # 纯字母串
+])
+def test_split_tracking_number_is_reported_as_unreadable(text, want):
+    """半截快递号**不许**交出去——它会被 `Order.express_no == no` 拿去精确匹配并原子挂靠。
+
+    匹配不上还好（只漏一单）；万一撞上别人的单号，就是把货挂到一张无关订单上，
+    而 `version` 已经 +1、不可撤销。口径与 `_same_row_value` 的兜底上限一致：
+    **宁可不取，也不能取错**——取不到会落进 `unreadable` 计数，用户看得见。
+
+    判据要求「偏短 **且** 紧邻另一段数字」，所以孤立的 8 位号不受影响。
+    """
+    assert ocr._extract_tracking(text) == want
+
+
+def test_split_tracking_row_lands_in_unreadable():
+    """端到端：断号那一行进 unreadable，不会悄悄少一单也不会取到错号。"""
+    result = [
+        *row(200, "快递单号", "SF1111111111"),
+        *row(300, "快递单号 YT2222 333344"),          # 同一个框里被断成两截
+        *row(2400, "客服电话", "13800138000"),
+    ]
+    f = ocr.parse_shipment_fields(result)
+    assert f["express_nos"] == ["SF1111111111"]
+    assert f["unreadable"] == 1
+
+
+# --- recognize_order 的整条链路（打桩引擎，不需要 rapidocr/pillow）------------
+
+def _stub_recognize(monkeypatch, texts):
+    """把引擎与解码都打桩，只跑 recognize_order 自己的控制流。"""
+    from app.services import ocr as m
+
+    monkeypatch.setattr(m, "_get_engine", lambda: object())
+    monkeypatch.setattr(m, "_decode_image", lambda b: "FAKE_ARRAY")
+    monkeypatch.setattr(m, "_run_engine", lambda eng, arr: [tok(t) for t in texts])
+    monkeypatch.setattr(m, "_truck_present", lambda arr: False)
+
+
+def test_recognize_order_rejects_other_platform_without_crashing(monkeypatch):
+    """含京东/淘宝强标记的截图走「拒识」分支——这条分支要用解码后的数组跑卡车模板匹配。
+
+    抽 `_decode_image` 出来时把局部变量 `arr` 一并消掉过，于是 60 行之外那句
+    `_truck_present(arr)` 静静变成 NameError：上传京东截图必崩 500。
+    而闲鱼截图（占绝大多数）走的是 else 分支，本地怎么点都试不出来——
+    所以这条链路必须有测试，不能只测纯解析层。
+    """
+    _stub_recognize(monkeypatch, ["京东自营 官方旗舰店", "订单编号 1234567890123456"])
+    f = ocr.recognize_order(b"fake")
+    assert f["platform"] is None
+    assert "京东" in f["reject_reason"]
+
+
+def test_recognize_order_accepts_xianyu(monkeypatch):
+    """反面：闲鱼截图正常识别，不该被拒。"""
+    _stub_recognize(monkeypatch, ["闲鱼", "订单编号 1234567890123456", "成交价 ¥88.00"])
+    f = ocr.recognize_order(b"fake")
+    assert f["platform"] == "闲鱼" and f["reject_reason"] is None
+    assert f["order_no"] == "1234567890123456"
+
+
+def test_recognize_order_passes_the_decoded_array_to_the_truck_matcher(monkeypatch):
+    """卡车模板匹配拿到的必须是**解码后的数组**，不是别的东西。"""
+    from app.services import ocr as m
+
+    seen = []
+    monkeypatch.setattr(m, "_get_engine", lambda: object())
+    monkeypatch.setattr(m, "_decode_image", lambda b: "DECODED")
+    monkeypatch.setattr(m, "_run_engine", lambda eng, arr: [tok("天猫旗舰店")])
+    monkeypatch.setattr(m, "_truck_present", lambda arr: (seen.append(arr), False)[1])
+    ocr.recognize_order(b"fake")
+    assert seen == ["DECODED"], f"_truck_present 收到的不是解码结果：{seen}"

@@ -10,6 +10,7 @@ from ..auth import get_current_user
 from ..config import settings
 from ..database import get_session
 from ..models import FxRate
+from ..plugins import scopes
 from ..schemas import FxRead
 from ..services.fx import (
     JST, SOURCE_LABELS, is_expired, latest_stored, pick_from, pick_on, rate_age_hours,
@@ -30,22 +31,43 @@ def _jst_hm(t: Optional[dt.datetime]) -> str:
     return t.astimezone(JST).strftime("%H:%M")
 
 
-def _auto_provider() -> str:
-    """现在有没有装着能写汇率的插件；有就返回它的名字。
+def _auto_provider(session: Session) -> tuple[str, str]:
+    """汇率现在**真的会**自动更新吗。返回 `(能跑的插件名, 装了但跑不起来的原因)`。
 
     判据是**声明了 `fx:write` 权限**，不是插件 id——核心不认识任何具体插件。
-    界面靠它说实话：插件被删掉之后还写着「自动获取由汇率插件负责」，那句话是假的，
-    用户点过去会看到一个空的插件页。
-    """
-    from ..routers.plugins import discover
 
+    「声明了 fx:write」只是第一关。原先就到此为止，于是把汇率插件停用之后，
+    设置页仍然写着「自动获取由『X』插件负责」——而它永远不会再跑。
+    这条假话很贵：汇率取不到时账本会**继续用兜底值建单**（有值好过没值，且逐行可审计），
+    所以「以为它在自动更新」和「知道它停了」之间，用户的行为完全不同。
+
+    四关全过才算数：声明了 → 装好了（venv 在）→ 用户授权了 fx:write → 总开关是开的。
+    差一关就把原因说出来，而不是退回「没有能自动取汇率的插件」——那对
+    「明明装了」的用户同样是假话。
+    """
+    from ..models import PluginConfig
+    from ..routers.plugins import _python, discover
+
+    blocked = ""
     try:
         for m in discover():
-            if "fx:write" in (m["_m"].scopes or ()):
-                return m["_m"].name
+            if "fx:write" not in (m["_m"].scopes or ()):
+                continue
+            name = m["_m"].name
+            cfg = session.get(PluginConfig, m["_m"].id)
+            if not _python(m).exists():
+                blocked = blocked or f"「{name}」还没装好（缺运行环境）"
+                continue
+            if "fx:write" not in scopes.token_scopes(m, cfg):
+                blocked = blocked or f"「{name}」还没被授权写入汇率"
+                continue
+            if not (cfg and cfg.enabled):
+                blocked = blocked or f"「{name}」已停用"
+                continue
+            return name, ""
     except Exception:                       # noqa: BLE001  发现失败不该让汇率接口炸
         pass
-    return ""
+    return "", blocked
 
 
 def _read(session: Session, row) -> FxRead:
@@ -55,8 +77,9 @@ def _read(session: Session, row) -> FxRead:
         # 恰恰是最需要告诉用户「有没有插件在供给」的时刻——设置页就是靠它
         # 在「有插件但还没跑」和「压根没装插件」之间说对话。
         # 漏掉的话那句提示永远显示成「没有能自动取汇率的插件」。
+        prov, blocked = _auto_provider(session)
         return FxRead(base=settings.FX_BASE, quote=settings.FX_QUOTE,
-                      auto_provider=_auto_provider())
+                      auto_provider=prov, auto_blocked=blocked)
     return FxRead(
         base=settings.FX_BASE,
         quote=settings.FX_QUOTE,
@@ -68,16 +91,16 @@ def _read(session: Session, row) -> FxRead:
         source_label=SOURCE_LABELS.get(row.source, row.source),
         age_hours=rate_age_hours(row),
         expired=is_expired(session, row),
-        auto_provider=_auto_provider(),
+        **dict(zip(("auto_provider", "auto_blocked"), _auto_provider(session))),
     )
 
 
-@router.get("", response_model=FxRead, openapi_extra={"x-scope": "meta:read"})
+@router.get("", response_model=FxRead, openapi_extra={"x-scope": "fx:read"})
 def get_fx(session: Session = Depends(get_session)):
     return _read(session, latest_stored(session))
 
 
-@router.get("/history", openapi_extra={"x-scope": "meta:read"})
+@router.get("/history", openapi_extra={"x-scope": "fx:read"})
 def history(days: int = Query(60, ge=1, le=730), session: Session = Depends(get_session)):
     """按天汇总：每天抓了几条、当天**实际采用**的是哪一条、区间是多少。
 
@@ -111,7 +134,7 @@ def history(days: int = Query(60, ge=1, le=730), session: Session = Depends(get_
     return {"items": out, "days": days}
 
 
-@router.get("/history/{on}", openapi_extra={"x-scope": "meta:read"})
+@router.get("/history/{on}", openapi_extra={"x-scope": "fx:read"})
 def history_day(on: dt.date, session: Session = Depends(get_session)):
     """某一天抓到的全部汇率，新的在前；标出实际采用的那条。"""
     rows = rows_on(session, on)

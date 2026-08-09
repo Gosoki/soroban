@@ -21,6 +21,7 @@ import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { miscApi } from '@/api'
 import { today } from '@/utils/datetime'
+import { afterCreate, afterDelete } from '@/utils/listRows'
 import NotionTable from '@/components/NotionTable.vue'
 
 
@@ -74,8 +75,7 @@ async function saveCell(row, key, value) {
 async function addRow(data = {}, done) {
   try {
     const created = await miscApi.create({ date: today(), name: '', ...data })
-    rows.value.unshift(created)
-    total.value++
+    await afterCreate(created, { rows, total, page, filters, load })
     done?.(true)
   } catch (_) {
     done?.(false)   // 失败时保留幽灵行里的草稿，让用户就地改，别把刚敲的内容一起吞掉
@@ -89,8 +89,7 @@ async function delRow(row) {
   try {
     await miscApi.remove(row.id)
     ElMessage.success('已删除')
-    if (rows.value.length === 1 && page.value > 1) page.value--   // 删掉本页最后一行 → 回上一页，避免停在空页
-    load()                                                        // 重新拉取：分页/总数与后端同步
+    await afterDelete({ rows, page, load })
   } catch (_) { /* 拦截器已提示 */ }
 }
 

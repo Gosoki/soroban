@@ -110,6 +110,7 @@ import { ORDER_SOURCES, PRICE_HELP, PURCHASE_STATUS, SHIPMENT_STATUS, canAdvance
 import { fmtJPY } from '@/utils/money'
 import { applyRowUpdate, queueOrderWrite } from '@/utils/orderWrites'
 import { today } from '@/utils/datetime'
+import { afterCreate, afterDelete, sortByDateDesc } from '@/utils/listRows'
 import NotionTable from '@/components/NotionTable.vue'
 import OrderItemsEditor from '@/components/OrderItemsEditor.vue'
 
@@ -410,7 +411,7 @@ async function mergeByOrderNo(existing, data) {
       // 重建物品并把成交价折进第一条的单价 → 响应才是真相，必须整体采纳。
       // 照抄 saveCell 的「排除 items」会让页面停在合并前的「单价 0」，随后任何一次物品编辑
       // 都会把这份陈旧数组 PATCH 回去，刚补进去的钱就没了。
-      if (idx >= 0) { applyRowUpdate(rows.value[idx], patch, updated); sortRows() }
+      if (idx >= 0) { applyRowUpdate(rows.value[idx], patch, updated); sortByDateDesc(rows.value) }
       ElMessage.success(`已按订单号匹配更新 · 订单号 ${data.order_no}${patch.date ? ' · 下单时间 ' + patch.date : ''}`)
       return
     } catch (e) {
@@ -462,11 +463,6 @@ function onWinDrop(e) {
   enqueueOcr(Array.from(e.dataTransfer.files || []))   // 多张入队，后台逐张识别
 }
 
-// 保持当前页按「下单日期」降序（与后端 order_by 一致）；新建/改期后即时重排，避免 unshift 打乱顺序
-function sortRows() {
-  rows.value.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : b.id - a.id))
-}
-
 async function addRow(data = {}, done) {
   try {
     // status 不写死：后端 OrderBase 默认「待发货」，避免枚举改名后前端残留非法值（曾用'已付'→422）
@@ -481,9 +477,7 @@ async function addRow(data = {}, done) {
       done?.(true)
       return created
     }
-    rows.value.unshift(created)
-    sortRows()                 // 按下单日期归位（OCR 可能录入历史日期，勿留在顶部）
-    total.value++
+    await afterCreate(created, { rows, total, page, filters, load })
     done?.(true)
     return created
   } catch (e) {
@@ -505,9 +499,8 @@ async function delRow(row) {
   } catch (_) { return }
   try {
     await ordersApi.remove(row.id)
-    rows.value = rows.value.filter((r) => r.id !== row.id)
-    total.value--
     ElMessage.success('已删除')
+    await afterDelete({ rows, page, load })
   } catch (_) { /* 拦截器已提示 */ }
 }
 

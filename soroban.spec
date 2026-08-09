@@ -34,8 +34,30 @@ datas = [
     # 闲鱼卡通卡车模板图：ocr.py 用 Path(__file__).with_name() 读，必须与模块同目录。
     (str(BACKEND / "app" / "services" / "xianyu_truck.png"), "app/services"),
 ]
-# RapidOCR 自带 ONNX 模型 + 配置 yaml，全是运行时按路径读的
-datas += collect_data_files("rapidocr_onnxruntime")
+# RapidOCR 自带 ONNX 模型 + 配置 yaml，全是运行时按路径读的。
+#
+# **打包机缺这个包时必须让打包失败，不能出一个残废的包。**
+# `collect_data_files` / `collect_submodules` 对装不上的包只发一句 WARNING 并返回**空列表**，
+# PyInstaller 照常出包——发到用户手里的 exe，OCR 是死的（`_get_engine()` 抛 OcrUnavailable
+# → 每次上传截图收 503），而这在打包日志里只是几百行输出中的一行黄字。
+# 更糟的是那句报错让用户「在 backend 下 pip install」——分发包里根本没有 backend 目录。
+# 同理检查 PIL：解码这一步没有它，OCR 一样是死的。
+_ocr_models = collect_data_files("rapidocr_onnxruntime")
+if not _ocr_models:
+    raise SystemExit(
+        "打包中止：找不到 rapidocr_onnxruntime 的模型数据。\n"
+        "  打包机上没装它（或装了但没有模型文件）。继续打下去会得到一个 OCR 全废的 exe，\n"
+        "  而这个故障只有到了用户手里才会暴露。\n"
+        "  解决：在**用来打包的那个解释器**里跑 pip install -r backend/requirements.txt"
+    )
+datas += _ocr_models
+try:
+    import PIL  # noqa: F401  仅探测；ocr.py 在解码那一步 import 它
+except ImportError:
+    raise SystemExit(
+        "打包中止：打包机上没装 pillow。OCR 的图片解码全靠它，缺了 exe 的 OCR 是死的。\n"
+        "  解决：在**用来打包的那个解释器**里跑 pip install -r backend/requirements.txt"
+    )
 
 # --- 静态分析看不到的模块 -----------------------------------------------------
 hiddenimports = [

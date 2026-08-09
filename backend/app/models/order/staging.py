@@ -27,8 +27,11 @@ class OrderStaging(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     # BinStr 的理由见 Order 同名列（唯一约束 / 批量精确匹配，必须逐字节）。
     order_no: Optional[str] = Field(default=None, max_length=64, sa_type=BinStr(64))  # 可空：手动新建空行后再填
-    platform_account: Optional[str] = Field(default=None, max_length=64, sa_type=BinStr(64))
-    platform: Optional[str] = Field(default=None, max_length=32, sa_type=BinStr(32))  # 来源平台（淘宝/闲鱼/京东）；淘宝插件抓取即「淘宝」，导入时随单迁移到账本
+    # 这两根列 index=True 与账本侧 `Order` 对齐：`GET /api/tags/{field}` 对它们做
+    # DISTINCT 扫描（同一个下拉框的两个数据源，不能一个走索引一个全表扫），
+    # 订单页/暂存页按账号昵称筛选也落在这里。见迁移 a1b2c3d4e5f6。
+    platform_account: Optional[str] = Field(default=None, max_length=64, index=True, sa_type=BinStr(64))
+    platform: Optional[str] = Field(default=None, max_length=32, index=True, sa_type=BinStr(32))  # 来源平台（淘宝/闲鱼/京东）；淘宝插件抓取即「淘宝」，导入时随单迁移到账本
     title: Optional[str] = Field(default=None, sa_type=Text)   # 商品标题；Text 的理由见 Order.title
     price_cny: Optional[Decimal] = Field(default=None, max_digits=12, decimal_places=2)
     postage_cny: Optional[Decimal] = Field(default=None, max_digits=12, decimal_places=2)  # 邮费（元）；空=包邮。价 = Σ(单价×数量) + 邮费
@@ -46,7 +49,9 @@ class OrderStaging(SQLModel, table=True):
         default=None, foreign_key="orders.id", index=True
     )
     version: int = Field(default=1)                         # 乐观锁（人工/爬虫并发编辑同一暂存行）
-    scraped_at: dt.datetime = Field(default_factory=utcnow, sa_type=UtcDateTime())
+    # index=True：暂存列表就按它排序分页（`scraped_at DESC, id DESC`），
+    # 没索引则每翻一页都是全表扫描 + filesort，而淘宝插件每轮要翻完整张表两遍。
+    scraped_at: dt.datetime = Field(default_factory=utcnow, index=True, sa_type=UtcDateTime())
     updated_at: dt.datetime = Field(default_factory=utcnow, sa_type=UtcDateTime())
 
     items: list["StagingItem"] = Relationship(

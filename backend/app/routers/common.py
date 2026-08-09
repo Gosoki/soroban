@@ -1,7 +1,8 @@
 """Shared router helpers: optimistic lock (DB-level guard), soft delete, errors, item building,
 OCR 截图上传（校验 + 线程池执行）。"""
 
-from decimal import ROUND_HALF_UP, Decimal
+import logging
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from typing import Callable
 
 from fastapi import HTTPException, UploadFile, status
@@ -10,8 +11,23 @@ from sqlmodel import Session
 
 from ..models import utcnow
 
+log = logging.getLogger("soroban")
+
 _CNY_Q = Decimal("0.01")     # 人民币量化到分
 MAX_OCR_BYTES = 10 * 1024 * 1024      # 截图上限 10MB（手机截图通常 < 2MB）
+_OCR_CONCURRENCY = 2         # 同时在解码/推理的 OCR 请求数上限，见 run_ocr
+_OCR_LIMITER = None
+
+
+def _ocr_limiter():
+    """OCR 专用并发闸。**懒建**：CapacityLimiter 要绑定到当前 async 后端，
+    模块导入时还没有事件循环。"""
+    global _OCR_LIMITER
+    if _OCR_LIMITER is None:
+        import anyio
+
+        _OCR_LIMITER = anyio.CapacityLimiter(_OCR_CONCURRENCY)
+    return _OCR_LIMITER
 
 
 def goods_seed(price_cny, postage_cny):
@@ -44,16 +60,30 @@ def build_items(items_in, seed_goods, fallback_name):
                  "auto": True}]
     any_priced = any(it.unit_price_cny is not None for it in items_in)
     if not any_priced and seed_goods is not None:
-        out = []
+        out, residual = [], Decimal("0.00")
         for i, it in enumerate(items_in):
             if i == 0:
                 q = it.quantity or 1
-                unit = (Decimal(seed_goods) / q).quantize(_CNY_Q, rounding=ROUND_HALF_UP)
+                # **向下**取整到分，余数单独成行——不能只写 `(seed/q).quantize(HALF_UP)`。
+                # 订单价是 Σ(单价×数量) 派生出来的（price_from_items），所以「单价」一旦
+                # 被舍入，乘回数量就不再等于种子价，账本金额与爬虫抓到的实付金额对不上：
+                #   ¥100.00 / 3  → 33.33 → 回乘 99.99（少 1 分）
+                #   ¥  5.00 /1000→  0.01 → 回乘 10.00（**翻一倍**，HALF_UP 向上舍的后果）
+                #   ¥  0.40 /1000→  0.00 → 回乘  0.00（**整单金额归零**）
+                # 后两种在「一批小商品按件录数量」时是能真实发生的，而且没有任何提示。
+                # ROUND_DOWN 保证余数恒为非负且 < 数量×0.01，再补一行把它加回去 ⇒ 总额精确。
+                unit = (Decimal(seed_goods) / q).quantize(_CNY_Q, rounding=ROUND_DOWN)
                 out.append({"name": it.name, "quantity": it.quantity,
                             "unit_price_cny": unit, "auto": True})
+                residual = Decimal(seed_goods) - unit * q
             else:
                 out.append({"name": it.name, "quantity": it.quantity,
                             "unit_price_cny": Decimal("0.00"), "auto": True})
+        if residual:
+            # 只在除不尽时才出现。名字带「尾差」是给人看的：这一分钱落在哪儿必须一目了然，
+            # 否则复核的人会以为系统算错了。auto=True → 前端灰显，跟其余待拆分的行同待遇。
+            out.append({"name": f"{items_in[0].name}（金额尾差）"[:255],
+                        "quantity": 1, "unit_price_cny": residual, "auto": True})
         return out
     # 有单价的原样用；没单价的记 0 并标 auto（灰显=待补价），避免误当作真实 ¥0
     return [{"name": it.name, "quantity": it.quantity,
@@ -150,8 +180,20 @@ async def run_ocr(file: UploadFile, recognizer: Callable[[bytes], dict]) -> dict
     """校验上传的截图并在线程池里跑 recognizer（商品订单/集运订单两条 OCR 路由共用）。
 
     OCR 为 CPU 密集且较慢（首次还要加载模型），放线程池 → 不阻塞事件循环，前端可连续上传；
-    真正的串行化在 services/ocr.py 的 _infer_lock（RapidOCR 引擎非保证可重入）。"""
-    from fastapi.concurrency import run_in_threadpool
+    真正的串行化在 services/ocr.py 的 _infer_lock（RapidOCR 引擎非保证可重入）。
+
+    **并发上限单独设一个 CapacityLimiter，不复用默认线程池的 40 个令牌。**
+    `_infer_lock` 只串行化「推理」那一段，**解码在锁外**——40 路并发上传就是 40 份
+    解码后的位图同时在内存里（实测两路 8000×8000 就 +1.2GB，线性叠加）。
+    限流器把同时在解码/推理的请求压到 _OCR_CONCURRENCY 路，内存尖峰随之封顶。
+    写法要注意：`run_in_threadpool(fn, data, limiter=...)` 会把 limiter 当成 fn 的
+    关键字参数传下去（TypeError）；必须走 `anyio.to_thread.run_sync` + partial。
+    也**不要**去替换 `run_in_threadpool` 这个名字——`contextmanager_in_threadpool`
+    也走它，换掉会连带劫持所有生成器依赖。
+    """
+    import functools
+
+    import anyio.to_thread
 
     from ..services.ocr import OcrUnavailable
 
@@ -163,8 +205,15 @@ async def run_ocr(file: UploadFile, recognizer: Callable[[bytes], dict]) -> dict
     if len(data) > MAX_OCR_BYTES:
         raise HTTPException(status_code=413, detail="图片过大（上限 10MB）")
     try:
-        return await run_in_threadpool(recognizer, data)
+        return await anyio.to_thread.run_sync(
+            functools.partial(recognizer, data), limiter=_ocr_limiter())
     except OcrUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except MemoryError:
+        # 像素闸之下仍可能撞上（多路并发、机器本来就紧）。漏成裸 500 的话前端只会说
+        # 「服务器错误」，用户不知道这是「稍后重试就好」而不是「这张图坏了」。
+        log.warning("OCR 内存不足：%s bytes", len(data))
+        raise HTTPException(status_code=503, detail="服务器内存不足，请稍后重试或换一张更小的截图",
+                            headers={"Retry-After": "10"})

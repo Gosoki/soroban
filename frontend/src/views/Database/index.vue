@@ -11,6 +11,13 @@
           {{ activeLabel }}
         </el-tag>
       </div>
+      <!-- 静默降级必须在**最显眼**的地方说出来：配置里写着 MySQL、连接串却解不开时，
+           应用会退回本地 SQLite，而用户看到的现象是「账本全空了」。
+           最容易踩到的路径是升级换目录忘了搬 .env（SECRET_KEY 一变就解不开）。 -->
+      <el-alert v-if="status.active.degraded" type="error" show-icon :closable="false" class="degraded">
+        <template #title>数据库已降级到本地 SQLite</template>
+        {{ status.active.degraded }}
+      </el-alert>
       <div class="hint">
         切换只改变「连接指向」，不迁移、不删除任何数据；如需目标数据最新，切换前先「迁移到此库」。
       </div>
@@ -89,7 +96,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Coin, Files } from '@element-plus/icons-vue'
 import { dbApi } from '@/api'
-import { typeStyle } from '@/constants'
+import { longToast, typeStyle } from '@/constants'
 
 // active 初值刻意留空：给 `{ backend: 'sqlite' }` 的话，首帧必然渲染成
 // 「SQLite（本地文件）」并给本地那行挂上「当前」标签——实际连着 MySQL 时，
@@ -228,11 +235,9 @@ async function onSourceChanged(target, name, detail) {
     if (e.response?.status === 409) {
       // 只提示不递归：迁移与切换之间源库又被写了（爬虫回灌 / 汇率刷新 / 另一个标签页）。
       // 递归重试会在爬虫逐单回灌时变成关不掉的弹窗循环。
-      ElMessage({
-        type: 'warning', duration: 8000,
-        message: (e.response?.data?.detail || '迁移与切换之间源库又有改动')
-          + '——**未切换**，当前仍连着原来的库。请等抓取/刷新结束后再试一次。',
-      })
+      longToast(ElMessage, 'warning',
+        (e.response?.data?.detail || '迁移与切换之间源库又有改动')
+        + '——**未切换**，当前仍连着原来的库。请等抓取/刷新结束后再试一次。')
     }
     // 其余错误拦截器已提示
     await loadStatus()                       // 无论成败都把真实状态拉回来，别让界面停在猜测里
@@ -261,6 +266,7 @@ onMounted(loadStatus)
 .title { margin: 0 0 16px; font-size: 20px; }
 .card { margin-bottom: 16px; }
 .card-hd { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-weight: 600; margin-bottom: 10px; }
+.degraded { margin: 8px 0; }
 .hint { color: var(--txt-3); font-size: 12px; }
 .dash { color: var(--txt-2); }
 .row-ic { margin-right: 4px; vertical-align: -2px; }

@@ -356,9 +356,17 @@ class OrderBase(MoneyIn, PostageIn, OrderFieldsIn):
 
 
 def _check_postage_within_total(price_cny, postage_cny, items) -> None:
-    """纯种子价（无物品明细）时：邮费是订单总价的一部分，不能超过总价。否则货款被夹到 0、
-    总价被悄悄抬成 = 邮费，与用户填的总价不符 → 明确 422 拒绝（有物品明细时价格另算，不检查）。"""
-    if not items and price_cny is not None and postage_cny is not None and postage_cny > price_cny:
+    """**种子价路径**上：邮费是订单总价的一部分，不能超过总价。否则货款被夹到 0、
+    总价被悄悄抬成 = 邮费，与用户填的总价不符 → 明确 422 拒绝。
+
+    判据是「有没有物品**带单价**」，不是「有没有物品」。`build_items` 只在
+    `not any_priced` 时才拿 price_cny 当种子（见其 any_priced 分支），也就是说
+    「传了 3 条没单价的物品」和「一条物品都没传」走的是**同一条**种子路径、
+    有**同样**的夹零后果。原先只判 `not items`，于是同一个非法输入
+    （邮费 > 总价）在前者是 422、在后者是 200 + 静默把总价改成邮费。
+    物品自带单价时 price_cny 根本不参与计算（订单价由物品派生），无从判起，也就不检查。"""
+    seeded = not any(getattr(it, "unit_price_cny", None) is not None for it in items)
+    if seeded and price_cny is not None and postage_cny is not None and postage_cny > price_cny:
         raise ValueError("邮费不能大于订单总价（订单价 = 商品单价×数量 + 邮费）")
 
 
@@ -515,6 +523,10 @@ class ShipmentOcrAttachResult(SQLModel):
     skipped: list[OrderBrief] = []       # 已挂在别的集运单 → 跳过不强改
     unmatched: list[str] = []            # 截图里有、但商品订单里找不到的快递号
     express_nos: list[str] = []          # 截图识别出的全部快递号（供人工核对）
+    # 截图里看得见「快递单号」这个标签、却没能取出号的行数（断行、糊字、与上一行重号）。
+    # 没有它的时候「少挂了一单」这件事**在响应里完全不存在**：前端只看到 attached 的数量，
+    # 于是照样弹绿色成功提示。三类回报之外必须有第四类——「我知道我漏了，但不知道漏了什么」。
+    unreadable: int = 0
 
 
 # --- 杂项 -------------------------------------------------------------------
@@ -603,7 +615,11 @@ class FxRead(SQLModel):
     expired: bool = False                   # 超过 fx.stale_hours → 界面明确标出、建单时记警告
     # 现在有没有插件能自动提供汇率（名字，没有则空）。界面据此说实话：
     # 插件被删掉之后还写着「自动获取由插件负责」，那句话就是假的——点过去什么都没有。
-    auto_provider: str = ""
+    auto_provider: str = ""      # 真的会自动更新时，写供给它的插件名
+    # 装了汇率插件、但它跑不起来（停用 / 没授权 / 缺环境）时的原因。
+    # 三态是必要的：「由 X 负责」和「没有插件」之间还有「装了但不会跑」，
+    # 而后者原先被显示成前者——那句话是假的，且汇率停更时账本会继续用兜底值建单。
+    auto_blocked: str = ""
 
 
 # --- 淘宝抓取暂存（全部淘宝订单 → 确认导入）---------------------------------

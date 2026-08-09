@@ -1,4 +1,7 @@
-"""爬虫插件配置（soroban 做管理层：存每个插件的启用/参数/定时；插件本体在 scraper/ 下）。"""
+"""插件配置（soroban 做管理层：存每个插件的启用/授权/参数/定时/上次结果；
+插件本体在 `plugins/soroban-plugin-*/` 下，各自成库、各自 venv）。
+
+「爬虫」这个词已经不准确了：汇率插件不爬任何东西。插件 = 外部数据来源，爬只是其中一种。"""
 
 import datetime as dt
 from typing import Optional

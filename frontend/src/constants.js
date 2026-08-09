@@ -124,3 +124,15 @@ export const FX_SOURCE_NAMES = {
 export function fxSourceName(r) {
   return FX_SOURCE_NAMES[r?.source] || r?.source_label || r?.source || ''
 }
+
+// —— 提示时长：全仓只有两档，别再出现第三个数字 ——
+//
+// Element Plus 默认 3000ms。「要看清具体内容」的提示（列了单号、说明为什么没生效、
+// 服务端 detail）3 秒读不完，一律用 8000。这个数字原先在 4 个文件里各写一遍，
+// 第 5 处很自然地写成了 10000——同一类提示两种时长，就是割裂感的来源。
+export const TOAST_LONG = 8000
+
+/** 需要看清内容的长提示。type 同 ElMessage：success | warning | info | error。 */
+export function longToast(ElMessage, type, message) {
+  ElMessage({ type, message, duration: TOAST_LONG })
+}

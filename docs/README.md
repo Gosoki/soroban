@@ -79,7 +79,10 @@
 - `created_at` / `updated_at`
 
 ### 其余表
-`fxrate`（每日汇率 + 来源）、`tagoption`（下拉候选/标签）、`pluginconfig`（插件与抓取账号）、
+`fxrate`（汇率 + 来源；**一天可有多条**，追加不覆盖，见迁移 `d2e3f4a5b6c7`。
+取哪一条由 `services/fx.pick_from` 定：手填优先，其次该日最后一条）、
+`tagoption`（下拉候选/标签）、`pluginconfig`（插件配置/授权/账号）、
+`pluginrecord`（插件自有存储，`data:own` 权限）、
 `columnlayout`（用户拖过的列宽/列序）、`setting`（业务偏好 key-value）、`user`。
 
 ### User
@@ -109,6 +112,7 @@
 - ✅ **退款/取消**：加 `退款/已取消` 状态，**允许金额为负**；看板只对「有效行」求和（排除已取消）
 - ✅ **结算优先级**：手填 `jpy_override` **永远最高级**，覆盖一切自动值；机器人绝不碰它
 - ✅ **软删除**：三张业务表加 `deleted_at`，删除只标记不物理删，所有查询过滤 `deleted_at IS NULL`。理由：账本留痕 + 多人/机器人易误删
+  （⚠️ 列名后来改成了布尔的 `is_delete`，见迁移 `d4e5f6a7b8c9`。本条及以下决策日志里的 `deleted_at` 都是**当时**的列名，按代码搜是搜不到的）
 - ✅ **看板求和**：`jpy_auto`/`jpy_settled` 落库为普通 int 列，**写入时由 `compute_money()` 用 Decimal + ROUND_HALF_UP 精确算出**（应用维护，非 DB 生成列）。SUM/GROUP BY 照常走 SQL。
   - **落地时的取舍（原计划是 SQLite 生成列，已改）**：SQLite 把 Decimal 存成 float，生成列里 `ROUND(price_cny*fx_rate)` 有浮点边界误差风险；改用 Python Decimal 精确计算更正确，也绕开 Alembic 认不全生成列的问题（原 P2）。所有写路径都过 `compute_money()`，机器人只写暂存表不写正表，故不会漂。
 - ✅ **汇率记录 + 兜底**：新增 `FxRate` 表缓存每日汇率（`date` 唯一, `rate`, `fetched_at`）；录单时取当日汇率预填，**抓取失败就用最近一次成功的汇率做基准**；每条订单仍存自己的 `fx_rate` 快照
@@ -150,14 +154,21 @@
 - [ ] 快递号分组一致性：UI 是否加「同快递号挂了不同 JF 单」的软告警
 - [ ] 退款是否支持部分退款（金额级冲抵）还是仅整单取消
 - [ ] **对接快递单号平台查物流**：接国家/第三方快递查询平台（如快递100 / 快递鸟 / 官方接口），按淘宝「快递号」或君丰「国际运单号」自动拉物流状态并展示（可加缓存/定时刷新）。
-- [ ] **更换汇率 API**：现用 open.er-api 免费源仅约每日更新；将来换更实时/更可靠的汇率源（改 `backend/app/services/fx.py::fetch_rate`，其余持久化/兜底逻辑可复用）。
-- [ ] **SECRET_KEY 硬化**（安全审查 #18）：默认 `dev-insecure-key-change-me` 现仅启动告警、不阻断；它同时用于签 JWT **和**（经 sha256）派生加密 MySQL 密码的 Fernet 密钥——故**不能自动轮换**（换了旧的加密 DSN 就解不开）。当前绑 `127.0.0.1` 尚可；**对外/局域网暴露前必须**设强随机 `SECRET_KEY`（`python -c "import secrets;print(secrets.token_hex(32))"`）。可加：绑定非环回地址且仍是默认/弱 key 时**启动硬失败**（`backend/app/main.py` 现只 `log.warning`）。
+- [x] ~~**更换汇率 API**~~ → **已由插件取代**。核心不再抓汇率（`fetch_rate` 已删除），
+  换源 = 换/改 `plugins/soroban-plugin-fx`，核心侧只保留存储、区间复核与按日期取值。
+- [x] ~~**SECRET_KEY 硬化**~~（安全审查 #18）：**已完成，且比原计划更严**。`main.py::_check_secret_key`
+  对默认值/长度 < 16 **一律拒绝启动**（不分是否环回——这类问题没法「登录进来再修」，
+  令牌本身就不可信）。start.sh / start.bat / run.py 首启都会生成含随机 key 的 `.env`，
+  所以正常路径踩不到。它仍然**不能自动轮换**：同一个 key 还经 sha256 派生着加密 MySQL
+  密码的 Fernet 密钥，换了旧的加密 DSN 就解不开。
 
 ## 待自动化（Roadmap）
 
 - 抓淘宝订单：需登录态、反爬重，现实做法是 Playwright 带持久化登录态**半自动**抓，或手动/CSV 导入。设计上把「数据导入」做成统一入口，抓取只是加一个数据源。
 - 抓君丰订单：看其是否有导出/接口，通常比淘宝好搞。
-- 汇率自动填充：**从 hiyori 移植抓取逻辑（直连 open.er-api.com），在 soroban 内自成一份 `services/fx.py`**。⚠️ 不要调用 hiyori 正在跑的接口——两个项目部署位置可能不同，soroban 的汇率必须能独立运行、不依赖 hiyori 是否在线。
+- ~~汇率自动填充：从 hiyori 移植抓取逻辑~~ → **已改为插件**：核心一行抓取代码都不含，
+  由 `plugins/soroban-plugin-fx` 走通用写入通道 `POST /api/plugins/ingest` 回灌。
+  「独立运行、不依赖别的项目在线」这条约束仍然成立，只是现在由插件边界来保证。
 
 ## 进度
 

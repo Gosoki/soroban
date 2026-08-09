@@ -30,8 +30,10 @@ class Settings(BaseSettings):
     TOKEN_EXPIRE_DAYS: int = 90  # 登录有效期 3 个月
     ALGORITHM: str = "HS256"
 
-    # --- Exchange rate (open.er-api.com, free, no key) ---
-    # 抓取逻辑从 hiyori 移植、本项目自带一份；不调用 hiyori 的接口（部署位置可能不同）。
+    # --- 汇率的**币种口径** ---
+    # 核心**不抓**汇率：抓取全部在 `plugins/soroban-plugin-fx` 里，走通用写入通道回灌。
+    # 这两个键留在这里是因为它们描述的是「这本账按什么折算」（CNY→JPY），
+    # 属于核心的记账口径，不是某个数据源的配置。
     FX_BASE: str = "CNY"
     FX_QUOTE: str = "JPY"
     # Frontend dev origin(s) for CORS（默认前端端口 8621；同源托管/vite 代理下其实用不到）。

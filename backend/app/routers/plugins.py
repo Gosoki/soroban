@@ -16,11 +16,13 @@ import logging
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import threading
 import time
 import tomllib
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -35,7 +37,7 @@ from ..plugins import manifest as pmanifest
 from ..plugins import params as plugin_params, scopes
 from ..config import settings
 from ..database import get_engine, get_session
-from ..models import Order, PluginConfig, User, utcnow
+from ..models import Order, PluginConfig, PluginRecord, User, utcnow
 from ..schemas import PluginConfigIn
 from .tags import (
     delete_account_staging,
@@ -110,9 +112,25 @@ def discover() -> list[dict]:
                     continue
                 try:
                     m = tomllib.loads(f.read_text(encoding="utf-8"))
-                except Exception:
-                    continue
-                mf = pmanifest.parse(m, d)
+                except Exception as e:                  # noqa: BLE001  语法错 / 编码错都算
+                    # **不 continue**。静默跳过的后果有三层，一层比一层糟：
+                    #   1. 插件从列表里凭空消失，零日志——用户看到的是「插件不见了」，
+                    #      而不是「plugin.toml 第几行写错了」。
+                    #   2. 它在库里的配置被当成孤儿，卡片上写「插件目录已不在」，
+                    #      而目录明明还在。
+                    #   3. `forget_plugin` 的护栏正是「discover() 里还有没有它」——
+                    #      于是一个只是打错了个引号的插件，它的授权与账号可以被一键清掉。
+                    # 清单本身解析不出来时 id 只能从目录名推（约定就是 soroban-plugin-<id>，
+                    # 见 tests/test_plugins.py::test_canonical_plugin_layout）。
+                    pid = d.name
+                    for pre in ("soroban-plugin-", "soroban-scraper-"):
+                        pid = pid.removeprefix(pre)
+                    m = {}
+                    mf = pmanifest.parse({"id": pid}, d)._replace(
+                        error=f"plugin.toml 读不了：{e}")
+                    log.warning("插件目录 %s 的 plugin.toml 解析失败：%s", d.name, e)
+                else:
+                    mf = pmanifest.parse(m, d)
                 if mf.id in seen:
                     continue
                 seen.add(mf.id)
@@ -422,12 +440,17 @@ def _browser_ready(py: Path) -> bool:
         return False
 
 
-def _summarize(line: str, returncode: int) -> str:
+def _summarize(line: str, returncode: int, errtail: str = "") -> str:
     """把插件吐的那行 JSON 变成一句人话，放插件卡片上。
 
     插件之间字段不统一（爬虫回 created/updated/failed，汇率回 source/rate），
     所以取「认识的键优先，认不出就原样截断」——核心不该规定插件必须回什么，
     但也不该让用户在卡片上看一坨 JSON。
+
+    `errtail` 是子进程 stderr 的尾巴，**只在没别的可说时**才用：插件崩在
+    import 阶段（缺依赖、解释器不对）时 stdout 是空的、returncode 非 0，
+    原先卡片上只有一句「退出码 1」——真正的原因（ModuleNotFoundError 之类）
+    全在 stderr 里，而用户看不到日志文件。这正是打包版汇率插件的失败形态。
     """
     try:
         d = json.loads(line or "{}")
@@ -438,17 +461,92 @@ def _summarize(line: str, returncode: int) -> str:
     if d.get("error"):
         return str(d["error"])[:200]
     bits = []
+    # skipped/logged_in 是淘宝插件最常见的两种结果（本轮无变化 / 登录成功），
+    # 原先不在表里 → 落到最后一支，卡片上显示的是原始 JSON。
     for k, label in (("created", "新建"), ("updated", "更新"), ("unchanged", "无变化"),
-                     ("blocked", "挡下"), ("failed", "失败")):
+                     ("skipped", "跳过"), ("blocked", "挡下"), ("failed", "失败"),
+                     ("rejected", "拒收")):
         if d.get(k):
             bits.append(f"{label} {d[k]}")
+    if d.get("logged_in"):
+        bits.append("登录成功")
     if d.get("rate"):
         bits.append(f"1元 = {str(d['rate'])[:8]}円" + (f"（{d['source']}）" if d.get("source") else ""))
     if bits:
         return "、".join(bits)
     if returncode != 0:
-        return f"退出码 {returncode}"
+        # stderr 的**最后一行非空内容**通常就是异常那一行，比整段栈更适合放卡片。
+        last = next((ln.strip() for ln in reversed((errtail or "").splitlines()) if ln.strip()), "")
+        return f"退出码 {returncode}" + (f"：{last[:160]}" if last else "")
     return (line or "已完成")[:200]
+
+
+_MAX_CAPTURE = 256 * 1024        # 每路输出最多留末尾 256KB
+
+
+def _drain(stream, sink: list) -> None:
+    """把一路输出读到 EOF，内存里**只留末尾 _MAX_CAPTURE 字节**。
+
+    话多的插件（playwright 的 debug 日志能到上百 MB）不该把后端的内存吃掉，
+    而按插件约定有用的只有尾巴：stdout 的最后一行是结果 JSON，stderr 的末尾是报错栈。
+
+    这个函数**可能永远返回不了**——孙进程继承着写端时 EOF 不会来。这没关系：
+    调用方用 join(timeout) 等它，等不到就当「拿不到输出」，daemon 线程随进程退出。
+    """
+    try:
+        for chunk in iter(lambda: stream.read(8192), ""):
+            if not chunk:
+                break
+            sink.append(chunk)
+            while len(sink) > 1 and sum(map(len, sink)) > _MAX_CAPTURE:
+                sink.pop(0)
+    except Exception:                                            # noqa: BLE001
+        pass                                                     # 管道被 kill 掐断是正常路径
+    finally:
+        try:
+            stream.close()
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
+def _kill_tree(proc: subprocess.Popen, label: str) -> None:
+    """终止插件子进程**连同它 fork 出来的孙进程**。
+
+    `_launch` 用 `start_new_session=True` 起进程，所以子进程是一个**新会话/新进程组的
+    组长**，pgid == 它自己的 pid。杀这个组正好覆盖它拉起的浏览器等孙进程，
+    且**不可能**波及本进程所在的组（uvicorn / 终端 / 其它无关进程）。
+
+    三重保险，缺一不可：
+      · pgid 必须等于 proc.pid —— 组长身份是我们自己创建时保证的。万一
+        start_new_session 没生效（老平台/被 patch），pgid 会是继承来的父进程组，
+        那时 killpg 会把**后端自己**一起带走。此时只杀单个进程。
+      · pgid 必须不等于本进程的组。前一条已经蕴含这一条，但显式写出来，
+        免得将来有人改了启动参数却没改这里。
+      · 任何异常都吞掉：进程可能刚好自己退了（ProcessLookupError）。
+    """
+    if os.name == "nt":
+        # Windows 没有进程组语义可用（start_new_session 在 nt 上是 no-op）。
+        # taskkill /T 按 PID 精确地连子树一起结束，不涉及任何按名匹配。
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=15, check=False)
+        except Exception as e:                                   # noqa: BLE001
+            log.warning("插件 %s taskkill 失败：%s", label, e)
+        proc.kill()
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+        if pgid == proc.pid and pgid != os.getpgid(0):
+            os.killpg(pgid, signal.SIGKILL)
+            return
+        log.error("插件 %s 的进程组是 %s（期望 %s）——只杀单个进程，不动整组",
+                  label, pgid, proc.pid)
+    except Exception as e:                                       # noqa: BLE001
+        log.warning("插件 %s 取进程组失败：%s", label, e)
+    try:
+        proc.kill()
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 def _reap(proc: subprocess.Popen, label: str, jti: Optional[str] = None, on_done=None) -> None:
@@ -462,27 +560,51 @@ def _reap(proc: subprocess.Popen, label: str, jti: Optional[str] = None, on_done
     超时被 kill 时也要有个交代，否则卡片会永远停在「执行中…」。
     """
     result, ok = "", False
+    outs: list[str] = []
+    errs: list[str] = []
     try:
+        # **不用 communicate()**，两个原因，都不是理论问题：
+        #
+        # 1. communicate() 等的是「管道到达 EOF」，不是「子进程退出」。浏览器类插件会
+        #    fork 出 chromium 之类的孙进程，它们**继承**着同一对管道；直接子进程被 kill
+        #    之后孙进程还攥着写端，EOF 永远不来 → 超时分支里那句无参 communicate()
+        #    自己挂死在收割线程里，令牌不作废、卡片永远停在「执行中…」。
+        #    改成 wait()（只等子进程）+ 独立的排空线程（可以放弃等待）。
+        # 2. communicate() 把 stdout/stderr 全量存进内存。插件日志走的正是 stderr，
+        #    一个话多的插件就能把后端 RSS 顶上去。_drain 只留末尾 _MAX_CAPTURE 字节——
+        #    而按插件约定，有用的东西（结果 JSON、报错栈）恰好都在尾巴上。
+        t_out = threading.Thread(target=_drain, args=(proc.stdout, outs), daemon=True)
+        t_err = threading.Thread(target=_drain, args=(proc.stderr, errs), daemon=True)
+        t_out.start()
+        t_err.start()
         try:
-            out, err = proc.communicate(timeout=_REAP_TIMEOUT)
+            proc.wait(timeout=_REAP_TIMEOUT)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
+            _kill_tree(proc, label)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:                    # 僵而不死（D 状态等）
+                log.error("插件 %s 已发 KILL 但仍未退出，放弃收割", label)
             log.warning("插件 %s 超时(%d 秒)已终止", label, _REAP_TIMEOUT)
-            result = "超时（30 分钟）已终止"
+            result = f"超时（{_REAP_TIMEOUT // 60} 分钟）已终止"
             return
         except Exception as e:                                   # noqa: BLE001
             log.warning("插件 %s 结果回收异常：%s", label, e)
             result = f"结果回收异常：{e}"
             return
+        # 子进程已退出。给排空线程一点时间收尾，但**绝不无限等**——孙进程还攥着管道时
+        # 它们本就不会结束，那属于「拿不到输出」，不属于「不能收割」。
+        t_out.join(5)
+        t_err.join(5)
+        out, err = "".join(outs), "".join(errs)
         tail = [ln for ln in (out or "").strip().splitlines() if ln.strip()]
         line = tail[-1] if tail else ""
         ok = proc.returncode == 0
-        result = _summarize(line, proc.returncode)
+        errtail = (err or "").strip()
+        result = _summarize(line, proc.returncode, errtail)
         if ok:
             log.info("插件 %s 完成：%s", label, line or "(无 stdout)")
         else:
-            errtail = (err or "").strip()
             log.warning("插件 %s 失败(exit=%s)：%s%s", label, proc.returncode,
                         line or "(无 stdout)",
                         ("｜stderr: " + errtail[-300:]) if errtail else "")
@@ -784,12 +906,24 @@ def forget_plugin(plugin_id: str, session: Session = Depends(get_session)):
     if any(m["_m"].id == plugin_id for m in discover()):
         raise HTTPException(status_code=409, detail="该插件还装着，先删掉它的目录再清理配置")
     cfg = session.get(PluginConfig, plugin_id)
-    if cfg is None:
+    records = session.exec(
+        select(PluginRecord).where(PluginRecord.plugin_id == plugin_id)
+    ).all()
+    if cfg is None and not records:
         raise HTTPException(status_code=404, detail="没有这个插件的配置")
-    session.delete(cfg)
+    # **私有存储必须一起删。** 它原先没有任何删除入口：卸载插件之后
+    # `pluginrecord` 里那些行会永久留着，而以后往 plugins/ 里放一个**同 id** 的插件
+    # （别人写的、或被改过的版本），它一上来就能读到前一个插件攒下的全部私有数据
+    # ——用户从没批准过这件事，界面上也完全看不到。
+    # 与授权同一条理由：清理残留 = 把这个 id 恢复成「从没装过」的状态。
+    for r in records:
+        session.delete(r)
+    granted = cfg.granted_scopes if cfg else "（无配置行）"
+    if cfg is not None:
+        session.delete(cfg)
     session.commit()
-    log.info("已清理插件 %s 的残留配置（含授权 %s）", plugin_id, cfg.granted_scopes)
-    return {"plugin_id": plugin_id, "removed": True}
+    log.info("已清理插件 %s 的残留：授权 %s、私有存储 %d 条", plugin_id, granted, len(records))
+    return {"plugin_id": plugin_id, "removed": True, "records_removed": len(records)}
 
 
 def _launch_conf(session: Session, m: dict, cfg: Optional[PluginConfig]) -> dict:
@@ -958,59 +1092,78 @@ def run_command(plugin_id: str, command: str, account: Optional[str] = None,
         raise HTTPException(status_code=409, detail=(
             f"「{cmd.label}」需要权限 {sorted(missing)}，请先在插件卡片上勾选授权"))
 
-    if cmd.per == "account":
-        known = _account_list(cfg)
-        if account:
-            # **点名某个账号时不看「启用」**：账号级的启用只决定「批量跑的时候带不带它」，
-            # 手动点某个号（补抓、重新登录）是用户当下的明确意图，不该被它挡住。
-            # 这是原先 POST /{id}/fetch 的语义，端点合并到这里时必须一起搬过来，
-            # 否则「停用的号点『抓这个号』没反应」——而按钮还亮着。
-            named = next((a for a in known if a["name"] == account), None)
-            # 磁盘上有会话、但配置里没登记的孤儿账号也允许点（换机/重置库之后就剩它了）
-            _check_account_name(m, account)
-            pool = [named or {"name": account, "platform": "淘宝", "enabled": True}]
-        else:
-            pool = [a for a in known if a["enabled"]]
-            if not pool:
-                raise HTTPException(status_code=400, detail="没有可用账号：先添加账号并启用。")
-        fan = [(["--account", a["name"], "--platform", a["platform"]], a["name"]) for a in pool]
-    else:
-        fan = [([], "")]
+    fan = _fan_targets(m, cfg, cmd, account)
+    if not fan:
+        raise HTTPException(status_code=400, detail="没有可用账号：先添加账号并启用。")
 
+    # **令牌只带这条命令声明要用的权限**，不是插件的全部授权。
+    # `needs` 原先只用来禁按钮，令牌照发全量：于是一条 `needs = []`（「只测试、不写入」）
+    # 的命令拿到的是能写暂存表、能改汇率的完整令牌——用户在卡片上看到的授权说明
+    # 与实际下发的能力对不上，而 `needs` 这个字段的字面意思正是「我要用哪些权限」。
+    # 少声明的命令会收 403 而不是悄悄越权，那是正确的失败方向：修法是去 plugin.toml 补声明。
+    cmd_scopes = granted & set(cmd.needs)
     conf = _launch_conf(session, m, cfg)
+    batch = uuid.uuid4().hex
     pids = []
     for extra, who in fan:
         # **一个子进程一枚令牌**。共用一枚的话，先跑完的那个账号在 `_reap` 里
         # `revoke(jti)`，还在跑的兄弟当场全部 401——它们已经抓到的订单再也回灌不进来，
         # 而且是静默的：插件那边只看到「soroban 拒绝了我」，用户只看到少了几单。
-        token, jti = scopes.issue(current, plugin_id, granted, timeout_s=_REAP_TIMEOUT)
+        token, jti = scopes.issue(current, plugin_id, cmd_scopes, timeout_s=_REAP_TIMEOUT)
         pids.append(_launch(m, cmd.name, [*extra, "--soroban-url", _SELF_URL],
                             token=token, config=conf, jti=jti,
-                            on_done=_result_writer(plugin_id, cmd.label)))
+                            on_done=_result_writer(plugin_id, cmd.label,
+                                                   who=who, batch=batch, total=len(fan))))
     cfg.last_outcome, cfg.last_summary = "running", f"{cmd.label} 执行中…"
     cfg.last_finished_at = None
     cfg.updated_at = utcnow()
     session.add(cfg)
     session.commit()
     return {"launched": True, "command": cmd.name, "pids": pids,
-            "targets": [w for _, w in fan if w], "scopes": sorted(granted)}
+            "targets": [w for _, w in fan if w], "scopes": sorted(cmd_scopes)}
 
 
-def _result_writer(plugin_id: str, label: str):
+_BATCHES: dict[str, list[tuple[str, bool, str]]] = {}      # batch_id -> [(账号, ok, 摘要)]
+_BATCH_LOCK = threading.Lock()
+
+
+def _result_writer(plugin_id: str, label: str, who: str = "",
+                   batch: Optional[str] = None, total: int = 1):
     """子进程收割完之后把结果写回 PluginConfig，供插件卡片显示。
 
     **开自己的 Session**：收割跑在 daemon 线程里，没有请求作用域的 session 可用。
     写失败只记日志——结果展示失败不该影响别的东西。
+
+    **多账号扇出要合并**：N 个子进程共写 PluginConfig 这**一行**的
+    last_outcome/last_summary，谁后完成谁覆盖。于是「3 个号里 1 个登录过期」这件事，
+    只要那个号先跑完，卡片上就只剩最后一个成功号的绿字——失败的账号在界面上
+    完全消失，而它恰恰是唯一需要人去处理的那个。
+    这里按 batch 聚合：全部完成前显示「已完成 k/N」，全部完成后逐个列出，
+    只要有一个失败整批就记 failed。
     """
     def done(ok: bool, summary: str) -> None:
+        outcome, text = ("ok" if ok else "failed"), f"{label}：{summary}"
+        if batch and total > 1:
+            with _BATCH_LOCK:
+                acc = _BATCHES.setdefault(batch, [])
+                acc.append((who, ok, summary))
+                parts, finished = list(acc), len(acc)
+                if finished >= total:
+                    _BATCHES.pop(batch, None)
+            body = "；".join(f"{w or '本次'} {'✓' if o else '✗'} {s}" for w, o, s in parts)
+            if finished < total:
+                outcome, text = "running", f"{label}（{finished}/{total}）：{body}"
+            else:
+                outcome = "ok" if all(o for _, o, _ in parts) else "failed"
+                text = f"{label}：{body}"
         try:
             with Session(get_engine()) as s:
                 cfg = s.get(PluginConfig, plugin_id)
                 if cfg is None:
                     return
-                cfg.last_outcome = "ok" if ok else "failed"
-                cfg.last_summary = f"{label}：{summary}"[:512]
-                cfg.last_finished_at = utcnow()
+                cfg.last_outcome = outcome
+                cfg.last_summary = text[:512]
+                cfg.last_finished_at = None if outcome == "running" else utcnow()
                 s.add(cfg)
                 s.commit()
         except Exception as e:                              # noqa: BLE001
@@ -1139,28 +1292,31 @@ def _due(last: Optional[dt.datetime], minutes: int, now: dt.datetime) -> bool:
     return (now - last).total_seconds() >= minutes * 60
 
 
-def _fanout(manifest: dict, cfg) -> list[tuple[list[str], str]]:
-    """一次定时触发要起几个子进程，各带什么参数。
+def _fan_targets(m: dict, cfg, cmd, account: Optional[str] = None) -> list[tuple[list[str], str]]:
+    """一次触发要起几个子进程、各带什么参数。返回 [(附加参数, 账号名)]。
 
-    返回 [(附加参数, 日志里的标识)]。
+    **手动与定时共用这一份**，因为扇出规则必须只有一条。原先定时走的是 `_fanout`
+    （判据是**插件**声明了 accounts），手动走的是 `cmd.per`（判据是**命令**声明了 per）
+    ——同一条命令于是有两种行为：手动跑一次、不带 --account；定时按账号跑 N 次、
+    每次多带 `--account X`。插件收到一个它在手动路径下从未见过的参数组合，
+    而这条差异只在无人值守的那条路径上出现，是最难被发现的一类。
 
-    **两类插件**：
-      · `accounts = true`（如淘宝）——一个账号一个进程，各带自己的 cookie 与平台。
-      · 不声明（如汇率、快递查询）——**整体跑一次**，不带 --account。
-
-    以前这里只有前一种：账号列表为空 → 一个都不起 → `launched` 恒为 0 →
-    `last_run_at` 永不推进 → 这类插件**永远不会被定时触发**，而且界面上看不出异常
-    （它「已启用」、有定时周期，只是从不运行）。无账号插件是本次要支持的主要形态，
-    所以这条分支必须存在。
+    判据取 `cmd.per`：per 是**命令**的属性（「这条命令要不要按账号各跑一遍」），
+    插件级的 `accounts` 只说明「这个插件有账号这个维度」。
     """
-    if not manifest.get("accounts"):
+    if cmd.per != "account":
         return [([], "")]
-    out = []
-    for a in _account_list(cfg):
-        if not a["enabled"]:                            # 停用的账号：定时跳过
-            continue
-        out.append((["--account", a["name"], "--platform", a["platform"]], f"/{a['name']}"))
-    return out
+    known = _account_list(cfg)
+    if account:
+        # **点名某个账号时不看「启用」**：账号级的启用只决定「批量跑的时候带不带它」，
+        # 手动点某个号（补抓、重新登录）是用户当下的明确意图，不该被它挡住。
+        # 磁盘上有会话、但配置里没登记的孤儿账号也允许点（换机/重置库之后就剩它了）。
+        named = next((a for a in known if a["name"] == account), None)
+        _check_account_name(m, account)
+        return [(["--account", account,
+                  "--platform", (named or {}).get("platform", "淘宝")], account)]
+    return [(["--account", a["name"], "--platform", a["platform"]], a["name"])
+            for a in known if a["enabled"]]
 
 
 def _scheduled_command(m: dict):
@@ -1168,7 +1324,7 @@ def _scheduled_command(m: dict):
 
     定时是**无人值守**的，所以判据必须来自清单而不是核心里的一个字符串常量：
     写死 "fetch" 的话，没声明它的插件会被一遍遍拉起来跑一个它不认识的动词。
-    （`per="account"` 的命令由 `_fanout` 负责展开，这里只挑动词。）
+    （`per="account"` 的命令由 `_fan_targets` 负责展开，这里只挑动词。）
     """
     cmds = m["_m"].commands
     return (next((c for c in cmds if c.name == "fetch"), None)
@@ -1204,19 +1360,24 @@ def _run_due(session: Session) -> None:
                         cfg.plugin_id, sorted(missing))
             continue
         launched = 0
-        for extra, who in _fanout(m, cfg):
+        # 扇出与令牌口径都与手动路径**同源**，见 _fan_targets / run_command 的注释。
+        targets = _fan_targets(m, cfg, cmd)
+        cmd_scopes = granted & set(cmd.needs)
+        batch = uuid.uuid4().hex
+        for extra, who in targets:
             try:
-                tok, jti = scopes.issue(user, cfg.plugin_id, granted,
+                tok, jti = scopes.issue(user, cfg.plugin_id, cmd_scopes,
                                         timeout_s=_REAP_TIMEOUT)
                 _launch(m, cmd.name, [*extra, "--soroban-url", _SELF_URL],
                         token=tok, config=_launch_conf(session, m, cfg), jti=jti,
                         # 定时也要写回结果。不写的话卡片上的「上次结果」永远停在上一次**手动**
                         # 那一次，而「上次触发」时间一直在走——定时失败在界面上完全不可见。
                         # 汇率取不到恰恰是账本会悄悄用兜底值的那类故障，最需要痕迹。
-                        on_done=_result_writer(cfg.plugin_id, f"定时·{cmd.label}"))
+                        on_done=_result_writer(cfg.plugin_id, f"定时·{cmd.label}",
+                                               who=who, batch=batch, total=len(targets)))
                 launched += 1
             except HTTPException as e:
-                log.warning("定时任务 %s%s 启动失败：%s", cfg.plugin_id, who, e.detail)
+                log.warning("定时任务 %s/%s 启动失败：%s", cfg.plugin_id, who or "-", e.detail)
         if launched:                                    # 只有真的起了进程才推进 last_run_at
             cfg.last_run_at = now                       # 空账号/全部启动失败 → 不推进，下轮重试
             session.add(cfg)

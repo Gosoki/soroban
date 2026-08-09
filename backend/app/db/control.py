@@ -102,14 +102,29 @@ def ensure_schema(engine: Engine) -> None:
 
 
 def read_config(engine: Engine) -> dict:
-    """返回 {'backend': 'sqlite'|'mysql', 'mysql_url': str|None}。无配置时默认 sqlite。"""
+    """返回 {'backend', 'mysql_url', 'degraded'}。无配置时默认 sqlite。
+
+    `degraded` 非空 = **配置里写着 MySQL，但连接串解不开**，已经退回本地 SQLite。
+    降级本身是对的（解不开就连不上，不能让应用起不来），但它**必须可见**：
+    用户看到的现象是打开应用「账本全空了」，而实际数据好端端在 MySQL 里。
+
+    最容易踩到的路径正是升级：`Releases\<VERSION>` 换了目录、exe 搬过去了、
+    `.env` 忘了搬 → SECRET_KEY 变了 → Fernet 解不开旧串 → 静默退回空的本地库。
+    原先这条路上只有一行 `log.error`，而分发版的用户根本不会去看日志。
+    """
     with engine.connect() as conn:
         row = conn.execute(select(app_db_config).where(app_db_config.c.id == 1)).first()
     if row is None:
-        return {"backend": "sqlite", "mysql_url": None}
+        return {"backend": "sqlite", "mysql_url": None, "degraded": ""}
     url = decrypt(row.mysql_url_enc) if row.mysql_url_enc else None
-    backend = row.backend if not (row.backend == "mysql" and url is None) else "sqlite"
-    return {"backend": backend, "mysql_url": url}
+    degraded = ""
+    backend = row.backend
+    if backend == "mysql" and url is None:
+        backend = "sqlite"
+        degraded = ("配置里写着 MySQL，但连接串解不开（SECRET_KEY 变过？）——"
+                    "已暂时退回本地 SQLite。你的 MySQL 数据没丢，"
+                    "恢复原来的 .env 即可；或在本页重新填一次 MySQL 连接。")
+    return {"backend": backend, "mysql_url": url, "degraded": degraded}
 
 
 def write_config(engine: Engine, backend: str, mysql_url: Optional[str] = None) -> None:

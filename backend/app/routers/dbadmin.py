@@ -78,12 +78,13 @@ def _resolve_target(t: Target):
 def _active_identity() -> dict:
     """当前生效后端 + （MySQL 时）连接标识，供前端展示/比对。不含密码。"""
     backend = current_backend()
-    d = {"backend": backend}
-    if backend == "mysql":
-        cfg = control.read_config(control_engine())
-        if cfg["mysql_url"]:
-            u = make_url(cfg["mysql_url"])
-            d.update(host=u.host, port=u.port, user=u.username, database=u.database)
+    cfg = control.read_config(control_engine())
+    # `degraded` 要**无条件**带上：它恰恰只在 backend 已被降级成 sqlite 时才非空，
+    # 放进 `if backend == "mysql"` 里就永远发不出去。
+    d = {"backend": backend, "degraded": cfg.get("degraded", "")}
+    if backend == "mysql" and cfg["mysql_url"]:
+        u = make_url(cfg["mysql_url"])
+        d.update(host=u.host, port=u.port, user=u.username, database=u.database)
     return d
 
 

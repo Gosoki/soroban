@@ -81,6 +81,7 @@ import { applyRowUpdate } from '@/utils/orderWrites'
 import { stagingApi, tagsApi } from '@/api'
 import { ORDER_SOURCES, PRICE_HELP, IMPORT_STATUS, PURCHASE_STATUS, importStatusStyle } from '@/constants'
 import { fmtDate } from '@/utils/datetime'
+import { afterCreate, afterDelete } from '@/utils/listRows'
 import NotionTable from '@/components/NotionTable.vue'
 
 // 默认列顺序 + 统一列宽（≈ 刚好显示日期，取整多留一点 = 110）；用户可拖动改序/改宽，改动持久化
@@ -198,8 +199,7 @@ async function savePostage(row) {
 async function addRow(data = {}, done) {
   try {
     const created = await stagingApi.create({ ...data })
-    rows.value.unshift(created)
-    total.value++
+    await afterCreate(created, { rows, total, page, filters, load, dateKey: 'order_date' })
     done?.(true)
   } catch (e) {
     done?.(false)   // 失败时保留幽灵行里的草稿，让用户就地改
@@ -236,7 +236,7 @@ async function doDelete(row) {
   try {
     await stagingApi.remove(row.id)
     ElMessage.success('已删除')
-    load()
+    await afterDelete({ rows, page, load })
   } catch (_) { /* 拦截器已提示 */ }
 }
 

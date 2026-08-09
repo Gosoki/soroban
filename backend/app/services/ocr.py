@@ -111,12 +111,48 @@ def _longest_digit_run(text: str, min_len: int = 1) -> Optional[str]:
     return best if len(best) >= min_len else None
 
 
+# 主流快递单号的长度下界：顺丰 12/15、圆通/中通/申通 12、韵达 13、EMS 13、京东 JD+13。
+# 短于它的「号」本身可疑，但只有在**旁边还紧邻着另一段数字**时才判定为被 OCR 断开——
+# 孤立的短号照常取，见 _looks_split。
+_TRACK_TYPICAL_MIN = 10
+
+
+def _looks_split(text: str, best: str) -> bool:
+    """`best` 左右紧邻（只隔一个空格）还有另一段含数字的字母数字串。
+
+    这是「这一行的号被 OCR 断成了两截」的信号。判据要求**紧邻且只隔一个空格**，
+    所以同行的日期（`2026-08-01` 会被切成三段，但分隔符是连字符）、
+    中文标签（不进 alnum run）都不会误触发。
+    """
+    m = re.search(rf"(?<![A-Za-z0-9]){re.escape(best)}(?![A-Za-z0-9])", text)
+    if not m:
+        return False
+    return bool(re.search(r"[A-Za-z0-9]*\d[A-Za-z0-9]* $", text[:m.start()])
+                or re.match(r"^ [A-Za-z0-9]*\d[A-Za-z0-9]*", text[m.end():]))
+
+
 def _extract_tracking(text: str, min_len: int = 8) -> Optional[str]:
     """快递单号：可能带字母前缀（顺丰 SF、京东 JD 等），取「字母数字混合、含≥6 位数字」的
-    最长串并统一大写；纯数字单号照常命中。要求含足够数字 → 排除纯字母串（如地址 ATPTSTKH）。"""
+    最长串并统一大写；纯数字单号照常命中。要求含足够数字 → 排除纯字母串（如地址 ATPTSTKH）。
+
+    **取到的号明显偏短、而旁边紧挨着另一段数字 → 返回 None（判为读不出）。**
+    OCR 会把一个长号断成两截，而这里原本只是「取最长的那一段」：
+        `快递单号 SF1234 56789012` → `56789012`   ← 后半截
+        `快递单号 SF123456 789012` → `SF123456`   ← 前半截
+    半截号会被 `shipment.py` 的 `Order.express_no == no` 拿去**精确匹配**并原子挂靠——
+    匹配不上还好（只是漏一单），万一撞上别人的单号就是把货挂到无关订单上。
+    口径与 `_same_row_value` 的兜底上限一致：**宁可不取，也不能取错**。
+    返回 None 之后这一行会落进 `parse_shipment_fields` 的 `unreadable` 计数，
+    用户会看到「另有 N 行未能读出单号，请核对」，而不是一个悄悄取错的号。
+    """
     runs = re.findall(r"[A-Za-z0-9]+", text or "")
     cands = [r for r in runs if len(r) >= min_len and sum(c.isdigit() for c in r) >= 6]
-    return max(cands, key=len).upper() if cands else None
+    if not cands:
+        return None
+    best = max(cands, key=len)
+    if len(best) < _TRACK_TYPICAL_MIN and _looks_split(text or "", best):
+        return None
+    return best.upper()
 
 
 # OCR 常把 ASCII 连字符识别成各种全角/排版破折号，统一归一后再做正则匹配。
@@ -185,6 +221,9 @@ def _nearest_company(anchor: dict, tokens: list[dict], row_tol: float) -> Option
     return None
 
 
+_BELOW_ROWS = 2      # 「往下兜底」最多跨几行（× row_tol）；见 _same_row_value
+
+
 def _same_row_value(anchor: dict, tokens: list[dict], row_tol: float,
                     min_len: int, key: str = "digits", allow_below: bool = True) -> Optional[str]:
     """在与 anchor 同一行（y 接近）里找 key 值（digits/tracking）最长的框，优先取右侧的。
@@ -192,7 +231,15 @@ def _same_row_value(anchor: dict, tokens: list[dict], row_tol: float,
 
     `allow_below=False` 用于**内容词锚点**（如快递公司名）——真标签（「订单编号」「快递单号」）
     只会出现在它的值旁边，往下兜底是安全的；而公司名可能出现在页面任何地方（商品标题里的
-    「顺丰包邮」），往下兜底会一路抓到页面下方的订单号，把它当成快递号。"""
+    「顺丰包邮」），往下兜底会一路抓到页面下方的订单号，把它当成快递号。
+
+    但「往下兜底是安全的」只在**紧邻下一行**成立，所以兜底带 `_BELOW_ROWS` 行的距离上限。
+    没有上限时：本行的号被 OCR 断成两截（`快递单号 YT2222 333344`，两段都不满足 min_len）
+    → 候选为空 → 一路向下扫**整页**，抓到页脚的客服电话当快递单号。实测能跨 2200px
+    抓到 11 位手机号，而 11 位纯数字正好落在中通/韵达单号的长度区间里，
+    `shipment.py` 那句 `Order.express_no == no` 会精确命中并把货挂到别人的订单上。
+    上限取 2 行而不是干脆禁用兜底：真实的「内含快递」页存在「列头在上、号在下一行」的
+    表格版式，禁用会把那种版式整页打空。"""
     cands = [t for t in tokens if t is not anchor and t[key]
              and len(t[key]) >= min_len]
     same_row = [t for t in cands if abs(t["cy"] - anchor["cy"]) <= row_tol]
@@ -202,7 +249,8 @@ def _same_row_value(anchor: dict, tokens: list[dict], row_tol: float,
         return pick[key]
     if not allow_below:
         return None
-    below = [t for t in cands if t["cy"] > anchor["cy"]]
+    below = [t for t in cands
+             if 0 < t["cy"] - anchor["cy"] <= row_tol * _BELOW_ROWS]
     if below:
         return min(below, key=lambda t: t["cy"] - anchor["cy"])[key]
     return None
@@ -455,24 +503,62 @@ def parse_order_fields(ocr_result) -> dict:
     return out
 
 
-def recognize_order(image_bytes: bytes) -> dict:
-    """对上传的截图跑 OCR 并解析出订单字段。抛 OcrUnavailable 表示引擎不可用。"""
-    engine = _get_engine()
-    try:
-        from PIL import Image
-        import numpy as np
+MAX_OCR_PIXELS = 40_000_000      # 4000 万像素 ≈ 8000×5000，覆盖 8K 截图与常规扫描件
 
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        arr = np.array(img)
+
+def _decode_image(image_bytes: bytes):
+    """字节 → RGB 数组，**带像素闸**。抛 ValueError（路由映射成 400）。
+
+    为什么必须卡像素而不只卡字节：`routers/common.MAX_OCR_BYTES` 卡的是**压缩后**大小，
+    而 PNG 对纯色/渐变的压缩比能到几千倍。实测 189KB 的 13000×13000 PNG 解出来是
+    507MB 的 uint8 数组，加上引擎前处理的副本峰值 1.1GB——一张图就能把这台机器
+    （可用内存 1.5GB 上下）打到 MemoryError 或被 OOM killer 带走整个 uvicorn。
+
+    闸放在这里而不是路由层：三条上传路由共用同一段解码，改一处全覆盖；
+    而且 `Image.open` 是惰性的，读 `.size` 不解码像素，判断本身零成本。
+
+    超限**直接拒绝**而不是降采样：降采样会掉小字体识别率，而识别错的快递单号
+    比识别不出来贵得多——错号会去精确匹配并挂靠到别人的订单上。
+    """
+    from PIL import Image
+    import numpy as np
+
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        w, h = img.size
+    except Exception as e:
+        raise ValueError(f"图片无法解析：{e}") from e
+    if w * h > MAX_OCR_PIXELS:
+        raise ValueError(
+            f"图片分辨率过大（{w}×{h}，上限 {MAX_OCR_PIXELS // 1_000_000} 百万像素）。"
+            "请裁掉无关区域或截短后重试"
+        )
+    try:
+        return np.array(img.convert("RGB"))
     except Exception as e:
         raise ValueError(f"图片无法解析：{e}") from e
 
-    with _infer_lock:                 # 串行化引擎推理（RapidOCR 非保证可重入）
+
+def _run_engine(engine, arr):
+    """串行化引擎推理（RapidOCR 非保证可重入），异常转 ValueError → 路由映射成 400。"""
+    with _infer_lock:
         try:
             result, _ = engine(arr)
         except Exception as e:        # noqa: BLE001  极端尺寸/畸形图让引擎前处理内部报错
-            # 转成 ValueError → 路由映射为 400「图片无法识别」，而不是裸 500。
             raise ValueError(f"图片无法识别（OCR 引擎处理失败）：{e}") from e
+    return result
+
+
+def recognize_order(image_bytes: bytes) -> dict:
+    """对上传的截图跑 OCR 并解析出订单字段。抛 OcrUnavailable 表示引擎不可用。"""
+    engine = _get_engine()
+    # `arr` 必须留着：下面判「拿错截图」时要用它跑卡通卡车模板匹配（_truck_present）。
+    # 曾经把这行写成 `_run_engine(engine, _decode_image(...))` 一步到位——解码结果没了名字，
+    # 而 60 行之外那处 `_truck_present(arr)` 静静地变成 NameError：
+    # 只要上传一张含京东/淘宝强标记的截图就必崩 500，而闲鱼截图（占绝大多数）走 else 分支、
+    # 一切正常，所以本地怎么点都试不出来。
+    arr = _decode_image(image_bytes)
+    result = _run_engine(engine, arr)
     fields = parse_order_fields(result)
 
     # OCR 只产出闲鱼数据：来源恒为「闲鱼」。仅当截图有明确淘宝/京东强标记、且无任何闲鱼信号
@@ -526,7 +612,7 @@ def parse_shipment_fields(ocr_result) -> dict:
     """从集运截图的 OCR 结果里抽取集运单字段。两个 Tab 共用本函数，靠 kind 区分识别到的是哪张。"""
     tokens = _to_tokens(ocr_result)
     out = {"kind": "unknown", "shipment_no": None, "intl_tracking_no": None,
-           "date": None, "channel": None, "express_nos": []}
+           "date": None, "channel": None, "express_nos": [], "unreadable": 0}
     if not tokens:
         return out
 
@@ -559,7 +645,13 @@ def parse_shipment_fields(ocr_result) -> dict:
     # 订单时间：只取日期部分（页面是 YYYY-MM-DD HH:MM:SS）
     _, out["date"] = _first("订单时间", lambda t: _parse_order_date(t, tokens, row_tol))
 
-    # 内含快递：**所有**含「快递单号」的框都是锚点（不是取首个），逐行取号后去重保序
+    # 内含快递：**所有**含「快递单号」的框都是锚点（不是取首个），逐行取号后去重保序。
+    #
+    # `unreadable` 是「看见了锚点、却没能取到号」的行数。没有它的时候这件事**零出口**：
+    # 3 行快递里坏了 1 行 → 响应里只有 2 个号 → 前端照样弹绿色的「已关联 2 单」，
+    # 用户没有任何线索知道第 3 单被丢了，也无从把遗留的未挂靠单对回是哪张截图。
+    # 注意：重号（两行取到同一个号，_same_row_value 跨行兜底时会发生）不计入 unreadable，
+    # 它是「取到了但重复」，与「取不到」是两回事——但它同样意味着少挂一单，故一并计数。
     seen = set()
     for t in tokens:
         if "快递单号" not in t["text"]:
@@ -568,6 +660,8 @@ def parse_shipment_fields(ocr_result) -> dict:
         if no and no not in seen:
             seen.add(no)
             out["express_nos"].append(no)
+        else:
+            out["unreadable"] += 1
 
     # kind：成品包裹页的标识字段优先；只有快递号列表则是内含快递页
     if out["intl_tracking_no"] or out["shipment_no"]:
@@ -581,21 +675,7 @@ def recognize_shipment(image_bytes: bytes) -> dict:
     """对上传的集运截图跑 OCR 并解析出集运单字段。抛 OcrUnavailable 表示引擎不可用。
     不做平台判定/卡车模板匹配——那套是闲鱼商品订单专用的。"""
     engine = _get_engine()
-    try:
-        from PIL import Image
-        import numpy as np
-
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        arr = np.array(img)
-    except Exception as e:
-        raise ValueError(f"图片无法解析：{e}") from e
-
-    with _infer_lock:                 # 串行化引擎推理（RapidOCR 非保证可重入）
-        try:
-            result, _ = engine(arr)
-        except Exception as e:        # noqa: BLE001  极端尺寸/畸形图让引擎前处理内部报错
-            # 转成 ValueError → 路由映射为 400「图片无法识别」，而不是裸 500。
-            raise ValueError(f"图片无法识别（OCR 引擎处理失败）：{e}") from e
+    result = _run_engine(engine, _decode_image(image_bytes))
     fields = parse_shipment_fields(result)
     fields["raw_text"] = "\n".join(item[1] for item in (result or []))
     return fields

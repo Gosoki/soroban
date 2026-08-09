@@ -42,7 +42,11 @@ rem ===== Ensure backend deps + pyinstaller are available in the chosen interpre
 rem All the checks below are FLAT (no parentheses around the `if errorlevel`), for the reason
 rem spelled out at the top: inside a block, %errorlevel% is expanded at parse time and would
 rem always read the value from before the block -- i.e. these install failures would go unnoticed.
-"%PY%" -c "import fastapi, uvicorn, sqlmodel, alembic" >nul 2>&1
+rem The sentinel must cover the OCR deps too. collect_data_files/collect_submodules only
+rem WARN when a package is missing and return an empty list, so PyInstaller happily ships an
+rem exe whose OCR is dead -- a failure that only shows up on the user's machine.
+rem (soroban.spec now hard-fails on this as well; this check just fixes it earlier.)
+"%PY%" -c "import fastapi, uvicorn, sqlmodel, alembic, rapidocr_onnxruntime, PIL" >nul 2>&1
 if not errorlevel 1 goto backend_deps_ok
 echo Backend deps missing, installing from requirements.txt ...
 "%PY%" -m pip install -r "%BACKEND%\requirements.txt"
@@ -116,6 +120,30 @@ rem next to soroban.exe to have them discovered (each plugin runs in its own ven
 
 rem ===== Clean build intermediates =====
 if exist "%ROOT%build" rmdir /s /q "%ROOT%build"
+
+rem ===== Warn when the ledger is left behind in an older release folder =====
+rem VERSION is a hand-edited constant and %RELEASE% doubles as the RUNTIME data dir.
+rem Bumping VERSION therefore produces a BRAND-NEW EMPTY folder: the new exe would create
+rem a fresh empty ledger on first run and the user reads that as "the upgrade ate my data".
+rem The data is not lost -- it is sitting in the previous version's folder -- but nothing
+rem says so anywhere, so say it here, loudly, right where they will see it.
+if exist "%RELEASE%\soroban.db" goto data_ok
+set "OLDDATA="
+for /d %%D in ("%ROOT%Releases\*") do if exist "%%D\soroban.db" set "OLDDATA=%%D"
+if not defined OLDDATA goto data_ok
+echo.
+echo ========================================
+echo   [!] YOUR LEDGER IS NOT IN THIS FOLDER
+echo   Found existing data in: %OLDDATA%
+echo   VERSION changed, so %RELEASE% is a brand-new EMPTY folder. Running the new
+echo   soroban.exe as-is would create an EMPTY ledger and a NEW SECRET_KEY.
+echo.
+echo   Copy these from the old folder into the new one BEFORE running the new exe:
+echo       soroban.db  soroban.db-wal  soroban.db-shm  .env  plugins\
+echo   .env holds the SECRET_KEY: without it everyone is logged out and the saved
+echo   MySQL connection string can no longer be decrypted.
+echo ========================================
+:data_ok
 
 echo.
 echo ========================================

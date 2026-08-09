@@ -26,14 +26,14 @@
         <!-- 绑定快递单：每行一个投放区，把该包裹的「内含快递」截图拖到这里即自动关联商品订单。
              与整窗拖拽（建单）是两个互不含糊的目标：拖到行上=绑快递，拖到别处=建单。 -->
         <template #cell-bind_express="{ row }">
-          <div class="bind-drop" :class="{ armed: dragActive, over: dragOverId === row.id, busy: bindBusy === row.id }"
+          <div class="bind-drop" :class="{ armed: dragActive, over: dragOverId === row.id, busy: isBinding(row) }"
                @click="pickForRow(row)"
                @dragenter.prevent.stop="dragOverId = row.id"
                @dragover.prevent.stop="dragOverId = row.id"
                @dragleave.prevent.stop="dragOverId = null"
                @drop.prevent.stop="onRowDrop(row, $event)">
-            <el-icon class="bind-ic"><Loading v-if="bindBusy === row.id" /><Upload v-else /></el-icon>
-            <span>{{ bindBusy === row.id ? '识别中…' : '拖入内含快递图' }}</span>
+            <el-icon class="bind-ic"><Loading v-if="isBinding(row)" /><Upload v-else /></el-icon>
+            <span>{{ isBinding(row) ? '识别中…' : '拖入内含快递图' }}</span>
           </div>
         </template>
 
@@ -110,9 +110,10 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Camera, Loading, Upload } from '@element-plus/icons-vue'
 import { shipmentApi, ordersApi } from '@/api'
-import { SHIPMENT_STATUS } from '@/constants'
+import { SHIPMENT_STATUS, longToast } from '@/constants'
 import { fmtJPY } from '@/utils/money'
 import { today } from '@/utils/datetime'
+import { afterCreate, afterDelete } from '@/utils/listRows'
 import NotionTable from '@/components/NotionTable.vue'
 
 const router = useRouter()
@@ -179,8 +180,7 @@ async function saveCell(row, key, value) {
 async function addRow(data = {}, done) {
   try {
     const created = await shipmentApi.create({ date: today(), shipment_status: '打包中', ...data })
-    rows.value.unshift(created)
-    total.value++
+    await afterCreate(created, { rows, total, page, filters, load })
     done?.(true)
     return created                    // OCR 建单据此判断是否真的建成（失败时拦截器已提示）
   } catch (e) {
@@ -202,8 +202,7 @@ async function delRow(row) {
   try {
     await shipmentApi.remove(row.id)
     ElMessage.success('已删除')
-    if (rows.value.length === 1 && page.value > 1) page.value--   // 删掉本页最后一行 → 回上一页，避免停在空页
-    load()                                                        // 重新拉取：分页/总数与后端同步
+    await afterDelete({ rows, page, load })
   } catch (_) { /* 拦截器已提示 */ }
 }
 
@@ -243,7 +242,7 @@ let pkgRunning = false
 const dragActive = ref(false)     // 整窗有文件拖入：亮起各行投放区 + 顶部横幅
 let dragDepth = 0                 // dragenter/leave 会因子元素冒泡多次触发，用计数判断真正离开
 const dragOverId = ref(null)      // 正悬停其上的行 id
-const bindBusy = ref(null)        // 正在识别内含快递的集运单 id
+const bindingRowId = ref(null)    // **正在识别**内含快递的那一行 id（排队中的行见 isBinding）
 const rowFileInput = ref(null)
 let pickTargetRow = null          // 行内投放区「点击选图」的目标行
 
@@ -308,8 +307,16 @@ async function processPkg(file) {
 }
 
 // --- 行内「绑定快递单」投放区 ---
+//
+// 这里原先是一个**全局**单闸：`if (bindBusy.value) return`，而 bindBusy 存的是行 id、
+// 只被当布尔用。后果是 A 行正在识别时（真实 OCR 是秒级的）往 B 行拖图 —— B 行照样亮绿环、
+// 光标是 pointer、松手看起来一切正常，而那张图**一次请求都没发**，也没有任何提示；
+// 紧接着 A 行完成还会弹一句绿色的「已关联 N 单」，更坐实了「两张都成了」的错觉。
+// `@drop.prevent.stop` 的 .stop 又挡住了冒泡，图连整窗建单队列都进不去，是彻底销毁。
+//
+// 改成排队（与本文件的 pkgQueue 同款）：后端 OCR 本来就是串行的（_infer_lock），
+// 排队既不会更慢，又保证用户交出去的每一张图都真的被处理。
 function pickForRow(row) {
-  if (bindBusy.value) return
   pickTargetRow = row
   rowFileInput.value.value = ''        // 清空，否则连选同一张图不触发 change
   rowFileInput.value.click()
@@ -325,16 +332,42 @@ function onRowDrop(row, e) {
   const files = Array.from(e.dataTransfer?.files || []).filter((f) => !f.type || f.type.startsWith('image/'))
   if (!files.length) return
   if (files.length > 1) ElMessage.warning('一行一次只处理一张「内含快递」截图，已取第一张')
-  bindExpress(row, files[0])
+  enqueueBind(row, files[0])
+}
+
+// 排队：把 {行, 图} 推进队列，逐张串行识别。行的「识别中…」显示条件改成
+// 「正在识别本行 或 本行还在队列里」，否则会出现「排着队但没有任何一行显示识别中」。
+const bindQueue = ref([])
+let bindRunning = false
+function isBinding(row) {
+  return bindingRowId.value === row.id || bindQueue.value.some((j) => j.row.id === row.id)
+}
+function enqueueBind(row, file) {
+  bindQueue.value.push({ row, file })
+  pumpBind()
+}
+async function pumpBind() {
+  if (bindRunning) return
+  bindRunning = true
+  try {
+    while (bindQueue.value.length) {
+      const { row, file } = bindQueue.value.shift()
+      await bindExpress(row, file)
+    }
+  } finally {
+    bindRunning = false
+  }
 }
 
 async function bindExpress(shipmentRow, file) {
-  if (bindBusy.value) return
-  bindBusy.value = shipmentRow.id
+  bindingRowId.value = shipmentRow.id
   try {
     const res = await shipmentApi.ocrExpress(shipmentRow.id, file)
+    const unreadable = res.unreadable || 0
     if (!res.express_nos.length) {
-      ElMessage.warning('未识别到快递单号，请确认拖入的是「内含快递」页截图')
+      ElMessage.warning(unreadable
+        ? `识别到 ${unreadable} 行「快递单号」，但一个号都没读出来（可能是断行或图太糊），请重截一张更清晰的`
+        : '未识别到快递单号，请确认拖入的是「内含快递」页截图')
       return
     }
     Object.assign(shipmentRow, res.shipment)
@@ -342,12 +375,18 @@ async function bindExpress(shipmentRow, file) {
     const parts = [`已关联 ${res.attached.length} 单`]
     if (res.skipped.length) parts.push(`跳过 ${res.skipped.length} 单（已挂其他集运单）`)
     if (res.unmatched.length) parts.push(`未匹配 ${res.unmatched.length} 个快递号：${res.unmatched.join('、')}`)
+    // 「看见了快递单号这一行、却没读出号」必须说出来。它原先在响应里根本不存在，
+    // 于是 3 行坏 1 行的截图会安安静静地弹绿色「已关联 2 单」，少挂的那单无人知晓。
+    if (unreadable) parts.push(`另有 ${unreadable} 行未能读出单号，请核对下方识别结果`)
+    // 识别到的号一并列出：这个字段一直都在（注释写着「供人工核对」），却从来没渲染过。
+    parts.push(`识别到：${res.express_nos.join('、')}`)
     const text = parts.join('；')
-    // 有跳过/未匹配就用 warning 常驻久一点，让用户看清是哪几个号
-    if (res.skipped.length || res.unmatched.length) ElMessage({ type: 'warning', message: text, duration: 8000 })
-    else ElMessage.success(text)
+    // 有跳过/未匹配/读不出就用 warning 常驻久一点，让用户看清是哪几个号
+    if (res.skipped.length || res.unmatched.length || unreadable) {
+      longToast(ElMessage, 'warning', text)      // 与全仓「长提示」同一档，见 constants.TOAST_LONG
+    } else ElMessage.success(text)
   } catch (_) { /* 拦截器已提示 */ } finally {
-    bindBusy.value = null
+    bindingRowId.value = null
   }
 }
 

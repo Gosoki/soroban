@@ -194,7 +194,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, ArrowUp, Refresh, QuestionFilled } from '@element-plus/icons-vue'
 import { pluginsApi, tagsApi } from '@/api'
-import { tagStyleAt, typeStyle } from '@/constants'
+import { longToast, tagStyleAt, typeStyle } from '@/constants'
 import { fmtDateTime } from '@/utils/datetime'
 
 const plugins = ref([])
@@ -377,7 +377,7 @@ async function doInstall(p) {
     // 不要写进 p.install.error：那是服务端字段，下一次 load()/轮询会用服务端的 {} 覆盖掉，
     // 表现成「错误提示自己消失」。
     if (e.response?.status === 409) {
-      ElMessage({ type: 'error', duration: 8000, message: e.response?.data?.detail || '无法开始安装' })
+      longToast(ElMessage, 'error', e.response?.data?.detail || '无法开始安装')
     }
     // 其余状态码拦截器已提示
   }
@@ -496,11 +496,9 @@ async function doDeleteAccountStaging(p, account) {
   try {
     const r = await pluginsApi.deleteAccountStaging(p.id, account)
     if (r.skipped) {
-      ElMessage({
-        type: 'warning', duration: 8000,
-        message: `已删除 ${account} 的暂存单 ${r.deleted} 条；跳过 ${r.skipped} 条已导入的`
-          + `（删了会在账本里留下导不回来的孤儿单，请先到「商品订单」页删掉对应订单）`,
-      })
+      longToast(ElMessage, 'warning',
+        `已删除 ${account} 的暂存单 ${r.deleted} 条；跳过 ${r.skipped} 条已导入的`
+        + `（删了会在账本里留下导不回来的孤儿单，请先到「商品订单」页删掉对应订单）`)
     } else {
       ElMessage.success(`已删除 ${account} 的暂存单 ${r.deleted} 条`)
     }

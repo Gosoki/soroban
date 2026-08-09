@@ -413,3 +413,126 @@ def test_plugin_token_ttl_is_derived_from_the_reap_timeout():
             f"令牌只活 {left:.0f} 秒，比子进程允许跑的 {mod._REAP_TIMEOUT} 秒还短"
     finally:
         scopes.revoke(jti)
+
+
+def test_kind_to_scope_map_is_pinned():
+    """每种 kind 对应哪一枚权限，**钉死在这里**。
+
+    `register()` 只校验「这个 scope 存在」，不校验「这是不是最窄的那一枚」。
+    把 `plugin.record` 的 scope 从 `data:own` 改成 `staging:write` 照样注册成功，
+    而效果是：任何拿到写暂存权限的插件，都能读写**别的插件**的私有存储——
+    用户在卡片上勾的是「写暂存订单」，实际给出去的远不止。
+    这类扩权在代码里只是一个单词的差别，review 时极易漏过；钉一张表，改了就红。
+
+    加新 kind 时把它加进来，并在 review 里回答一句：这枚权限是**能表达该操作的最窄**的吗？
+    """
+    ingest.load_kinds()
+    expected = {
+        "fx.rate": "fx:write",          # 只写汇率表
+        "plugin.record": "data:own",    # 只写本插件自己的私有存储
+    }
+    actual = {k: h.scope for k, h in ingest.KINDS.items()}
+    assert actual == expected, (
+        f"kind→scope 映射变了：{actual}。若是有意改动，请连带更新这张表，"
+        f"并确认新权限是能表达该操作的**最窄**的一枚。"
+    )
+
+
+def test_by_kind_sentinel_is_used_by_exactly_one_route():
+    """`x-scope: "*by-kind*"` 是个哨兵：中间件对它**只验「有没有任何权限」**，
+    真正的判定交给该路由自己按 kind 做（见 routers/ingest.py）。
+
+    也就是说，任何挂上这个哨兵、却没有自己那层 kind 级判权的路由，
+    等于对**所有**持令牌的插件敞开。今天只有 `POST /api/plugins/ingest` 有这层判权，
+    所以哨兵只允许出现一次；再多一条就必须先回答「它的第二层闸在哪」。
+    """
+    from app.main import app
+
+    marked = [f"{sorted(r.methods)} {r.path}" for r in scopes._iter_routes(app)
+              if (r.openapi_extra or {}).get("x-scope") == "*by-kind*"]
+    assert len(marked) == 1, (
+        f"`*by-kind*` 哨兵出现在 {len(marked)} 条路由上：{marked}。"
+        f"每一条都必须自带 kind 级判权，否则它对所有持令牌的插件是敞开的。"
+    )
+
+
+# --- 基础设施权限（baseline）---------------------------------------------------
+
+def test_plugin_token_can_always_read_the_ingest_contract(client, session):
+    """`GET /api/plugins/contract` 是「插件自我投影」的地基，任何插件令牌都必须进得去。
+
+    令牌按 `cmd.needs` 收窄之后，仓库里两个插件四条命令**没有任何一条**把 meta:read
+    写进 needs → 这条自检接口对所有插件恒 403，地基根本没浇上。
+    而它返回的是纯元数据（kind 名、字段名、批量上限），零业务数据。
+
+    ⚠️ 这条测试必须用 `scopes.issue()` **正常签发**的令牌，不能手工拼一个带 meta:read 的
+    ——原先的守卫就是那么写的，于是它绕过了签发路径，一直是绿的，而真实插件全部 403。
+    """
+    from app.plugins import scopes
+
+    class _U:
+        id, username = 1, "admin"
+
+    tok, _ = scopes.issue(_U(), "anyplugin", set())     # 一项授权都没有
+    r = client.get("/api/plugins/contract", headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 200, f"零授权的插件读不到 contract：{r.status_code} {r.text}"
+    assert "kinds" in r.json()
+
+
+def test_plugin_token_can_always_read_status_rules(client, session):
+    """同上：状态机规则是淘宝插件同步已导入订单状态的依据，拿不到就静默同步不上。"""
+    from app.plugins import scopes
+
+    class _U:
+        id, username = 1, "admin"
+
+    tok, _ = scopes.issue(_U(), "anyplugin", set())
+    r = client.get("/api/meta/status-rules", headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 200, f"零授权的插件读不到状态机规则：{r.status_code}"
+
+
+def test_reading_fx_needs_its_own_scope(client, session):
+    """汇率读取**不是**核心元数据：它是业务数据，要单独授权。
+
+    `meta:read` 曾经把 `/api/fx`、`/api/fx/history` 一起开着，而它的名字与文案都在说
+    「只读规则」。拆成 `fx:read` 之后，baseline 就真的只剩零业务数据的那部分。
+    """
+    from app.plugins import scopes
+
+    class _U:
+        id, username = 1, "admin"
+
+    bare, _ = scopes.issue(_U(), "anyplugin", set())
+    assert client.get("/api/fx", headers={"Authorization": f"Bearer {bare}"}).status_code == 403
+    ok, _ = scopes.issue(_U(), "anyplugin", {"fx:read"})
+    assert client.get("/api/fx", headers={"Authorization": f"Bearer {ok}"}).status_code == 200
+
+
+def test_baseline_scopes_are_not_offered_for_granting():
+    """baseline 项不出现在授权勾选框里——勾一个「反正都有」的框只会制造疑惑。"""
+    from app.plugins import scopes
+
+    offered = {s["key"] for s in scopes.describe()}
+    assert "meta:read" not in offered
+    assert offered == set(scopes.SCOPES) - set(scopes._BASELINE)
+
+
+def test_token_scopes_and_issue_agree_on_baseline():
+    """`token_scopes()`（算 blocked 用）与 `issue()`（真发令牌）必须同口径。
+
+    不一致的后果：把 baseline 项写进 `needs` 的命令，卡片上按钮永久禁用且无法自救
+    （用户勾不到那一项），而 `issue()` 其实照发不误——界面说没权限，实际有。
+    """
+    from app.plugins import scopes
+
+    class _U:
+        id, username = 1, "admin"
+
+    effective = scopes.token_scopes({"scopes": []}, None)
+    tok, _ = scopes.issue(_U(), "p", set())
+    import jose.jwt as jwt
+
+    from app.config import settings
+    scp = set(jwt.decode(tok, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])["scp"])
+    assert set(scopes._BASELINE) <= effective, "token_scopes 漏了 baseline → 按钮会永久变灰"
+    assert set(scopes._BASELINE) <= scp, "issue 漏了 baseline"

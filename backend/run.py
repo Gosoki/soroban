@@ -40,21 +40,73 @@ def _runtime_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _fatal(msg: str, *, hint: str = "") -> "NoReturn":       # noqa: F821
+    """打印人话错误并退出。**打包态下挂住窗口**。
+
+    打包版是双击运行的：任何异常都会让控制台窗口在几毫秒内关掉，用户看到的是
+    「点了没反应」。而这些失败恰恰都是用户自己能解决的（换个目录、关掉另一个实例），
+    前提是他得看见错在哪。所以冻结态下必须停下来等一次回车。
+    源码运行不 pause——那会卡住 CI 与脚本。
+    """
+    print(f"\n[soroban 启动失败] {msg}", file=sys.stderr)
+    if hint:
+        print(f"  → {hint}", file=sys.stderr)
+    if getattr(sys, "frozen", False):
+        try:
+            input("\n按回车关闭这个窗口…")
+        except (EOFError, KeyboardInterrupt):
+            pass
+    raise SystemExit(1)
+
+
 def ensure_env(rt: Path) -> bool:
     """保证运行目录下有 .env（含随机 SECRET_KEY）。返回是否是本次新建的。
 
     必须在 `import app.*` **之前**调用——app.config 在导入时就实例化 Settings 并读 .env。
     已存在则原样不动（不覆盖用户改过的配置）。
+
+    写不进去是**致命的**，不能吞掉继续跑：没有 .env 就没有随机 SECRET_KEY，
+    而 config.py 的默认值写在公开仓库里——那等于任何人都能伪造管理员令牌。
+    最常见的触发是把 exe 放进 `C:\\Program Files\\` 后双击（该目录对普通用户只读），
+    原先这里抛的是一句裸 PermissionError traceback，窗口随即关闭。
     """
     f = rt / ".env"
     if f.exists():
         return False
-    f.write_text(_ENV_TEMPLATE.format(secret=secrets.token_hex(32)), encoding="utf-8")
+    try:
+        f.write_text(_ENV_TEMPLATE.format(secret=secrets.token_hex(32)), encoding="utf-8")
+    except OSError as e:
+        _fatal(
+            f"无法在 {rt} 里创建 .env（{e.__class__.__name__}: {e}）。\n"
+            "  soroban 需要把配置、账本数据库、插件登录会话都写在自己所在的目录里。",
+            hint="把整个 soroban 文件夹移到有写权限的位置（如 桌面 或 D:\\soroban）再双击。"
+                 "别放在 C:\\Program Files 下——那里对普通用户是只读的。",
+        )
     try:                                   # 尽量收紧权限；Windows 上 chmod 基本无效，忽略即可
         f.chmod(0o600)
     except OSError:
         pass
     return True
+
+
+def _check_port_free(host: str, port: int) -> None:
+    """端口占用 → **启动前**就说清楚，而不是让 uvicorn 抛异常后窗口一闪而过。
+
+    这是打包版最常见的失败：用户双击了第二次（第一个还在跑）。原先的表现是
+    先打印「soroban 已启动」、然后一串 traceback、然后窗口关闭——最后留在屏幕上的
+    那句话还是「已启动」，与事实完全相反。
+    """
+    import socket
+
+    probe_host = "127.0.0.1" if host == "0.0.0.0" else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1.0)
+        if s.connect_ex((probe_host, port)) == 0:
+            _fatal(
+                f"端口 {port} 已被占用——多半是 soroban 已经在跑了。",
+                hint=f"先去看看是不是已经开着（浏览器打开 http://{probe_host}:{port}）。"
+                     f"确实要再开一个的话，换个端口：设环境变量 BACKEND_PORT=8621 再启动。",
+            )
 
 
 def main() -> None:
@@ -90,6 +142,8 @@ def main() -> None:
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("BACKEND_PORT", "8620"))
 
+    _check_port_free(host, port)           # 占用 → 现在就说清楚，别等 uvicorn 抛异常
+
     import uvicorn
     from app.main import app  # 触发建表/迁移在 lifespan 内进行
 
@@ -102,14 +156,39 @@ def main() -> None:
 
     if created_env:
         print(f"已生成 {rt / '.env'}（含随机 SECRET_KEY）。请勿外传或提交。")
-    print(f"soroban 已启动，监听 {host}:{port}  (API 文档 /docs)")
+    # 措辞是「正在启动」不是「已启动」：这一行**在 serve 之前**打印，
+    # 真正的「已启动」由 uvicorn 自己的 `Uvicorn running on ...` 负责。
+    # 原先这里写「soroban 已启动」，端口占用时它就成了屏幕上最后一句话，
+    # 而事实恰恰相反。
+    print(f"soroban 正在启动，将监听 {host}:{port}  (API 文档 /docs)")
     print(f"  本机访问 -> http://{'127.0.0.1' if host == '0.0.0.0' else host}:{port}")
     if host == "0.0.0.0":
         print(f"  局域网访问 -> http://<本机IP>:{port}（需放行防火墙 TCP {port}）")
         print("  ⚠️ 已对外监听：请确认已改掉默认密码，并只在可信网络里这么开。")
     print("按 Ctrl+C 退出。")
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    try:
+        uvicorn.run(app, host=host, port=port, log_level="info")
+    except KeyboardInterrupt:              # 正常退出路径，不该报「启动失败」
+        pass
+    except OSError as e:
+        _fatal(f"无法监听 {host}:{port}（{e}）。",
+               hint="换个端口：设环境变量 BACKEND_PORT=8621 再启动。")
 
 
 if __name__ == "__main__":
-    main()
+    # 兜住**所有**逃逸到这里的异常。打包版双击时，裸 traceback 等于「点了没反应」——
+    # 迁移失败、库损坏、SECRET_KEY 校验不过（main.py 是 fail-closed 的），
+    # 这些原先都只会让窗口闪一下。
+    try:
+        main()
+    except SystemExit:
+        raise                              # _fatal / argv 白名单已经给过交代
+    except BaseException as e:             # noqa: BLE001  KeyboardInterrupt 也走这儿收尾
+        if isinstance(e, KeyboardInterrupt):
+            raise SystemExit(0)
+        import traceback
+
+        traceback.print_exc()
+        _fatal(f"{e.__class__.__name__}: {e}",
+               hint="上面是完整堆栈。常见原因：数据库文件损坏或被占用、.env 里的 "
+                    "SECRET_KEY 被改坏、磁盘满。把这段完整截图下来最好排查。")

@@ -13,7 +13,7 @@ import pathlib
 from decimal import Decimal
 
 import pytest
-from sqlmodel import Session, SQLModel, create_engine, select
+from sqlmodel import Session, SQLModel, col, create_engine, select
 
 from app.models import Order, OrderItem, OrderStaging, StagingItem
 from tools.backfill_item_price import backfill
@@ -92,7 +92,11 @@ def test_backfill_is_idempotent(iso_engine):
 
 
 def test_backfill_splits_price_across_priced_items(iso_engine):
-    """有物品但全部无单价：折成首件单价，允许分位取整误差。"""
+    """有物品但全部无单价：折成首件单价，**总价分毫不差**（余数进「金额尾差」行）。
+
+    回填走的就是 `routers/common.build_items`（不再自带一份规则），所以这里钉的是
+    「两条路径同结果」：同一批数据经回填工具和经 API 建单必须得到同一个总价。
+    """
     with Session(iso_engine) as s:
         o = Order(date=dt.date(2026, 1, 1), title="折价", price_cny=Decimal("100.00"))
         o.items = [OrderItem(name="a", quantity=3), OrderItem(name="b", quantity=1)]
@@ -103,9 +107,11 @@ def test_backfill_splits_price_across_priced_items(iso_engine):
 
     with Session(iso_engine) as s:
         o = s.exec(select(Order)).one()
-        assert o.price_cny == Decimal("99.99")          # 33.33×3 —— 取整误差 1 分，容差内
+        assert o.price_cny == Decimal("100.00")         # 33.33×3 + 0.01 —— 无损
         first = s.exec(select(OrderItem).where(OrderItem.name == "a")).one()
         assert first.unit_price_cny == Decimal("33.33")
+        resid = s.exec(select(OrderItem).where(col(OrderItem.name).like("%（金额尾差）"))).one()
+        assert resid.unit_price_cny == Decimal("0.01") and resid.quantity == 1
 
 
 def test_backfill_aborts_instead_of_zeroing(iso_engine, monkeypatch):
