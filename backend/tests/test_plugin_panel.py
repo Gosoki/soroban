@@ -859,3 +859,330 @@ def test_token_from_the_real_run_path_can_open_the_doors_the_plugin_needs(
     # 4) 没声明的门仍然关着——收窄本身不能被 baseline 顺手放开
     assert client.get("/api/fx", headers=h).status_code == 403, \
         "命令没声明 fx:read，令牌却能读汇率"
+
+
+# --- 权限计数：分子分母必须取自同一个集合 --------------------------------------
+
+def test_scope_ratio_counts_only_what_the_user_can_tick(client, fake_plugin):
+    """「已授权 X / 声明 Y」的 X **不能**把 baseline 算进去。
+
+    卡片上的分子曾经用的是 `scopes.effective`（含 baseline），分母是 `declared`。
+    baseline 不在 declared 里、勾选框里也没有它，于是一个**一项都没勾**的插件
+    显示成「1/1」——用户唯一能得出的结论是「权限已经全给了」。
+    用户自己看出了不对（「是不是有一个默认权限一直批准」），那正是这条比值在说假话。
+    """
+    def ratio():
+        sc = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["scopes"]
+        # 前端 grantedCount() 的口径：分子分母都取自 declared
+        return len(set(sc["declared"]) & set(sc["granted"])), len(sc["declared"]), sc
+
+    # 授权状态是库里存着的，别的用例可能已经勾过——显式清成已知状态再断言。
+    client.put("/api/plugins/demo/grants", json={"granted": []})
+    num, den, sc = ratio()
+    assert den == 1, "夹具插件的声明数变了，下面的数字断言会失去意义"
+    assert num == 0, "一项都没勾，比值的分子却不是 0"
+    assert set(sc["effective"]) - set(sc["declared"]), \
+        "effective 里没有 baseline，这条用例测不到它想测的东西"
+
+    client.put("/api/plugins/demo/grants", json={"granted": ["fx:write"]})
+    assert ratio()[:2] == (1, 1), "勾满之后应当是 1/1"
+
+
+def test_baseline_scopes_are_shown_not_hidden(client, fake_plugin):
+    """baseline 不进比值，但**必须在界面上说出来**。
+
+    只把它从分子里减掉会走到另一个极端：用户看到「已授权 0 / 声明 1」会问
+    「那它现在到底能干什么」，而勾选框里找不到答案。所以单列一行「默认持有」。
+    """
+    sc = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["scopes"]
+    assert sc["baseline"], "卡片拿不到 baseline 的展示信息，那一行渲染不出来"
+    keys = {b["key"] for b in sc["baseline"]}
+    assert keys == set(sc["effective"]) - set(sc["declared"]), \
+        "baseline 清单与令牌里多出来的那些对不上——界面会漏说或多说"
+    for b in sc["baseline"]:
+        assert b["label"] and b["hint"], "默认持有的权限没有说明，等于只报了个 key"
+    assert not (keys & {c["key"] for c in sc["catalog"]}), \
+        "baseline 同时出现在勾选表里——用户会以为它可以取消，而勾了也没用"
+
+
+# --- 「执行中」必须收尾 ---------------------------------------------------------
+
+def test_stale_running_is_reclaimed_on_startup(session):
+    """进程重启后，库里遗留的「执行中」必须被收掉。
+
+    `last_outcome` 是跨进程持久化的，而唯一会把它从 running 改走的是收割线程
+    ——daemon 线程，主进程一没它就没了。于是「插件还在跑时关掉 soroban」
+    会在库里留下一个**永久**的 running：卡片顶着黄色「执行中」，
+    而没有任何进程会再来改它，刷新和重启都没用。
+    """
+    from app.routers.plugins import reclaim_stale_runs
+
+    session.add(PluginConfig(plugin_id="stale-demo", last_outcome="running",
+                             last_summary="抓取 执行中…", last_finished_at=None))
+    session.commit()
+    try:
+        assert reclaim_stale_runs() >= 1
+        session.expire_all()
+        cfg = session.get(PluginConfig, "stale-demo")
+        assert cfg.last_outcome == "failed", "遗留的「执行中」没被收掉，卡片会一直挂着"
+        assert cfg.last_finished_at is not None, "没有结束时间，界面上仍显示成在跑"
+        assert "重跑" in cfg.last_summary, "只改了状态却没告诉用户该怎么办"
+    finally:
+        session.delete(session.get(PluginConfig, "stale-demo"))
+        session.commit()
+
+
+def test_reclaim_leaves_finished_rows_alone(session):
+    """只收 running。把 ok/failed 也一起改掉的话，重启一次就把上一次真实的
+    成功结果抹成失败——那比不收还糟。"""
+    from app.routers.plugins import reclaim_stale_runs
+
+    session.add(PluginConfig(plugin_id="done-demo", last_outcome="ok",
+                             last_summary="抓取：本次 ✓ 新增 3 单"))
+    session.commit()
+    try:
+        reclaim_stale_runs()
+        session.expire_all()
+        cfg = session.get(PluginConfig, "done-demo")
+        assert cfg.last_outcome == "ok" and "新增 3 单" in cfg.last_summary
+    finally:
+        session.delete(session.get(PluginConfig, "done-demo"))
+        session.commit()
+
+
+def test_frontend_scope_ratio_never_mixes_two_sets():
+    """前端那条比值不许再拿 `scopes.effective` 当分子。
+
+    这是本项目最典型的一类 bug——不是算错，是**分子分母取自两个集合**：
+    effective 含 baseline、declared 不含，于是一项没勾也显示「1/1」。
+    这种数字没有任何一种读法是对的，而它在界面上完全看不出异常。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "views" / "Plugins" / "index.vue").read_text(encoding="utf-8")
+    tpl = src.split("<script", 1)[0]
+    bad = re.findall(r"scopes\.effective[^\n]*\.length", tpl)
+    assert not bad, f"模板又把 effective 当计数用了：{bad}——分子请用 grantedCount()"
+    assert "grantedCount(p)" in tpl, \
+        "比值的分子不是 grantedCount()，这条守卫已经守不住它本来要守的东西"
+
+
+# --- inherit 类插件（与 soroban 共用环境）--------------------------------------
+
+_INHERIT_TOML = _FAKE_TOML.replace('id = "demo"', 'id = "inh"').replace(
+    'entry = "-m demo"', 'entry = "-m inh_mod"')
+
+
+@pytest.fixture()
+def inherit_plugin(tmp_path, monkeypatch):
+    from app.routers import plugins as mod
+
+    d = tmp_path / "plugins" / "soroban-plugin-inh"
+    d.mkdir(parents=True)
+    (d / "plugin.toml").write_text(_INHERIT_TOML, encoding="utf-8")
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "plugins"))
+    monkeypatch.setattr(mod, "_SOROBAN_ROOT", tmp_path)
+    mod._needs_cache.clear()
+    return d
+
+
+def test_inherit_uses_sorobans_own_interpreter_not_a_system_one(monkeypatch):
+    """`python = "inherit"` 只能是 `sys.executable`，不许借道 `_base_python()`。
+
+    `_base_python()` 找的是「能用来**建 venv** 的系统 Python」。冻结态下它返回
+    PATH 里的 python3——而 inherit 的字面意思是「继承 soroban 的环境」，
+    系统 python3 里没有 httpx。走通了是 ModuleNotFoundError，
+    走不通（机器没装 python）则回落到 exe 自己，每跑一次插件就把 soroban 再启动一遍。
+    """
+    from app.routers import plugins as mod
+
+    monkeypatch.setattr(mod, "_base_python", lambda: "/usr/bin/python3-not-ours")
+    m = {"python": "inherit", "_dir": Path("/tmp/x"), "entry": "-m x"}
+    assert str(mod._python(m)) == sys.executable
+
+
+def test_packaged_inherit_plugin_goes_through_the_exe_verb(monkeypatch):
+    """冻结态下 inherit 插件必须走 `--run-plugin`，而不是 `exe -m 模块`。
+
+    PyInstaller 的 bootloader **不解释 `-m`**：那条命令的实际效果是
+    把 soroban 又启动一遍（建 .env、连库跑迁移、卡在端口占用），
+    而用户在卡片上看到的失败原因与汇率毫无关系。
+    """
+    from app.routers import plugins as mod
+
+    m = {"python": "inherit", "_dir": Path("/tmp/plug"), "entry": "-m soroban_fx"}
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    got = mod._plugin_argv(m, "fetch", ["--soroban-url", "http://x"])
+    assert got == [sys.executable, "--run-plugin", "/tmp/plug", "-m", "soroban_fx",
+                   "fetch", "--soroban-url", "http://x"]
+
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    assert mod._plugin_argv(m, "fetch", []) == [sys.executable, "-m", "soroban_fx", "fetch"], \
+        "源码态不该多绕一层——那时 sys.executable 就是一个真的 python"
+
+
+def test_normal_plugin_argv_is_unchanged(monkeypatch):
+    """独立 venv 的插件不受影响：拼法必须与重构前逐字节相同。"""
+    from app.routers import plugins as mod
+
+    m = {"python": ".venv/bin/python", "_dir": Path("/tmp/plug"), "entry": "-m taobao_scraper"}
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    assert mod._plugin_argv(m, "login", ["--account", "a"]) == [
+        "/tmp/plug/.venv/bin/python", "-m", "taobao_scraper", "login", "--account", "a"]
+
+
+def test_inherit_plugin_never_asks_to_build_a_venv(client, inherit_plugin):
+    """inherit 插件没有 venv 可建，就不该报「缺 Python 环境」。
+
+    报了的话用户会去点「一键安装」，而那会在插件目录里建一个**永远不会被用到**的
+    .venv——一个有进度条、有成功提示、却什么也没改变的按钮。
+    """
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}["inh"]
+    assert "venv" not in {n["key"] for n in got["needs"]}, \
+        f"inherit 插件被要求建 venv：{got['needs']}"
+    r = client.post("/api/plugins/inh/install")
+    assert r.status_code == 409 and "共用运行环境" in r.json()["detail"]
+
+
+def test_inherit_needs_are_probed_in_process(tmp_path):
+    """inherit 插件的依赖在**本进程**里查，且要如实报缺。
+
+    不能 spawn 子进程去问：解释器就是 soroban 自己，冻结态下
+    `[soroban.exe, "-c", ...]` 会把 soroban 再启动一遍——而这条路径挂在
+    前端**轮询**的 GET /api/plugins 上。
+    """
+    from app.routers.plugins import _inherit_needs
+
+    assert _inherit_needs(tmp_path) == [], "没有 requirements.txt 时不该凭空报缺"
+    (tmp_path / "requirements.txt").write_text(
+        "httpx\nthis-package-does-not-exist-anywhere\n", encoding="utf-8")
+    got = _inherit_needs(tmp_path)
+    assert len(got) == 1 and got[0]["key"] == "deps"
+    assert "this-package-does-not-exist-anywhere" in got[0]["hint"]
+    assert "httpx" not in got[0]["hint"], "soroban 环境里装着的包被误报成缺失"
+    # 提示不能指向「一键安装」——那个按钮对这类插件是 409
+    assert "共用运行环境" in got[0]["hint"]
+
+
+def test_fx_plugin_declares_its_dependency():
+    """汇率插件必须有 requirements.txt。
+
+    没有的话依赖探测**整段跳过**，卡片上 installed 恒为 true：
+    界面写着「已就绪」，每次运行却 ModuleNotFoundError。
+    这是「界面说假话」里代价最大的一种——用户不会去查一个显示正常的东西。
+
+    插件各自成库（`.gitignore` 里 `/plugins/*/`），所以本机可能根本没 checkout 它。
+    跳过的口径与 test_consistency.plugin_source 完全一致：**找不到就红**，
+    真没有插件仓请显式设 `SOROBAN_NO_PLUGINS=1`——要跳过必须是有人明确表示，
+    不能是「目录恰好不在」的副作用（那正是守卫悄悄归零的经典形态）。
+    """
+    import os
+
+    d = _REPO / "plugins" / "soroban-plugin-fx"
+    if not d.is_dir():
+        if os.environ.get("SOROBAN_NO_PLUGINS"):
+            pytest.skip("显式声明了本机没有插件仓（SOROBAN_NO_PLUGINS=1）")
+        raise AssertionError(
+            "找不到 plugins/soroban-plugin-fx/。本条守卫钉的是「卡片上的『已就绪』是不是真的」，"
+            "不能静默跳过——真没有插件仓请设 SOROBAN_NO_PLUGINS=1。")
+    req = d / "requirements.txt"
+    assert req.is_file(), "汇率插件没声明依赖 → 卡片上的「已就绪」是假的"
+    assert "httpx" in req.read_text(encoding="utf-8")
+
+
+# --- 打进 exe 的插件：释放到磁盘 -------------------------------------------------
+
+def _fake_bundle(tmp_path, version="1.0.0", body="v1"):
+    """伪造 exe 内那份插件（_MEIPASS/plugins/…）。"""
+    src = tmp_path / "meipass" / "plugins" / "soroban-plugin-demo"
+    src.mkdir(parents=True, exist_ok=True)
+    (src / "plugin.toml").write_text(
+        f'id = "demo"\nname = "演示"\nversion = "{version}"\nentry = "-m demo"\n', encoding="utf-8")
+    (src / "code.py").write_text(body, encoding="utf-8")
+    return src
+
+
+def test_bundled_plugins_are_released_on_first_run(tmp_path, monkeypatch):
+    from app.routers import plugins as mod
+
+    _fake_bundle(tmp_path)
+    dst = tmp_path / "run" / "plugins"
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path / "meipass"), raising=False)
+    monkeypatch.setattr(mod, "plugin_dir", lambda: dst)
+
+    assert mod.seed_bundled_plugins() == {"soroban-plugin-demo": "new"}
+    assert (dst / "soroban-plugin-demo" / "code.py").read_text(encoding="utf-8") == "v1"
+    # 幂等：再跑一次不该重复释放（每次启动都覆盖等于每次都可能盖掉用户改的东西）
+    assert mod.seed_bundled_plugins() == {}
+
+
+def test_release_updates_on_version_change_but_keeps_venv_and_session(tmp_path, monkeypatch):
+    """换 exe 就该换到新插件；但**绝不能**碰 .venv 与 .state。
+
+    那两样一个是几百 MB 的已装依赖、一个是扫码登录换来的会话。
+    带删除逻辑的「同步」会把它们一起清掉，而用户看到的是
+    「升级了一下，插件要重新装、还要重新扫码」。
+    """
+    from app.routers import plugins as mod
+
+    _fake_bundle(tmp_path, version="1.0.0", body="v1")
+    dst = tmp_path / "run" / "plugins"
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path / "meipass"), raising=False)
+    monkeypatch.setattr(mod, "plugin_dir", lambda: dst)
+    mod.seed_bundled_plugins()
+
+    live = dst / "soroban-plugin-demo"
+    (live / ".venv" / "bin").mkdir(parents=True)
+    (live / ".venv" / "bin" / "python").write_text("#!/bin/sh", encoding="utf-8")
+    (live / ".state").mkdir()
+    (live / ".state" / "a.json").write_text('{"cookie": "…"}', encoding="utf-8")
+
+    _fake_bundle(tmp_path, version="1.1.0", body="v2")
+    assert mod.seed_bundled_plugins() == {"soroban-plugin-demo": "updated"}
+    assert (live / "code.py").read_text(encoding="utf-8") == "v2", "版本变了却没更新代码"
+    assert (live / ".venv" / "bin" / "python").exists(), "把插件已装的依赖删掉了"
+    assert (live / ".state" / "a.json").exists(), "把用户的登录会话删掉了"
+
+
+def test_release_is_a_noop_without_a_bundle(tmp_path, monkeypatch):
+    """源码运行没有 _MEIPASS——这条路径必须是彻底的空操作，
+    否则开发时每次启动都会去动仓库里的 plugins/。"""
+    from app.routers import plugins as mod
+
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+    monkeypatch.setattr(mod, "plugin_dir", lambda: tmp_path / "nope")
+    assert mod.seed_bundled_plugins() == {}
+    assert not (tmp_path / "nope").exists(), "源码模式下不该凭空建出插件目录"
+
+
+# --- 结果的第三档：warn（T4）----------------------------------------------------
+
+@pytest.mark.parametrize("line,ok,want", [
+    ('{"created": 3}', True, "ok"),
+    ('{"created": 3, "error": "3 个号里 1 个登录过期"}', True, "warn"),
+    ('{"error": "全部源都取不到"}', False, "failed"),
+    ("", True, "ok"),
+])
+def test_outcome_has_a_third_state_for_self_reported_errors(line, ok, want):
+    """退出码 0 但自报了 error → 第三档 warn，不是绿色的「成功」。
+
+    **退出码是跨进程契约，不改**：淘宝插件的 `already_running` 刻意 return 0，
+    那是「这次没什么可做」而不是失败，信 JSON 会把它刷成红色。
+    但绿色同样不行——用户看到绿字就不会再点开摘要，而那句话里写着出了什么事。
+    """
+    from app.routers.plugins import _batch_text, _self_reported_error
+
+    warn = ok and _self_reported_error(line)
+    outcome, _ = _batch_text("抓取", [("a", ok, "x", warn)], 1)
+    assert outcome == want
+
+
+def test_warn_does_not_swallow_a_real_failure():
+    """一批里既有失败又有警告 → 整批算 failed。
+    警告压过失败的话，那个真正需要人处理的号会从卡片上消失。"""
+    from app.routers.plugins import _batch_text
+
+    outcome, text = _batch_text("抓取", [("a", True, "部分成功", True),
+                                         ("b", False, "登录过期", False)], 2)
+    assert outcome == "failed"
+    assert "登录过期" in text and "部分成功" in text, "合并摘要吞掉了其中一个号"

@@ -143,6 +143,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowRight, Brush, Check, Delete, Edit, Loading, Plus, QuestionFilled, Setting } from '@element-plus/icons-vue'
 import GotionCell from './GotionCell.vue'
 import { layoutApi, tagsApi } from '@/api'
+import { handled } from '@/api/http'
 import { TAG_PALETTE, tagStyleAt } from '@/constants'
 
 const props = defineProps({
@@ -269,7 +270,7 @@ async function removeTag(field, value) {
     applyTags(field, await tagsApi.remove(field, value))
   } catch (e) {
     // 409（使用中不可删）被拦截器刻意跳过，这里自行提示；其余错误拦截器已提示
-    if (e.response?.status === 409) ElMessage.warning(e.response?.data?.detail || '该标签使用中，不能删除')
+    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || '该标签使用中，不能删除') }
   }
 }
 async function renameTag(field, oldVal) {
@@ -292,7 +293,7 @@ async function renameTag(field, oldVal) {
     emit('reload')         // 通知父页重拉行数据，让已用到该标签的单元格显示新值
   } catch (e) {
     // 409（新名占用）被拦截器刻意跳过，这里自行提示；其余错误拦截器已提示
-    if (e.response?.status === 409) ElMessage.warning(e.response?.data?.detail || '新名字已被占用')
+    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || '新名字已被占用') }
   }
 }
 

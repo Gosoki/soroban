@@ -136,7 +136,9 @@ async def ocr_attach_express(
     不强改（沿用 attach_order 的防误抢语义）。重复上传同一张截图是幂等的。
     路由为 async（run_ocr 要 await 读文件）；DB 用同步 Session，SQLite 建连时已
     check_same_thread=False，本地库单次查询亚毫秒级，不构成事件循环阻塞。"""
-    from ..services.ocr import recognize_shipment
+    # 长度下界与 ocr.py 共用**同一个常量**：抄一份数字过去，两边一旦漂移，
+    # 表现是「识别时判为可疑、挂靠时照挂」（或反过来），而两处都看不出不一致。
+    from ..services.ocr import _TRACK_TYPICAL_MIN, recognize_shipment
 
     shipment = session.get(ShipmentOrder, shipment_id)
     if not shipment or shipment.is_delete:
@@ -150,6 +152,17 @@ async def ocr_attach_express(
     unmatched: list[str] = []
 
     for no in express_nos:
+        # **短到不像快递单号的，一律不拿去自动挂靠。**
+        # OCR 会把一个长号断成两截（`SF1234 56789012` → 取到 `56789012`）。
+        # ocr.py 的 `_looks_split` 已经挡掉了「旁边紧邻另一段数字」那种，但那条判据
+        # 依赖排版，挡不住所有情形——而这里是**不可逆后果**的所在：
+        # 半截号拿去 `Order.express_no == no` 精确匹配，匹配不上只是漏一单，
+        # 万一撞上别人的单号，就是把货挂到一张无关订单上，且挂靠是自动提交的。
+        # 主流快递单号最短 12 位（顺丰/圆通/中通/申通），留 2 位余量取 10。
+        # 判为读不出而不是静默丢弃：它会出现在 unmatched 里，用户看得见、能手动挂。
+        if len(no) < _TRACK_TYPICAL_MIN:
+            unmatched.append(no)
+            continue
         matches = session.exec(
             select(Order).where(Order.express_no == no, Order.is_delete.is_(False))
         ).all()

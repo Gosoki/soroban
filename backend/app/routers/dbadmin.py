@@ -126,6 +126,20 @@ def status():
     return {"active": _active_identity(), "connections": control.list_connections(control_engine())}
 
 
+def _reject_unsupported(version: str) -> None:
+    """服务端版本不够就**在门口拒绝**，别让它跑到迁移中途才炸。
+
+    MySQL 的 DDL 是隐式提交的：迁移链跑到一半失败时，前面几条已经落地、后面的没跑，
+    库停在一个既不是旧版也不是新版的半升级态。而这一刻用户能看到的只有一句
+    驱动层的英文报错（`Unknown collation` / 语法错误），完全不知道该回滚什么。
+    这道闸挂在 test 与 migrate 两处——**test 是用户点「测试连接」的地方**，
+    只挂 migrate 的话，界面会先说「连接成功」，再在下一步崩掉。
+    """
+    why = db_migrate.unsupported_server(version or "")
+    if why:
+        raise HTTPException(status_code=400, detail=why)
+
+
 @router.post("/test")
 def test(t: Target):
     if t.connection_id is None and t.backend == "sqlite":
@@ -133,11 +147,13 @@ def test(t: Target):
     host, port, user, pw, db = _mysql_conn_fields(t)
     ok, msg = db_migrate.test_connection(host, port, user, pw, db)
     if ok:
+        _reject_unsupported(msg)
         cid = _remember(host, port, user, pw, db)
         return {"ok": True, "version": msg, "connection_id": cid}
     # 库尚不存在 → 退一步只测服务器连通（迁移时会自动建库）
     ok2, msg2 = db_migrate.test_connection(host, port, user, pw, None)
     if ok2:
+        _reject_unsupported(msg2)
         cid = _remember(host, port, user, pw, db)
         return {"ok": True, "version": msg2, "connection_id": cid,
                 "note": f"服务器可连，但库 {db} 暂不存在（迁移时会自动创建）"}
@@ -158,6 +174,9 @@ def migrate(t: Target):
             ok, msg = db_migrate.test_connection(host, port, user, pw, None)
             if not ok:
                 raise HTTPException(status_code=400, detail=f"MySQL 连接失败：{msg}")
+            # 版本闸门必须排在 ensure_database **之前**：建库本身在老服务端上是成功的，
+            # 建完再拒绝就留下一个空库，而用户会以为「已经建好了、是别的地方出错」。
+            _reject_unsupported(msg)
             try:
                 db_migrate.ensure_database(host, port, user, pw, db)
             except ValueError as e:                             # 库名不合白名单

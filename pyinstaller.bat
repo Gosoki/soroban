@@ -4,12 +4,22 @@ echo   soroban one-click build (PyInstaller)
 echo ========================================
 
 rem ===== Version (edit this on each release) =====
+rem VERSION is a LABEL only -- it is printed and stamped, it does NOT pick a directory.
 set VERSION=v1.0.0
 
 set ROOT=%~dp0
 set BACKEND=%ROOT%backend
 set FRONTEND=%ROOT%frontend
-set RELEASE=%ROOT%Releases\%VERSION%
+rem The release dir is FIXED, deliberately WITHOUT the version in its name.
+rem It doubles as the RUNTIME DATA dir: soroban.db, .env (holding SECRET_KEY) and the
+rem plugins\ venvs + login sessions all live next to the exe (run.py chdir's to itself).
+rem While this was Releases\%VERSION%, bumping VERSION produced a brand-new EMPTY folder:
+rem the new exe created a fresh empty ledger and a NEW SECRET_KEY on first run, and the
+rem user read that as "the upgrade ate my data". The data was never lost -- it was sitting
+rem in the previous version's folder -- but nothing in the flow said so.
+rem A fixed dir removes the failure instead of warning about it: rebuilding only replaces
+rem soroban.exe and leaves the ledger exactly where it was.
+set RELEASE=%ROOT%Releases\soroban
 set VENV_PY=%BACKEND%\.venv\Scripts\python.exe
 
 rem ===== Pick Python: prefer backend venv (start.bat creates it), else system =====
@@ -114,19 +124,23 @@ if errorlevel 1 goto build_fail
 copy /y "%ROOT%build\dist\soroban.exe" "%RELEASE%\soroban.exe" >nul
 if errorlevel 1 goto copy_fail
 
-rem frontend\dist and alembic migrations are bundled INTO soroban.exe (see soroban.spec).
-rem Plugins (plugins\soroban-plugin-*) are NOT bundled; drop the plugins folder
-rem next to soroban.exe to have them discovered (each plugin runs in its own venv).
+rem frontend\dist, alembic migrations AND the plugins are all bundled INTO soroban.exe
+rem (see soroban.spec). On first run soroban releases the plugins next to the exe --
+rem they need a writable home for their own .venv / .state / params, and the onefile
+rem _MEIPASS dir is wiped on every exit.
+rem soroban.spec strips .state\ .env *.log .venv\ __pycache__\ from the bundle: those
+rem are the packager's OWN credentials and machine-specific paths. Once inside the exe
+rem they could not be deleted afterwards, so the stripping is not optional.
 
 rem ===== Clean build intermediates =====
 if exist "%ROOT%build" rmdir /s /q "%ROOT%build"
 
-rem ===== Warn about shipping YOUR OWN plugin credentials =====
-rem The line further down says "ship a plugins folder next to the exe". The only plugins
-rem folder the packager has at hand is the repo's development one -- which contains
-rem .state\*.json (the packager's own Taobao LOGIN SESSION), .env, and scrape.log.
-rem .gitignore covers them, but shipping is a file copy: git has no say in it.
-rem So check for the real artefacts and say it loudly, right before the ship instructions.
+rem ===== Tell the packager what happened to their plugin credentials =====
+rem The repo's development plugins folder contains .state\*.json (the packager's own
+rem Taobao LOGIN SESSION), .env and scrape.log. soroban.spec excludes those from the
+rem bundle -- but say so out loud, because "my cookies are inside the exe I just built"
+rem is exactly the kind of thing nobody thinks to check, and inside an exe it cannot
+rem be deleted afterwards. Print it only when the artefacts actually exist.
 set "PLUGSECRET="
 if exist "%ROOT%plugins" for /d %%P in ("%ROOT%plugins\*") do (
     if exist "%%P\.state" set "PLUGSECRET=1"
@@ -135,23 +149,24 @@ if exist "%ROOT%plugins" for /d %%P in ("%ROOT%plugins\*") do (
 if not defined PLUGSECRET goto plugsecret_ok
 echo.
 echo ========================================
-echo   [!] DO NOT SHIP plugins\ AS-IS
-echo   Your plugins folder contains YOUR OWN credentials:
+echo   [i] Your plugins folder holds YOUR OWN credentials:
 echo       .state\*.json   = your logged-in browser session (Taobao cookies)
 echo       .env            = your own soroban account / API keys
-echo   Anyone you send the release to could use them as you.
-echo   Copy the plugin folders, then DELETE from each copy:
-echo       .state\   .env   *.log   .venv\   __pycache__\
-echo   (.venv is also machine-specific and will not work on their box anyway.)
+echo   These were EXCLUDED from soroban.exe (see _PLUG_SKIP_* in soroban.spec),
+echo   together with .venv\ (machine-specific) and __pycache__\.
+echo   The exe carries plugin SOURCE only; users get a clean copy on first run.
+echo   [!] DO NOT SHIP plugins\ AS-IS if you copy the folder by hand anyway --
+echo       DELETE .state\ .env *.log .venv\ from each copy first.
 echo ========================================
 :plugsecret_ok
 
-rem ===== Warn when the ledger is left behind in an older release folder =====
-rem VERSION is a hand-edited constant and %RELEASE% doubles as the RUNTIME data dir.
-rem Bumping VERSION therefore produces a BRAND-NEW EMPTY folder: the new exe would create
-rem a fresh empty ledger on first run and the user reads that as "the upgrade ate my data".
-rem The data is not lost -- it is sitting in the previous version's folder -- but nothing
-rem says so anywhere, so say it here, loudly, right where they will see it.
+rem ===== Warn when the ledger is left behind in an older versioned folder =====
+rem The release dir is fixed now, so this can no longer happen on a rebuild. But the
+rem builds made BEFORE that change wrote into Releases\<VERSION>\ -- so the very first
+rem build after the switch lands in an empty Releases\soroban\ while the real ledger
+rem still sits in the old versioned folder. Running the new exe as-is would create an
+rem empty ledger and a NEW SECRET_KEY, and that reads exactly like "the upgrade ate my
+rem data". One-time migration, but nothing else says it, so say it here.
 if exist "%RELEASE%\soroban.db" goto data_ok
 set "OLDDATA="
 for /d %%D in ("%ROOT%Releases\*") do if exist "%%D\soroban.db" set "OLDDATA=%%D"
@@ -160,13 +175,15 @@ echo.
 echo ========================================
 echo   [!] YOUR LEDGER IS NOT IN THIS FOLDER
 echo   Found existing data in: %OLDDATA%
-echo   VERSION changed, so %RELEASE% is a brand-new EMPTY folder. Running the new
-echo   soroban.exe as-is would create an EMPTY ledger and a NEW SECRET_KEY.
+echo   The release dir no longer carries the version number, so %RELEASE%
+echo   is a brand-new EMPTY folder. Running the new soroban.exe as-is would
+echo   create an EMPTY ledger and a NEW SECRET_KEY.
 echo.
-echo   Copy these from the old folder into the new one BEFORE running the new exe:
+echo   MOVE these from the old folder into the new one BEFORE running the new exe:
 echo       soroban.db  soroban.db-wal  soroban.db-shm  .env  plugins\
 echo   .env holds the SECRET_KEY: without it everyone is logged out and the saved
 echo   MySQL connection string can no longer be decrypted.
+echo   This is a ONE-TIME move -- from now on every rebuild reuses this same folder.
 echo ========================================
 :data_ok
 
@@ -181,7 +198,10 @@ echo   seeds an admin, then serves API + frontend on one port.
 echo   This dir is also the DATA dir: soroban.db / .env / plugins\ live here and are
 echo   preserved across rebuilds. Back them up before moving or deleting it.
 echo   Open http://127.0.0.1:8620 in your browser (set BACKEND_PORT to change the port).
-echo   Ship a "plugins" folder next to the exe if you use plugins -- but FIRST delete
+echo   Plugins ride inside the exe and are released into plugins\ on first run.
+echo   Nothing to copy. Existing plugin folders are only refreshed when plugin.toml's
+echo   version changed, and .venv\ / .state\ are never touched.
+echo   Ship a "plugins" folder by hand only if you must -- and then FIRST delete
 echo   .state\ .env *.log .venv\ from each plugin copy (they hold YOUR credentials).
 echo ========================================
 pause

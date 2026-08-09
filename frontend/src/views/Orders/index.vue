@@ -106,6 +106,8 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Camera, Check } from '@element-plus/icons-vue'
 import { shipmentApi, ordersApi, tagsApi } from '@/api'
+import { checkImageSize } from '@/utils/imageGate'
+import { handled } from '@/api/http'
 import { ORDER_SOURCES, PRICE_HELP, PURCHASE_STATUS, SHIPMENT_STATUS, canAdvancePurchase, statusStyle, typeStyle } from '@/constants'
 import { fmtJPY } from '@/utils/money'
 import { applyRowUpdate, queueOrderWrite } from '@/utils/orderWrites'
@@ -262,7 +264,7 @@ async function saveCell(row, key, value) {
       applyRowUpdate(row, patch, updated)
     })
   } catch (e) {
-    if (e.response?.status === 409) { ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
+    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
   }
 }
 
@@ -311,6 +313,10 @@ async function pumpOcr() {
 }
 
 async function processOcr(file) {
+  // 分辨率超上限的在本机就拦下来：后端是硬拒绝（400），
+  // 传上去只是让用户在慢网络上白等一趟。判据与后端逐字节相同。
+  const tooBig = await checkImageSize(file)
+  if (tooBig) { ElMessage.warning(tooBig); return }
   try {
     const res = await ordersApi.ocr(file)
     if (res.reject_reason) {   // 拿错平台截图（淘宝/京东）→ 提示改用爬虫，不建单
@@ -416,6 +422,7 @@ async function mergeByOrderNo(existing, data) {
       return
     } catch (e) {
       if (e.response?.status !== 409) return   // 非冲突：拦截器已提示
+      handled(e)   // 409 是本循环的正常分支：重试，不该再弹提示
       const fresh = await findByOrderNo(data.order_no)
       if (!fresh) break
       base = fresh
@@ -472,6 +479,14 @@ async function addRow(data = {}, done) {
     // 而刷新一下它又凭空消失——用户会以为刚才那单没存上。
     // 原先只有 OCR 那条路径清了隔离态，幽灵行手工新建这条漏了；
     // 放进 addRow 里，两条路径（以及以后任何新入口）自动都对。
+    // **这是「保留筛选」那条统一规则的唯一例外，而且应当保持例外。**
+    // 四页统一的做法是：保留用户设的筛选 + 重拉 + 确认新记录确实不在列表里才提示。
+    // 那条规则的前提是「筛选是用户精心设的，清掉不可撤销」。
+    // `?focus=` 不满足这个前提：它不是用户设的筛选，是从别处跳过来的**一次性定位**
+    // （URL 参数，界面上有一个「点 × 看全部」的标签明说它是临时的），
+    // 而且它按 id 过滤 —— 新建的单**永远**不可能满足它，走统一规则只能得到
+    // 一条「新单不在当前筛选内」的提示，然后用户还得自己点 ×。
+    // 所以这里清掉定位、回到全量列表。改成走统一规则会让这一页比别的页更难用。
     if (focusId.value) {
       clearFocus()             // 会触发 load()，新单自然出现在全量列表里
       done?.(true)
@@ -484,6 +499,7 @@ async function addRow(data = {}, done) {
     done?.(false)   // 失败时保留幽灵行里的草稿，让用户就地改
     // 409 被 http 拦截器刻意跳过（留给页面处理）→ 这里对「订单号+来源」重复给明确提示
     if (e.response?.status === 409) {
+      handled(e)
       const who = data.order_no
         ? `订单号「${data.order_no}」${data.platform ? '·' + data.platform : ''}`
         : '该记录'

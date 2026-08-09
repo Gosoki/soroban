@@ -62,6 +62,15 @@ def post_ingest(payload: IngestIn, session: Session = Depends(get_session),
     claims = getattr(current, "_plugin_claims", None) or {}
     granted = set(claims.get("scp") or [])
     plugin_id = claims.get("plg") or "?"
+    # **人类令牌不能写「插件私有存储」**：这类数据按 plugin_id 分命名空间，
+    # 人没有 plugin_id，会落进 `plugin_id="?"` 这个假命名空间；
+    # 而读接口（GET /records/{kind}）明确拒绝人类令牌 ⇒ 写进去的东西**谁都读不回来**。
+    # 一条 200 OK、库里真的多了行、然后永远拿不出来——比直接报错难查得多。
+    # 别的 kind 不受影响：它们写的是账本表，人类本来就该能写（手工补录、排障）。
+    if not claims and handler.kind == "plugin.record":
+        raise HTTPException(status_code=400, detail=(
+            "「插件私有存储」按插件分命名空间，只能由插件令牌写入。"
+            "人类登录写进去之后没有任何接口读得回来。"))
     if claims and handler.scope not in granted:
         # 人类登录（无 claims）不受此限：他本来就有全部权限，走这条通道只是图方便。
         raise HTTPException(status_code=403, detail=(

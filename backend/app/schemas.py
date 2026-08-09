@@ -598,6 +598,11 @@ class DashboardRead(SQLModel):
     misc_count: int
     by_month: list[MonthTotal] = []
     fx_rate: Optional[Decimal] = None       # 当前 CNY→JPY（兜底值）
+    # 有货款、却因为缺汇率算不出日元的行。SUM(jpy_settled) 会把 NULL 直接跳过，
+    # 于是这些行**金额被吞、笔数照数**——合计变小而单数不变，看板上没有任何异常信号。
+    # 把它单列出来，让「被吞掉」变成看得见的东西。0 = 没有这种行。
+    uncounted_count: int = 0
+    uncounted_cny: Decimal = Decimal("0")
 
 
 # --- 汇率 -------------------------------------------------------------------
@@ -607,10 +612,15 @@ class FxRead(SQLModel):
     quote: str = "JPY"
     rate: Optional[Decimal] = None
     date: Optional[dt.date] = None
-    stale: bool = False                     # True = 用的是历史兜底值
+    # 「这条汇率不是今天的」——**日粒度**。刻意不叫 stale：
+    # `is_expired()`（超过 fx.stale_hours）在英文里是同义词，在这里却是另一回事，
+    # 而两者会同时出现在同一个响应里，字段名撞义就只能靠猜。
+    # 名字撞义的代价是读代码的人得每次回来确认一遍哪个是哪个。
+    not_today: bool = False
     source: str = ""   # 源标识由插件自定，核心只存不解释；"manual"=用户手填
     source_label: str = ""                  # 上面那个的中文名，供前端提示显示
-    # stale 是**日粒度**（不是今天的），1 天前和 3 个月前长得一样；下面两个才说得清「还能不能信」。
+    # not_today 是**日粒度**（不是今天的），1 天前和 3 个月前长得一样；
+    # 下面两个才说得清「还能不能信」。
     age_hours: Optional[float] = None       # 距上次成功取到多少小时
     expired: bool = False                   # 超过 fx.stale_hours → 界面明确标出、建单时记警告
     # 现在有没有插件能自动提供汇率（名字，没有则空）。界面据此说实话：

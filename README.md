@@ -150,6 +150,14 @@ cd ../backend && BACKEND_PORT=8620 .venv/bin/uvicorn app.main:app --host 0.0.0.0
 > 路由用的是 **hash 模式**（`/#/orders`），所以浏览器只会向后端请求 `/`，不需要 SPA history 回退。
 > 若将来改成 history 模式，得给后端补一条「未知路径返回 index.html」的兜底，否则刷新子页面会 404。
 
+> ⚠️ **不要加 `--workers`（也别在 gunicorn 后面挂多个 worker）。** soroban 只能单进程跑：
+> 插件令牌的撤销表、在飞子进程表、批次聚合、安装进度全都是**进程内**状态。多开一个进程，
+> 插件回灌会被负载均衡分到没有那枚令牌的进程 → **全线 401**，表现是「抓了一批单一条都没回来」，
+> 而日志里只有一串 401，看不出跟 worker 数有关。
+> 现在这是有**闸门**的：同一份数据目录的第二个进程会拿不到 `soroban.lock` 并当场退出并说明原因
+> （`app/single_process.py`）。同机跑两份互不相干的账本仍然可以——换目录 + 换端口即可。
+> 并发能力不是瓶颈：单人记账的负载，一个进程绰绰有余。
+
 ## 更新（git）
 
 ```bash
@@ -278,9 +286,16 @@ SOROBAN_TEST_MYSQL_URL='mysql+pymysql://user:pass@host:3306/db?charset=utf8mb4' 
 
 ⚠️ 它会**清空**目标库的业务表，只能指向专用测试库，别指向在用的库。
 
-需要 MySQL 8.0+：键列要用 `utf8mb4_0900_bin` 才能与 SQLite 的逐字节比较等价
-（`utf8mb4_bin` 是 PAD SPACE，尾空格会被折叠）。老服务端/MariaDB 会自动回退到
-`utf8mb4_bin`，其余行为一致。
+**必须是 MySQL 8.0 或更新版本，MariaDB 不支持。** 两条硬依赖：
+键列要用 `utf8mb4_0900_bin` 才能与 SQLite 的逐字节比较等价（`utf8mb4_bin` 是 PAD SPACE，
+尾空格会被折叠），而它是 MySQL 8.0 引入的；迁移链里还用到了 8.0 才有的 `RENAME COLUMN`。
+
+> 这里曾承诺老服务端会**自动降级**到 `utf8mb4_bin` 且行为一致——**那是假的**。
+> 降级逻辑确实存在（`dialect.bin_collation()`），但建表走的 `dialect.BinStr` 硬写了
+> `utf8mb4_0900_bin`，绕过了它。照着那句话去连老服务端，迁移会在中途 `ERROR 1273`，
+> 而 MySQL 的 DDL 是隐式提交的 → 库停在半升级态。
+> 现在「数据库」页的**测试连接**与**迁移**两处都会先查版本并当场拒绝，
+> 把「炸在中途」换成「一开始就说清楚」。
 
 ## 状态
 

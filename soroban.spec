@@ -14,7 +14,13 @@ PyInstaller 静态分析看不到，必须显式声明。改代码时若动了�
   backend/app/database.py      _ROOT = Path(sys._MEIPASS)          → 需要 alembic.ini + alembic/
   backend/app/main.py          _DIST = _MEIPASS/frontend/dist      → 需要 frontend/dist
   backend/app/services/ocr.py  Path(__file__).with_name(...png)    → 需要 app/services/xianyu_truck.png
-  backend/app/routers/plugins.py  _SOROBAN_ROOT = exe 同级          → plugins/ **不打包**，随包放 exe 旁边
+  backend/app/routers/plugins.py  _SOROBAN_ROOT = exe 同级          → 插件在**磁盘上**的家，见下
+  backend/run.py               --run-plugin 内部动词               → 见下面 httpx 那一段
+
+插件（plugins/soroban-plugin-*）现在**打进 exe**，首次运行时由 `seed_bundled_plugins()`
+释放到 exe 同级的 plugins/。必须落到磁盘、不能就地跑：插件目录是**可写**的
+（各自的 .venv、登录会话 .state、参数），而 onefile 的 _MEIPASS 每次退出就被清掉。
+打包时刻意剔掉三类东西，见下面 _PLUG_SKIP_* 的说明。
 """
 from pathlib import Path
 
@@ -75,6 +81,67 @@ hiddenimports = [
 # uvicorn/rapidocr 的子模块都是按名字动态挑选（协议实现、事件循环、推理后端）
 hiddenimports += collect_submodules("uvicorn")
 hiddenimports += collect_submodules("rapidocr_onnxruntime")
+
+# --- inherit 类插件的依赖：httpx ------------------------------------------------
+# soroban 自己**一行都不 import httpx**（汇率抓取搬进了插件），所以 PyInstaller 的
+# 静态分析根本看不见它——requirements.txt 里写着不算数，进不了 exe。
+# 而 `python = "inherit"` 的插件（汇率）跑在 exe 自己的解释器里、`import httpx`：
+# 不显式带上，run.py 的 `--run-plugin` 一路走通到最后一步才 ModuleNotFoundError，
+# 表现就是**分发包上汇率永远取不到**，而打包日志里一个字都不会提。
+#
+# 同 OCR 那两段一个道理：打包机缺它就让打包失败，别出一个「汇率是死的」的包。
+try:
+    import httpx  # noqa: F401
+except ImportError:
+    raise SystemExit(
+        "打包中止：打包机上没装 httpx。汇率插件与 soroban 共用解释器、直接 import 它，\n"
+        "  缺了的话分发包上汇率永远取不到（而 exe 本身照常启动，故障只有到了用户手里才暴露）。\n"
+        "  解决：在**用来打包的那个解释器**里跑 pip install -r backend/requirements.txt"
+    )
+hiddenimports += collect_submodules("httpx")
+# httpx 校验 TLS 用 certifi 的 CA 包（一个**数据文件**，不是模块）。
+# 不带上的话 https 请求全部 SSLCertVerificationError——同样只在用户机器上出现。
+datas += collect_data_files("certifi")
+
+# --- 插件源码：打包机上有什么就带什么 -------------------------------------------
+# 原先插件完全不打包，靠打包者「记得把 plugins 文件夹复制到 exe 旁边」。
+# 那一步没有任何东西会提醒他做，漏了的表现是**整个插件页空空如也**，
+# 而 exe 本身一切正常——最难往「是不是少复制了个文件夹」上想的一种故障。
+#
+# 剔掉的三类，都不是为了省体积，是因为带上就是错的：
+#   1. **凭据**：.state/（打包者自己的淘宝登录 cookie）、.env、*.log。
+#      原先那段红色警告说的正是这个——但「随包分发一个文件夹」还能事后删，
+#      **打进 exe 就再也删不掉了**，所以这里必须是硬性剔除，不能靠人记得。
+#   2. **机器相关**：.venv/（写死了打包机的路径，到别人机器上根本跑不起来），
+#      而且体积以百 MB 计。到了用户那边由插件页的「一键安装」重建。
+#   3. **构建垃圾**：__pycache__、*.pyc、.git、node_modules。
+# 除此之外一律照带（含 README、tests、LICENSE）——「打包机上有什么就有什么」
+# 是一条不需要维护的规则，而白名单要求每加一种文件就回来改一次这里。
+_PLUG_SKIP_DIRS = {".venv", ".state", "__pycache__", ".git", "node_modules", ".pytest_cache"}
+_PLUG_SKIP_NAMES = {".env"}
+_PLUG_SKIP_SUFFIXES = (".pyc", ".pyo", ".log")
+
+
+def _bundle_plugins(base):
+    out = []
+    if not base.is_dir():
+        return out
+    for f in sorted(base.rglob("*")):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(base)
+        if set(rel.parts[:-1]) & _PLUG_SKIP_DIRS:
+            continue
+        if rel.name in _PLUG_SKIP_NAMES or rel.name.endswith(_PLUG_SKIP_SUFFIXES):
+            continue
+        out.append((str(f), str(Path("plugins") / rel.parent)))
+    return out
+
+
+_plugin_files = _bundle_plugins(ROOT / "plugins")
+print(f"[soroban.spec] 打包 {len(_plugin_files)} 个插件文件"
+      f"（已剔除 .state/.env/*.log/.venv/__pycache__）")
+datas += _plugin_files
 
 a = Analysis(                            # noqa: F821
     [str(BACKEND / "run.py")],

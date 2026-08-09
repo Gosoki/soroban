@@ -133,3 +133,32 @@ html.dark {
   white-space: pre-line;
   line-height: 1.7;
 }
+
+/* --- 浮层的面：全部收敛到卡片头那一档 -------------------------------------
+ * Element 暗色下浮层用的是它自己的两个值，**都不是本站的取色**：
+ *   · 下拉 / popover / 消息框 → --el-bg-color-overlay = #1d1e1f（中性近黑，
+ *     而全站的面是带蓝的 #131c2f / #161f33，并排放着像另一个应用的控件）；
+ *   · tooltip(is-dark) → --el-popper-bg-color-dark = --el-text-color-primary
+ *     = #e5eaf3，也就是在一片暗色里**开出一块白板**，落差最大的就是它。
+ * 两处都改成 --bg-head：浮层与卡片头同一个面，是全站已有的层次语言。
+ *
+ * 为什么要写 `.el-popper` 而不是只在 html.dark 里改变量：
+ * --el-popper-bg-color-dark 是 Element 直接定义在 `.el-popper` 元素上的，
+ * 祖先上再怎么改都被它自己那条压掉。必须同选择器覆盖（tokens.css 排在
+ * Element 之后，同特异性后来者胜）。 */
+html.dark {
+  --el-bg-color-overlay: var(--bg-head);
+}
+.el-popper {
+  --el-popper-bg-color-dark: var(--bg-head);
+}
+/* is-dark 还把**文字**写成了 var(--el-bg-color)（暗色下＝页面底色），
+   面换成暗的之后就是深色字压深色底，等于看不见。连文字和边一起接管。 */
+html.dark .el-popper.is-dark {
+  color: var(--txt-1);
+  border-color: var(--border);
+}
+html.dark .el-popper.is-dark > .el-popper__arrow::before {
+  background: var(--bg-head);
+  border-color: var(--border);
+}

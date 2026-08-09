@@ -143,3 +143,51 @@ def test_staging_search_escapes_wildcards(client):
     total_all = client.get("/api/staging", params={"limit": 1}).json()["total"]
     r = client.get("/api/staging", params={"q": "%"})
     assert r.json()["total"] < total_all
+
+
+def _fetch(client, staging_id: int) -> dict:
+    """按 id 取一行暂存。没有 GET /api/staging/{id}，只能从列表里挑。"""
+    items = client.get("/api/staging", params={"limit": 500}).json()["items"]
+    row = next((x for x in items if x["id"] == staging_id), None)
+    assert row is not None, f"列表里找不到暂存行 {staging_id}"
+    return row
+
+
+def test_import_status_cannot_be_patched_on_an_unimported_row(client, mk):
+    """未导入的暂存行不许被 PATCH 成「已导入」。
+
+    漏挡的后果不会报错，而是**同一笔货能进账本两遍**：
+    列表按 `import_status` 筛选时它算已导入（用户以为账已经记了），
+    而 `/import` 判的是 `imported_order_id`（仍是 NULL）→ 照样能再导一次。
+
+    前端该列是 readonly、插件的 `_PUSH_FIELDS` 也不含这个键，所以今天没人会发。
+    但端点挂的是 `staging:write`——持该权限的令牌在**协议上**发得出来，
+    而「今天没人这么用」不是不变量。
+    """
+    row = mk("/api/staging", {"order_date": "2026-03-01", "title": "还没导入的一单"})
+    assert row["import_status"] != "已导入", "用例前提不成立"
+
+    r = client.patch(f"/api/staging/{row['id']}",
+                     json={"version": row["version"], "import_status": "已导入"})
+    assert r.status_code == 422, r.text
+    assert "导入状态不能直接修改" in r.json()["detail"]
+
+    after = _fetch(client, row["id"])
+    assert after["import_status"] == row["import_status"], "被改动了"
+    assert after["imported_order_id"] is None
+    # 仍能正常导入——这道闸不该把唯一的正路也堵上
+    assert client.post(f"/api/staging/{row['id']}/import").status_code == 200
+
+
+def test_import_status_patch_is_rejected_before_anything_else_is_written(client, mk):
+    """带着别的字段一起发时，整条 PATCH 都要被拒——不能「状态挡住了、别的字段却改了」。
+
+    半成功比全失败难查得多：用户看到 422 会以为什么都没变。
+    """
+    row = mk("/api/staging", {"order_date": "2026-03-01", "title": "原标题"})
+    r = client.patch(f"/api/staging/{row['id']}",
+                     json={"version": row["version"], "title": "新标题",
+                           "import_status": "已导入"})
+    assert r.status_code == 422
+    assert _fetch(client, row["id"])["title"] == "原标题", \
+        "状态挡住了，但同一条请求里的别的字段被写进去了"

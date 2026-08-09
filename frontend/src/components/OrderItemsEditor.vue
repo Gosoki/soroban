@@ -11,8 +11,8 @@
         <tr><th>物品名</th><th>数量</th><th>单价（元）</th><th></th></tr>
       </thead>
       <tbody>
-        <tr v-for="(it, i) in (order.items || [])" :key="i" :class="{ 'item-auto': isTitleItem(it) }"
-            :title="isTitleItem(it) ? '物品名与商品标题相同（无独立物品详情）；改成真实物品名即变正常色' : ''">
+        <tr v-for="(it, i) in (order.items || [])" :key="i" :class="{ 'item-auto': isDerived(it) }"
+            :title="derivedWhy(it)">
           <td><el-input v-model="it.name" placeholder="物品名" @change="onItemEdit(it)" /></td>
           <td><el-input-number v-model="it.quantity" :min="1" :controls="false" @change="onItemEdit(it)" /></td>
           <td><el-input-number v-model="it.unit_price_cny" :min="0" :precision="2" :controls="false"
@@ -57,6 +57,7 @@ import { computed, reactive, ref, watchEffect } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Delete, Plus, QuestionFilled } from '@element-plus/icons-vue'
 import { ordersApi } from '@/api'
+import { handled } from '@/api/http'
 import { applyRowUpdate, queueOrderWrite } from '@/utils/orderWrites'
 
 // order 必须含 id / version / items / postage_cny / title（订单页的行 或 ordersApi.get 的结果都满足）
@@ -104,6 +105,19 @@ async function applyGoods(v) {
 function itemPrice(v) { return (v === '' || v === null || v === undefined) ? null : Number(v) }
 // 灰显 = 物品名与商品标题相同（无独立物品详情，多为自动占位）；有真实物品名即正常
 function isTitleItem(it) { return !!it.name && (it.name || '').trim() === (props.order.title || '').trim() }
+// 灰显 = 「这一行不是你亲手确认的」。两种来源，都该灰：
+//   · 物品名与商品标题相同 —— 手填货款时自动绑出来的占位行，没有独立物品详情；
+//   · `auto=true` —— 服务端派生的行，最典型的是「金额尾差」那条
+//     （单价除不尽时补出来保证总价守恒）。
+// 原先只认第一种，于是「金额尾差」行是正常色：它看起来和用户自己敲的一模一样，
+// 而它其实是派生的、会随下一次改单被重算/替换。任一格被编辑过就转成正常色
+// （onItemEdit 会置 auto=false），这条语义两种来源共用。
+function isDerived(it) { return !!it.auto || isTitleItem(it) }
+function derivedWhy(it) {
+  if (it.auto && !isTitleItem(it)) return '这一行由系统派生（如金额尾差），改任一格即转为你确认的物品'
+  if (isTitleItem(it)) return '物品名与商品标题相同（无独立物品详情）；改成真实物品名即变正常色'
+  return ''
+}
 function ensureItems() { if (!props.order.items) props.order.items = []; return props.order.items }
 
 async function saveItems() {
@@ -134,7 +148,7 @@ async function saveItems() {
     // 分工固定：**组件只管 409**（拦截器刻意放行它），其余一律交给拦截器。
     // 这里再弹一次的话会出现两条提示，而且 detail 是 FastAPI 的校验数组时，
     // 这条会把 JSON 原样打进提示框（拦截器那边是展平过的）。
-    if (e.response?.status === 409) { ElMessage.warning('数据已变，已刷新'); emit('conflict') }
+    if (e.response?.status === 409) { handled(e); ElMessage.warning('数据已变，已刷新'); emit('conflict') }
     return false
   }
 }
@@ -163,7 +177,7 @@ async function savePostage() {
     // 分工固定：**组件只管 409**（拦截器刻意放行它），其余一律交给拦截器。
     // 这里再弹一次的话会出现两条提示，而且 detail 是 FastAPI 的校验数组时，
     // 这条会把 JSON 原样打进提示框（拦截器那边是展平过的）。
-    if (e.response?.status === 409) { ElMessage.warning('数据已变，已刷新'); emit('conflict') }
+    if (e.response?.status === 409) { handled(e); ElMessage.warning('数据已变，已刷新'); emit('conflict') }
     return false
   }
 }

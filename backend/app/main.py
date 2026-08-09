@@ -9,19 +9,30 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.exc import TimeoutError as SATimeoutError
 
 from . import models  # noqa: F401  确保建表前所有模型已注册
+from . import single_process
 from .config import settings
-from .database import checkpoint_and_dispose, create_db_and_tables, wal_checkpoint_loop
+from .database import (
+    _control_url,
+    checkpoint_and_dispose,
+    create_db_and_tables,
+    wal_checkpoint_loop,
+)
 from .maintenance import barrier
 from .routers import (
     auth, dashboard, dbadmin, fx,
     ingest, items, layout, meta, misc, orders, plugins,
     settings as settings_router, shipment, staging, tags,
 )
-from .routers.plugins import scheduler_loop, shutdown_plugins
+from .routers.plugins import (
+    reclaim_stale_runs,
+    scheduler_loop,
+    seed_bundled_plugins,
+    shutdown_plugins,
+)
 from .services.ingest import load_kinds
 
 # 通用写入通道的 handler 在**模块级**注册：重复注册 / 未知权限 → 导入即炸，
@@ -64,7 +75,16 @@ def _check_secret_key() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _check_secret_key()
+    # 单进程闸：排在**建表之前**。多 worker 时后来的那些会在这里当场退出，
+    # 而不是先各自跑一遍迁移（幂等归幂等，但那是几个进程同时 ALTER 同一个库）。
+    single_process.acquire(_control_url())
     create_db_and_tables()          # Alembic upgrade head（幂等；旧库自动接管，见 database.py）
+    # 打包版：把 exe 里自带的插件释放到运行目录（源码运行是空操作）。
+    # 必须排在定时循环之前——那个循环起来就会去发现插件并按 schedule 触发。
+    seed_bundled_plugins()
+    # 建表**之后**、放定时循环之前：库里若还留着上一条命的「执行中」，此刻收掉。
+    # 进程刚起来，在飞的插件必然是零个，所以这一刻的判据最干净。
+    reclaim_stale_runs()
     tasks = [
         asyncio.create_task(scheduler_loop()),
         # 控制引擎恒为 SQLite（存 app_db_config），故 WAL 截断循环始终运行
@@ -79,6 +99,7 @@ async def lifespan(app: FastAPI):
         # 顺序反了的话，那些请求会撞上一个已经 dispose 的池，日志里刷一片无意义的异常。
         shutdown_plugins()              # 不做这件事，浏览器会变成 PPID=1 的孤儿永久留着
         checkpoint_and_dispose()        # 合并并截断 WAL、关连接池 → 回收 -wal/-shm
+        single_process.release()        # 松锁排最后：松早了下一个实例会撞上还没关完的库
 
 
 # 交互式文档：**只在只监听环回时默认开**。
@@ -193,6 +214,40 @@ async def _value_error_handler(request: Request, exc: ValueError):
     # 逃逸到 ASGI 层的 ValueError。仍记日志，避免把真正的代码 bug 悄悄伪装成「输入错误」。
     log.warning("ValueError on %s %s: %s", request.method, request.url.path, exc)
     return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+# MySQL 的并发写冲突。**按 errno 判，不按文案判**：
+#   1213 ER_LOCK_DEADLOCK      —— 死锁，服务端已经回滚了其中一方
+#   1205 ER_LOCK_WAIT_TIMEOUT  —— 等锁超时（innodb_lock_wait_timeout，默认 50s）
+# 两者都是「有人跟你抢同一批行」，重试就能过去；语义与乐观锁冲突同类。
+_RETRYABLE_MYSQL = {1213, 1205}
+
+
+@app.exception_handler(OperationalError)
+async def _deadlock_handler(request: Request, exc: OperationalError):
+    """MySQL 死锁 / 等锁超时 → 409（前端已有成熟处理），其余 OperationalError 照旧 500。
+
+    **为什么不能全部 OperationalError 都转 409**：这个异常类是个大杂烩，
+    「连接断了」「库不存在」「权限不足」也走它。把连接断开报成「数据已变，请刷新重试」
+    会让用户一直刷新一个根本连不上的库——那比裸 500 更误导。
+    所以按 errno 精确挑出可重试的那两个，剩下的**原样抛出去**走默认 500 路径。
+
+    409 是刻意的：前端对它已经有一整套处理（提示「数据已变」+ 重新拉取），
+    而死锁的正确用户动作恰好就是「再试一次」。挂在这里而不是逐个端点 try/except——
+    与只读屏障同一条理由：将来新增的写端点自动被覆盖，不会有人忘了加。
+    """
+    # 取 errno 必须防空：驱动层的异常不保证带 args（SQLite 那些就不带），
+    # 直接 `args[0]` 会在 handler 里抛 IndexError——异常处理器自己炸掉，
+    # 用户看到的是一个完全无关的 500，而真正的原因彻底消失。
+    args = getattr(getattr(exc, "orig", None), "args", ()) or ()
+    code = args[0] if args else None
+    if code not in _RETRYABLE_MYSQL:
+        raise exc                       # 不是并发冲突：交给默认处理，别伪装成业务冲突
+    log.warning("MySQL 并发写冲突(errno=%s) on %s %s", code, request.method, request.url.path)
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "另一个操作正在改同一批数据（数据库死锁），已回滚，请重试"},
+    )
 
 
 @app.exception_handler(SATimeoutError)

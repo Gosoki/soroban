@@ -90,13 +90,13 @@ export function platformSemanticStyle(s) {
 // 抄两份必然漂移——上一轮 OCR 合并把终态盖掉的事故，根因就是前后端各存了一份规则。
 // 必须与后端 models/base.py 的 PURCHASE_STATUS_RANK / PURCHASE_TERMINAL_STATUSES 一致。
 export const PURCHASE_STATUS_RANK = { 待付款: 0, 待发货: 1, 待收货: 2, 已签收: 3 }
-export const PURCHASE_TERMINAL = ['退款', '交易关闭']
+export const PURCHASE_TERMINAL_STATUSES = ['退款', '交易关闭']
 
 // 能不能把 cur 推进到 next。终态是明确结论，自动识别不该推翻它。
 export function canAdvancePurchase(cur, next) {
   if (!next || next === cur) return false
-  if (PURCHASE_TERMINAL.includes(cur)) return false
-  if (PURCHASE_TERMINAL.includes(next)) return true
+  if (PURCHASE_TERMINAL_STATUSES.includes(cur)) return false
+  if (PURCHASE_TERMINAL_STATUSES.includes(next)) return true
   return (PURCHASE_STATUS_RANK[next] ?? -1) > (PURCHASE_STATUS_RANK[cur] ?? -1)
 }
 

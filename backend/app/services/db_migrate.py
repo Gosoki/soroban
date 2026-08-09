@@ -84,6 +84,43 @@ def test_connection(host: str, port: int, user: str, password: str, database=Non
         return False, str(e)
 
 
+MIN_MYSQL = (8, 0)
+
+
+def unsupported_server(version: str) -> str:
+    """这台服务端能不能用。能用返回空串，不能用返回一句人话原因。
+
+    **为什么必须在门口拦**：不拦的话，迁移会跑到一半才炸，而 DDL 在 MySQL 上是
+    **隐式提交**的——前面几条已经落地、后面的没跑，库停在一个半升级态，
+    既不是旧版也不是新版，`alembic upgrade` 再跑一次也未必能自愈。
+    「一开始就拒绝」和「炸在中途」对用户的代价差着一个数量级。
+
+    两条判据都来自真实的建表语句，不是猜的：
+      · MariaDB 没有 `utf8mb4_0900_bin`（那是 MySQL 8.0 引入的 NO PAD 规则）。
+        `dialect.BinStr` 硬写了它 → `ERROR 1273: Unknown collation`。
+      · MySQL 5.7 更早就过不去：`ALTER TABLE … RENAME COLUMN` 是 8.0 才有的语法，
+        迁移链里用到它。所以「只修 BinStr」既买不到 5.7、也买不到 MariaDB。
+
+    README 曾承诺「MariaDB 会自动回退」。回退逻辑确实在 `bin_collation()` 里，
+    但 `BinStr` 这条路径绕过了它——承诺是假的。与其补一条从未在真机验证过的兼容分支，
+    不如把话说准：需要 MySQL 8.0+。
+    """
+    v = (version or "").strip()
+    low = v.lower()
+    if "mariadb" in low:
+        return (f"检测到 MariaDB（{v}）。soroban 需要 MySQL 8.0 或更新版本："
+                "唯一键用的 utf8mb4_0900_bin 排序规则 MariaDB 没有，"
+                "迁移会在中途失败并把库留在半升级状态。")
+    m = re.match(r"(\d+)\.(\d+)", v)
+    if not m:
+        return ""                       # 认不出版本号就放行——不该因为格式没见过而挡住人
+    if (int(m.group(1)), int(m.group(2))) < MIN_MYSQL:
+        return (f"检测到 MySQL {v}。soroban 需要 8.0 或更新版本："
+                "迁移用到了 8.0 才有的 RENAME COLUMN 语法与 utf8mb4_0900_bin 排序规则，"
+                "在旧版上会中途失败并把库留在半升级状态。")
+    return ""
+
+
 def ensure_database(host: str, port: int, user: str, password: str, database: str) -> None:
     """建库（utf8mb4），已存在则跳过。库名做白名单校验，防注入。"""
     if not _DB_NAME_RE.match(database):

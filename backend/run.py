@@ -141,15 +141,61 @@ def _check_port_free(host: str, port: int) -> None:
             )
 
 
+def _run_plugin(argv: list[str]) -> "NoReturn":                 # noqa: F821
+    """内部动词 `--run-plugin <插件目录> <入口…>`：**把 exe 自己当解释器**跑一个插件。
+
+    存在的理由是打包版的一个死结：`plugin.toml` 里写 `python = "inherit"` 的插件
+    （汇率就是）意思是「用 soroban 自己的环境跑，不建 venv」。源码模式下
+    `sys.executable` 就是那个环境，一切正常；**打包之后 `sys.executable` 是 soroban.exe**：
+      · 拿它去 `soroban.exe -m soroban_fx fetch` —— bootloader 根本不解释 `-m`，
+        结果是把 soroban 又启动一遍（见 `_base_python` 的说明）；
+      · 退一步去找系统的 python，那个 python 里**没有 httpx**，ModuleNotFoundError。
+    两条路都不通 ⇒ 分发包上汇率插件必然跑不起来，而它是账本唯一的汇率来源。
+
+    出路是承认一件事：这类插件本来就是 soroban 的一部分，依赖也已经在 exe 里了。
+    所以给 exe 开一个内部动词，让它以「python 解释器」的语义跑一次插件入口，
+    `-m mod` 与 `脚本.py` 两种写法都照 python 自己的规矩解释。
+    重依赖插件（浏览器、OCR）不走这里，照旧用自带 venv，隔离仍然成立。
+
+    这不构成新的攻击面：能给 exe 传参数的人本来就能直接运行任意程序，
+    而 soroban 平时就在起插件子进程。它只是把「误用」变成「明确支持的一种用法」。
+
+    这里**不能**做 chdir / 建 .env / 起服务：工作目录由调用方（`_launch` 的 cwd）
+    设成插件目录，令牌与配置走环境变量。做了就等于每跑一次插件顺手改一次运行目录。
+    """
+    if len(argv) < 2:
+        print("--run-plugin 需要 <插件目录> <入口…>，例如 "
+              "--run-plugin /path/to/plugin -m soroban_fx fetch", file=sys.stderr)
+        raise SystemExit(2)
+    import runpy
+
+    plugin_dir, rest = argv[0], argv[1:]
+    sys.path.insert(0, plugin_dir)          # 让插件包可 import（等价于 python 的 cwd 规则）
+    if rest[0] == "-m":
+        if len(rest) < 2:
+            print("--run-plugin 的 -m 后面要跟模块名", file=sys.stderr)
+            raise SystemExit(2)
+        sys.argv = [rest[1], *rest[2:]]
+        runpy.run_module(rest[1], run_name="__main__", alter_sys=True)
+    else:
+        sys.argv = list(rest)
+        runpy.run_path(rest[0], run_name="__main__")
+    raise SystemExit(0)
+
+
 def main() -> None:
-    # 本入口只接受一个**精确白名单**：`--use-local-db [--yes]`（MySQL 连不上时的离线自救）。
-    # 其余一律拒绝。这道保险是因为：打包成 exe 后 sys.executable 就是 exe 自己，任何
-    # 「拿它当 python 跑」的误用（如 `soroban.exe -m venv …`）都会静默地**把 soroban 再启动
-    # 一遍**——建 .env、连库跑迁移，最后卡在端口占用。直接报错退出，能把这类误用从
-    # 「莫名其妙的影子实例」变成一眼可见的错误。
+    # 本入口只接受一个**精确白名单**：`--use-local-db [--yes]`（MySQL 连不上时的离线自救）
+    # 与内部动词 `--run-plugin`（见上）。其余一律拒绝。这道保险是因为：打包成 exe 后
+    # sys.executable 就是 exe 自己，任何「拿它当 python 跑」的误用（如 `soroban.exe -m venv …`）
+    # 都会静默地**把 soroban 再启动一遍**——建 .env、连库跑迁移，最后卡在端口占用。
+    # 直接报错退出，能把这类误用从「莫名其妙的影子实例」变成一眼可见的错误。
     argv = sys.argv[1:]
     rescue = False
     if argv:
+        # --run-plugin 必须**最先**判：它后面跟的是插件自己的参数，
+        # 不该被下面那条「整个 argv 必须落在白名单里」的规则误伤。
+        if argv[0] == "--run-plugin":
+            _run_plugin(argv[1:])
         if set(argv) <= {"--use-local-db", "--yes"} and "--use-local-db" in argv:
             rescue = True
         else:

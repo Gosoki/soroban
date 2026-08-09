@@ -90,4 +90,17 @@ def get_current_user(
             raise credentials_error
         # 路由需要知道「是哪个插件、拿了哪些权限」——挂在 user 上而不是再解一次令牌。
         user._plugin_claims = payload
+    # `session.get(User, ...)` 开了一个读事务，而 `get_session` 的生成器要兜到**响应结束**
+    # 才关。对普通路由无所谓（毫秒级），但 OCR 路由的推理要跑好几秒到十几秒——
+    # 那期间这条连接一直是「idle in transaction」。在 MySQL 上它会一路攥着
+    # REPEATABLE READ 快照与 MDL，让并发的 DDL/迁移一起等；同时并发上传几张图，
+    # 池（20+20）也更容易见底。
+    #
+    # 这一行只是**结束事务**，不还连接（还连接要改 get_session 的生命周期，
+    # 那是影响每一条路由的结构性改动，见审计报告 T14）。但代价接近零：
+    # user 已经读出来了，后面路由自己的查询会开新事务。
+    # 用 rollback 而不是 commit：这里一个字节都没写，commit 语义上是错的，
+    # 而且会把**路由还没提交的写**一起提交掉——依赖是在路由函数之前跑的，
+    # 今天没有写，但 commit 会让「以后有人在依赖里写一笔」变成一个静默的越界提交。
+    session.rollback()
     return user

@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from app.models import PURCHASE_STATUS_RANK, PurchaseStatus, ShipmentStatus, ImportStatus
+from app.models import (
+    PURCHASE_STATUS_RANK,
+    PURCHASE_TERMINAL_STATUSES,
+    ImportStatus,
+    PurchaseStatus,
+    ShipmentStatus,
+)
 
 _REPO = Path(__file__).resolve().parents[2]
 _CONSTANTS_JS = _REPO / "frontend" / "src" / "constants.js"
@@ -80,6 +86,20 @@ def test_frontend_status_rank_matches_backend():
     assert m, "没在 constants.js 里找到 PURCHASE_STATUS_RANK"
     fe = {k: int(v) for k, v in re.findall(r"([^\s,{]+)\s*:\s*(\d+)", m.group(1))}
     assert fe == PURCHASE_STATUS_RANK
+
+
+def test_frontend_terminal_statuses_match_backend(constants_js):
+    """终态集合两边必须逐值一致——**这条断言比那次改名重要得多**。
+
+    前端拿它决定「这个状态还能不能往前推」；后端拿它决定「这一单计不计入合计」。
+    两边漂移的后果不是报错，是**看板金额凭空变大**：前端以为某单是终态、不再推进，
+    后端却不认为它是终态、照样加进 SUM——这个项目栽过一次一模一样的跟头
+    （OCR 合并把终态盖掉），根因正是前后端各存了一份规则。
+    改名（PURCHASE_TERMINAL → PURCHASE_TERMINAL_STATUSES）只是让两边同名好找，
+    真正拦住漂移的是这一条。
+    """
+    assert set(_js_array(constants_js, "PURCHASE_TERMINAL_STATUSES")) == \
+        set(PURCHASE_TERMINAL_STATUSES)
 
 
 def test_scraper_status_map_targets_are_valid(constants_js):
@@ -503,3 +523,62 @@ def test_fx_history_returns_exactly_n_days(client, session):
 
     got = client.get("/api/fx/history", params={"days": 7}).json()
     assert len(got["items"]) == 7, f"「近 7 天」返回了 {len(got['items'])} 天"
+
+
+def test_409_is_never_silent():
+    """409 的失败方向必须是「多一条提示」，不是「什么都不显示」。
+
+    原先的约定是「409 交给页面处理，拦截器不弹」。约定本身没错，错的是失败方向：
+    页面忘了处理 → 点下去**完全没反应**，是最难排查的那种「没坏但也不动」。
+    409 的调用点已经涨到 22 处，其中 6 处漏了处理——复发率证明「靠作者记住」不成立。
+
+    现在拦截器延后一拍兜底：页面给了更好的提示就 `handled(e)` 取消，忘了就由它说话。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    http = (root / "api" / "http.js").read_text(encoding="utf-8")
+    assert "export function handled" in http, "取消兜底的入口没了，页面无法避免重复提示"
+    assert "pending409" in http and "setTimeout(" in http, "409 没有兜底提示"
+    # 老写法：整段跳过 409。留着它就等于兜底从来不会触发。
+    assert "status !== 409" not in http, \
+        "拦截器又把 409 整段跳过了——兜底提示失效，漏处理的调用点重新变成静默"
+
+    # 每个 `handled(` 的使用点都得先 import，否则运行时才炸（而 409 本就是少见分支）
+    for f in sorted(root.rglob("*.vue")):
+        src = f.read_text(encoding="utf-8")
+        if "handled(e)" in src:
+            assert "from '@/api/http'" in src, f"{f.name} 用了 handled() 却没 import"
+
+
+def test_frontend_pre_checks_image_size_on_every_ocr_upload():
+    """三条 OCR 上传路径都要在本机先量一下分辨率。
+
+    后端 `MAX_OCR_PIXELS` 是硬拒绝（400），而且必须硬：降采样会掉小字体识别率，
+    而**识别错的快递单号比识别不出来贵得多**（错号会精确匹配并挂到别人的订单上）。
+    但硬拒绝不等于让用户白等——尺寸浏览器本地一读就知道，传上去再回 400
+    在慢网络上是几十秒的空等。
+
+    漏一条路径的表现最难受：另外两处会提前提示、这一处传完才报错，
+    用户会以为是「这张图有什么特别」。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    gate = (root / "utils" / "imageGate.js").read_text(encoding="utf-8")
+    # 判据必须与后端同一个数字，抄歪了就是两边说法不一致
+    from app.services.ocr import MAX_OCR_PIXELS
+    assert str(MAX_OCR_PIXELS).replace("000000", "_000_000") in gate or \
+        f"{MAX_OCR_PIXELS:,}".replace(",", "_") in gate, "前端上限与后端对不上"
+
+    uploads = {
+        "views/Orders/index.vue": "ordersApi.ocr(",
+        "views/Shipment/index.vue": "shipmentApi.ocr(",
+    }
+    for rel, call in uploads.items():
+        src = (root / rel).read_text(encoding="utf-8")
+        assert call in src, f"{rel} 里找不到 OCR 上传调用，这条守卫已经守错了地方"
+        assert "checkImageSize" in src, f"{rel} 的 OCR 上传没有做分辨率预检"
+    ship = (root / "views" / "Shipment" / "index.vue").read_text(encoding="utf-8")
+    assert ship.count("checkImageSize(file)") >= 2, \
+        "集运页有两条上传路径（成品包裹页 / 内含快递挂靠），预检只加了一条"

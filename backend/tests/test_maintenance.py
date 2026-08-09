@@ -8,6 +8,7 @@ autocommit），拷贝期间的写入会产生撕裂的拷贝。所以迁移全�
 import json
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -278,3 +279,74 @@ def test_control_tables_excluded_from_legacy_detection():
     src = inspect.getsource(run_migrations)
     assert "control.control_metadata.tables" in src, \
         "排除集又写成手抄清单了——加一张控制表就会瘫痪全新部署"
+
+
+# --- 单进程闸（T8）-------------------------------------------------------------
+
+_APP_DIR = str(Path(__file__).resolve().parents[1])
+
+
+def _try_acquire_in_subprocess(url: str):
+    """在**另一个进程**里抢同一把锁。同进程内 flock 是可重入的，自己抢自己测不出东西。"""
+    import subprocess
+    import sys
+    import textwrap
+
+    code = textwrap.dedent(f"""
+        import sys
+        sys.path.insert(0, {_APP_DIR!r})
+        from app import single_process
+        try:
+            ok = single_process.acquire({url!r})
+        except single_process.MultipleInstances as e:
+            print("REFUSED", str(e).replace(chr(10), " "))
+            raise SystemExit(0)
+        print("ACQUIRED" if ok else "SKIPPED")
+    """)
+    return subprocess.run([sys.executable, "-c", code], capture_output=True,
+                          text=True, timeout=60)
+
+
+def test_second_instance_on_the_same_data_dir_is_refused(tmp_path):
+    """同一份数据目录起第二个进程 → 当场拒绝，并说清为什么。
+
+    插件令牌的撤销表 `scopes._ALIVE` 是**进程内**的 dict：多一个 worker 就多一份空表，
+    插件回灌被负载均衡分到另一个进程就是 **401**——「抓了一批单一条都没回来」，
+    而日志里只有一串 401，没有任何一处会说「因为你开了多进程」。
+    """
+    from app import single_process
+
+    url = f"sqlite:///{tmp_path / 'ctl.db'}"
+    assert single_process.acquire(url) is True
+    try:
+        r = _try_acquire_in_subprocess(url)
+        assert "REFUSED" in r.stdout, f"第二个进程拿到了锁：{r.stdout!r} {r.stderr[-300:]!r}"
+        assert "--workers" in r.stdout, "拒绝了却没说清怎么解决"
+    finally:
+        single_process.release()
+
+
+def test_lock_is_per_data_dir_not_global(tmp_path):
+    """同机跑两份互不相干的 soroban（不同目录、不同端口）是合法用法，不该被误伤。"""
+    from app import single_process
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    assert single_process.acquire(f"sqlite:///{a / 'ctl.db'}") is True
+    try:
+        r = _try_acquire_in_subprocess(f"sqlite:///{b / 'ctl.db'}")
+        assert "ACQUIRED" in r.stdout, f"另一个目录也被挡住了：{r.stdout!r} {r.stderr[-300:]!r}"
+    finally:
+        single_process.release()
+
+
+def test_release_lets_the_next_instance_in(tmp_path):
+    """正常关停后，下一次启动必须能拿到锁——否则重启一次就再也起不来了。"""
+    from app import single_process
+
+    url = f"sqlite:///{tmp_path / 'ctl.db'}"
+    assert single_process.acquire(url) is True
+    single_process.release()
+    assert single_process.acquire(url) is True
+    single_process.release()

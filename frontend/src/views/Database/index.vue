@@ -96,6 +96,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Coin, Files } from '@element-plus/icons-vue'
 import { dbApi } from '@/api'
+import { handled } from '@/api/http'
 import { longToast, typeStyle } from '@/constants'
 
 // active 初值刻意留空：给 `{ backend: 'sqlite' }` 的话，首帧必然渲染成
@@ -192,6 +193,7 @@ async function doSwitch(target, name) {
     // 409 = 后端发现「迁移之后当前库又被改过」。这些改动不在目标库里，切过去就静默没了。
     // 409 被 http 拦截器刻意跳过（留给页面处理），所以这里必须自己弹，否则用户什么都看不到。
     if (e.response?.status === 409) {
+      handled(e)
       await onSourceChanged(target, name, e.response?.data?.detail)
     }
     // 其余错误拦截器已提示
@@ -233,6 +235,7 @@ async function onSourceChanged(target, name, detail) {
     // 这里原先是空 catch：弹窗关掉、loading 停掉、既无成功也无失败提示、loadStatus 也被跳过
     // —— 用户完全不知道到底切没切。上面 doSwitch 为同一件事写了处理，这条分支漏了。
     if (e.response?.status === 409) {
+      handled(e)
       // 只提示不递归：迁移与切换之间源库又被写了（爬虫回灌 / 汇率刷新 / 另一个标签页）。
       // 递归重试会在爬虫逐单回灌时变成关不掉的弹窗循环。
       longToast(ElMessage, 'warning',

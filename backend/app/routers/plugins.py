@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -281,6 +282,16 @@ def _rename_state(manifest: dict, old: str, new: str) -> bool:
     return moved
 
 
+def _inherits(manifest: dict) -> bool:
+    """这个插件是不是「跟 soroban 用同一个环境」（`python = "inherit"`）。
+
+    单独成函数是因为它决定了**四件事**的分支：用哪个解释器、命令行怎么拼、
+    依赖怎么探测、能不能点「安装」。散在四处各写一遍 `== "inherit"`，
+    只要有一处漏了，表现就是「界面说已就绪、点了 ModuleNotFoundError」。
+    """
+    return manifest.get("python", ".venv/bin/python") == "inherit"
+
+
 def _python(manifest: dict) -> Path:
     """跑这个插件用哪个解释器。
 
@@ -289,16 +300,43 @@ def _python(manifest: dict) -> Path:
     汇率是记账的必要供给方，不该让「Windows 上装不了 venv」变成「记不了账」——
     打包版 exe 在系统没有 Python 时一个插件都装不上，那时唯一能跑的就是这类。
     重依赖插件（浏览器、OCR）照旧走独立 venv，隔离仍然成立。
+
+    ⚠️ inherit **必须**是 `sys.executable`，不能借道 `_base_python()`。
+    那个函数找的是「能用来建 venv 的**系统** Python」，冻结态下它返回的是
+    PATH 里的 python3——而 inherit 的字面意思是「继承 soroban 的环境」，
+    系统 python3 里根本没有 httpx。这条路走通的表现是 ModuleNotFoundError，
+    走不通（机器上没装 python）的表现更糟：回落到 exe 自己，
+    于是每次跑插件都把 soroban 又启动一遍。
+    冻结态下用 exe 当解释器是**刻意的**，配套的是 run.py 的 `--run-plugin`
+    内部动词（见 `_plugin_argv`）。
     """
+    if _inherits(manifest):
+        return Path(sys.executable)
     want = manifest.get("python", ".venv/bin/python")
-    if want == "inherit":
-        return Path(_base_python() or sys.executable)
     p = manifest["_dir"] / want
     if not p.exists() and os.name == "nt":          # Windows 的 venv 是 Scripts/python.exe
         alt = manifest["_dir"] / ".venv" / "Scripts" / "python.exe"
         if alt.exists():
             return alt
     return p
+
+
+def _plugin_argv(manifest: dict, command: str, extra: list[str]) -> list[str]:
+    """跑一次插件的完整命令行。
+
+    普通插件：`<插件venv的python> <entry…> <command> <extra…>`，就是 python 的老规矩。
+
+    inherit 插件**在冻结态**要绕一下：`sys.executable` 是 soroban.exe，
+    而 bootloader 不认 `-m`。改走 exe 的内部动词：
+    `soroban.exe --run-plugin <插件目录> <entry…> <command> <extra…>`，
+    由 run.py 的 `_run_plugin` 按 python 的语义解释 `entry`（见那边的说明）。
+    源码态不需要这一层——那时 `sys.executable` 就是一个真的 python。
+    """
+    entry = shlex.split(manifest.get("entry", ""))
+    if _inherits(manifest) and getattr(sys, "frozen", False):
+        return [sys.executable, "--run-plugin", str(manifest["_dir"]),
+                *entry, command, *extra]
+    return [str(_python(manifest)), *entry, command, *extra]
 
 
 _needs_cache: dict[str, tuple[float, list[dict]]] = {}
@@ -333,6 +371,8 @@ def probe_needs(manifest: dict) -> list[dict]:
     用户看到「缺什么」才知道点下去会发生什么，也才看得懂失败在哪一步。
     """
     d, out = manifest["_dir"], []
+    if _inherits(manifest):
+        return _inherit_needs(d)                     # 没有 venv 可探，见那边
     py = _python(manifest)
     # 判据是「解释器能跑」而不是「文件存在」：venv 建到一半失败（例如系统缺 ensurepip）时，
     # bin/python 这个符号链接**已经在了**，只看存在与否会把半成品当成装好了，
@@ -351,6 +391,43 @@ def probe_needs(manifest: dict) -> list[dict]:
         out.append({"key": "browser", "label": "浏览器内核（Chromium）",
                     "hint": "Playwright 需要一份自带的 Chromium（约 150MB），系统装的浏览器不算"})
     return out
+
+
+def _inherit_needs(d: Path) -> list[dict]:
+    """inherit 插件缺什么。**在本进程里问**，不 spawn 任何子进程。
+
+    两条都不能走原来那套：
+      · venv 检查：inherit 插件根本没有 venv，报「缺 Python 环境」会让用户去点安装，
+        而安装建出来的 venv 永远不会被用到——一个点了没有任何效果的按钮。
+      · `_missing_dists` 的子进程探测：解释器就是 soroban 自己；冻结态下
+        `[soroban.exe, "-c", ...]` 会**把 soroban 又启动一遍**，而这条路径挂在
+        前端**轮询**的 GET /api/plugins 上（60 秒缓存也拦不住每分钟一个影子实例）。
+        本进程里 `importlib.metadata` 问的是同一个环境，答案更准且零开销。
+
+    汇率插件原先连 `requirements.txt` 都没有 ⇒ 这一整段被跳过 ⇒ 卡片上
+    `installed` 恒为 `true`：**界面写着「已就绪」，每次运行却 ModuleNotFoundError**。
+    现在它声明了 httpx，这里如实检查 soroban 自己有没有。
+    """
+    req = d / "requirements.txt"
+    if not req.exists():
+        return []
+    from importlib.metadata import PackageNotFoundError, distribution
+
+    missing = []
+    for name in _declared_dists(req):
+        try:
+            distribution(name)
+        except PackageNotFoundError:
+            missing.append(name)
+        except Exception:                            # noqa: BLE001  元数据坏了不算缺
+            pass
+    if not missing:
+        return []
+    return [{"key": "deps", "label": "Python 依赖",
+             # 刻意不给「一键安装」那套话术：这类插件跟 soroban 同环境，
+             # 缺的包要装进 soroban 自己，不是建一个插件 venv 能解决的。
+             "hint": "本插件与 soroban 共用运行环境，缺少：" + "、".join(missing)
+                     + "。需要把它装进 soroban 自己的环境（打包版则要重新打包）"}]
 
 
 def _declared_dists(req: Path) -> list[str]:
@@ -481,6 +558,22 @@ def _summarize(line: str, returncode: int, errtail: str = "") -> str:
     return (line or "已完成")[:200]
 
 
+def _self_reported_error(line: str) -> bool:
+    """插件在它那行 JSON 里自己说「出事了」吗（`{"error": ...}`）。
+
+    与退出码是**两个独立的信号**，都要看：
+      · 退出码是跨进程契约（非零=失败），插件作者会刻意用 0 表达「本次没什么可做」；
+      · JSON 里的 error 是插件自己的交代，可能伴随 0 退出码（部分成功、软跳过）。
+    只信前者会把「跑完了但有一半没抓到」显示成绿色的「成功」——而用户看到绿字
+    就不会再去点开摘要，那句话里恰恰写着出了什么事。
+    """
+    try:
+        d = json.loads(line or "{}")
+    except (TypeError, ValueError):
+        return False
+    return isinstance(d, dict) and bool(d.get("error"))
+
+
 _MAX_CAPTURE = 256 * 1024        # 每路输出最多留末尾 256KB
 
 # 在飞的插件子进程：pid → (Popen, 标签)。进程关停时要连它们一起收掉。
@@ -569,7 +662,7 @@ def _reap(proc: subprocess.Popen, label: str, jti: Optional[str] = None, on_done
     `on_done(ok, summary)` 把结果写回 PluginConfig 供界面显示。同样在 finally 里：
     超时被 kill 时也要有个交代，否则卡片会永远停在「执行中…」。
     """
-    result, ok = "", False
+    result, ok, warn = "", False, False
     outs: list[str] = []
     errs: list[str] = []
     try:
@@ -612,6 +705,12 @@ def _reap(proc: subprocess.Popen, label: str, jti: Optional[str] = None, on_done
         ok = proc.returncode == 0
         errtail = (err or "").strip()
         result = _summarize(line, proc.returncode, errtail)
+        # **退出码是跨进程契约，不动它**：淘宝插件的 `already_running` 刻意 return 0，
+        # 那是「这次没什么可做的」而不是失败，改成信 JSON 会把它刷成红色。
+        # 但「退出码 0 且自报了 error」也不该显示成绿色的「成功」——
+        # 用户看到绿字就不会再去点开摘要，而那句话里写着出了什么事。
+        # 所以加第三档：成败仍由退出码定，颜色多一档黄。
+        warn = ok and _self_reported_error(line)
         if ok:
             log.info("插件 %s 完成：%s", label, line or "(无 stdout)")
         else:
@@ -623,7 +722,7 @@ def _reap(proc: subprocess.Popen, label: str, jti: Optional[str] = None, on_done
             _ALIVE_PROCS.pop(proc.pid, None)
         scopes.revoke(jti)          # 任务结束 → 令牌立即失效
         if on_done:
-            on_done(ok, result or "已完成")
+            on_done(ok, result or "已完成", warn)
 
 
 def plugin_settings(session: Session, manifest: dict) -> dict:
@@ -666,7 +765,7 @@ def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str]
     python = _python(manifest)
     if not python.exists():
         raise HTTPException(status_code=400, detail=f"插件未安装：缺 venv（{python}）。见插件 README。")
-    cmd = [str(python)] + shlex.split(manifest.get("entry", "")) + [command] + extra
+    cmd = _plugin_argv(manifest, command, extra)
     env = None
     if token or config:
         env = {**os.environ}
@@ -805,6 +904,15 @@ def install_plugin(
 ):
     """补齐插件依赖。后台执行，用 GET /api/plugins 轮询 install 字段看进度。"""
     m = _find_manifest(plugin_id)
+    if _inherits(m):
+        # 这类插件跟 soroban 共用环境，没有 venv 可建。原先照样往下走：
+        # 在插件目录里建一个**永远不会被用到**的 .venv，装完还是缺什么缺什么——
+        # 一个点了有进度条、有成功提示、却什么也没改变的按钮。
+        raise HTTPException(
+            status_code=409,
+            detail=f"「{m['_m'].name}」与 soroban 共用运行环境，没有独立环境可安装。"
+                   "它缺的依赖要装进 soroban 自己（打包版则需重新打包）。",
+        )
     if _base_python() is None:
         # 打包版（exe）里没有可用解释器。与其拿 exe 去当 python 跑出一个影子实例，
         # 不如明说——用户至少知道该装什么。
@@ -883,6 +991,10 @@ def list_plugins(session: Session = Depends(get_session)):
                 "granted": sorted(json.loads(cfg.granted_scopes or "[]")) if cfg else [],
                 "effective": sorted(effective),
                 "catalog": scopes.describe(),
+                # baseline 单独给：卡片上要能明说「这一项默认持有、勾选框里没有它」。
+                # 不给的话前端只能在 effective 里看到一个 declared 里没有的 key，
+                # 唯一能做的就是把它算进比值——那正是「一项没勾却显示 1/1」的来历。
+                "baseline": scopes.describe_baseline(),
             },
         })
 
@@ -905,7 +1017,10 @@ def list_plugins(session: Session = Depends(get_session)):
             "last_run": {"outcome": cfg.last_outcome, "summary": cfg.last_summary,
                          "at": cfg.last_finished_at},
             "scopes": {"declared": [], "granted": sorted(json.loads(cfg.granted_scopes or "[]")),
-                       "effective": [], "catalog": scopes.describe()},
+                       "effective": [], "catalog": scopes.describe(),
+                       # 残留配置没有清单、也不会再签发令牌，baseline 对它没有意义——
+                       # 给空列表而不是省掉这个键：前端一份渲染代码走两条分支。
+                       "baseline": []},
         })
     return out
 
@@ -1153,11 +1268,12 @@ _BATCHES: dict[str, dict] = {}
 _BATCH_LOCK = threading.Lock()
 
 
-def _batch_add(batch: str, who: str, ok: bool, summary: str) -> tuple[bool, list, Optional[int]]:
+def _batch_add(batch: str, who: str, ok: bool, summary: str,
+               warn: bool = False) -> tuple[bool, list, Optional[int]]:
     """登记一个子进程的结果。返回 (是否已全部完成, 当前全部结果, 最终数量或 None)。"""
     with _BATCH_LOCK:
         b = _BATCHES.setdefault(batch, {"done": [], "total": None})
-        b["done"].append((who, ok, summary))
+        b["done"].append((who, ok, summary, warn))
         total, parts = b["total"], list(b["done"])
         finished = total is not None and len(parts) >= total
         if finished:
@@ -1180,10 +1296,24 @@ def _batch_seal(batch: str, total: int) -> tuple[bool, list]:
 
 
 def _batch_text(label: str, parts: list, total: Optional[int]) -> tuple[str, str]:
-    """把一批结果拼成卡片上的一行。返回 (outcome, summary)。"""
-    body = "；".join(f"{w or '本次'} {'✓' if o else '✗'} {s}" for w, o, s in parts)
+    """把一批结果拼成卡片上的一行。返回 (outcome, summary)。
+
+    outcome 是**三档**：ok / warn / failed。warn = 全都正常退出，但至少有一个
+    自己报了 error（部分成功、软跳过）。少了这一档，那种结果只能二选一：
+    算成功 → 绿字，用户不会再点开摘要；算失败 → 把插件作者刻意的软跳过刷成红色。
+    """
+    def _mark(o, w):
+        return "✗" if not o else ("!" if w else "✓")
+
+    body = "；".join(f"{w or '本次'} {_mark(o, wn)} {s}" for w, o, s, wn in parts)
     if total is not None and len(parts) >= total:
-        return ("ok" if all(o for _, o, _ in parts) else "failed"), f"{label}：{body}"
+        if not all(o for _, o, _, _ in parts):
+            outcome = "failed"
+        elif any(wn for _, _, _, wn in parts):
+            outcome = "warn"
+        else:
+            outcome = "ok"
+        return outcome, f"{label}：{body}"
     n = f"{len(parts)}/{total}" if total else f"{len(parts)}"
     return "running", f"{label}（{n}）：{body}"
 
@@ -1219,11 +1349,12 @@ def _result_writer(plugin_id: str, label: str, who: str = "",
     这里按 batch 聚合：全部完成前显示「已完成 k/N」，全部完成后逐个列出，
     只要有一个失败整批就记 failed。
     """
-    def done(ok: bool, summary: str) -> None:
+    def done(ok: bool, summary: str, warn: bool = False) -> None:
         if not batch:
-            _write_outcome(plugin_id, "ok" if ok else "failed", f"{label}：{summary}")
+            outcome = "failed" if not ok else ("warn" if warn else "ok")
+            _write_outcome(plugin_id, outcome, f"{label}：{summary}")
             return
-        _, parts, total = _batch_add(batch, who, ok, summary)
+        _, parts, total = _batch_add(batch, who, ok, summary, warn)
         outcome, text = _batch_text(label, parts, total)
         _write_outcome(plugin_id, outcome, text)
     return done
@@ -1484,6 +1615,111 @@ async def scheduler_loop(interval: int = 60) -> None:
         except Exception as e:                          # 单轮异常不结束循环
             log.warning("插件定时循环异常：%s", e)
         await asyncio.sleep(interval)
+
+
+def _bundled_plugin_root() -> Optional[Path]:
+    """打进 exe 里的那份插件源码（只有冻结态才有）。"""
+    base = getattr(sys, "_MEIPASS", None)
+    if not base:
+        return None
+    d = Path(base) / "plugins"
+    return d if d.is_dir() else None
+
+
+def _manifest_version(f: Path) -> str:
+    """从 plugin.toml 里取版本号。取不到就返回空串——**空串一律当作「不升级」**，
+    否则一个读坏的清单会让每次启动都覆盖一遍用户目录。"""
+    try:
+        return str(tomllib.loads(f.read_text(encoding="utf-8")).get("version", "") or "")
+    except Exception:                                   # noqa: BLE001
+        return ""
+
+
+def seed_bundled_plugins() -> dict[str, str]:
+    """把打进 exe 的插件释放到运行目录的 plugins/。返回 {目录名: "new"|"updated"}。
+
+    **为什么必须落到磁盘**：插件目录是可写的——各自的 `.venv`、登录会话 `.state`、
+    参数都写在里面，而 onefile 的 `_MEIPASS` 每次进程退出就被清掉。
+    就地跑的话，淘宝插件每次启动都要重新装一遍依赖、重新扫码登录。
+
+    两条规则：
+      · 目录**不存在** → 整份复制过去（首次运行、或用户手滑删了）。
+      · 目录已在，但 exe 里那份 `plugin.toml` 的 version 与磁盘上的**不同** →
+        逐文件覆盖。换 exe 就该换到新插件，否则「升级了却不生效」会变成下一个 bug。
+        比的是「不同」而不是「更新」：版本号格式由插件作者定，
+        解析不出大小的时候，回滚（装个旧 exe）同样应该生效。
+
+    **只覆盖、绝不删除**：`.venv`、`.state`、用户自己加的文件都不在 exe 那份里，
+    删除逻辑会把它们一起带走——那是登录会话和几百 MB 的依赖。
+    """
+    src_root = _bundled_plugin_root()
+    if src_root is None:
+        return {}
+    dst_root = plugin_dir()
+    done: dict[str, str] = {}
+    try:
+        dst_root.mkdir(parents=True, exist_ok=True)
+        for src in sorted(src_root.iterdir()):
+            if not src.is_dir():
+                continue
+            dst = dst_root / src.name
+            bundled_ver = _manifest_version(src / "plugin.toml")
+            if not dst.exists():
+                action = "new"
+            elif bundled_ver and bundled_ver != _manifest_version(dst / "plugin.toml"):
+                action = "updated"
+            else:
+                continue
+            for f in src.rglob("*"):
+                if not f.is_file():
+                    continue
+                target = dst / f.relative_to(src)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, target)
+            done[src.name] = action
+        if done:
+            log.info("已从 exe 内释放插件：%s",
+                     "、".join(f"{k}({v})" for k, v in done.items()))
+    except OSError as e:
+        # 释放失败不该挡启动：插件页会照常显示「没发现插件」，比整个应用起不来好。
+        log.warning("释放内置插件失败：%s", e)
+    return done
+
+
+def reclaim_stale_runs() -> int:
+    """启动时把上一条命还留在库里的「执行中」收掉。返回改了几行。
+
+    **为什么必须有**：`last_outcome` 是**跨进程持久化**的，而唯一会把它从 `running`
+    改走的是收割线程（`_reap` 的 finally）——它是 daemon 线程，主进程一没，它就没了。
+    于是任何一次「插件还在跑的时候关掉 soroban」（关窗口、Ctrl-C、崩溃、断电）
+    都会在库里留下一个永久的 `running`：下次启动后卡片顶着黄色「执行中」，
+    而**没有任何进程会再来改它**——刷新没用、重启没用，只能去改数据库。
+
+    `_BATCHES` 是纯内存的，重启即空，所以那条批次也永远凑不齐，属于同一件事的两半。
+
+    判据只有一条：**进程刚起来，`_ALIVE_PROCS` 必然是空的**，所以此刻库里任何
+    `running` 都不可能有活着的进程与之对应。不需要时间窗、不需要 PID 表。
+    改成 `failed` 而不是清空：那一轮到底抓没抓到东西无人知道，说成「没结果」
+    比说成「成功」诚实，用户看到就知道该重跑一次。
+    """
+    try:
+        with Session(get_engine()) as s:
+            rows = s.exec(select(PluginConfig)
+                          .where(PluginConfig.last_outcome == "running")).all()
+            for cfg in rows:
+                cfg.last_outcome = "failed"
+                cfg.last_summary = (f"{cfg.last_summary or '上次执行'}"
+                                    "——soroban 在它跑完之前退出了，结果已丢失，请重跑")[:512]
+                cfg.last_finished_at = utcnow()
+                s.add(cfg)
+            if rows:
+                s.commit()
+                log.info("启动清扫：%d 个插件的「执行中」是上一条命遗留的，已标为失败",
+                         len(rows))
+            return len(rows)
+    except Exception as e:                              # noqa: BLE001  清扫失败不该挡启动
+        log.warning("启动清扫遗留的插件运行状态失败：%s", e)
+        return 0
 
 
 def shutdown_plugins(grace: float = 3.0) -> int:

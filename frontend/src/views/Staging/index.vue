@@ -79,6 +79,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Plus } from '@element-plus/icons-vue'
 import { applyRowUpdate } from '@/utils/orderWrites'
 import { stagingApi, tagsApi } from '@/api'
+import { handled } from '@/api/http'
 import { ORDER_SOURCES, PRICE_HELP, IMPORT_STATUS, PURCHASE_STATUS, importStatusStyle } from '@/constants'
 import { fmtDate } from '@/utils/datetime'
 import { afterCreate, afterDelete } from '@/utils/listRows'
@@ -161,6 +162,7 @@ async function saveCell(row, key, value) {
     applyRowUpdate(row, patch, updated)      // 没送 items → 不覆盖展开面板里未保存的物品编辑
   } catch (e) {
     if (e.response?.status === 409) {
+      handled(e)
       ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新')
       load()   // 冲突：刷新回退到服务器状态
     }
@@ -180,7 +182,7 @@ async function saveItems(row) {
     ElMessage.success('物品已保存')
   } catch (e) {
     // 仅 409（数据已变）才整表刷新；其它错误交拦截器提示，保留本地未保存编辑
-    if (e.response?.status === 409) { ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
+    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
   }
 }
 
@@ -192,7 +194,7 @@ async function savePostage(row) {
     const updated = await stagingApi.update(row.id, patch)
     applyRowUpdate(row, patch, updated)
   } catch (e) {
-    if (e.response?.status === 409) { ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
+    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
   }
 }
 
@@ -206,6 +208,7 @@ async function addRow(data = {}, done) {
     // 409 被 http 拦截器刻意跳过（留给页面处理）。撞订单号唯一约束时若这里也不提示，
     // 页面就是「什么都没发生」——连幽灵行里刚敲的单号都被 commitNew 清空了。
     if (e.response?.status === 409) {
+      handled(e)
       const who = data.order_no ? `订单号「${data.order_no}」` : '该记录'
       ElMessage.warning(`${who} 已存在，未添加`)
     }
@@ -219,6 +222,7 @@ async function doImport(row) {
     load()
   } catch (e) {
     if (e.response?.status === 409) {
+      handled(e)
       await ElMessageBox.alert(e.response?.data?.detail || '导入冲突', '导入失败', { type: 'warning' })
     }
   }

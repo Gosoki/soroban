@@ -5,6 +5,8 @@
 那会把收入当支出加进合计。`tests/test_tags_dashboard.py` 钉着「恰好这三张表」。
 """
 
+from decimal import Decimal
+
 from fastapi import APIRouter, Depends
 from sqlalchemy import func
 from sqlmodel import Session, select
@@ -46,6 +48,31 @@ def _count(session: Session, model) -> int:
     return int(session.exec(select(func.count()).select_from(model).where(*conds)).one())
 
 
+def _uncounted(session: Session, model) -> tuple[int, Decimal]:
+    """有钱、却没能算出日元的行：(笔数, 人民币合计)。
+
+    **为什么要单独数出来**：`_sum` 求的是 `SUM(jpy_settled)`，NULL 被 SQL 直接跳过——
+    于是「有货款但缺汇率」的行，**金额被吞、笔数照数**。看板上合计变小、单数不变，
+    没有任何一处显示异常。命中条件很实在：全新部署且汇率插件一次都没成功跑过
+    （断网 / 源挂了 / 打包版根本跑不起来，见 T9），而用户已经开始录单。
+
+    行级其实有信号（汇率、结算两列空白），但看板侧完全静默——而看板正是用来
+    「一眼看总数」的地方。这里不改写入（缺汇率照样能记账，断网时不该记不了账），
+    只把被吞掉的部分摆到台面上。
+
+    判据用 `price_cny` 真值而不是 `is not None`：显式填 0 的行（预付/包邮）
+    没有任何金额会被吞，报出来只是噪音。
+    """
+    conds = [*_valid_conds(model),
+             model.jpy_settled.is_(None),
+             model.price_cny.is_not(None),
+             model.price_cny != 0]
+    n, cny = session.exec(
+        select(func.count(), func.coalesce(func.sum(model.price_cny), 0)).where(*conds)
+    ).one()
+    return int(n), Decimal(str(cny or 0))
+
+
 def _month_expr(session: Session, date_col):
     """按月分组的 '%Y-%m' 表达式，跨方言：MySQL 用 DATE_FORMAT，SQLite 用 strftime。"""
     if is_mysql(session.get_bind()):
@@ -85,7 +112,15 @@ def dashboard(session: Session = Depends(get_session)):
             order_count=t_c, shipment_count=s_c, misc_count=x_c,
         ))
 
+    # 被吞掉的部分：三张表各数一遍再合并。分表数没有额外价值——用户要知道的是
+    # 「合计里少了多少」，而补救动作（把汇率填上）也只有一个。
+    unc = [_uncounted(session, m) for m in (Order, ShipmentOrder, MiscExpense)]
+    unc_n = sum(n for n, _ in unc)
+    unc_cny = sum((c for _, c in unc), Decimal("0"))
+
     return DashboardRead(
+        uncounted_count=unc_n,
+        uncounted_cny=unc_cny,
         total_jpy=order_jpy + shipment_jpy + misc_jpy,
         order_jpy=order_jpy,
         shipment_jpy=shipment_jpy,

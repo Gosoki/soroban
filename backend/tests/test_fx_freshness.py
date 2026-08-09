@@ -458,3 +458,36 @@ def test_falling_back_to_an_older_rate_still_warns(client, session, caplog):
         fxsvc.rate_for_date(session, dt.datetime.now(fxsvc.JST).date(), "建商品订单 TEST-FALLBACK")
     assert [r for r in caplog.records if "已过期" in r.getMessage()], \
         "退回了 19 天前的汇率却一声不吭"
+
+
+def test_dashboard_and_fx_endpoint_show_the_same_rate_as_the_ledger_uses(client, session):
+    """顶栏/看板显示的汇率，必须**就是**现在建单会用的那一条。
+
+    分叉场景很常见：今天手填了一条，之后插件又抓了一条。
+    `latest_stored` 给插件那条、建单走 `pick_on` 用手填那条——
+    于是界面上的数字和账本里真正用的不是一个，而手填的**本意**恰恰是「用我这个值」。
+    这种不一致不会报错，要等到对账才发现。
+    """
+    import datetime as dt
+    from decimal import Decimal
+
+    from app.models import FxRate
+    from app.services.fx import JST, SOURCE_MANUAL, current_rate, rate_for_date
+
+    today = dt.datetime.now(JST).date()
+    old = session.exec(select(FxRate).where(FxRate.date == today)).all()
+    for r in old:
+        session.delete(r)
+    session.commit()
+    # 先手填，再让「插件」抓一条更晚的——latest_stored 会给后者
+    session.add(FxRate(date=today, rate=Decimal("19.0000"), source=SOURCE_MANUAL,
+                       fetched_at=dt.datetime(2026, 1, 1, 0, 0)))
+    session.add(FxRate(date=today, rate=Decimal("25.0000"), source="boc",
+                       fetched_at=dt.datetime(2026, 1, 1, 9, 0)))
+    session.commit()
+
+    ledger = rate_for_date(session, today)          # 建单真正用的
+    assert ledger == Decimal("19.0000"), "手填优先这条规则本身坏了，下面的对比失去意义"
+    assert current_rate(session) == ledger, "看板显示的汇率与建单用的不是同一条"
+    shown = client.get("/api/fx").json()
+    assert Decimal(str(shown["rate"])) == ledger, "GET /api/fx 与建单用的不是同一条"

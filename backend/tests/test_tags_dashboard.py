@@ -1,4 +1,5 @@
 """标签（增删改名/颜色/在用保护）+ 看板聚合 + 物品列表。"""
+import datetime as dt
 from decimal import Decimal
 
 from sqlmodel import Session, delete, select
@@ -196,3 +197,52 @@ def test_items_total_matches_rows(client):
     ]})
     res = client.get("/api/items", params={"limit": 500}).json()
     assert res["total"] == len(res["items"]) == 3
+
+
+def test_dashboard_reports_rows_whose_money_was_swallowed(client, session, mk):
+    """有货款、却缺汇率算不出日元的行，看板必须**报出来**。
+
+    `SUM(jpy_settled)` 把 NULL 直接跳过 → 金额被吞、笔数照数：合计变小而单数不变，
+    界面上没有任何一处显示异常。命中条件很实在：全新部署且汇率插件一次都没跑成
+    （断网 / 源挂了 / 打包版跑不起来），而用户已经开始录单。
+    """
+    from decimal import Decimal
+
+    from app.models import MiscExpense
+
+    before = client.get("/api/dashboard").json()
+    row = MiscExpense(date=dt.date(2026, 3, 1), name="缺汇率的一笔",
+                      price_cny=Decimal("100.00"))
+    row.compute_money()
+    assert row.jpy_settled is None, "构造前提不成立：这一行居然算出了日元"
+    session.add(row)
+    session.commit()
+    try:
+        got = client.get("/api/dashboard").json()
+        assert got["uncounted_count"] == before["uncounted_count"] + 1, \
+            "被吞掉的行没有被数出来——看板会静默少一笔钱"
+        assert Decimal(str(got["uncounted_cny"])) == \
+            Decimal(str(before["uncounted_cny"])) + Decimal("100.00")
+        assert got["total_jpy"] == before["total_jpy"], "用例前提变了：这一行不该进合计"
+        assert got["misc_count"] == before["misc_count"] + 1, "笔数照数——这正是它的隐蔽之处"
+    finally:
+        session.delete(row)
+        session.commit()
+
+
+def test_zero_amount_rows_are_not_reported_as_swallowed(client, session):
+    """货款显式填 0（预付/包邮）没有任何金额会被吞，报出来只是噪音。"""
+    from decimal import Decimal
+
+    from app.models import MiscExpense
+
+    before = client.get("/api/dashboard").json()["uncounted_count"]
+    row = MiscExpense(date=dt.date(2026, 3, 2), name="零元", price_cny=Decimal("0.00"))
+    row.compute_money()
+    session.add(row)
+    session.commit()
+    try:
+        assert client.get("/api/dashboard").json()["uncounted_count"] == before
+    finally:
+        session.delete(row)
+        session.commit()

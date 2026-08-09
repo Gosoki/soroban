@@ -20,6 +20,7 @@
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { miscApi } from '@/api'
+import { handled } from '@/api/http'
 import { today } from '@/utils/datetime'
 import { afterCreate, afterDelete } from '@/utils/listRows'
 import NotionTable from '@/components/NotionTable.vue'
@@ -68,7 +69,7 @@ async function saveCell(row, key, value) {
     const updated = await miscApi.update(row.id, { version: row.version, [key]: value })
     Object.assign(row, updated)
   } catch (e) {
-    if (e.response?.status === 409) { ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
+    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
   }
 }
 

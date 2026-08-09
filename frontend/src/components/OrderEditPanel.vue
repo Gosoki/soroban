@@ -69,6 +69,7 @@
 import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { ordersApi, shipmentApi } from '@/api'
+import { handled } from '@/api/http'
 import { ORDER_SOURCES, PURCHASE_STATUS } from '@/constants'
 import { fmtCNY, fmtJPY } from '@/utils/money'
 import { applyRowUpdate, queueOrderWrite } from '@/utils/orderWrites'
@@ -131,7 +132,7 @@ async function saveField(key, value) {
       emit('saved', updated)
     })
   } catch (e) {
-    if (e.response?.status === 409) { ElMessage.warning('数据已变，已刷新'); emit('conflict') }
+    if (e.response?.status === 409) { handled(e); ElMessage.warning('数据已变，已刷新'); emit('conflict') }
     // 其它（如 422 校验失败）：拦截器已提示，保留用户输入待修正重试
   }
 }

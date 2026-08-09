@@ -177,3 +177,43 @@ def test_multi_table_writers_take_locks_in_one_order():
     # 静默跳过判定不了的调用，等于给绕过留后门：宁可在这里红，逼作者把模型写成字面量。
     assert not unknown, ("这些 guarded_bump 调用的 model 参数无法静态判定，锁序守卫覆盖不到：\n  "
                          + "\n  ".join(unknown) + "\n请直接把模型类名写成字面量实参。")
+
+
+# --- MySQL 并发写冲突（甲）------------------------------------------------------
+
+@pytest.mark.parametrize("errno,as_409", [
+    (1213, True),      # ER_LOCK_DEADLOCK：服务端已回滚一方，重试即可
+    (1205, True),      # ER_LOCK_WAIT_TIMEOUT：等锁超时，同上
+    (2013, False),     # 连接断开——报成「数据已变，请刷新重试」会让人一直刷一个连不上的库
+    (1044, False),     # 权限不足
+    (None, False),     # 没有 errno 的 OperationalError
+])
+def test_only_retryable_mysql_errors_become_409(errno, as_409):
+    """死锁转 409，其余 OperationalError 原样抛出去走 500。
+
+    OperationalError 是个大杂烩：「连接断了」「库不存在」「权限不足」也走它。
+    整类转 409 的话，前端会对着一个根本连不上的库反复提示「数据已变，请重试」——
+    比裸 500 更误导。所以按 errno 精确挑。
+    """
+    import asyncio
+
+    from sqlalchemy.exc import OperationalError
+
+    from app.main import _deadlock_handler
+
+    orig = Exception(errno, "boom") if errno is not None else Exception()
+    exc = OperationalError("SELECT 1", {}, orig)
+
+    class _Req:
+        method = "POST"
+
+        class url:
+            path = "/api/orders"
+
+    if as_409:
+        resp = asyncio.run(_deadlock_handler(_Req(), exc))
+        assert resp.status_code == 409
+        assert "重试" in resp.body.decode()
+    else:
+        with pytest.raises(OperationalError):
+            asyncio.run(_deadlock_handler(_Req(), exc))

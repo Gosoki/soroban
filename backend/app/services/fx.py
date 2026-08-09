@@ -159,7 +159,7 @@ def rate_age_hours(row: Optional[FxRate]) -> Optional[float]:
 def is_expired(session: Session, row: Optional[FxRate]) -> bool:
     """超过 `fx.stale_hours` 没更新 → 视为过期。
 
-    与 FxRead.stale（「不是今天的」）**不是一回事**：那个是日粒度、1 天前和 3 个月前
+    与 FxRead.not_today（「不是今天的」）**不是一回事**：那个是日粒度、1 天前和 3 个月前
     长得一模一样；这个才是「还能不能信」的判断，可配置、并且会进日志。
     """
     from . import prefs
@@ -170,15 +170,34 @@ def is_expired(session: Session, row: Optional[FxRate]) -> bool:
     return age > int(prefs.load(session)["fx.stale_hours"])
 
 
+def current_row(session: Session) -> Optional[FxRate]:
+    """「当前汇率」那一条 = **现在建一张今天的单会用的那一条**。
+
+    不能用 `latest_stored()`：它取的是全库最新（date desc, fetched_at desc），
+    而建单走的是 `pick_on()`（当天**手填优先**，其次当天最后一条）。
+    两者在一个很常见的场景下会分叉：用户今天手填了一条，之后汇率插件又抓了一条
+    ——`latest_stored` 给插件那条，建单用手填那条。于是侧栏、看板、设置页显示的数字
+    和账本里真正用的不是同一个，而用户手填的**本意**恰恰是「用我这个值」。
+    显示层无视手填，是这套「手填优先」规则里唯一说话不算数的地方。
+
+    当天一条都没有（凌晨还没抓、或很久没跑）→ 回退全库最新，与 `rate_for_date`
+    在「那天没记录」时的兜底口径一致。
+
+    **这里是唯一实现**：`GET /api/fx` 与看板都取它。抄第二份的代价已经付过一次——
+    顶栏和账本显示两个数，而那种不一致要等到对账才发现。
+    """
+    return pick_on(session, dt.datetime.now(JST).date()) or latest_stored(session)
+
+
 def current_rate(session: Session) -> Optional[Decimal]:
-    """当前汇率（最近一条记录）。库里空 → None。
+    """当前汇率的数值。库里空 → None。口径见 `current_row`。
 
     ⚠️ **过期也照样返回**，不返回 None。理由：拒绝供给会让建单直接失去日元金额，
     而一个两天前的真实汇率比「没有」更接近事实；订单会把当时用的汇率**逐行存下来**，
     事后可审计、可改。代价是它安静——所以取值时会在过期时记一条警告，
     界面上也会标出已过期多久。
     """
-    row = latest_stored(session)
+    row = current_row(session)
     return row.rate if row else None
 
 

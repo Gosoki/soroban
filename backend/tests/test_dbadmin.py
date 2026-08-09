@@ -305,3 +305,41 @@ def test_undecryptable_mysql_url_degrades_visibly(tmp_path, monkeypatch):
     assert bad["mysql_url"] is None
     assert bad["degraded"], "降级了却一声不吭——用户只会看到「账本全空了」"
     assert "SECRET_KEY" in bad["degraded"] and "没丢" in bad["degraded"]
+
+
+@pytest.mark.parametrize("version,rejected", [
+    ("8.0.36", False),
+    ("8.4.0", False),
+    ("9.7.0", False),
+    ("5.7.44", True),
+    ("5.6.51", True),
+    ("10.11.6-MariaDB-1:10.11.6+maria~ubu2204", True),
+    ("11.4.2-MariaDB", True),
+    ("", False),                 # 认不出就放行：不该因为格式没见过而挡住人
+    ("weird-build", False),
+])
+def test_unsupported_server_is_rejected_at_the_door(version, rejected):
+    """版本不够要**在门口拒绝**，不能跑到迁移中途才炸。
+
+    MySQL 的 DDL 是隐式提交的：迁移链跑到一半失败时，前面几条已经落地、后面的没跑，
+    库停在一个既不是旧版也不是新版的半升级态，而用户看到的只有一句驱动层英文报错。
+
+    README 曾承诺「MariaDB 会自动回退」——回退逻辑确实在 `bin_collation()` 里，
+    但建表走的 `BinStr` 硬写了 `utf8mb4_0900_bin`，绕过了它。承诺是假的。
+    """
+    from app.services.db_migrate import unsupported_server
+
+    why = unsupported_server(version)
+    assert bool(why) is rejected, f"{version!r} → {why!r}"
+    if rejected:
+        assert "8.0" in why, "拒绝了却没说清要什么版本，用户不知道下一步做什么"
+
+
+def test_readme_does_not_promise_mariadb():
+    """README 里那句「MariaDB 会自动回退」是假的，不能再出现。
+
+    文档里的假承诺比代码 bug 更贵：它会让人**照着做**，然后掉进一个半升级的库。
+    """
+    readme = (Path(__file__).resolve().parents[2] / "README.md").read_text(encoding="utf-8")
+    assert "MariaDB 会自动回退" not in readme
+    assert "MariaDB 不支持" in readme, "得明说不支持，光删掉旧句子等于没说"

@@ -74,6 +74,12 @@ SCOPES: dict[str, ScopeSpec] = {
     # 一天可以有多条汇率（每次抓取追加一条），所以这里不再说「每天最多一行」。
     # 写进来的值仍会被核心按 [FX_MIN, FX_MAX] 复核，写不进离谱值。
     "fx:write": ScopeSpec("写入汇率", "记一条汇率。\n值由核心复核区间，写不进离谱数；\n你手填的那条不会被它盖掉。"),
+    # ⏳ **日落期：2027-02-09**。到期若仍是零消费者就整套删掉
+    # （这一条 + services/ingest/kinds/plugin_record.py + PluginRecord 表 + 迁移）。
+    # 现状：仓库里两个 plugin.toml 都没声明它，一个真实写入者都没有。
+    # 之所以给期限而不是现在删——删要写一条不可逆迁移，比留着贵；
+    # 而留着的「利息」（边界校验、命名空间隔离、人类令牌误写）本轮已经付清。
+    # 到期检查方法：`grep -rn 'data:own' plugins/*/plugin.toml`，空 = 可以删。
     "data:own": ScopeSpec("插件自有存储", "读写本插件自己的存储，\n与账本隔离，其它插件读不到。"),
 }
 
@@ -235,3 +241,18 @@ def describe() -> list[dict]:
     """给前端的授权勾选表。与设置页同一套做法：元信息从后端来，前端不写死第二份。"""
     return [{"key": k, "label": v.label, "hint": v.hint, "risk": v.risk}
             for k, v in SCOPES.items() if not v.baseline]
+
+
+def describe_baseline() -> list[dict]:
+    """基础设施权限的展示信息——**要给前端，但不是给勾选框用的**。
+
+    卡片上那个「权限（X/Y）」曾经把 baseline 计进分子、却不计进分母：一个插件
+    在**一项都没勾**的状态下就显示「1/1」，读起来正是「全都授权了」。
+    分子分母取自两个不同的集合，这种比值没有任何一种读法是对的。
+
+    修法不是把 baseline 从分子里悄悄减掉——那会走到另一个极端：用户
+    自己已经猜到「是不是有一个默认权限一直批准」，而界面上确实找不到它。
+    所以比值只数**用户能勾的那些**，baseline 单独列一行明说「默认持有」。
+    """
+    return [{"key": k, "label": v.label, "hint": v.hint, "risk": v.risk}
+            for k, v in SCOPES.items() if v.baseline]

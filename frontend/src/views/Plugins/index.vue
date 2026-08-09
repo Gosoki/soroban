@@ -20,7 +20,7 @@
           <el-tag :style="typeStyle(installTagType(p))">{{ installTagText(p) }}</el-tag>
           <el-tag v-if="p.last_run.outcome" :style="typeStyle(runTagType(p.last_run.outcome))"
                   :title="p.last_run.summary + (p.last_run.at ? ' · ' + fmtTime(p.last_run.at) : '')">
-            {{ { ok: '成功', failed: '失败', running: '执行中' }[p.last_run.outcome] || p.last_run.outcome }}
+            {{ { ok: '成功', warn: '有警告', failed: '失败', running: '执行中' }[p.last_run.outcome] || p.last_run.outcome }}
           </el-tag>
           <el-tag v-if="pendingGrants(p).length" :style="typeStyle('warning')"
                   :title="`还没授权：${pendingGrants(p).join('、')}——展开卡片勾选`">需要授权</el-tag>
@@ -108,34 +108,6 @@
           <span class="sub">保存后下一次执行即按新值跑</span>
         </div>
       </template>
-      <!-- 权限：清单声明 ∩ 你勾选 ∩ 核心已知，三者的交集才是插件实际拿到的。
-           有「需要新授权」时**自动展开**——那是要人处理的事，藏起来就等于没提示。 -->
-      <div class="sect">
-        权限（{{ p.scopes.effective.length }}/{{ p.scopes.declared.length }}）
-        <el-tag v-if="pendingGrants(p).length" :style="typeStyle('warning')"
-                title="插件更新后新要了权限，需要你确认">需要新授权</el-tag>
-      </div>
-      <div class="grants">
-        <!-- 一行只放「勾选框 + 短名 + 风险标 + ? 」。说明放进 tooltip：
-             整句塞在行内会把每一行撑成一根长条，而且长短不一、扫不出重点。 -->
-        <label v-for="k in p.scopes.declared" :key="k" class="grant">
-          <el-checkbox :model-value="p._form.granted.includes(k)"
-                       @change="(v) => toggleGrant(p, k, v)" />
-          <span class="g-name">{{ scopeMeta(p, k).label || k }}</span>
-          <el-tag v-if="scopeMeta(p, k).risk === 'high'" :style="typeStyle('danger')">高风险</el-tag>
-          <el-tag v-else-if="scopeMeta(p, k).risk === 'medium'" :style="typeStyle('warning')">留意</el-tag>
-          <el-tooltip v-if="scopeMeta(p, k).hint" :content="scopeMeta(p, k).hint"
-                      placement="top" popper-class="wrap-tip">
-            <el-icon class="help"><QuestionFilled /></el-icon>
-          </el-tooltip>
-          <span class="g-key">{{ k }}</span>
-        </label>
-        <div class="sub">
-          没勾的权限插件一个都用不了（默认全拒）。插件更新后自己多写一项权限**不会**自动生效——
-          <b>`git pull` 不该悄悄扩大它能碰的范围</b>。
-        </div>
-      </div>
-
       <div v-if="p.accounts_enabled" class="sect">账号（{{ enabledCount(p) }} 启用 / {{ p.accounts.length }}）</div>
       <!-- 账号列表 -->
       <div v-if="p.accounts_enabled && !p.accounts.length" class="sub">还没有账号——用下面「添加账号」加一个。</div>
@@ -184,6 +156,56 @@
         <span class="sub">平台加时确定、之后不可改（改名只改昵称）</span>
       </div>
 
+      <!-- 权限：所有插件一律排在卡片**最末**，且自成一个折叠段。
+           它是「配一次就不动」里最不常动的那一块，排在参数和账号之前只会把
+           每天真要用的东西往下顶；每张卡片位置一致，扫的时候不用重新找。
+           比值只数**你能勾的那些**：baseline 项勾选框里根本没有，把它算进分子
+           会让「一项都没勾」显示成 1/1。它单独列在下面一行，明说默认持有。 -->
+      <div class="sect grantsect" :class="{ open: p._grants }" @click="p._grants = !p._grants">
+        <el-icon class="caret"><ArrowRight /></el-icon>
+        <span>权限（已授权 {{ grantedCount(p) }} / 声明 {{ p.scopes.declared.length }}）</span>
+        <el-tag v-if="pendingGrants(p).length" :style="typeStyle('warning')"
+                title="插件更新后新要了权限，需要你确认">需要新授权</el-tag>
+        <!-- 收起时也得看得出「有没有高风险项被授出去」——那正是折叠最容易藏掉的东西 -->
+        <el-tag v-if="!p._grants && riskyGranted(p).length" :style="typeStyle('danger')"
+                :title="`已授出高风险权限：${riskyGranted(p).join('、')}`">含高风险</el-tag>
+      </div>
+      <el-collapse-transition>
+        <div v-show="p._grants" class="grants">
+          <!-- 一行只放「勾选框 + 短名 + 风险标 + ? 」。说明放进 tooltip：
+               整句塞在行内会把每一行撑成一根长条，而且长短不一、扫不出重点。 -->
+          <label v-for="k in p.scopes.declared" :key="k" class="grant">
+            <el-checkbox :model-value="p._form.granted.includes(k)"
+                         @change="(v) => toggleGrant(p, k, v)" />
+            <span class="g-name">{{ scopeMeta(p, k).label || k }}</span>
+            <el-tag v-if="scopeMeta(p, k).risk === 'high'" :style="typeStyle('danger')">高风险</el-tag>
+            <el-tag v-else-if="scopeMeta(p, k).risk === 'medium'" :style="typeStyle('warning')">留意</el-tag>
+            <el-tooltip v-if="scopeMeta(p, k).hint" :content="scopeMeta(p, k).hint"
+                        placement="top" popper-class="wrap-tip">
+              <el-icon class="help"><QuestionFilled /></el-icon>
+            </el-tooltip>
+            <span class="g-key">{{ k }}</span>
+          </label>
+          <div v-if="!p.scopes.declared.length" class="sub">本插件没有声明任何需要授权的权限。</div>
+          <!-- 基础权限：勾选框里没有它，所以必须在这里说出来。
+               用户看到「已授权 0 / 声明 1」时会问「那它现在到底能干什么」，
+               答案就是这一行；藏起来只会让人怀疑还有别的没写出来的。 -->
+          <div v-for="b in (p.scopes.baseline || [])" :key="b.key" class="grant base">
+            <el-checkbox :model-value="true" disabled />
+            <span class="g-name">{{ b.label }}</span>
+            <el-tag :style="typeStyle('info')" title="每个插件默认持有，不需要也无法单独授权">默认</el-tag>
+            <el-tooltip v-if="b.hint" :content="b.hint" placement="top" popper-class="wrap-tip">
+              <el-icon class="help"><QuestionFilled /></el-icon>
+            </el-tooltip>
+            <span class="g-key">{{ b.key }}</span>
+          </div>
+          <div class="sub">
+            没勾的权限插件一个都用不了（默认全拒）。插件更新后自己多写一项权限**不会**自动生效——
+            <b>`git pull` 不该悄悄扩大它能碰的范围</b>。
+          </div>
+        </div>
+      </el-collapse-transition>
+
       </div>
     </el-card>
   </div>
@@ -192,8 +214,9 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowDown, ArrowUp, Refresh, QuestionFilled } from '@element-plus/icons-vue'
+import { ArrowDown, ArrowRight, ArrowUp, Refresh, QuestionFilled } from '@element-plus/icons-vue'
 import { pluginsApi, tagsApi } from '@/api'
+import { handled } from '@/api/http'
 import { longToast, tagStyleAt, typeStyle } from '@/constants'
 import { fmtDateTime } from '@/utils/datetime'
 
@@ -209,8 +232,12 @@ function platformTagStyle(v) { return tagStyleAt(platformColor.value[v] ?? -1, v
 const fmtTime = fmtDateTime   // 后端存 naive UTC，必须补 Z 再解析，见 utils/datetime.js
 // 权限元信息由后端随列表下发（catalog），前端不写第二份说明文案——
 // 那份必然与后端漂移，而漂移的方向通常是「界面上写的比实际权限小」。
+// warn = 插件正常退出、但自己在结果里报了 error（部分成功 / 软跳过）。
+// 没有这一档时只能二选一：算成功 → 绿字，用户不会再点开摘要看那句话；
+// 算失败 → 把插件作者刻意的软跳过（淘宝的 already_running 就是 return 0）刷成红色。
+// 「执行中」用蓝色而不是黄：它和 warn 同屏出现，两个黄标签分不出哪个要人处理。
 function runTagType(outcome) {
-  return { ok: 'success', failed: 'danger', running: 'warning' }[outcome] || 'info'
+  return { ok: 'success', warn: 'warning', failed: 'danger', running: 'primary' }[outcome] || 'info'
 }
 // 按钮为什么点不了，鼠标悬停时说清楚——比一个灰按钮强
 function cmdTitle(p, c) {
@@ -221,12 +248,21 @@ function cmdTitle(p, c) {
   return c.hint || ''
 }
 async function doForget(p) {
-  if (!window.confirm(`清理「${p.id}」的残留配置？\n\n会删掉它的授权、定时、账号与上次结果。\n`
-    + `留着的话，以后放一个同 id 的插件进来会直接继承这份授权。`)) return
+  // 文案里要点名**插件私有存储**：它跟授权/定时不一样，是插件自己写进去的业务数据
+  // （`data:own` / PluginRecord）。不说的话，用户以为只是清掉几项配置，
+  // 而实际上那些数据也一并没了——这一步是不可逆的。
+  if (!window.confirm(`清理「${p.id}」的残留配置？\n\n`
+    + `会删掉它的授权、定时、账号、上次结果，以及它写入的插件私有存储。\n`
+    + `这一步不可逆。\n\n`
+    + `留着的话，以后放一个同 id 的插件进来会直接继承这份授权与私有存储。`)) return
   p._busy = true
   try {
-    await pluginsApi.forget(p.id)
-    ElMessage.success('已清理')
+    const r = await pluginsApi.forget(p.id)
+    // 把「顺带删了多少条私有数据」说出来：不说的话，那条删除对用户是完全不可见的，
+    // 而它恰恰是这个操作里唯一会丢业务数据的部分。
+    ElMessage.success(r?.records_removed
+      ? `已清理（含插件私有存储 ${r.records_removed} 条）`
+      : '已清理')
     await load()
   } catch (_) { /* 拦截器已提示 */ } finally { p._busy = false }
 }
@@ -236,10 +272,16 @@ async function doRun(p, c) {
   try {
     const r = await pluginsApi.run(p.id, c.name)
     ElMessage.success(`已触发「${c.label}」${r.targets?.length ? '：' + r.targets.join('、') : ''}`)
-    resultTimer = setTimeout(load, 3000)   // 稍后刷一次，把「上次结果」拉回来
+    // 卡片立刻进入「执行中」，然后**一直盯到它收尾**。
+    // 原先只是 3 秒后刷一次：抓取动辄几分钟，那一刷必然还在跑，之后再没有人来问，
+    // 于是「执行中」就一直挂着——看起来和真的卡死一模一样，而它其实早就跑完了。
+    p.last_run = { outcome: 'running', summary: `${c.label} 执行中…`, at: null }
+    scheduleRunPoll()
   } catch (e) {
-    // 不能空 catch：409（插件已停用 / 缺权限）被 http 拦截器刻意放行不弹提示，
-    // 吞掉之后按钮点下去**完全没反应**——最难排查的那种「没坏但也不动」。
+    // 不能空 catch：这里要把「哪个命令没起来」也说出来（后端的 detail 只说原因，
+    // 不知道用户点的是哪个按钮）。带上命令名之后就比拦截器那条兜底更有用，
+    // 所以取消兜底，避免两条提示叠在一起。
+    handled(e)
     ElMessage.warning(e.response?.data?.detail || `「${c.label}」没能启动`)
   } finally { p._busy = false }
 }
@@ -266,6 +308,20 @@ function scopeMeta(p, key) {
 function pendingGrants(p) {
   return (p.scopes?.declared || []).filter((k) => !(p.scopes?.granted || []).includes(k))
 }
+// 「已授权 X / 声明 Y」的 X。**必须与 Y 取自同一个集合**：分子曾经用的是
+// scopes.effective（= 声明 ∩ 授权 ∩ 已知 ∪ baseline），而 baseline 不在 declared 里，
+// 于是一项都没勾的插件显示成「1/1」——读起来正是「全都授权了」。
+// 库里存着、但插件已经不再声明的旧授权也不该计入：它不在分母里，进了分子同样跑偏。
+function grantedCount(p) {
+  return (p.scopes?.declared || []).filter((k) => (p.scopes?.granted || []).includes(k)).length
+}
+// 折叠之后还必须一眼看得出的东西：已经授出去的高风险权限。
+// 折叠最容易藏掉的恰恰是这一类——「处置暂存单」能让暂存行直接消失。
+function riskyGranted(p) {
+  return (p.scopes?.declared || [])
+    .filter((k) => (p.scopes?.granted || []).includes(k) && scopeMeta(p, k).risk === 'high')
+    .map((k) => scopeMeta(p, k).label || k)
+}
 async function toggleGrant(p, key, on) {
   const next = on ? [...p._form.granted, key] : p._form.granted.filter((k) => k !== key)
   p._form.granted = next
@@ -273,7 +329,9 @@ async function toggleGrant(p, key, on) {
   try {
     const r = await pluginsApi.saveGrants(p.id, next)
     p.scopes.granted = r.granted
-    p.scopes.effective = r.granted            // 已授权 ∩ 已声明 ∩ 已知，后端算好回给我们
+    // 刻意**不**顺手更新 scopes.effective：它是「令牌实际带的权限」（含 baseline），
+    // 与 granted 不是一回事。写成 `effective = r.granted` 只是把界面上的数字凑对，
+    // 而下一次 load() 就会露馅。卡片上的比值现在只数 declared ∩ granted。
     // 就地重算每条命令还缺哪些权限。不重算的话按钮仍停在「缺权限」禁用态，
     // 要手动刷新整页才活过来——用户会以为刚才那一勾没生效。
     for (const c of p.commands) c.blocked = (c.needs || []).filter((k) => !r.granted.includes(k))
@@ -295,6 +353,11 @@ async function load() {
       // 反而比不折叠还乱。要人处理的事改成在卡片头挂一个标签——不展开也看得见。
       // 轮询刷新时沿用上一次的展开状态，别把用户展开的合上。
       _open: prev[p.id]?._open ?? false,
+      // 权限段自己的折叠位。默认收起——它是全卡片最不常动的一块；
+      // 但**有待授权时默认展开**：那是要人处理的事，藏在两层折叠底下等于没提示
+      // （卡片头上那个「需要授权」标签只说明有事，说不清是哪一项）。
+      _grants: prev[p.id]?._grants ?? !!(p.scopes?.declared || [])
+        .filter((k) => !(p.scopes?.granted || []).includes(k)).length,
       // 刷新时保留用户勾过的选项与输了一半的账号昵称——
       // 安装轮询那段(scheduleInstallPoll)的注释早就写着「否则用户正在输入的账号名会被冲掉」，
       // 但整体刷新这条路径上它一直是被硬编码重置的。
@@ -311,6 +374,9 @@ async function load() {
     }))
     // 有安装在跑就继续盯着，装完自动刷新（按钮解禁、缺依赖提示消失）
     if (list.some((p) => p.install && p.install.running)) scheduleInstallPoll()
+    // 定时触发的执行不经过本页面，进页面时可能已经在跑了——同样得盯到收尾，
+    // 否则「执行中」要等用户自己想起来点刷新才会变。
+    if (list.some((p) => p.last_run?.outcome === 'running')) scheduleRunPoll()
     try { platformTags.value = await tagsApi.list('platform') } catch (_) { /* 无所谓，下拉可自建 */ }
   } catch (_) { /* 拦截器已提示 */ } finally {
     loading.value = false
@@ -331,9 +397,7 @@ function installTagText(p) {
 }
 
 let installTimer = null
-// 离页后这次延时刷新仍会跑：届时若有插件在装，它还会新建一个
-// onBeforeUnmount 管不到的 2 秒轮询。存句柄，卸载时一起清掉。
-let resultTimer = null
+let runTimer = null
 function scheduleInstallPoll() {
   if (installTimer) return                    // 单例：多张卡同时装也只有一个轮询
   installTimer = setInterval(async () => {
@@ -352,9 +416,28 @@ function scheduleInstallPoll() {
     } catch (_) { clearInterval(installTimer); installTimer = null }
   }, 2000)
 }
+// 有插件在跑就盯着，跑完自动把结果换上。**与安装轮询分开两个计时器**：
+// 安装是分钟级、抓取可以是十几分钟，合成一个的话只要有一件在跑，另一件的节奏就被带偏。
+// 只更新 last_run 与 last_run_at 两处，绝不整体替换——否则用户正在输入的账号昵称、
+// 刚勾了一半的授权都会被冲掉（安装轮询那段的注释早就写着这一条）。
+function scheduleRunPoll() {
+  if (runTimer) return                        // 单例：多张卡同时在跑也只有一个轮询
+  runTimer = setInterval(async () => {
+    try {
+      const list = await pluginsApi.list()
+      for (const fresh of list) {
+        const cur = plugins.value.find((x) => x.id === fresh.id)
+        if (cur) { cur.last_run = fresh.last_run; cur.config.last_run_at = fresh.config.last_run_at }
+      }
+      if (!list.some((x) => x.last_run?.outcome === 'running')) {
+        clearInterval(runTimer); runTimer = null
+      }
+    } catch (_) { clearInterval(runTimer); runTimer = null }
+  }, 4000)
+}
 onBeforeUnmount(() => {
   if (installTimer) { clearInterval(installTimer); installTimer = null }
-  if (resultTimer) { clearTimeout(resultTimer); resultTimer = null }
+  if (runTimer) { clearInterval(runTimer); runTimer = null }
 })
 
 async function doInstall(p) {
@@ -377,6 +460,7 @@ async function doInstall(p) {
     // 不要写进 p.install.error：那是服务端字段，下一次 load()/轮询会用服务端的 {} 覆盖掉，
     // 表现成「错误提示自己消失」。
     if (e.response?.status === 409) {
+      handled(e)
       longToast(ElMessage, 'error', e.response?.data?.detail || '无法开始安装')
     }
     // 其余状态码拦截器已提示
@@ -411,7 +495,7 @@ async function doAddAccount(p) {
     await load()
   } catch (e) {
     // 409（账号已存在）被 http 拦截器刻意跳过（留给页面处理），这里显式弹出后端 detail，否则静默无反馈
-    if (e.response?.status === 409) ElMessage.error(e.response?.data?.detail || '账号已存在')
+    if (e.response?.status === 409) { handled(e); ElMessage.error(e.response?.data?.detail || '账号已存在') }
   } finally {
     p._busy = false
   }
@@ -462,7 +546,7 @@ async function doRenameAccount(p, account) {
     await load()
   } catch (e) {
     // 409（新名字已被占用）被 http 拦截器刻意跳过，这里显式弹出后端 detail，否则静默无反馈
-    if (e.response?.status === 409) ElMessage.error(e.response?.data?.detail || '新名字已被占用')
+    if (e.response?.status === 409) { handled(e); ElMessage.error(e.response?.data?.detail || '新名字已被占用') }
   } finally {
     p._busy = false
   }
@@ -555,8 +639,18 @@ onMounted(load)
 .c-plat { min-width: 64px; flex: none; display: inline-flex; }
 .c-auth { min-width: 58px; flex: none; display: inline-flex; }
 .c-state { min-width: 56px; flex: none; display: inline-flex; }
+/* 权限段的标题行就是折叠开关：整行可点（不是只有那个小箭头），
+   命中区域和它在视觉上占的宽度一致。用 .sect 的排版，只加一个转向的箭头,
+   刻意**不**换底色——换了就成了卡片里嵌一块深色板，而全站没有第二处这么做。 */
+.grantsect { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+.grantsect:hover { color: var(--brand); }
+.caret { color: var(--txt-3); font-size: 12px; transition: transform 0.2s; }
+.grantsect.open .caret { transform: rotate(90deg); }
 .grants { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
 .grant { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+/* 基础权限那一行：勾选框是禁用的，整行也不该表现得可点 */
+.grant.base { cursor: default; }
+.grant.base .g-name { color: var(--txt-2); }
 .g-name { font-weight: 600; }
 /* 只显示权限 key（fx:write 这种），给愿意深究的人看；说明在 ? 里 */
 .g-key { color: var(--txt-3); font-size: 11px; font-family: ui-monospace, monospace; }

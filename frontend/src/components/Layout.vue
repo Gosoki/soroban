@@ -44,7 +44,7 @@
                     :title="`已过期 ${fx.ageText}，取汇率的链路可能断了。建单仍会用它，但金额可能不准——去设置页手填一个，或检查汇率插件`">
               已过期 {{ fx.ageText }}
             </el-tag>
-            <el-tag v-else-if="fx.stale" :style="typeStyle('warning')">旧</el-tag>
+            <el-tag v-else-if="fx.notToday" :style="typeStyle('warning')">旧</el-tag>
             <!-- 「手填」= 这条汇率是你在设置页填的，不是自动取到的。
                  原先这里是「备用」（不是链上首选源），但「谁是首选」现在是插件的私有参数，
                  核心看不到——留一个恒 False 的标签等于持续输出假信息。 -->
@@ -126,7 +126,7 @@ try {
   userName.value = u.display_name || u.username || '用户'
 } catch (_) { /* ignore */ }
 
-const fx = reactive({ rate: null, stale: false, source: '', expired: false, ageText: '' })
+const fx = reactive({ rate: null, notToday: false, source: '', expired: false, ageText: '' })
 
 // 侧栏汇率原先只在 onMounted 取一次。Layout 是父级路由组件、切页不卸载，
 // 于是那一行是**登录那一刻的快照**：红色的「已过期」标签正劝用户去设置页手填一个，
@@ -136,7 +136,7 @@ async function loadFx() {
   try {
     const r = await fxApi.get()
     fx.rate = r.rate
-    fx.stale = r.stale
+    fx.notToday = r.not_today
     fx.source = r.source || ''
     fx.expired = !!r.expired
     const h = r.age_hours || 0

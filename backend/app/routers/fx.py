@@ -13,7 +13,7 @@ from ..models import FxRate
 from ..plugins import scopes
 from ..schemas import FxRead
 from ..services.fx import (
-    JST, SOURCE_LABELS, is_expired, latest_stored, pick_from, pick_on, rate_age_hours,
+    JST, SOURCE_LABELS, current_row, is_expired, pick_from, pick_on, rate_age_hours,
     rows_on,
 )
 
@@ -85,7 +85,7 @@ def _read(session: Session, row) -> FxRead:
         quote=settings.FX_QUOTE,
         rate=row.rate,
         date=row.date,
-        stale=row.date < dt.datetime.now(JST).date(),
+        not_today=row.date < dt.datetime.now(JST).date(),
         source=row.source,
         # 认不出就原样透传裸 key：源标识由插件自定，核心不维护它的中文名
         source_label=SOURCE_LABELS.get(row.source, row.source),
@@ -95,25 +95,11 @@ def _read(session: Session, row) -> FxRead:
     )
 
 
-def _current_row(session: Session):
-    """「当前汇率」= **现在建一张今天的单会用的那一条**。
-
-    不能用 `latest_stored()`：它取的是全库最新（按 date desc, fetched_at desc），
-    而建单走的是 `pick_on()`（当天**手填优先**，其次当天最后一条）。
-    两者在一个很常见的场景下会分叉：用户今天手填了一条，之后汇率插件又抓了一条
-    ——`latest_stored` 给插件那条，建单用手填那条。于是侧栏、看板、设置页显示的数字
-    和账本里真正用的不是同一个，而用户手填的**本意**恰恰是「用我这个值」。
-    显示层无视手填，是这套「手填优先」规则里唯一说话不算数的地方。
-
-    当天一条都没有（凌晨还没抓、或很久没跑）→ 回退全库最新，与 `rate_for_date`
-    在「那天没记录」时的兜底口径一致。
-    """
-    return pick_on(session, dt.datetime.now(JST).date()) or latest_stored(session)
-
-
 @router.get("", response_model=FxRead, openapi_extra={"x-scope": "fx:read"})
 def get_fx(session: Session = Depends(get_session)):
-    return _read(session, _current_row(session))
+    # 口径与看板、与建单**同一个函数**（services.fx.current_row）。
+    # 这里曾经有一份同名的本地实现，而看板走的是 latest_stored——两处显示不同的数。
+    return _read(session, current_row(session))
 
 
 @router.get("/history", openapi_extra={"x-scope": "fx:read"})

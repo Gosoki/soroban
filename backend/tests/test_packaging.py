@@ -76,17 +76,40 @@ def test_every_source_path_in_spec_exists(spec_text):
         assert (_REPO / rel).exists(), f"spec 引用了不存在的路径：{rel}"
 
 
-def test_scraper_is_not_bundled(spec_text):
-    """插件各自带 venv + Playwright，体积巨大且要能单独更新；plugins.py 冻结后从
-    **exe 同级目录**找它们，绝不该被打进包里。"""
+def test_plugins_are_bundled_but_secrets_never_are(spec_text):
+    """插件源码打进 exe，但**凭据与机器相关的东西一律剔除**。
+
+    带上插件是为了消灭「打包者忘了把 plugins 文件夹复制到 exe 旁边」——
+    那一步没有任何东西提醒他做，漏了的表现是整个插件页空空如也，而 exe 一切正常。
+
+    剔除清单是这条改动的**前提条件**，不是优化：
+    `.state/` 是打包者自己的淘宝登录 cookie。随包分发一个文件夹时它还能事后删，
+    **打进 exe 就再也删不掉了**——所以这里必须是硬性剔除，不能靠人记得。
+    """
+    assert "_bundle_plugins(ROOT / \"plugins\")" in spec_text, \
+        "spec 没把插件打进去——分发包会一个插件都没有"
+    for must in (".state", ".env", ".venv", "__pycache__", ".pyc"):
+        assert must in spec_text, f"打包插件时没有剔除 {must}"
+    # 剔除是真的在代码里生效，而不是只写在注释里
+    assert "_PLUG_SKIP_DIRS" in spec_text and "set(rel.parts[:-1]) & _PLUG_SKIP_DIRS" in spec_text
+
+
+def test_bundled_plugins_are_released_to_a_writable_dir():
+    """打进包的插件必须在启动时**释放到磁盘**，不能就地跑。
+
+    插件目录是可写的（各自的 .venv、登录会话 .state、参数都写在里面），
+    而 onefile 的 _MEIPASS 每次进程退出就被清掉——就地跑的话，
+    淘宝插件每次启动都要重装依赖、重新扫码登录。
+    """
     plug = (_REPO / "backend" / "app" / "routers" / "plugins.py").read_text(encoding="utf-8")
-    assert "Path(sys.executable).resolve().parent" in plug
-    # 查的是「插件目录有没有被列进打包内容」，不是查某个词是否出现——
-    # 目录从 scraper/ 改名成 plugins/ 之后，原来那句 `"scraper" not in ...` 变成了恒真的空话。
-    head = spec_text.split("# --- 静态分析")[0]
-    for name in ("plugins", "scraper"):
-        assert f"{name}/" not in head.replace(f"{name}/ ", "").replace(f"`{name}/`", ""), \
-            f"spec 不该把 {name}/ 打进 exe（插件各自带 venv+Playwright，体积巨大且要能单独更新）"
+    assert "Path(sys.executable).resolve().parent" in plug, \
+        "插件在磁盘上的家不再是 exe 同级——释放出去也找不到"
+    assert "def seed_bundled_plugins" in plug
+    main = (_REPO / "backend" / "app" / "main.py").read_text(encoding="utf-8")
+    assert "seed_bundled_plugins()" in main, "释放函数没人调用，等于没打包"
+    i_seed = main.index("    seed_bundled_plugins()")
+    i_loop = main.index("scheduler_loop()")
+    assert i_seed < i_loop, "释放排在定时循环之后——第一轮定时会看不到任何插件"
 
 
 def test_pyinstaller_bat_checks_for_spec():
@@ -277,17 +300,19 @@ def test_port_hint_tells_the_user_something_they_can_actually_do():
 
 
 def test_build_script_warns_before_shipping_plugin_credentials():
-    """分发指引说「把 plugins 文件夹拷到 exe 旁边」，而打包者手边唯一的 plugins
-    就是仓库里那个开发用的——里面有 `.state/*.json`（他自己的淘宝登录会话）和 `.env`。
+    """打包者手边唯一的 plugins 就是仓库里那个开发用的——里面有 `.state/*.json`
+    （他自己的淘宝登录会话）和 `.env`。
 
-    `.gitignore` 覆盖了它们，但**分发是文件拷贝，git 没有发言权**。
-    照着说明发一次版，就等于把自己的登录态发出去了。
+    插件现在**打进 exe**，所以这段话的分量比以前更重：随包分发一个文件夹时凭据
+    还能事后删，**打进 exe 就再也删不掉了**。spec 里已经硬性剔除，
+    但必须在打包日志里说出来——「我的 cookie 是不是在这个 exe 里」
+    没人会主动去查。手工拷文件夹那条老路仍然存在，告诫也仍然要留着。
     """
     bat = (_REPO / "pyinstaller.bat").read_text(encoding="utf-8", errors="replace")
-    assert "DO NOT SHIP plugins" in bat, "缺少「别原样分发 plugins」的警告"
+    assert "EXCLUDED from soroban.exe" in bat, "没说清凭据有没有被打进 exe"
+    assert "DO NOT SHIP plugins" in bat, "手工拷贝那条路的告诫不该删掉"
     for token in (".state", ".env", ".log", ".venv"):
         assert token in bat, f"警告里没列出要删的 {token}"
-    # 那句「ship a plugins folder」本身也得带上告诫，别让人只看见前半句
     ship = [ln for ln in bat.splitlines() if "Ship a" in ln and "plugins" in ln]
     assert ship and any("delete" in ln.lower() for ln in ship), \
         "「拷 plugins 过去」这句话必须自带「先删掉凭据」"
@@ -298,3 +323,114 @@ def test_plugin_readme_documents_what_to_strip_before_sharing():
     assert "发给别人之前" in readme
     for token in (".state/", ".env", "*.log", ".venv/"):
         assert token in readme, f"插件 README 没说要删 {token}"
+
+
+# --- inherit 类插件：打包版必须真能跑起来 --------------------------------------
+
+def test_spec_bundles_httpx_for_inherit_plugins(spec_text):
+    """soroban 自己一行都不 import httpx，所以必须**显式**带进 exe。
+
+    汇率插件写的是 `python = "inherit"`（跑在 exe 自己的解释器里）并 import httpx。
+    只在 requirements.txt 里写着是不够的——PyInstaller 打的是**静态可达的模块图**，
+    没人 import 它就不进包。表现是分发包上汇率永远取不到，
+    而 exe 本身照常启动、打包日志里一个字都不提。
+    """
+    assert 'collect_submodules("httpx")' in spec_text, \
+        "spec 没带 httpx —— 打包版的 inherit 类插件必然 ModuleNotFoundError"
+    assert 'collect_data_files("certifi")' in spec_text, \
+        "没带 certifi 的 CA 包，httpx 的 https 请求会全部证书校验失败"
+    assert "import httpx" in spec_text and "打包中止" in spec_text, \
+        "打包机缺 httpx 时没有让打包失败——会出一个「汇率是死的」的包"
+
+
+def test_run_py_has_the_plugin_verb_and_it_precedes_the_whitelist():
+    """`--run-plugin` 是打包版跑 inherit 插件的唯一出路，且必须**先于**参数白名单判。
+
+    白名单那条规则是「整个 argv 必须落在集合里」，而 --run-plugin 后面跟的是插件
+    自己的参数（fetch、--soroban-url…）。判晚了会被自己的保险打下来，
+    表现是插件一启动就 exit 2，而错误信息说的是「soroban 不接受命令行参数」。
+    """
+    src = _RUN_PY.read_text(encoding="utf-8")
+    assert "def _run_plugin(" in src, "打包版没有跑 inherit 插件的入口"
+    i_verb = src.index('if argv[0] == "--run-plugin":')
+    i_white = src.index('if set(argv) <= {"--use-local-db", "--yes"}')
+    assert i_verb < i_white, "--run-plugin 判在白名单之后，会被白名单先拒掉"
+    # 它必须支持 python 自己那两种入口写法，否则清单里换个 entry 就跑不了
+    assert 'rest[0] == "-m"' in src and "run_path" in src, \
+        "--run-plugin 没有按 python 的规矩解释 entry（-m 模块 / 脚本路径）"
+
+
+def test_run_plugin_does_not_boot_the_server(tmp_path, monkeypatch):
+    """真跑一遍：`--run-plugin` 必须执行插件入口，**不能**顺手把 soroban 启动起来。
+
+    这条是整个动词的价值所在——它存在的理由正是「exe 被当解释器用时会把自己再启动一遍」。
+    只断言源码里有那几个字符串是不够的：分支写错（比如落到 rescue 或继续往下走）
+    在文本上完全看不出来。
+    """
+    import subprocess
+    import sys
+
+    d = tmp_path / "plug"
+    (d / "demo_mod").mkdir(parents=True)
+    (d / "demo_mod" / "__init__.py").write_text("", encoding="utf-8")
+    (d / "demo_mod" / "__main__.py").write_text(
+        "import sys; print('PLUGIN-RAN', sys.argv[1:])", encoding="utf-8")
+    r = subprocess.run([sys.executable, str(_RUN_PY), "--run-plugin", str(d),
+                        "-m", "demo_mod", "fetch", "--soroban-url", "http://x"],
+                       capture_output=True, text=True, timeout=60, cwd=str(tmp_path))
+    assert "PLUGIN-RAN" in r.stdout, f"插件没被跑起来：{r.stdout!r} {r.stderr[-400:]!r}"
+    assert "'fetch', '--soroban-url', 'http://x'" in r.stdout, \
+        "插件拿到的 argv 不对——命令与参数没原样传过去"
+    assert "正在启动" not in r.stdout, "把 soroban 服务也启动了，这正是这个动词要消灭的事"
+
+
+def test_spec_plugin_filter_really_excludes_credentials(spec_text, tmp_path):
+    """把 spec 里那个过滤函数**真跑一遍**，别只比对字符串。
+
+    这是整条改动里唯一「错了会把打包者的淘宝 cookie 焊进 exe」的地方，
+    而字符串断言证明不了 `set(rel.parts[:-1]) & _PLUG_SKIP_DIRS` 这行逻辑是对的
+    ——比如漏掉最后一段路径、或者把 startswith 写反，文本上完全看不出来。
+    所以从 spec 源码里把那一段抠出来执行，测的就是真正会跑的代码。
+    """
+    import re as _re
+
+    block = _re.search(r"^_PLUG_SKIP_DIRS = .*?^_plugin_files = ", spec_text,
+                       _re.S | _re.M)
+    assert block, "spec 里找不到插件过滤那一段——改了名字就把这条守卫架空了"
+    ns = {"Path": Path}
+    exec(compile(block.group(0).rsplit("\n_plugin_files", 1)[0], "<spec>", "exec"), ns)
+
+    base = tmp_path / "plugins" / "soroban-plugin-demo"
+    (base / ".state").mkdir(parents=True)
+    (base / ".venv" / "bin").mkdir(parents=True)
+    (base / "__pycache__").mkdir()
+    (base / "pkg").mkdir()
+    (base / ".state" / "session.json").write_text('{"cookie":"secret"}', encoding="utf-8")
+    (base / ".venv" / "bin" / "python").write_text("x", encoding="utf-8")
+    (base / "__pycache__" / "m.cpython-312.pyc").write_text("x", encoding="utf-8")
+    (base / ".env").write_text("TOKEN=secret", encoding="utf-8")
+    (base / "scrape.log").write_text("x", encoding="utf-8")
+    (base / "plugin.toml").write_text('id = "demo"', encoding="utf-8")
+    (base / "README.md").write_text("hi", encoding="utf-8")
+    (base / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+
+    got = {Path(src).name for src, _dest in ns["_bundle_plugins"](tmp_path / "plugins")}
+    assert got == {"plugin.toml", "README.md", "__init__.py"}, \
+        f"过滤结果不对：{sorted(got)}——凭据或机器相关文件被打进了 exe"
+
+
+def test_release_dir_does_not_carry_the_version():
+    """发布目录**同时是运行数据目录**，所以它的名字里不能有版本号。
+
+    带版本号时，改一次 VERSION 就产出一个全新的空目录：新 exe 首次启动会建一个
+    空账本 + 新 SECRET_KEY，而用户读到的是「升级把我的数据吃了」。
+    数据并没丢，它在上一个版本的目录里——但流程里没有任何一处会这么说。
+    固定目录是把这个失败**消除**掉，而不是再加一句警告。
+    """
+    bat = (_REPO / "pyinstaller.bat").read_text(encoding="utf-8", errors="replace")
+    m = re.search(r"^set RELEASE=(.+)$", bat, re.M)
+    assert m, "pyinstaller.bat 里找不到 RELEASE 的定义"
+    assert "%VERSION%" not in m.group(1), \
+        f"发布目录又带上版本号了：{m.group(1)}——升级会产出空账本"
+    # 老用户的数据还在带版本号的旧目录里，那句一次性搬迁提示不能删
+    assert "YOUR LEDGER IS NOT IN THIS FOLDER" in bat

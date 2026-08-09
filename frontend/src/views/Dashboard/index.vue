@@ -9,6 +9,15 @@
       下面显示的<b>不是</b>你的账本，只是初值。请检查网络或后端后重试。
       <el-button link type="primary" @click="load">重试</el-button>
     </el-alert>
+    <!-- 有货款、却因为缺汇率算不出日元的行：SUM 会把 NULL 直接跳过，
+         于是**金额被吞、笔数照数**——合计变小而单数不变，看板上没有任何异常信号。
+         记账不该因为断网就记不了，所以写入侧照旧放行；代价是这里必须说出来。 -->
+    <el-alert v-if="data.uncounted_count" type="warning" show-icon :closable="false" class="load-failed">
+      <template #title>有 {{ data.uncounted_count }} 笔没算进下面的合计</template>
+      这些行填了货款（合计 ¥{{ data.uncounted_cny }}）但当时**没有汇率**，折不出日元。
+      下面的总支出因此偏小，而单数是全的。
+      <router-link to="/fx">去汇率页补一条</router-link>，然后在对应行重填一次货款即可重算。
+    </el-alert>
     <el-row :gutter="16" v-loading="loading">
       <el-col :xs="12" :sm="12" :md="6" v-for="c in cards" :key="c.label">
         <div class="stat" :style="{ borderTopColor: c.color }">
@@ -64,6 +73,9 @@ const loading = ref(false)
 const data = reactive({
   total_jpy: 0, order_jpy: 0, shipment_jpy: 0, misc_jpy: 0,
   order_count: 0, shipment_count: 0, misc_count: 0, by_month: [], fx_rate: null,
+  // 初值必须是 0：接口挂掉时 loadFailed 那条 alert 已经在说话了，
+  // 这里若初值非 0，会再叠一条「有 N 笔没算进合计」的假警报。
+  uncounted_count: 0, uncounted_cny: 0,
 })
 
 // 当前年月（按本地=JST）；本月行浅色底强调

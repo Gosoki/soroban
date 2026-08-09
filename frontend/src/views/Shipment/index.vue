@@ -110,6 +110,8 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Camera, Loading, Upload } from '@element-plus/icons-vue'
 import { shipmentApi, ordersApi } from '@/api'
+import { checkImageSize } from '@/utils/imageGate'
+import { handled } from '@/api/http'
 import { SHIPMENT_STATUS, longToast } from '@/constants'
 import { fmtJPY } from '@/utils/money'
 import { today } from '@/utils/datetime'
@@ -173,7 +175,7 @@ async function saveCell(row, key, value) {
     const updated = await shipmentApi.update(row.id, { version: row.version, [key]: value })
     Object.assign(row, updated)
   } catch (e) {
-    if (e.response?.status === 409) { ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
+    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
   }
 }
 
@@ -188,6 +190,7 @@ async function addRow(data = {}, done) {
     // 409 被 http 拦截器刻意跳过（留给页面处理）。不在这里提示的话，撞集运单号唯一约束时
     // 页面「什么都没发生」：没有 toast、没有新行、幽灵行里刚敲的单号也被 commitNew 清掉了。
     if (e.response?.status === 409) {
+      handled(e)
       const who = data.shipment_no ? `集运单号「${data.shipment_no}」` : '该记录'
       ElMessage.warning(`${who} 已存在，未添加`)
     }
@@ -277,6 +280,10 @@ async function pumpPkg() {
 }
 
 async function processPkg(file) {
+  // 分辨率超上限的在本机就拦下来：后端是硬拒绝（400），
+  // 传上去只是让用户在慢网络上白等一趟。判据与后端逐字节相同。
+  const tooBig = await checkImageSize(file)
+  if (tooBig) { ElMessage.warning(tooBig); return }
   try {
     const res = await shipmentApi.ocr(file)
     if (res.express_nos?.length && !res.shipment_no && !res.intl_tracking_no) {
@@ -360,6 +367,9 @@ async function pumpBind() {
 }
 
 async function bindExpress(shipmentRow, file) {
+  // 三条 OCR 上传路径都要预检，漏一条就是「另外两处会提前提示、这一处传完才报错」
+  const tooBig = await checkImageSize(file)
+  if (tooBig) { ElMessage.warning(tooBig); return }
   bindingRowId.value = shipmentRow.id
   try {
     const res = await shipmentApi.ocrExpress(shipmentRow.id, file)

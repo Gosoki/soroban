@@ -476,3 +476,25 @@ def test_user_facing_copy_has_no_bare_markdown():
                 line_no = text[:m.start()].count("\n") + 1
                 bad.append(f"{f.relative_to(root)}:{line_no}: {val.strip()[:70]}")
     assert not bad, "用户可见文案里有裸 markdown（Element 不解析，会显示成字面星号）：\n" + "\n".join(bad)
+
+
+def test_humans_cannot_write_into_the_plugin_private_namespace(client):
+    """人类令牌写「插件私有存储」→ 400，而不是 200 + 一行谁都读不回来的数据。
+
+    这类数据按 plugin_id 分命名空间，人没有 plugin_id，会落进 `plugin_id="?"`；
+    而读接口（GET /api/plugins/records/{kind}）明确拒绝人类令牌 ⇒ **写得进、读不出**。
+    「200 OK、库里真的多了行、然后永远拿不出来」比直接报错难查得多。
+    """
+    r = client.post("/api/plugins/ingest", json={
+        "kind": "plugin.record",
+        "items": [{"kind": "note", "key": "k1", "data": {"a": 1}}],
+    })
+    assert r.status_code == 400, r.text
+    assert "插件令牌" in r.json()["detail"]
+
+
+def test_humans_can_still_write_the_ledger_kinds(client):
+    """反面：别的 kind 人类本来就该能写（手工补录、排障），别一刀切。"""
+    r = client.post("/api/plugins/ingest", json={
+        "kind": "fx.rate", "items": [{"rate": "20.5000", "source": "manual-test"}]})
+    assert r.status_code == 200, r.text

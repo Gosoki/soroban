@@ -269,3 +269,50 @@ def test_order_status_enum_is_domestic_only():
 
     assert {s.value for s in PurchaseStatus} == {
         "待付款", "待发货", "待收货", "已签收", "退款", "交易关闭"}
+
+
+def test_short_tracking_number_is_never_auto_attached(client, session, monkeypatch):
+    """短到不像快递单号的，绝不拿去自动挂靠。
+
+    OCR 会把一个长号断成两截（`SF1234 56789012` → 取到后半截）。ocr.py 里已有一道
+    「旁边紧邻另一段数字」的判据，但它依赖排版，挡不住所有情形——而**不可逆后果**在这一端：
+    半截号拿去 `Order.express_no == no` 精确匹配，匹配不上只是漏一单，
+    万一撞上别人的单号，就是把货自动挂到一张无关订单上。
+    """
+    from app.routers import shipment as mod
+
+    ship = client.post("/api/shipment", json={
+        "date": "2026-03-01", "shipment_no": "SHORT-GUARD-1"}).json()
+    # 造一张订单，它的快递号**恰好**等于那截半截号——正是最坏的那种巧合
+    od = client.post("/api/orders", json={
+        "date": "2026-03-01", "title": "无关订单", "express_no": "56789012"}).json()
+
+    async def fake_ocr(file, recognizer):
+        return {"express_nos": ["56789012"], "unreadable": 0}
+
+    monkeypatch.setattr(mod, "run_ocr", fake_ocr)
+    r = client.post(f"/api/shipment/{ship['id']}/ocr-express",
+                    files={"file": ("x.png", b"\x89PNG", "image/png")})
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert [o["id"] for o in got["attached"]] == [], "半截号把货挂到了无关订单上"
+    assert "56789012" in got["unmatched"], "被静默丢弃了——用户看不到、也没法手动挂"
+    assert client.get(f"/api/orders/{od['id']}").json()["shipment_order_id"] is None
+
+
+def test_full_length_tracking_number_still_attaches(client, session, monkeypatch):
+    """反面：正常长度的单号必须照常挂上去，否则这道闸就是把功能关掉了。"""
+    from app.routers import shipment as mod
+
+    ship = client.post("/api/shipment", json={
+        "date": "2026-03-01", "shipment_no": "SHORT-GUARD-2"}).json()
+    od = client.post("/api/orders", json={
+        "date": "2026-03-01", "title": "该挂上的订单", "express_no": "SF1234567890123"}).json()
+
+    async def fake_ocr(file, recognizer):
+        return {"express_nos": ["SF1234567890123"], "unreadable": 0}
+
+    monkeypatch.setattr(mod, "run_ocr", fake_ocr)
+    got = client.post(f"/api/shipment/{ship['id']}/ocr-express",
+                      files={"file": ("x.png", b"\x89PNG", "image/png")}).json()
+    assert [o["id"] for o in got["attached"]] == [od["id"]], "正常单号也挂不上了"
