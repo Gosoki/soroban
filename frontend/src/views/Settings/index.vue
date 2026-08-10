@@ -40,6 +40,7 @@
         </span>
       </div>
 
+      <div class="field-grid">
       <div v-for="sp in g.items" :key="sp.key" class="field">
         <label class="flabel">
           {{ sp.label }}
@@ -61,6 +62,7 @@
                   :placeholder="String(sp.default || '')" />
 
         <span class="sub">{{ extraHint(sp) }}</span>
+      </div>
       </div>
     </el-card>
 
@@ -145,15 +147,21 @@ onMounted(load)
 </script>
 
 <style scoped>
-.set-page { max-width: 820px; }
+/* 页宽不再自己设上限：全站统一「卡片占满宽度、卡片内字段自动分列」（见 tokens.css 的
+   .field-grid）。原先这里是 820px，而汇率页 900、数据库页 760——同一个应用四种页宽。 */
 .title { margin: 0 0 8px; font-size: 20px; }
 .lead { margin: 0 0 16px; color: var(--txt-3); font-size: 12px; line-height: 1.8; }
 .lead code { background: var(--el-fill-color-light); padding: 1px 5px; border-radius: 3px; }
 .card { margin-bottom: 16px; }
-.card-hd { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-weight: 600; margin-bottom: 12px; }
+/* 刻意**不用** space-between：「汇率」与它右边那句「当前：1元 = …」是同一件事的标题和值，
+   页宽放开后 space-between 会把它们推到相隔一千多像素的两端，读起来不像一组。
+   与插件页卡片头同一套做法：相关的挤在左边，真正的「操作」才用 .grow 顶到右边。 */
+.card-hd { display: flex; align-items: center; gap: 12px; font-weight: 600; margin-bottom: 12px; }
 .cur { font-weight: 400; font-size: 13px; color: var(--txt-2); display: flex; align-items: center; gap: 8px; }
 .field { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
-.flabel { width: 148px; flex: none; font-size: 13px; color: var(--txt-2); display: flex; align-items: center; gap: 4px; }
+/* 180px 与插件页的 .flabel 同宽：两页长得一模一样的字段行，没有理由用两个数。
+   148px 时「手填汇率（1元 = ？円)」这种标签会折成两行，行高跟着变，整列对不齐。 */
+.flabel { width: 180px; flex: none; font-size: 13px; color: var(--txt-2); display: flex; align-items: center; gap: 4px; }
 .help { color: var(--txt-3); cursor: help; font-size: 13px; }
 .sub { color: var(--txt-3); font-size: 12px; }
 .sub.warn { color: var(--el-color-warning); }

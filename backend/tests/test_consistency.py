@@ -582,3 +582,54 @@ def test_frontend_pre_checks_image_size_on_every_ocr_upload():
     ship = (root / "views" / "Shipment" / "index.vue").read_text(encoding="utf-8")
     assert ship.count("checkImageSize(file)") >= 2, \
         "集运页有两条上传路径（成品包裹页 / 内含快递挂靠），预检只加了一条"
+
+
+def test_no_page_sets_its_own_width_cap():
+    """页面不许自己写死宽度上限——全站一个页宽。
+
+    这条守卫是从一次真实的割裂里长出来的：汇率 900px、数据库 760px、设置 820px，
+    其余页面占满宽度。四种页宽，而那三个数字彼此毫无关系，只是各写各的时随手定的。
+    代价不只是「不好看」：汇率页主体是一张**表**，760/900 下右边白掉几百像素，
+    数据库页的 DSN 那一列则被挤得折行。
+
+    统一后的规则：**卡片占满宽度，卡片内的字段按可用宽度自动分列**
+    （`.field-grid`，定义在 tokens.css，两页共用）。
+    要收窄就收窄**控件**，不要收窄**页面**。
+    """
+    import re
+    from pathlib import Path
+
+    views = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "views")
+    offenders = []
+    for f in sorted(views.rglob("index.vue")):
+        src = f.read_text(encoding="utf-8")
+        m = re.search(r"<template>\s*<div class=\"([\w-]+)\"", src)
+        if not m:
+            continue                      # 根节点没带 class 的页面本来就没有这个问题
+        root = m.group(1)
+        style = src.split("<style", 1)[-1]
+        # 只看**根节点那条规则**：控件级的 max-width（输入框收窄）是正当的
+        for rule in re.findall(rf"\.{re.escape(root)}\s*\{{([^}}]*)\}}", style):
+            if "max-width" in rule:
+                offenders.append(f"{f.parent.name}: .{root} {{{rule.strip()}}}")
+    assert not offenders, (
+        "页面自己写死了宽度上限，会和其余页面长得不一样：\n  " + "\n  ".join(offenders)
+        + "\n要收窄请收窄控件（或用 tokens.css 的 .field-grid 分列），不要收窄页面。")
+
+
+def test_field_grid_is_defined_once_globally():
+    """`.field-grid` 只能有一处定义。
+
+    这三页要的是同一件事——各页抄一份必然漂移，它们原来那三个不一样的
+    max-width 正是这么来的。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    defs = [f for f in list(root.rglob("*.vue")) + list(root.rglob("*.css"))
+            if ".field-grid {" in f.read_text(encoding="utf-8")]
+    assert [f.name for f in defs] == ["tokens.css"], \
+        f".field-grid 被定义了多份：{[str(f) for f in defs]}"
+    users = [f.parent.name for f in root.rglob("index.vue")
+             if 'class="field-grid"' in f.read_text(encoding="utf-8")]
+    assert set(users) >= {"Settings", "Database"}, f"没人用它了？当前使用者：{users}"

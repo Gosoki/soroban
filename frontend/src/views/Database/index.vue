@@ -57,9 +57,12 @@
     <el-card shadow="never" class="card">
       <div class="card-hd"><span>连接新的 MySQL</span></div>
       <el-form :model="form" label-width="92px" class="form" @submit.prevent>
+        <!-- 连接参数按可用宽度自动分列（窄屏仍是一列）。一个连接串的五个字段
+             本来就是一组，横着排比竖着排一长条更好扫，也不至于让输入框拉到 1300px 宽。 -->
+        <div class="field-grid">
         <el-form-item label="主机"><el-input v-model="form.host" placeholder="127.0.0.1" /></el-form-item>
         <el-form-item label="端口">
-          <el-input v-model.number="form.port" placeholder="3306" style="max-width: 160px" />
+          <el-input v-model.number="form.port" placeholder="3306" />
         </el-form-item>
         <el-form-item label="用户名">
           <el-input v-model="form.user" name="soroban-mysql-user"
@@ -71,6 +74,7 @@
                     :readonly="ro.pass" @focus="ro.pass = false" />
         </el-form-item>
         <el-form-item label="数据库名"><el-input v-model="form.database" placeholder="soroban" /></el-form-item>
+        </div>
         <el-form-item>
           <!-- 任一操作进行中(busy)全部禁用：与表格行按钮同规则，杜绝迁移中又点切换的并发操作 -->
           <el-button :disabled="!!busy" :loading="busy === 'test'" @click="onTest">测试连接并记住</el-button>
@@ -265,10 +269,14 @@ onMounted(loadStatus)
 </script>
 
 <style scoped>
-.db-page { max-width: 760px; }
+/* 页宽不再自己设上限：这一页有两张**表格**（连接过的库），760px 下 DSN 那列会折行，
+   而右边空着 600px。统一成「占满宽度 + 字段自动分列」，见 tokens.css 的 .field-grid。 */
 .title { margin: 0 0 16px; font-size: 20px; }
 .card { margin-bottom: 16px; }
-.card-hd { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-weight: 600; margin-bottom: 10px; }
+/* 刻意**不用** space-between：「当前使用」与它右边那个后端标签是标题和值，
+   页宽放开后 space-between 会把它们推到相隔一千多像素的两端，读起来不像一组。
+   与插件页卡片头同一套做法：相关的挤在左边，真正的「操作」才用 .grow 顶到右边。 */
+.card-hd { display: flex; align-items: center; gap: 12px; font-weight: 600; margin-bottom: 10px; }
 /* 与插件页的 .needs 同一档间距：三处 el-alert 都是「要人处理的异常态」，
    同一种组件不该有两种排版。 */
 .degraded { margin-bottom: 12px; }

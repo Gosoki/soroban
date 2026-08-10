@@ -7,6 +7,9 @@
       当天有多条时取<b>手填的那条</b>，没有手填就取<b>当天最后抓到的</b>。
     </p>
 
+    <!-- 工具栏 + 表格装进卡片：全站其余页面（订单/集运/插件/设置/数据库）都是
+         「内容装在 el-card 里」，只有这一页是裸的一张表贴在页底色上。 -->
+    <el-card shadow="never">
     <div class="bar">
       <el-radio-group v-model="days" @change="load">
         <el-radio-button v-for="d in [7, 30, 90, 365]" :key="d" :value="d">近 {{ d }} 天</el-radio-button>
@@ -21,12 +24,14 @@
     <table v-else class="tbl">
       <thead>
         <tr>
-          <th style="width: 120px">日期</th>
-          <th style="width: 120px">采用</th>
-          <th style="width: 90px">来源</th>
-          <th style="width: 140px">当天区间</th>
-          <th style="width: 70px">条数</th>
-          <th></th>
+          <!-- 百分比而不是像素：页宽放开之后，固定像素列会把多出来的宽度**全部**
+               丢给最后一列，数据挤在左边、右边空 700px。按比例分配才跟着页宽走。 -->
+          <th style="width: 16%">日期</th>
+          <th style="width: 12%">采用</th>
+          <th style="width: 14%">来源</th>
+          <th style="width: 18%">当天区间</th>
+          <th style="width: 8%">条数</th>
+          <th style="width: 32%"></th>
         </tr>
       </thead>
       <tbody>
@@ -66,6 +71,7 @@
         </template>
       </tbody>
     </table>
+    </el-card>
   </div>
 </template>
 
@@ -117,7 +123,8 @@ onMounted(load)
 </script>
 
 <style scoped>
-.fx-page { max-width: 900px; }
+/* 页宽不再自己设上限：这一页主体就是一张**表**，900px 下右边白掉 450px。
+   全站统一「内容装在卡片里、卡片占满宽度」。 */
 .title { margin: 0 0 8px; font-size: 20px; }
 .lead { margin: 0 0 16px; color: var(--txt-3); font-size: 12px; line-height: 1.9; }
 .bar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
