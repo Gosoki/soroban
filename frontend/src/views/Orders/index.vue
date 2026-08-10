@@ -9,16 +9,6 @@
     <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable hide-id :open-id="focusId"
                  table-name="orders" @save="saveCell" @add="addRow" @delete="delRow" @reload="load">
       <template #toolbar>
-        <el-upload ref="ocrUpload" class="ocr-up" multiple :show-file-list="false" :auto-upload="false"
-                   accept="image/*" :on-change="onOcrPick">
-          <div class="ocr-drop" :class="{ busy: ocrPending }">
-            <el-icon class="ocr-ic"><Camera /></el-icon>
-            <span>{{ ocrPending ? `后台识别中 ${ocrPending} 张…` : '点击选图 OCR识别（或拖图到页面）' }}</span>
-          </div>
-        </el-upload>
-        <el-tag v-if="focusId" :style="typeStyle('warning')" closable disable-transitions class="focus-chip" @close="clearFocus">
-          定位订单 #{{ focusId }} · 点 × 看全部
-        </el-tag>
         <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="reload" />
         <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
           <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
@@ -38,6 +28,18 @@
         </el-select>
         <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
                         start-placeholder="起" end-placeholder="止" @change="reload" />
+        <el-tag v-if="focusId" :style="typeStyle('warning')" closable disable-transitions class="focus-chip" @close="clearFocus">
+          定位订单 #{{ focusId }} · 点 × 看全部
+        </el-tag>
+      </template>
+
+      <template #toolbar-right>
+        <OcrButton ref="ocrUpload" :pending="ocrPending" @pick="onOcrPick">
+          点「OCR」选图，或把图<b>拖到页面任意位置</b>松手，都会识别并自动建单（支持一次多张）。
+          认得淘宝/京东/闲鱼的订单截图；识别到的下单日期、商品、金额、快递号会填进新行，
+          没认出来的格子留空等你补。
+          <br>拿错平台的截图（比如淘宝的）会提示改用爬虫插件，不会建出一张错单。
+        </OcrButton>
       </template>
 
       <template #cell-shipment_order_id="{ row }">
@@ -119,6 +121,7 @@ import { applyRowUpdate, queueOrderWrite } from '@/utils/orderWrites'
 import { today } from '@/utils/datetime'
 import { afterCreate, afterDelete, sortByDateDesc } from '@/utils/listRows'
 import NotionTable from '@/components/NotionTable.vue'
+import OcrButton from '@/components/OcrButton.vue'
 import OrderItemsEditor from '@/components/OrderItemsEditor.vue'
 
 
@@ -554,16 +557,6 @@ onBeforeUnmount(() => {
 
 <style scoped>
 /* OCR 上传：工具栏里的点选按钮（拖拽走整窗覆盖层，这里只负责点击选图）。 */
-.ocr-up { display: inline-flex; }
-.ocr-up :deep(.el-upload) { display: inline-flex; }
-.ocr-drop {
-  display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 14px;
-  border: 1px dashed var(--border-strong); border-radius: 4px; color: var(--brand-soft); font-size: 13px;
-  white-space: nowrap; cursor: pointer;
-}
-.ocr-drop:hover { border-color: var(--brand); background: var(--brand-weak); }
-.ocr-drop.busy { color: var(--txt-3); }
-.ocr-ic { font-size: 15px; }
 
 /* 整窗拖拽覆盖层：居中的上传提示框，不拦截拖拽事件 */
 .ocr-overlay {

@@ -9,19 +9,21 @@
     <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable
                  table-name="shipment" @save="saveCell" @add="addRow" @delete="delRow" @reload="load">
       <template #toolbar>
-        <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
-                        start-placeholder="起" end-placeholder="止" @change="reload" />
-        <el-select v-model="filters.shipmentStatus" placeholder="状态" clearable style="width: 110px" @change="reload">
+        <el-input v-model="filters.q" placeholder="搜集运单号" clearable style="width: 200px" @change="reload" />
+        <el-select v-model="filters.shipmentStatus" placeholder="状态" clearable style="width: 120px" @change="reload">
           <el-option v-for="s in SHIPMENT_STATUS" :key="s" :label="s" :value="s" />
         </el-select>
-        <el-input v-model="filters.q" placeholder="搜集运单号" clearable style="width: 150px" @change="reload" />
-        <el-upload ref="pkgUpload" class="ocr-up" multiple :show-file-list="false" :auto-upload="false"
-                   accept="image/*" :on-change="onPkgPick">
-          <div class="ocr-drop" :class="{ busy: pkgPending }">
-            <el-icon class="ocr-ic"><Camera /></el-icon>
-            <span>{{ pkgPending ? `后台识别中 ${pkgPending} 张…` : '点击选图 OCR建单（或拖「成品包裹」图到页面）' }}</span>
-          </div>
-        </el-upload>
+        <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
+                        start-placeholder="起" end-placeholder="止" @change="reload" />
+      </template>
+
+      <template #toolbar-right>
+        <OcrButton ref="pkgUpload" :pending="pkgPending" @pick="onPkgPick">
+          点「OCR」选图，或把图<b>拖到页面任意位置</b>松手，识别<b>「成品包裹」页</b>截图建集运单
+          （集运单号、国际运单号、下单时间、渠道）。
+          <br>另一种截图是<b>「内含快递」页</b>——那个要拖到某一行的「绑定快递单」格里，
+          按快递单号自动挂靠商品订单；拖到页面上会提示你拖错地方了。
+        </OcrButton>
       </template>
 
       <template #cell-orders="{ row }">
@@ -122,6 +124,7 @@ import { fmtJPY } from '@/utils/money'
 import { today } from '@/utils/datetime'
 import { afterCreate, afterDelete } from '@/utils/listRows'
 import NotionTable from '@/components/NotionTable.vue'
+import OcrButton from '@/components/OcrButton.vue'
 
 const router = useRouter()
 // 点关联订单的订单号 → 跳到商品页、隔离显示该单并自动展开（用 id，兼容无订单号的单）
@@ -459,16 +462,6 @@ onBeforeUnmount(() => {
 .ex-title { color: var(--txt-2); font-size: 13px; margin-bottom: 8px; }
 
 /* 工具栏 OCR 建单入口（拖拽由 window 监听统一处理，这里只负责点击选图） */
-.ocr-up { display: inline-flex; }
-.ocr-up :deep(.el-upload) { display: inline-flex; }
-.ocr-drop {
-  display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 14px;
-  border: 1px dashed var(--border-strong); border-radius: 4px; color: var(--brand-soft); font-size: 13px;
-  white-space: nowrap; cursor: pointer;
-}
-.ocr-drop:hover { border-color: var(--brand); background: var(--brand-weak); }
-.ocr-drop.busy { color: var(--txt-3); }
-.ocr-ic { font-size: 15px; }
 
 /* 行内「绑定快递单」投放区：平时低调，拖拽中(armed)亮起，悬停(over)高亮 */
 .bind-drop {

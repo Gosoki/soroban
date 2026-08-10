@@ -1,6 +1,13 @@
 <template>
   <div class="gtn">
-    <div v-if="$slots.toolbar" class="gtn-toolbar"><slot name="toolbar" /></div>
+
+    <div v-if="$slots.toolbar || $slots['toolbar-right']" class="gtn-toolbar">
+      <slot name="toolbar" />
+      <!-- 右侧入口（OCR 之类）：靠 flex 间隔顶过去，而不是让每一页自己拼一个
+           `<div class="grow" />`——那样每页的写法和间距都会各长各的。 -->
+      <div class="gtn-tb-gap" />
+      <slot name="toolbar-right" />
+    </div>
 
     <div class="gtn-scroll" v-loading="loading">
       <table class="gtn-table" :style="{ width: totalWidth + 'px' }">
@@ -394,7 +401,20 @@ function stopResize() {
    与本行最高者等高。工具栏里混着输入框(24px)和日期范围选择器(32px)，于是搜索框被
    悄悄拉成 32px——同一行里两种高度，而且只在带日期筛选的页面上出现，很难联想到原因。 */
 .gtn-empty td { padding: 22px 12px; text-align: center; color: var(--txt-3); font-size: 13px; }
-.gtn-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+/* 筛选栏的控件比表格里的高一档（24 → 30）。表格单元格要密，筛选栏是要**点**的，
+   24px 在 1500px 宽的屏幕上又矮又挤。
+   改 Element 的尺寸变量而不是各页去写 size="default"（那是 32px，跳得太多，
+   而且要在五个页面的每一个控件上都写一遍）。
+   ⚠️ select 必须单独补一条：Element 把它的 min-height 按尺寸档**写死**在类里，
+   不读 --el-component-size-small——只设变量的话，输入框和日期变高了、下拉还是 24，
+   一排控件参差不齐（实测：[30, 24, 24, 24, 30]）。 */
+.gtn-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px;
+               --el-component-size-small: 30px; }
+.gtn-toolbar :deep(.el-select__wrapper) { min-height: var(--el-component-size-small); }
+/* 按钮同理：`.el-button--small` 的 height 也是写死的。不补这条，
+   右侧的 OCR 按钮会是 24px，和左边一排 30px 的筛选框对不齐（实测 [30, 24]）。 */
+.gtn-toolbar :deep(.el-button) { height: var(--el-component-size-small); }
+.gtn-tb-gap { flex: 1; }
 /* background 是**去掉外层 el-card 之后补的**：表格页现在不再套卡片，
    这圈边框自己就是容器，行底色必须由它给，否则整表掉到页面底 --bg-page（深一档），
    而表头（--bg-hover）还亮着，看起来像表头浮在一个洞上。 */

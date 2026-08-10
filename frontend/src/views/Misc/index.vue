@@ -8,9 +8,9 @@
     <NotionTable :columns="columns" :rows="rows" :loading="loading" table-name="misc"
                  @save="saveCell" @add="addRow" @delete="delRow">
       <template #toolbar>
+        <el-input v-model="filters.q" placeholder="搜名称" clearable style="width: 200px" @change="reload" />
         <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
                         start-placeholder="起" end-placeholder="止" @change="reload" />
-        <el-input v-model="filters.q" placeholder="搜名称" clearable style="width: 150px" @change="reload" />
       </template>
     </NotionTable>
 

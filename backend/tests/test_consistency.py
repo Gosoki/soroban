@@ -414,7 +414,14 @@ def test_control_size_is_set_globally_not_per_widget():
         # 只认 Element 的三档尺寸。别的 size=（图标像素 size="18"、分页 :size="pageSize"、
         # el-image 的 size="none"）与控件尺寸无关，一起查会产生假红——
         # 而假红的下场是有人把断言改松，等于没有守卫。
-        for m in re.finditer(r'\bsize="(large|default|small)"', f.read_text(encoding="utf-8")):
+        # **先把注释剥掉**：注释里写「不要用 size="default"」的那种句子本身会命中，
+        # 而假红的下场是有人把断言改松、等于没有守卫。
+        # （NotionTable 里解释「为什么改变量而不写 size」的那段注释就踩过这一下。）
+        text = f.read_text(encoding="utf-8")
+        text = re.sub(r"<!--.*?-->", "", text, flags=re.S)      # 模板注释
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)       # JS / CSS 块注释
+        text = re.sub(r"^\s*//.*$", "", text, flags=re.M)        # JS 行注释
+        for m in re.finditer(r'\bsize="(large|default|small)"', text):
             bad.append(f"{f.relative_to(_REPO)}: size=\"{m.group(1)}\"")
     assert not bad, (
         "这些地方又逐个写死了控件尺寸，会和全局默认打架：\n  " + "\n  ".join(bad)
@@ -854,3 +861,90 @@ def test_no_markdown_bold_in_templates():
         for hit in re.findall(r"\*\*[^*\n]{1,40}\*\*", body):
             bad.append(f"{f.parent.name}/{f.name}: {hit}")
     assert not bad, "模板里有 markdown 加粗，会原样显示成星号：\n  " + "\n  ".join(bad)
+
+
+# --- 列表页工具栏 --------------------------------------------------------------
+
+_LIST_PAGES = ["Orders", "Items", "Shipment", "Misc", "Staging"]
+
+
+def _toolbar(src: str, slot: str = "toolbar") -> str:
+    m = re.search(rf"<template #{slot}>(.*?)</template>\n", src, re.S)
+    return m.group(1) if m else ""
+
+
+def test_all_list_toolbars_share_one_layout():
+    """五个列表页的筛选栏顺序一致：**搜索 → 各下拉 → 日期区间**。
+
+    改之前是各排各的：集运把日期排在最前、杂项也是、订单把 OCR 那块塞在最左边。
+    同一个人在五页之间切换，每换一页都要重新找搜索框在哪。
+    以物品列表为基准（它本来就是这个顺序）。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src" / "views"
+    for name in _LIST_PAGES:
+        tb = _toolbar((root / name / "index.vue").read_text(encoding="utf-8"))
+        assert tb, f"{name} 找不到 #toolbar"
+        seq = re.findall(r"<el-(input|select|date-picker)\b", tb)
+        assert seq, f"{name} 的筛选栏是空的？"
+        assert seq[0] == "input", f"{name} 的筛选栏第一个不是搜索框：{seq}"
+        assert seq[-1] == "date-picker", f"{name} 的筛选栏最后一个不是日期区间：{seq}"
+        assert "select" not in seq[seq.index("date-picker"):], \
+            f"{name} 有下拉排在日期区间后面：{seq}"
+
+
+def test_all_list_toolbars_share_one_set_of_widths():
+    """同一种控件在五页里宽度一致。原先搜索框有 200/150/150 三种、状态下拉有 120/110 两种。"""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src" / "views"
+    bad = []
+    for name in _LIST_PAGES:
+        tb = _toolbar((root / name / "index.vue").read_text(encoding="utf-8"))
+        for tag, want in (("input", "200px"), ("select", "120px")):
+            for w in re.findall(rf'<el-{tag}\b[^>]*?style="width: ([^"]+)"', tb, re.S):
+                if w != want:
+                    bad.append(f"{name}: el-{tag} 宽 {w}（应为 {want}）")
+    assert not bad, "筛选栏控件宽度不统一：\n  " + "\n  ".join(bad)
+
+
+def test_ocr_entry_is_a_right_aligned_button_not_a_dropzone():
+    """OCR 收成右对齐的小按钮，说明进「?」。
+
+    原先是筛选栏里**最宽**的一块（266~344px 的虚线投放区），里面写着一整句话——
+    而筛选才是每天要用的东西。两页各写一份，尺寸和文案已经不一样了。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    assert (root / "components" / "OcrButton.vue").is_file(), "没有共用的 OCR 组件"
+    for name in ("Orders", "Shipment"):
+        src = (root / "views" / name / "index.vue").read_text(encoding="utf-8")
+        assert "ocr-drop" not in src, f"{name} 还留着旧的投放区"
+        assert "<OcrButton" in src, f"{name} 没用共用的 OCR 组件"
+        assert "<OcrButton" in _toolbar(src, "toolbar-right"), \
+            f"{name} 的 OCR 不在 #toolbar-right 里，不会靠右"
+        assert "<OcrButton" not in _toolbar(src), f"{name} 的 OCR 还在左边的筛选栏里"
+    nt = (root / "components" / "NotionTable.vue").read_text(encoding="utf-8")
+    assert "toolbar-right" in nt and "gtn-tb-gap" in nt, "NotionTable 没有靠右的工具栏槽"
+
+
+def test_toolbar_control_heights_are_overridden_in_all_three_places():
+    """筛选栏控件抬到 30px 需要**三条**规则，少一条就参差不齐。
+
+    Element 只有输入框/日期读 `--el-component-size-small`；
+    `.el-select__wrapper` 的 min-height 和 `.el-button` 的 height 都是按尺寸档**写死**在类里的。
+    只设变量的实测结果是 `[30, 24, 24, 24, 30]`——一排控件三种高度。
+    """
+    from pathlib import Path
+
+    nt = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "components"
+          / "NotionTable.vue").read_text(encoding="utf-8")
+    style = nt.split("<style", 1)[-1]
+    for what, need in (
+        ("尺寸变量", "--el-component-size-small: 30px"),
+        ("下拉", ".el-select__wrapper) { min-height: var(--el-component-size-small)"),
+        ("按钮", ".el-button) { height: var(--el-component-size-small)"),
+    ):
+        assert need in style, f"筛选栏高度少了「{what}」那条：{need}"
