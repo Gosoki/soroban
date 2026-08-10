@@ -699,6 +699,18 @@ def test_fx_table_matches_the_shared_table_language():
     }
     missing = [k for k, (want, got) in checks.items() if want not in got]
     assert not missing, f"汇率表与其余表格的共同视觉语言缺了：{missing}"
+
+    # 展开箭头必须**独占一列**（NotionTable 的 EXPAND_COL_W = 30，表头留空、单元格居中）。
+    # 内联在第一个数据格里的话，那一列的文字会被箭头顶开、而其余列不会——
+    # 所有数据列的左缘就落不到同一条竖线上。
+    nt = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "components"
+          / "NotionTable.vue").read_text(encoding="utf-8")
+    m = re.search(r"EXPAND_COL_W\s*=\s*(\d+)", nt)
+    assert m, "NotionTable 里找不到 EXPAND_COL_W，这条守卫的参照没了"
+    w = m.group(1)
+    assert f'<th style="width: {w}px"></th>' in fx, \
+        f"汇率表的箭头列不是独立的 {w}px 空表头（要与 NotionTable 的 EXPAND_COL_W 同宽）"
+    assert "text-align: center" in rule(".fx-tbl td.c-exp"), "箭头列没有居中（同 .gtn-td-exp）"
     # 等宽数字走 tokens.css 的共享规则，不再各页自己加一个类
     tokens = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "styles"
               / "tokens.css").read_text(encoding="utf-8")

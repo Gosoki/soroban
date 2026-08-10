@@ -27,8 +27,13 @@
     <table class="fx-tbl">
       <thead>
         <tr>
-          <!-- 百分比而不是像素：页宽放开之后，固定像素列会把多出来的宽度**全部**
-               丢给最后一列，数据挤在左边、右边空 700px。按比例分配才跟着页宽走。 -->
+          <!-- 箭头独占一列，宽 30px（NotionTable 的 EXPAND_COL_W）。表头留空，
+               与 `<th v-if="expandable" class="gtn-th"></th>` 一致。
+               独立成列之后，所有数据列的左缘落在同一条竖线上——原先箭头内联在
+               日期格里，日期的文字被顶开而其余列没有，第一列的文字左缘对不齐。
+               30px 是像素、其余是百分比：table-layout: fixed 下两者可以混用，
+               固定列先扣掉，剩余宽度再按百分比分。 -->
+          <th style="width: 30px"></th>
           <th style="width: 24%">日期</th>
           <th style="width: 16%">采用</th>
           <th style="width: 18%">来源</th>
@@ -39,12 +44,13 @@
       <tbody>
         <template v-for="r in rows" :key="r.date">
           <tr class="day" :class="{ open: openDay === r.date }" @click="toggle(r)">
-            <td>
-              <!-- 与 NotionTable 的 .chev 同款：**同一个图标转 90°**，不是换一个图标。
-                   换图标没有中间态，展开/收起是「跳」过去的。 -->
+            <!-- 与 .gtn-td-exp 同款：独立一格、居中、弱色。
+                 图标本身也同款——**同一个图标转 90°**，不是换一个图标；
+                 换图标没有中间态，展开/收起是「跳」过去的。 -->
+            <td class="c-exp">
               <el-icon class="chev" :class="{ open: openDay === r.date }"><ArrowRight /></el-icon>
-              {{ r.date }}
             </td>
+            <td>{{ r.date }}</td>
             <td>{{ r.used ?? '—' }}</td>
             <td>
               <el-tag :style="typeStyle(r.used_source === 'manual' ? 'info' : 'success')">
@@ -58,7 +64,7 @@
             <td class="dim">{{ r.count }}<span v-if="r.count > 1" class="tip"> · 点开看各次</span></td>
           </tr>
           <tr v-if="openDay === r.date" class="detail">
-            <td colspan="5">
+            <td colspan="6">
               <div v-if="!detail.length" class="sub">加载中…</div>
               <div v-for="x in detail" :key="x.id" class="hit" :class="{ used: x.used }">
                 <!-- 用后端给的 JST 时刻，不用浏览器本地时区：date 是 JST 日期，
@@ -173,9 +179,11 @@ onMounted(load)
    它和悬停不是同一个维度，所以悬停一个已展开的行时两者都还在。 */
 .day.open td { background: var(--bg-hover); }
 .day.open td:first-child { box-shadow: inset 2px 0 0 var(--brand); }
-/* 与 .gtn-td-exp .chev 同款：转 90°，带 0.15s 过渡 */
-.chev { font-size: 12px; color: var(--txt-3); margin-right: 6px; vertical-align: -1px;
-        transition: transform 0.15s; }
+/* 箭头列：与 .gtn-td-exp 逐项相同（居中、弱色、可点）。
+   padding 归零由 text-align: center 定位；原先内联在日期格里时靠
+   `margin-right` + `vertical-align: -1px` 微调，进了居中格之后那两个都成了净负分。 */
+.fx-tbl td.c-exp { text-align: center; padding: 0; color: var(--txt-3); }
+.chev { transition: transform 0.15s; }
 .chev.open { transform: rotate(90deg); }
 /* 弱化只改颜色、**不改字号**：NotionTable 整表统一 13px，没有任何单元格改字号。
    原先「当天区间/条数」挂的是全局 .sub（12px），6 列里 3 列小一号，同一行里两种字号。 */
