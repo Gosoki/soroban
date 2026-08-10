@@ -808,6 +808,35 @@ def test_hide_title_pref_is_browser_local_only():
     assert "这个浏览器" in settings, "界面偏好没在页面上说清「只对这个浏览器生效」"
 
 
+def test_hiding_the_title_does_not_hide_the_actions():
+    """隐藏页面标题**只**关掉标题和那个「?」，右上角的入口必须留着。
+
+    第一版把整行都包进 `v-if="!hidePageTitle"`，于是插件页的「刷新」按钮、
+    汇率页的「汇率由插件抓取 →」跟着一起消失了——那不是标题，是功能。
+    只隐藏一行装饰，结果把入口藏没了，用户根本不会想到是那个开关干的。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    ph = (root / "components" / "PageHeader.vue").read_text(encoding="utf-8")
+    # 取到 <script> 为止，**不能**按第一个 </template> 切——那个是内层
+    # `<template v-if="!hidePageTitle">` 的收尾，切完就把要查的东西切没了。
+    tpl = ph.split("<script", 1)[0]
+
+    # actions 槽必须在 hidePageTitle 的判断**之外**
+    i_inner = tpl.index('<template v-if="!hidePageTitle">')
+    i_inner_end = tpl.index("</template>", i_inner)
+    i_actions = tpl.index('<slot name="actions"')
+    assert not (i_inner < i_actions < i_inner_end), \
+        "actions 槽被关进了「隐藏标题」的分支里——插件页的刷新、汇率页的入口会一起消失"
+    # 标题与「?」则必须在里面
+    assert i_inner < tpl.index("page-title") < i_inner_end, "H1 没有跟着开关走"
+    assert i_inner < tpl.index("page-help") < i_inner_end, "「?」没有跟着开关走"
+    # 标题隐藏且这一页没有 actions 时，整行不该留下一条空白
+    assert '<div v-if="!hidePageTitle || $slots.actions"' in tpl, \
+        "没有 actions 的页面在隐藏标题后会留下一条空行"
+
+
 def test_no_markdown_bold_in_templates():
     """模板里不许写 `**加粗**`——Vue 不解析 markdown，会原样显示成星号。
 

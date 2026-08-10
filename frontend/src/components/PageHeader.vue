@@ -9,18 +9,26 @@
      每页都占掉两三行、字号还比正文小。那段话是「第一次来的人要看一遍」的东西，
      不是每天都要看的——放进点开才显示的气泡里，页面顶部就只剩一行。 -->
 <template>
-  <div v-if="!hidePageTitle" class="page-hd">
-    <h1 class="page-title">{{ title }}</h1>
+  <!-- 「隐藏页面标题」只关掉**标题和那个「?」**，右边的 actions 必须留着——
+       它们是真正的入口（插件页的「刷新」、汇率页的「汇率由插件抓取 →」），
+       跟着标题一起消失就是把功能藏没了。
+       第一版把整行都包在 v-if 里，正是这个 bug。
+       整行只在「标题被隐藏**且**这一页没有 actions」时才不渲染，
+       否则会留下一条 14px 的空行。 -->
+  <div v-if="!hidePageTitle || $slots.actions" class="page-hd">
+    <template v-if="!hidePageTitle">
+      <h1 class="page-title">{{ title }}</h1>
 
-    <el-popover v-if="$slots.default" trigger="click" :width="440" placement="bottom-start">
-      <template #reference>
-        <el-icon class="page-help" title="这一页是干什么的"><QuestionFilled /></el-icon>
-      </template>
-      <div class="page-help-text"><slot /></div>
-    </el-popover>
+      <el-popover v-if="$slots.default" trigger="click" :width="440" placement="bottom-start">
+        <template #reference>
+          <el-icon class="page-help" title="这一页是干什么的"><QuestionFilled /></el-icon>
+        </template>
+        <div class="page-help-text"><slot /></div>
+      </el-popover>
+    </template>
 
-    <!-- 页首右侧的入口（如汇率页的「汇率由插件抓取 →」）。用具名插槽而不是让各页
-         自己在标题旁边拼 flex——那样每页的间距和对齐都会各长各的。 -->
+    <!-- 页首右侧的入口。用具名插槽而不是让各页自己在标题旁边拼 flex——
+         那样每页的间距和对齐都会各长各的。 -->
     <div class="grow" />
     <slot name="actions" />
   </div>
