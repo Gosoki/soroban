@@ -716,3 +716,112 @@ def test_fx_table_matches_the_shared_table_language():
               / "tokens.css").read_text(encoding="utf-8")
     assert ".fx-tbl" in tokens.split("font-variant-numeric")[0].split("/* 金额必须等宽")[-1], \
         "汇率表没被共享的 tabular-nums 规则覆盖到"
+
+
+# --- 页首（PageHeader）--------------------------------------------------------
+
+def _views(root):
+    return sorted((root / "views").rglob("index.vue"))
+
+
+def test_every_page_uses_the_shared_header():
+    """每一页的标题都走 PageHeader，没有第二种写法。
+
+    改之前是三种：订单/集运/杂项**根本没有标题**、物品/暂存在顶上挂一行 `.hint` 小字、
+    汇率/设置/数据库各写各的 `<h2 class="title">` + `<p class="lead">`。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    bad = []
+    for f in _views(root):
+        if f.parent.name == "Login":          # 登录页不在框架里，没有导航也没有页名
+            continue
+        src = f.read_text(encoding="utf-8")
+        if "<PageHeader" not in src:
+            bad.append(f"{f.parent.name}: 没有用 PageHeader")
+        if re.search(r"<h[12] class=\"title\"", src):
+            bad.append(f"{f.parent.name}: 还留着自己写的 h1/h2 标题")
+    assert not bad, "页首没有统一：\n  " + "\n  ".join(bad)
+
+
+def test_page_title_comes_from_the_router_not_a_prop():
+    """标题从 `route.meta.title` 取，**不接受 prop**。
+
+    router/index.js 里每条路由都写了 title，左侧导航与浏览器标签页也都用它——
+    那是唯一来源。写成 prop 就是第四份手抄清单，而导航里叫「日元汇率」、
+    页首叫「汇率」这种漂移不会有任何东西报错。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    ph = (root / "components" / "PageHeader.vue").read_text(encoding="utf-8")
+    assert "route.meta" in ph and "useRoute" in ph, "PageHeader 没有从路由取标题"
+    assert "defineProps" not in ph, "PageHeader 又接受 prop 了——标题会分裂成两处来源"
+    for f in _views(root):
+        m = re.search(r"<PageHeader[^>]*\btitle=", f.read_text(encoding="utf-8"))
+        assert not m, f"{f.parent.name} 给 PageHeader 传了 title，绕开了路由这个唯一来源"
+
+    # 反向：路由里每个页面都得有 title，否则那一页的 H1 会是空的
+    router = (root / "router" / "index.js").read_text(encoding="utf-8")
+    paths = re.findall(r"path: '([a-z]+)', name: '\w+'.*?meta: \{ title: '([^']+)'", router)
+    assert len(paths) >= 10, f"路由里带 title 的页面只有 {len(paths)} 个，守卫可能没匹配到"
+
+
+def test_table_pages_are_not_wrapped_in_a_card():
+    """表格页不再套 el-card：表格自带的那圈边框就是容器。
+
+    套着卡片时是「框里再套一个框」，而筛选栏也被关在卡片里。
+    去掉之后必须给表格框补上 `background`——否则行底掉到页面底色（比卡片深一档），
+    表头还亮着，看起来像表头浮在一个洞上。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    for name in ("Orders", "Items", "Shipment", "Misc", "Staging", "Fx"):
+        src = (root / "views" / name / "index.vue").read_text(encoding="utf-8")
+        assert "<el-card" not in src, f"{name} 页又把表格套回 el-card 里了"
+    nt = (root / "components" / "NotionTable.vue").read_text(encoding="utf-8")
+    m = re.search(r"\.gtn-scroll\s*\{([^}]*)\}", nt)
+    assert m and "background: var(--bg-card)" in m.group(1), \
+        "表格框没有自己的底色——去掉卡片后整表会掉到页面底色上"
+
+
+def test_hide_title_pref_is_browser_local_only():
+    """「隐藏页面标题」只存在浏览器里，不进数据库、也不走那套「保存/撤销」。
+
+    设置页开篇写着「这里改的是业务偏好，存在数据库里」。这个开关要是混进同一套
+    提交流程，那句话就成了假话，而用户换台电脑发现设置没跟过去时不会回来读注释。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    prefs = (root / "utils" / "uiPrefs.js").read_text(encoding="utf-8")
+    assert "localStorage" in prefs and "ref(" in prefs, "界面偏好不是 localStorage + 响应式 ref"
+    assert "api" not in prefs.lower().replace("apiece", ""), "界面偏好里出现了 API 调用"
+
+    settings = (root / "views" / "Settings" / "index.vue").read_text(encoding="utf-8")
+    assert "hidePageTitle" in settings and "uiPrefs" in settings
+    # 不能进 draft/dirty 那套：那是提交给后端的业务偏好
+    assert not re.search(r"draft\[[^\]]*hidePageTitle", settings), \
+        "隐藏标题被塞进了要提交给后端的 draft 里"
+    assert "这个浏览器" in settings, "界面偏好没在页面上说清「只对这个浏览器生效」"
+
+
+def test_no_markdown_bold_in_templates():
+    """模板里不许写 `**加粗**`——Vue 不解析 markdown，会原样显示成星号。
+
+    这一条是踩出来的：本轮我自己在看板的「没算进合计」提示、插件页的权限说明里
+    各写了一处，两处都会在界面上显示成 `**没有汇率**`。
+    注释里的 `**` 不算（那是给读代码的人看的），所以先把注释剥掉再找。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    bad = []
+    for f in sorted(root.rglob("*.vue")):
+        tpl = f.read_text(encoding="utf-8").split("<script", 1)[0]
+        body = re.sub(r"<!--.*?-->", "", tpl, flags=re.S)
+        for hit in re.findall(r"\*\*[^*\n]{1,40}\*\*", body):
+            bad.append(f"{f.parent.name}/{f.name}: {hit}")
+    assert not bad, "模板里有 markdown 加粗，会原样显示成星号：\n  " + "\n  ".join(bad)

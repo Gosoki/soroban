@@ -1,6 +1,10 @@
 <template>
   <div class="db-page" v-loading="loadingStatus">
-    <h2 class="title">数据库</h2>
+    <PageHeader>
+      两个库：<b>控制库</b>恒为本地 SQLite（存「当前用哪个后端」与加密的连接串），
+      <b>数据库</b>存全部业务数据、可在这里运行期热切换。
+      「迁移」是把当前库的数据整表覆盖到目标；「切换」只改指向、不动任何数据。
+    </PageHeader>
 
     <!-- 当前后端 -->
     <el-card shadow="never" class="card">
@@ -96,6 +100,7 @@
 </template>
 
 <script setup>
+import PageHeader from '@/components/PageHeader.vue'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Coin, Files } from '@element-plus/icons-vue'

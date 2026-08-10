@@ -1,106 +1,111 @@
 <template>
   <div>
-    <el-card>
-      <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable hide-id :open-id="focusId"
-                   table-name="orders" @save="saveCell" @add="addRow" @delete="delRow" @reload="load">
-        <template #toolbar>
-          <el-upload ref="ocrUpload" class="ocr-up" multiple :show-file-list="false" :auto-upload="false"
-                     accept="image/*" :on-change="onOcrPick">
-            <div class="ocr-drop" :class="{ busy: ocrPending }">
-              <el-icon class="ocr-ic"><Camera /></el-icon>
-              <span>{{ ocrPending ? `后台识别中 ${ocrPending} 张…` : '点击选图 OCR识别（或拖图到页面）' }}</span>
-            </div>
-          </el-upload>
-          <el-tag v-if="focusId" :style="typeStyle('warning')" closable disable-transitions class="focus-chip" @close="clearFocus">
-            定位订单 #{{ focusId }} · 点 × 看全部
-          </el-tag>
-          <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="reload" />
-          <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
-            <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
-          </el-select>
-          <!-- 选项 = 国内段 + 集运段：列表显示的是继承后的状态，只列国内段的话，
-               界面上一堆「已发出」却在筛选框里选不到它 -->
-          <el-select v-model="filters.fulfillmentStatus" placeholder="状态" clearable style="width: 120px" @change="reload">
-            <el-option-group label="国内段（商品订单）">
-              <el-option v-for="s in PURCHASE_STATUS" :key="s" :label="s" :value="s" />
-            </el-option-group>
-            <el-option-group label="国际段（集运订单）">
-              <el-option v-for="s in SHIPMENT_STATUS" :key="s" :label="s" :value="s" />
-            </el-option-group>
-          </el-select>
-          <el-select v-model="filters.platform_account" placeholder="账号昵称" clearable filterable style="width: 120px" @change="reload">
-            <el-option v-for="a in accountOptions" :key="a" :label="a" :value="a" />
-          </el-select>
-          <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
-                          start-placeholder="起" end-placeholder="止" @change="reload" />
-        </template>
+    <PageHeader>
+    账本里的<b>商品订单</b>。一单可含多件物品，订单价 = Σ(单价×数量) + 邮费，由物品派生。
+    把截图拖到页面任意位置即可 OCR 录单；已导入的暂存单也落在这里。
+    列可拖动换位/拖宽，宽度按浏览器记住。
+    </PageHeader>
 
-        <template #cell-shipment_order_id="{ row }">
-          <el-select :model-value="row.shipment_order_id" filterable placeholder="未集运" class="ship-pick" popper-class="ship-pop"
-                     :persistent="false"
-                     remote :remote-method="searchShipment" :loading="shipSearching"
-                     remote-show-suffix reserve-keyword
-                     no-data-text="没有匹配的集运单"
-                     @visible-change="onShipDropdown"
-                     @change="(v) => onPickShipment(row, v)">
-            <template #label="{ value }">
-              <span class="ship-sel">
-                <b>{{ shipNo(value, row) }}</b>
-                <el-tag v-if="row.fulfillment_status && row.shipment_order_id"
-                        :style="statusStyle(row.fulfillment_status)">{{ row.fulfillment_status }}</el-tag>
-              </span>
-            </template>
-            <!-- 清除固定在列表最上（集运单可能很多）；无归属时不显示。
-                 搜索态下也不显示：它不是命中结果，留着会顶住 options.size，让「没有匹配」提示出不来 -->
-            <el-option v-if="row.shipment_order_id && !shipHits" :value="-1" label="清除">
-              <div class="ship-clear">清除（取消集运）</div>
-            </el-option>
-            <el-option v-for="j in sortedShipments" :key="j.id" :label="j.shipment_no || ('#' + j.id)" :value="j.id">
-              <div class="ship-opt">
-                <div class="ship-opt-top">
-                  <b>{{ j.shipment_no || ('#' + j.id) }}</b>
-                  <el-tag :style="statusStyle(j.shipment_status)">{{ j.shipment_status }}</el-tag>
-                  <el-icon v-if="j.id === row.shipment_order_id" class="ship-ck"><Check /></el-icon>
-                </div>
-                <span class="ship-meta">{{ j.date }} · 运费 {{ j.jpy_settled != null ? fmtJPY(j.jpy_settled) : '待定' }}</span>
+    <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable hide-id :open-id="focusId"
+                 table-name="orders" @save="saveCell" @add="addRow" @delete="delRow" @reload="load">
+      <template #toolbar>
+        <el-upload ref="ocrUpload" class="ocr-up" multiple :show-file-list="false" :auto-upload="false"
+                   accept="image/*" :on-change="onOcrPick">
+          <div class="ocr-drop" :class="{ busy: ocrPending }">
+            <el-icon class="ocr-ic"><Camera /></el-icon>
+            <span>{{ ocrPending ? `后台识别中 ${ocrPending} 张…` : '点击选图 OCR识别（或拖图到页面）' }}</span>
+          </div>
+        </el-upload>
+        <el-tag v-if="focusId" :style="typeStyle('warning')" closable disable-transitions class="focus-chip" @close="clearFocus">
+          定位订单 #{{ focusId }} · 点 × 看全部
+        </el-tag>
+        <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="reload" />
+        <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
+          <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
+        </el-select>
+        <!-- 选项 = 国内段 + 集运段：列表显示的是继承后的状态，只列国内段的话，
+             界面上一堆「已发出」却在筛选框里选不到它 -->
+        <el-select v-model="filters.fulfillmentStatus" placeholder="状态" clearable style="width: 120px" @change="reload">
+          <el-option-group label="国内段（商品订单）">
+            <el-option v-for="s in PURCHASE_STATUS" :key="s" :label="s" :value="s" />
+          </el-option-group>
+          <el-option-group label="国际段（集运订单）">
+            <el-option v-for="s in SHIPMENT_STATUS" :key="s" :label="s" :value="s" />
+          </el-option-group>
+        </el-select>
+        <el-select v-model="filters.platform_account" placeholder="账号昵称" clearable filterable style="width: 120px" @change="reload">
+          <el-option v-for="a in accountOptions" :key="a" :label="a" :value="a" />
+        </el-select>
+        <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
+                        start-placeholder="起" end-placeholder="止" @change="reload" />
+      </template>
+
+      <template #cell-shipment_order_id="{ row }">
+        <el-select :model-value="row.shipment_order_id" filterable placeholder="未集运" class="ship-pick" popper-class="ship-pop"
+                   :persistent="false"
+                   remote :remote-method="searchShipment" :loading="shipSearching"
+                   remote-show-suffix reserve-keyword
+                   no-data-text="没有匹配的集运单"
+                   @visible-change="onShipDropdown"
+                   @change="(v) => onPickShipment(row, v)">
+          <template #label="{ value }">
+            <span class="ship-sel">
+              <b>{{ shipNo(value, row) }}</b>
+              <el-tag v-if="row.fulfillment_status && row.shipment_order_id"
+                      :style="statusStyle(row.fulfillment_status)">{{ row.fulfillment_status }}</el-tag>
+            </span>
+          </template>
+          <!-- 清除固定在列表最上（集运单可能很多）；无归属时不显示。
+               搜索态下也不显示：它不是命中结果，留着会顶住 options.size，让「没有匹配」提示出不来 -->
+          <el-option v-if="row.shipment_order_id && !shipHits" :value="-1" label="清除">
+            <div class="ship-clear">清除（取消集运）</div>
+          </el-option>
+          <el-option v-for="j in sortedShipments" :key="j.id" :label="j.shipment_no || ('#' + j.id)" :value="j.id">
+            <div class="ship-opt">
+              <div class="ship-opt-top">
+                <b>{{ j.shipment_no || ('#' + j.id) }}</b>
+                <el-tag :style="statusStyle(j.shipment_status)">{{ j.shipment_status }}</el-tag>
+                <el-icon v-if="j.id === row.shipment_order_id" class="ship-ck"><Check /></el-icon>
               </div>
-            </el-option>
-          </el-select>
-        </template>
-        <template #cell-items="{ row }">
-          <span :class="{ ph: !(row.items && row.items.length), 'auto-txt': allTitleItems(row) }">{{ itemSummary(row) }}</span>
-        </template>
+              <span class="ship-meta">{{ j.date }} · 运费 {{ j.jpy_settled != null ? fmtJPY(j.jpy_settled) : '待定' }}</span>
+            </div>
+          </el-option>
+        </el-select>
+      </template>
+      <template #cell-items="{ row }">
+        <span :class="{ ph: !(row.items && row.items.length), 'auto-txt': allTitleItems(row) }">{{ itemSummary(row) }}</span>
+      </template>
 
-        <template #expand="{ row }">
-          <!-- 物品/邮费编辑：与物品列表编辑弹窗共用同一组件、同一写入链 -->
-          <OrderItemsEditor :order="row" @conflict="load" />
-        </template>
+      <template #expand="{ row }">
+        <!-- 物品/邮费编辑：与物品列表编辑弹窗共用同一组件、同一写入链 -->
+        <OrderItemsEditor :order="row" @conflict="load" />
+      </template>
 
-      </NotionTable>
+    </NotionTable>
 
-      <div v-if="focusId && !loading && !total" class="focus-empty">
-        未找到该订单（可能已删除）。<el-link type="primary" @click="clearFocus">显示全部</el-link>
-      </div>
+    <div v-if="focusId && !loading && !total" class="focus-empty">
+      未找到该订单（可能已删除）。<el-link type="primary" @click="clearFocus">显示全部</el-link>
+    </div>
 
-      <el-pagination class="pager" layout="prev, pager, next, total" :total="total"
-                     :page-size="pageSize" :current-page="page" @current-change="onPage" />
-    </el-card>
+    <el-pagination class="pager" layout="prev, pager, next, total" :total="total"
+                   :page-size="pageSize" :current-page="page" @current-change="onPage" />
 
     <!-- 整窗拖拽：把图片拖到浏览器任意位置即在中间浮出上传框，松手识别（支持多张）。
-         pointer-events:none 不拦截拖拽，drop 交给 window 监听统一处理，避免与工具栏重复触发。 -->
+       pointer-events:none 不拦截拖拽，drop 交给 window 监听统一处理，避免与工具栏重复触发。 -->
     <Teleport to="body">
-      <div v-if="dragActive" class="ocr-overlay">
-        <div class="ocr-overlay-box">
-          <el-icon class="ocr-overlay-ic"><Camera /></el-icon>
-          <div class="ocr-overlay-title">松开鼠标，识别截图（OCR）</div>
-          <div class="ocr-overlay-sub">支持一次拖入多张 · 自动填单</div>
-        </div>
+    <div v-if="dragActive" class="ocr-overlay">
+      <div class="ocr-overlay-box">
+        <el-icon class="ocr-overlay-ic"><Camera /></el-icon>
+        <div class="ocr-overlay-title">松开鼠标，识别截图（OCR）</div>
+        <div class="ocr-overlay-sub">支持一次拖入多张 · 自动填单</div>
       </div>
+    </div>
     </Teleport>
   </div>
 </template>
 
 <script setup>
+import PageHeader from '@/components/PageHeader.vue'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'

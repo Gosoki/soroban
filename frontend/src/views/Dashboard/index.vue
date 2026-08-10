@@ -1,5 +1,10 @@
 <template>
   <div>
+    <PageHeader>
+      三张账本表（商品 / 集运 / 杂项）的合计与按月分布。
+      合计只数<b>计入</b>的行：软删、以及「取消 / 退款」这类状态不算。
+      点某个月可以看它的构成占比。
+    </PageHeader>
     <!-- **失败不能长得像「这个账本是空的」**。原先 load() 只有 try/finally：
          接口挂了 data 保持初值全 0，整屏渲染成「总支出 ¥0、0 单、暂无数据」，
          而拦截器那句 toast 3 秒后就没了——此后与「真的还没记过账」完全无法区分。
@@ -14,7 +19,7 @@
          记账不该因为断网就记不了，所以写入侧照旧放行；代价是这里必须说出来。 -->
     <el-alert v-if="data.uncounted_count" type="warning" show-icon :closable="false" class="load-failed">
       <template #title>有 {{ data.uncounted_count }} 笔没算进下面的合计</template>
-      这些行填了货款（合计 ¥{{ data.uncounted_cny }}）但当时**没有汇率**，折不出日元。
+      这些行填了货款（合计 ¥{{ data.uncounted_cny }}）但当时<b>没有汇率</b>，折不出日元。
       下面的总支出因此偏小，而单数是全的。
       <router-link to="/fx">去汇率页补一条</router-link>，然后在对应行重填一次货款即可重算。
     </el-alert>
@@ -63,6 +68,7 @@
 </template>
 
 <script setup>
+import PageHeader from '@/components/PageHeader.vue'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ArrowRight } from '@element-plus/icons-vue'
 import { dashboardApi } from '@/api'

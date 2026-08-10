@@ -1,9 +1,12 @@
 <template>
   <div>
-    <div class="bar">
-      <span class="hint">soroban 扫 plugins/ 下 soroban-plugin-* 目录作为插件。这里加账号、授权、启停、定时。抓取类插件抓到的单进「暂存订单」待处理。</span>
-      <el-button :icon="Refresh" :loading="loading" @click="load">刷新</el-button>
-    </div>
+    <PageHeader>
+      soroban 扫 plugins/ 下 soroban-plugin-* 目录作为插件。这里加账号、授权、启停、定时。
+      抓取类插件抓到的单进「暂存订单」待处理。
+      <template #actions>
+        <el-button :icon="Refresh" :loading="loading" @click="load">刷新</el-button>
+      </template>
+    </PageHeader>
 
     <el-empty v-if="!loading && !plugins.length" description="未发现插件（plugins/ 下没有 soroban-plugin-* 目录）" />
 
@@ -200,7 +203,7 @@
             <span class="g-key">{{ b.key }}</span>
           </div>
           <div class="sub">
-            没勾的权限插件一个都用不了（默认全拒）。插件更新后自己多写一项权限**不会**自动生效——
+            没勾的权限插件一个都用不了（默认全拒）。插件更新后自己多写一项权限<b>不会</b>自动生效——
             <b>`git pull` 不该悄悄扩大它能碰的范围</b>。
           </div>
         </div>
@@ -212,6 +215,7 @@
 </template>
 
 <script setup>
+import PageHeader from '@/components/PageHeader.vue'
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, ArrowRight, ArrowUp, Refresh, QuestionFilled } from '@element-plus/icons-vue'
@@ -615,7 +619,6 @@ onMounted(load)
 .needlist { margin: 6px 0 0; padding-left: 18px; font-size: 12px; line-height: 1.7; }
 .needact { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
 .neederr { margin-top: 8px; font-size: 12px; color: var(--el-color-danger); white-space: pre-wrap; word-break: break-all; }
-.bar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
 .hint { color: var(--txt-3); font-size: 12px; flex: 1; }
 .plugin { margin-bottom: 16px; }
 .head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -655,6 +658,5 @@ onMounted(load)
 /* 只显示权限 key（fx:write 这种），给愿意深究的人看；说明在 ? 里 */
 .g-key { color: var(--txt-3); font-size: 11px; font-family: ui-monospace, monospace; }
 .help { color: var(--txt-3); cursor: help; font-size: 13px; }
-.cmds { flex-wrap: wrap; }
 .subsect { color: var(--txt-3); font-size: 12px; margin: 8px 0 6px; }
 </style>

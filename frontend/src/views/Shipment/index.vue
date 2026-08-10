@@ -1,110 +1,115 @@
 <template>
   <div>
-    <el-card>
-      <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable
-                   table-name="shipment" @save="saveCell" @add="addRow" @delete="delRow" @reload="load">
-        <template #toolbar>
-          <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
-                          start-placeholder="起" end-placeholder="止" @change="reload" />
-          <el-select v-model="filters.shipmentStatus" placeholder="状态" clearable style="width: 110px" @change="reload">
-            <el-option v-for="s in SHIPMENT_STATUS" :key="s" :label="s" :value="s" />
-          </el-select>
-          <el-input v-model="filters.q" placeholder="搜集运单号" clearable style="width: 150px" @change="reload" />
-          <el-upload ref="pkgUpload" class="ocr-up" multiple :show-file-list="false" :auto-upload="false"
-                     accept="image/*" :on-change="onPkgPick">
-            <div class="ocr-drop" :class="{ busy: pkgPending }">
-              <el-icon class="ocr-ic"><Camera /></el-icon>
-              <span>{{ pkgPending ? `后台识别中 ${pkgPending} 张…` : '点击选图 OCR建单（或拖「成品包裹」图到页面）' }}</span>
-            </div>
-          </el-upload>
-        </template>
+    <PageHeader>
+    <b>集运订单</b>：把多张商品订单打包发往日本的那一段。运费按单据日期的汇率折算。
+    展开一行可以挂靠商品订单；也可以把「内含快递」截图拖到某一行的绑定格，
+    按快递单号自动挂靠。
+    </PageHeader>
 
-        <template #cell-orders="{ row }">
-          <span :class="row.orders && row.orders.length ? '' : 'ph'">{{ tbSummary(row) }}</span>
-        </template>
-
-        <!-- 绑定快递单：每行一个投放区，把该包裹的「内含快递」截图拖到这里即自动关联商品订单。
-             与整窗拖拽（建单）是两个互不含糊的目标：拖到行上=绑快递，拖到别处=建单。 -->
-        <template #cell-bind_express="{ row }">
-          <div class="bind-drop" :class="{ armed: dragActive, over: dragOverId === row.id, busy: isBinding(row) }"
-               @click="pickForRow(row)"
-               @dragenter.prevent.stop="dragOverId = row.id"
-               @dragover.prevent.stop="dragOverId = row.id"
-               @dragleave.prevent.stop="dragOverId = null"
-               @drop.prevent.stop="onRowDrop(row, $event)">
-            <el-icon class="bind-ic"><Loading v-if="isBinding(row)" /><Upload v-else /></el-icon>
-            <span>{{ isBinding(row) ? '识别中…' : '拖入内含快递图' }}</span>
+    <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable
+                 table-name="shipment" @save="saveCell" @add="addRow" @delete="delRow" @reload="load">
+      <template #toolbar>
+        <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
+                        start-placeholder="起" end-placeholder="止" @change="reload" />
+        <el-select v-model="filters.shipmentStatus" placeholder="状态" clearable style="width: 110px" @change="reload">
+          <el-option v-for="s in SHIPMENT_STATUS" :key="s" :label="s" :value="s" />
+        </el-select>
+        <el-input v-model="filters.q" placeholder="搜集运单号" clearable style="width: 150px" @change="reload" />
+        <el-upload ref="pkgUpload" class="ocr-up" multiple :show-file-list="false" :auto-upload="false"
+                   accept="image/*" :on-change="onPkgPick">
+          <div class="ocr-drop" :class="{ busy: pkgPending }">
+            <el-icon class="ocr-ic"><Camera /></el-icon>
+            <span>{{ pkgPending ? `后台识别中 ${pkgPending} 张…` : '点击选图 OCR建单（或拖「成品包裹」图到页面）' }}</span>
           </div>
-        </template>
+        </el-upload>
+      </template>
 
-        <template #expand="{ row }">
-          <div class="expand">
-            <div class="ex-title">关联商品订单（在此点选增删；商品页「集运(点选)」列也能改；
-              也可把「内含快递」截图拖到本行的「绑定快递单」格自动关联）</div>
-            <el-table v-if="row.orders && row.orders.length" :data="row.orders">
-              <el-table-column label="下单日期" width="110">
-                <template #default="{ row: t }"><span :class="t.date ? '' : 'ph'">{{ t.date || '—' }}</span></template>
-              </el-table-column>
-              <el-table-column label="订单号" min-width="130">
-                <template #default="{ row: t }">
-                  <el-link type="primary" :underline="false" @click="gotoOrder(t)">{{ t.order_no || ('#' + t.id) }}</el-link>
-                </template>
-              </el-table-column>
-              <el-table-column label="商品" min-width="160" show-overflow-tooltip>
-                <template #default="{ row: t }"><span :class="t.title ? '' : 'ph'">{{ t.title || '—' }}</span></template>
-              </el-table-column>
-              <el-table-column label="物品" min-width="180">
-                <template #default="{ row: t }">
-                  <span :class="t.items && t.items.length ? '' : 'ph'">{{ itemSummary(t) }}</span>
-                </template>
-              </el-table-column>
-              <el-table-column label="结算（円）" width="110">
-                <template #default="{ row: t }">{{ fmtJPY(t.jpy_settled) }}</template>
-              </el-table-column>
-              <el-table-column label="" width="72">
-                <template #default="{ row: t }">
-                  <el-button link type="danger" @click="detach(row, t)">移除</el-button>
-                </template>
-              </el-table-column>
-            </el-table>
-            <div v-else class="ph">暂无关联商品订单</div>
-            <div class="add-line">
-              <el-select :model-value="null" filterable placeholder="＋ 添加商品订单（未挂靠）" class="tb-pick" @change="(id) => attach(row, id)">
-                <el-option v-for="t in unassignedOptions" :key="t.id" :label="t.order_no || ('#' + t.id)" :value="t.id">
-                  <div class="tb-opt">
-                    <b>{{ t.order_no || ('#' + t.id) }}</b>
-                    <span class="tb-meta">{{ itemSummary(t) }} · {{ fmtJPY(t.jpy_settled) }}</span>
-                  </div>
-                </el-option>
-              </el-select>
-              <span v-if="!unassignedOptions.length" class="ph small">没有未挂靠的商品订单</span>
-            </div>
+      <template #cell-orders="{ row }">
+        <span :class="row.orders && row.orders.length ? '' : 'ph'">{{ tbSummary(row) }}</span>
+      </template>
+
+      <!-- 绑定快递单：每行一个投放区，把该包裹的「内含快递」截图拖到这里即自动关联商品订单。
+           与整窗拖拽（建单）是两个互不含糊的目标：拖到行上=绑快递，拖到别处=建单。 -->
+      <template #cell-bind_express="{ row }">
+        <div class="bind-drop" :class="{ armed: dragActive, over: dragOverId === row.id, busy: isBinding(row) }"
+             @click="pickForRow(row)"
+             @dragenter.prevent.stop="dragOverId = row.id"
+             @dragover.prevent.stop="dragOverId = row.id"
+             @dragleave.prevent.stop="dragOverId = null"
+             @drop.prevent.stop="onRowDrop(row, $event)">
+          <el-icon class="bind-ic"><Loading v-if="isBinding(row)" /><Upload v-else /></el-icon>
+          <span>{{ isBinding(row) ? '识别中…' : '拖入内含快递图' }}</span>
+        </div>
+      </template>
+
+      <template #expand="{ row }">
+        <div class="expand">
+          <div class="ex-title">关联商品订单（在此点选增删；商品页「集运(点选)」列也能改；
+            也可把「内含快递」截图拖到本行的「绑定快递单」格自动关联）</div>
+          <el-table v-if="row.orders && row.orders.length" :data="row.orders">
+            <el-table-column label="下单日期" width="110">
+              <template #default="{ row: t }"><span :class="t.date ? '' : 'ph'">{{ t.date || '—' }}</span></template>
+            </el-table-column>
+            <el-table-column label="订单号" min-width="130">
+              <template #default="{ row: t }">
+                <el-link type="primary" :underline="false" @click="gotoOrder(t)">{{ t.order_no || ('#' + t.id) }}</el-link>
+              </template>
+            </el-table-column>
+            <el-table-column label="商品" min-width="160" show-overflow-tooltip>
+              <template #default="{ row: t }"><span :class="t.title ? '' : 'ph'">{{ t.title || '—' }}</span></template>
+            </el-table-column>
+            <el-table-column label="物品" min-width="180">
+              <template #default="{ row: t }">
+                <span :class="t.items && t.items.length ? '' : 'ph'">{{ itemSummary(t) }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="结算（円）" width="110">
+              <template #default="{ row: t }">{{ fmtJPY(t.jpy_settled) }}</template>
+            </el-table-column>
+            <el-table-column label="" width="72">
+              <template #default="{ row: t }">
+                <el-button link type="danger" @click="detach(row, t)">移除</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+          <div v-else class="ph">暂无关联商品订单</div>
+          <div class="add-line">
+            <el-select :model-value="null" filterable placeholder="＋ 添加商品订单（未挂靠）" class="tb-pick" @change="(id) => attach(row, id)">
+              <el-option v-for="t in unassignedOptions" :key="t.id" :label="t.order_no || ('#' + t.id)" :value="t.id">
+                <div class="tb-opt">
+                  <b>{{ t.order_no || ('#' + t.id) }}</b>
+                  <span class="tb-meta">{{ itemSummary(t) }} · {{ fmtJPY(t.jpy_settled) }}</span>
+                </div>
+              </el-option>
+            </el-select>
+            <span v-if="!unassignedOptions.length" class="ph small">没有未挂靠的商品订单</span>
           </div>
-        </template>
+        </div>
+      </template>
 
-      </NotionTable>
+    </NotionTable>
 
-      <el-pagination class="pager" layout="prev, pager, next, total" :total="total"
-                     :page-size="pageSize" :current-page="page" @current-change="onPage" />
-    </el-card>
+    <el-pagination class="pager" layout="prev, pager, next, total" :total="total"
+                   :page-size="pageSize" :current-page="page" @current-change="onPage" />
 
     <!-- 行内「绑定快递单」的点选入口共用这一个 input（每行各挂一个太浪费） -->
     <input ref="rowFileInput" type="file" accept="image/*" class="hidden-file" @change="onRowPick">
 
     <!-- 拖拽提示：用顶部横幅而非整屏遮罩——遮罩会盖住行内的「绑定快递单」投放区，
-         用户就没法瞄准了。横幅 pointer-events:none，不拦截拖拽。 -->
+       用户就没法瞄准了。横幅 pointer-events:none，不拦截拖拽。 -->
     <Teleport to="body">
-      <div v-if="dragActive" class="drag-hint">
-        <el-icon class="drag-hint-ic"><Camera /></el-icon>
-        <span><b>松手 = 识别「成品包裹」截图建单</b>（可多张）</span>
-        <span class="drag-hint-sep">·</span>
-        <span>拖到某行的「绑定快递单」格 = 关联该包裹的内含快递</span>
-      </div>
+    <div v-if="dragActive" class="drag-hint">
+      <el-icon class="drag-hint-ic"><Camera /></el-icon>
+      <span><b>松手 = 识别「成品包裹」截图建单</b>（可多张）</span>
+      <span class="drag-hint-sep">·</span>
+      <span>拖到某行的「绑定快递单」格 = 关联该包裹的内含快递</span>
+    </div>
     </Teleport>
   </div>
 </template>
 
 <script setup>
+import PageHeader from '@/components/PageHeader.vue'
 import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'

@@ -1,22 +1,26 @@
 <template>
   <div>
-    <el-card>
-      <NotionTable :columns="columns" :rows="rows" :loading="loading" table-name="misc"
-                   @save="saveCell" @add="addRow" @delete="delRow">
-        <template #toolbar>
-          <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
-                          start-placeholder="起" end-placeholder="止" @change="reload" />
-          <el-input v-model="filters.q" placeholder="搜名称" clearable style="width: 150px" @change="reload" />
-        </template>
-      </NotionTable>
+    <PageHeader>
+    <b>杂项支出</b>：不属于商品也不属于集运的花销（工具、耗材、手续费…）。
+    与另外两张表一样计入看板合计。
+    </PageHeader>
 
-      <el-pagination class="pager" layout="prev, pager, next, total" :total="total"
-                     :page-size="pageSize" :current-page="page" @current-change="onPage" />
-    </el-card>
-  </div>
+    <NotionTable :columns="columns" :rows="rows" :loading="loading" table-name="misc"
+                 @save="saveCell" @add="addRow" @delete="delRow">
+      <template #toolbar>
+        <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
+                        start-placeholder="起" end-placeholder="止" @change="reload" />
+        <el-input v-model="filters.q" placeholder="搜名称" clearable style="width: 150px" @change="reload" />
+      </template>
+    </NotionTable>
+
+    <el-pagination class="pager" layout="prev, pager, next, total" :total="total"
+                   :page-size="pageSize" :current-page="page" @current-change="onPage" />
+    </div>
 </template>
 
 <script setup>
+import PageHeader from '@/components/PageHeader.vue'
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { miscApi } from '@/api'

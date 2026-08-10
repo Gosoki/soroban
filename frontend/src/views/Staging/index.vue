@@ -1,79 +1,78 @@
 <template>
   <div>
-    <div class="bar">
-      <span class="hint">一个账号昵称下的所有订单都放这里（一单可多物），逐单点「导入」才进入账本。（将来爬虫自动灌入）</span>
-    </div>
+    <PageHeader>
+    一个账号昵称下的所有订单都放这里（一单可多物），逐单点「导入」才进入账本。（将来爬虫自动灌入）
+    </PageHeader>
 
-    <el-card>
-      <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable
-                   table-name="staging" :actions-width="128" @save="saveCell" @add="addRow" @delete="doDelete" @reload="load">
-        <template #toolbar>
-          <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="reload" />
-          <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
-            <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
-          </el-select>
-          <el-select v-model="filters.importStatus" placeholder="全部状态" clearable style="width: 120px" @change="reload">
-            <el-option v-for="s in IMPORT_STATUS" :key="s" :label="s" :value="s" />
-          </el-select>
-          <el-select v-model="filters.platform_account" placeholder="账号昵称" clearable filterable style="width: 120px" @change="reload">
-            <el-option v-for="a in accountOptions" :key="a" :label="a" :value="a" />
-          </el-select>
-          <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
-                          start-placeholder="起" end-placeholder="止" @change="reload" />
-        </template>
+    <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable
+                 table-name="staging" :actions-width="128" @save="saveCell" @add="addRow" @delete="doDelete" @reload="load">
+      <template #toolbar>
+        <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="reload" />
+        <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
+          <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
+        </el-select>
+        <el-select v-model="filters.importStatus" placeholder="全部状态" clearable style="width: 120px" @change="reload">
+          <el-option v-for="s in IMPORT_STATUS" :key="s" :label="s" :value="s" />
+        </el-select>
+        <el-select v-model="filters.platform_account" placeholder="账号昵称" clearable filterable style="width: 120px" @change="reload">
+          <el-option v-for="a in accountOptions" :key="a" :label="a" :value="a" />
+        </el-select>
+        <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
+                        start-placeholder="起" end-placeholder="止" @change="reload" />
+      </template>
 
-        <template #cell-scraped_at="{ row }">
-          <span :class="row.scraped_at ? '' : 'ph'">{{ fmtDate(row.scraped_at) }}</span>
-        </template>
-        <template #cell-items="{ row }">
-          <span :class="{ ph: !(row.items && row.items.length), 'auto-txt': allTitleItems(row) }">{{ itemSummary(row) }}</span>
-        </template>
-        <template #cell-import_status="{ row }">
-          <el-tag :style="importStatusStyle(row.import_status)">{{ row.import_status }}</el-tag>
-        </template>
+      <template #cell-scraped_at="{ row }">
+        <span :class="row.scraped_at ? '' : 'ph'">{{ fmtDate(row.scraped_at) }}</span>
+      </template>
+      <template #cell-items="{ row }">
+        <span :class="{ ph: !(row.items && row.items.length), 'auto-txt': allTitleItems(row) }">{{ itemSummary(row) }}</span>
+      </template>
+      <template #cell-import_status="{ row }">
+        <el-tag :style="importStatusStyle(row.import_status)">{{ row.import_status }}</el-tag>
+      </template>
 
-        <template #expand="{ row }">
-          <div class="expand">
-            <div class="ex-title">物品明细（一单多物）· 单价×数量汇总为订单价</div>
-            <div v-for="(it, i) in row.items" :key="i" class="item-row" :class="{ 'item-auto': isTitleItem(row, it) }"
-                 :title="isTitleItem(row, it) ? '物品名与商品标题相同（无独立物品详情）；改成真实物品名即正常' : ''">
-              <el-input v-model="it.name" placeholder="物品名" style="width: 180px" @change="it.auto = false" />
-              <el-input-number v-model="it.quantity" :min="1" :controls="false" style="width: 80px" @change="it.auto = false" />
-              <el-input-number v-model="it.unit_price_cny" :min="0" :precision="2" :controls="false"
-                               style="width: 110px" placeholder="单价" @change="it.auto = false" />
-              <el-button link type="danger" :icon="Delete" @click="row.items.splice(i, 1)" />
-            </div>
-            <div>
-              <el-button :icon="Plus" @click="ensureItems(row).push({ name: '', quantity: 1, unit_price_cny: null, auto: false })">加物品</el-button>
-              <el-button type="primary" @click="saveItems(row)">保存物品</el-button>
-            </div>
-            <div class="postage-row">
-              <span class="postage-lb">邮费（元）</span>
-              <el-input-number v-model="row.postage_cny" :min="0" :precision="2" :controls="false"
-                               placeholder="包邮" style="width: 130px" @change="savePostage(row)" />
-              <span class="postage-hint">不填 = 包邮（订单价 = Σ单价×数量 + 邮费）</span>
-            </div>
+      <template #expand="{ row }">
+        <div class="expand">
+          <div class="ex-title">物品明细（一单多物）· 单价×数量汇总为订单价</div>
+          <div v-for="(it, i) in row.items" :key="i" class="item-row" :class="{ 'item-auto': isTitleItem(row, it) }"
+               :title="isTitleItem(row, it) ? '物品名与商品标题相同（无独立物品详情）；改成真实物品名即正常' : ''">
+            <el-input v-model="it.name" placeholder="物品名" style="width: 180px" @change="it.auto = false" />
+            <el-input-number v-model="it.quantity" :min="1" :controls="false" style="width: 80px" @change="it.auto = false" />
+            <el-input-number v-model="it.unit_price_cny" :min="0" :precision="2" :controls="false"
+                             style="width: 110px" placeholder="单价" @change="it.auto = false" />
+            <el-button link type="danger" :icon="Delete" @click="row.items.splice(i, 1)" />
           </div>
-        </template>
+          <div>
+            <el-button :icon="Plus" @click="ensureItems(row).push({ name: '', quantity: 1, unit_price_cny: null, auto: false })">加物品</el-button>
+            <el-button type="primary" @click="saveItems(row)">保存物品</el-button>
+          </div>
+          <div class="postage-row">
+            <span class="postage-lb">邮费（元）</span>
+            <el-input-number v-model="row.postage_cny" :min="0" :precision="2" :controls="false"
+                             placeholder="包邮" style="width: 130px" @change="savePostage(row)" />
+            <span class="postage-hint">不填 = 包邮（订单价 = Σ单价×数量 + 邮费）</span>
+          </div>
+        </div>
+      </template>
 
-        <template #actions="{ row }">
-          <template v-if="row.imported_order_id">
-            <el-tag :style="importStatusStyle('已导入')">已导入 #{{ row.imported_order_id }}</el-tag>
-          </template>
-          <template v-else>
-            <el-button type="primary" @click="doImport(row)">导入</el-button>
-            <el-button v-if="row.import_status !== '已忽略'" link @click="doIgnore(row)">忽略</el-button>
-          </template>
+      <template #actions="{ row }">
+        <template v-if="row.imported_order_id">
+          <el-tag :style="importStatusStyle('已导入')">已导入 #{{ row.imported_order_id }}</el-tag>
         </template>
-      </NotionTable>
+        <template v-else>
+          <el-button type="primary" @click="doImport(row)">导入</el-button>
+          <el-button v-if="row.import_status !== '已忽略'" link @click="doIgnore(row)">忽略</el-button>
+        </template>
+      </template>
+    </NotionTable>
 
-      <el-pagination class="pager" layout="prev, pager, next, total" :total="total"
-                     :page-size="pageSize" :current-page="page" @current-change="onPage" />
-    </el-card>
-  </div>
+    <el-pagination class="pager" layout="prev, pager, next, total" :total="total"
+                   :page-size="pageSize" :current-page="page" @current-change="onPage" />
+    </div>
 </template>
 
 <script setup>
+import PageHeader from '@/components/PageHeader.vue'
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Plus } from '@element-plus/icons-vue'
@@ -248,8 +247,6 @@ onMounted(() => { loadAccounts(); load() })
 </script>
 
 <style scoped>
-.bar { margin-bottom: 10px; }
-.hint { color: var(--txt-3); font-size: 12px; }
 .auto-txt { color: var(--txt-3); font-style: italic; }   /* 列表「物品」格：自动生成(名=标题)时灰显 */
 .expand { padding: 12px 20px; }
 .ex-title { color: var(--txt-2); font-size: 13px; margin-bottom: 8px; }

@@ -1,28 +1,25 @@
 <template>
-  <div class="fx-page" v-loading="loading">
-    <h2 class="title">日元汇率</h2>
-    <p class="lead">
+  <div v-loading="loading">
+    <PageHeader>
       每抓一次记一条，<b>一天可以有多条</b>。建单与补录都按<b>那一天</b>的汇率折算——
       爬虫抓回前几天买的东西时，用的是当天的值而不是今天的。
       当天有多条时取<b>手填的那条</b>，没有手填就取<b>当天最后抓到的</b>。
-    </p>
+      <template #actions>
+        <router-link to="/plugins" class="sub">汇率由插件抓取 →</router-link>
+      </template>
+    </PageHeader>
 
-    <!-- 工具栏 + 表格装进卡片：全站其余页面（订单/集运/插件/设置/数据库）都是
-         「内容装在 el-card 里」，只有这一页是裸的一张表贴在页底色上。 -->
-    <el-card shadow="never">
     <div class="bar">
       <el-radio-group v-model="days" @change="load">
         <el-radio-button v-for="d in [7, 30, 90, 365]" :key="d" :value="d">近 {{ d }} 天</el-radio-button>
       </el-radio-group>
       <span class="sub">共 {{ rows.length }} 天有记录</span>
-      <div class="grow" />
-      <router-link to="/plugins" class="sub">汇率由插件抓取 →</router-link>
     </div>
 
     <el-empty v-if="!loading && !rows.length" description="还没有任何汇率记录。装上汇率插件并授权，或去设置页手填一个。" />
 
     <!-- .fx-scroll 与 NotionTable 的 .gtn-scroll 是同一件东西：1px 外框 + 8px 圆角 +
-         自身滚动。表格靠它拿到「一块有边界的面」，而不是几行字浮在卡片上。 -->
+         自身的面。表格页不套 el-card，这圈框自己就是容器。 -->
     <div v-else class="fx-scroll">
     <table class="fx-tbl">
       <thead>
@@ -83,11 +80,11 @@
       </tbody>
     </table>
     </div>
-    </el-card>
   </div>
 </template>
 
 <script setup>
+import PageHeader from '@/components/PageHeader.vue'
 import { onMounted, ref } from 'vue'
 import { ArrowRight } from '@element-plus/icons-vue'
 import { fxApi } from '@/api'
@@ -137,15 +134,13 @@ onMounted(load)
 <style scoped>
 /* 页宽不再自己设上限：这一页主体就是一张**表**，900px 下右边白掉 450px。
    全站统一「内容装在卡片里、卡片占满宽度」。 */
-.title { margin: 0 0 8px; font-size: 20px; }
-.lead { margin: 0 0 16px; color: var(--txt-3); font-size: 12px; line-height: 1.9; }
 .bar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-.grow { flex: 1; }
 /* ↓ 以下逐条对齐 components/NotionTable.vue 的取值。
    这张表是手写的（只读 + 按天展开，用不上 NotionTable 的列宽持久化/单元格编辑/
    幽灵新建行），但**看上去必须是同一个应用里的表**。差异原先有九处，
    最扎眼的是：没有外框、表头没有底色、没有纵向网格线。 */
-.fx-scroll { overflow: auto; border: 1px solid var(--border); border-radius: var(--r-md); }
+.fx-scroll { overflow: auto; border: 1px solid var(--border); border-radius: var(--r-md);
+             background: var(--bg-card); }   /* 理由同 .gtn-scroll */
 .fx-tbl { width: 100%; border-collapse: collapse; font-size: 13px; color: var(--txt-body);
           table-layout: fixed; }
 /* 表头：底色 + **2px** 下边框 + 12px/500 —— 与 .gtn-th 逐项相同。

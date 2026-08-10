@@ -1,10 +1,9 @@
 <template>
   <div class="set-page" v-loading="loading">
-    <h2 class="title">设置</h2>
-    <p class="lead">
+    <PageHeader>
       这里改的是<b>业务偏好</b>，存在数据库里、即时生效。密钥、监听地址、数据库连接串那些属于部署配置，
       在 <code>backend/.env</code> 里改、要重启，不在这一页。
-    </p>
+    </PageHeader>
 
     <!-- 卡片按后端注册表的 group 自动分组，控件由 kind 决定。
          页面**不写死**渲染哪些键——加一项设置只改 backend/app/services/prefs.py 的 SPECS，
@@ -66,6 +65,32 @@
       </div>
     </el-card>
 
+    <!-- 界面偏好**单独成卡**，且卡头就写明「只对这个浏览器生效」。
+         这一页开篇那句是「这里改的是业务偏好，存在数据库里、即时生效」——
+         把一个存 localStorage 的开关混进上面那些卡片里，那句话就成了假话，
+         而用户换台电脑发现设置没跟过去时，是不会回来读这段注释的。
+         也刻意**不受下面那个「保存 / 撤销改动」管**：它拨一下就生效，
+         和需要提交的业务偏好不是一种东西，放进同一个 dirty 流程只会让人以为没保存上。 -->
+    <el-card shadow="never" class="card">
+      <div class="card-hd">
+        <span>界面</span>
+        <span class="cur">只对<b>这个浏览器</b>生效，不存进数据库、不跟着账号走</span>
+      </div>
+      <div class="field-grid">
+        <div class="field">
+          <label class="flabel">
+            隐藏页面标题
+            <el-tooltip placement="top" popper-class="wrap-tip"
+                        content="每页顶部那行大标题（「商品订单」「日元汇率」…）。&#10;左侧导航已经写着页面名，是同一句话说两遍；&#10;关掉能给表格多让出一行。说明那个「?」也跟着一起收起来。">
+              <el-icon class="help"><QuestionFilled /></el-icon>
+            </el-tooltip>
+          </label>
+          <el-switch v-model="hidePageTitle" />
+          <span class="sub">{{ hidePageTitle ? '已隐藏（拨一下立即生效）' : '显示中' }}</span>
+        </div>
+      </div>
+    </el-card>
+
     <div class="acts">
       <el-button type="primary" :disabled="!dirty" :loading="saving" @click="save">保存</el-button>
       <el-button :disabled="!dirty" @click="reset">撤销改动</el-button>
@@ -75,6 +100,8 @@
 </template>
 
 <script setup>
+import PageHeader from '@/components/PageHeader.vue'
+import { hidePageTitle } from '@/utils/uiPrefs'
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { QuestionFilled } from '@element-plus/icons-vue'
@@ -149,9 +176,6 @@ onMounted(load)
 <style scoped>
 /* 页宽不再自己设上限：全站统一「卡片占满宽度、卡片内字段自动分列」（见 tokens.css 的
    .field-grid）。原先这里是 820px，而汇率页 900、数据库页 760——同一个应用四种页宽。 */
-.title { margin: 0 0 8px; font-size: 20px; }
-.lead { margin: 0 0 16px; color: var(--txt-3); font-size: 12px; line-height: 1.8; }
-.lead code { background: var(--el-fill-color-light); padding: 1px 5px; border-radius: 3px; }
 .card { margin-bottom: 16px; }
 /* 刻意**不用** space-between：「汇率」与它右边那句「当前：1元 = …」是同一件事的标题和值，
    页宽放开后 space-between 会把它们推到相隔一千多像素的两端，读起来不像一组。

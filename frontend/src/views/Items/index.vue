@@ -1,85 +1,84 @@
 <template>
   <div>
-    <div class="bar">
-      <span class="hint">所有订单的物品拉平成一张表（对接的最小单位）。列可拖动换位/拖宽。物品编辑请到「商品订单」页展开面板里做。</span>
-    </div>
+    <PageHeader>
+    所有订单的物品拉平成一张表（对接的最小单位）。列可拖动换位/拖宽。物品编辑请到「商品订单」页展开面板里做。
+    </PageHeader>
 
-    <el-card>
-      <NotionTable :columns="columns" :rows="rows" :loading="loading" :actions-width="60"
-                   :empty-text="loadFailed ? '加载失败——请检查网络或后端，然后重试' : '没有符合条件的记录'"
-                   table-name="items" hide-id :addable="false" :deletable="false" @reload="load">
-        <template #toolbar>
-          <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="reload" />
-          <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
-            <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
-          </el-select>
-          <!-- 选项 = 国内段 + 集运段：列表显示的是继承后的状态，只列国内段的话，
-               界面上一堆「已发出」却在筛选框里选不到（与订单页同款） -->
-          <el-select v-model="filters.fulfillmentStatus" placeholder="状态" clearable style="width: 120px" @change="reload">
-            <el-option-group label="国内段（商品订单）">
-              <el-option v-for="s in PURCHASE_STATUS" :key="s" :label="s" :value="s" />
-            </el-option-group>
-            <el-option-group label="国际段（集运订单）">
-              <el-option v-for="s in SHIPMENT_STATUS" :key="s" :label="s" :value="s" />
-            </el-option-group>
-          </el-select>
-          <el-select v-model="filters.platform_account" placeholder="账号昵称" clearable filterable style="width: 120px" @change="reload">
-            <el-option v-for="a in accountOptions" :key="a" :label="a" :value="a" />
-          </el-select>
-          <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
-                          start-placeholder="起" end-placeholder="止" @change="reload" />
-        </template>
+    <NotionTable :columns="columns" :rows="rows" :loading="loading" :actions-width="60"
+                 :empty-text="loadFailed ? '加载失败——请检查网络或后端，然后重试' : '没有符合条件的记录'"
+                 table-name="items" hide-id :addable="false" :deletable="false" @reload="load">
+      <template #toolbar>
+        <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="reload" />
+        <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
+          <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
+        </el-select>
+        <!-- 选项 = 国内段 + 集运段：列表显示的是继承后的状态，只列国内段的话，
+             界面上一堆「已发出」却在筛选框里选不到（与订单页同款） -->
+        <el-select v-model="filters.fulfillmentStatus" placeholder="状态" clearable style="width: 120px" @change="reload">
+          <el-option-group label="国内段（商品订单）">
+            <el-option v-for="s in PURCHASE_STATUS" :key="s" :label="s" :value="s" />
+          </el-option-group>
+          <el-option-group label="国际段（集运订单）">
+            <el-option v-for="s in SHIPMENT_STATUS" :key="s" :label="s" :value="s" />
+          </el-option-group>
+        </el-select>
+        <el-select v-model="filters.platform_account" placeholder="账号昵称" clearable filterable style="width: 120px" @change="reload">
+          <el-option v-for="a in accountOptions" :key="a" :label="a" :value="a" />
+        </el-select>
+        <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
+                        start-placeholder="起" end-placeholder="止" @change="reload" />
+      </template>
 
-        <!-- 彩色标签（只读），配色与订单列表一致：账号用持久化色序、来源/状态用语义色 -->
-        <template #cell-platform_account="{ row }">
-          <el-tag v-if="row.platform_account" :style="tagStyleAt(acctColor[row.platform_account] ?? -1, row.platform_account)">{{ row.platform_account }}</el-tag>
-          <span v-else class="ph">—</span>
-        </template>
-        <template #cell-platform="{ row }">
-          <el-tag v-if="row.platform" :style="platformSemanticStyle(row.platform)">{{ row.platform }}</el-tag>
-          <span v-else class="ph">—</span>
-        </template>
-        <!-- 与商品订单页同一口径：挂了集运单就显示继承来的集运状态。
-             ⚠️ 这里必须自己取 fulfillment_status —— 列配置里的 col.display 对**有插槽的列无效**
-             （NotionTable 的插槽分支优先于 GotionCell，而 display 只在 GotionCell 里被调用），
-             曾因此让两个页面对同一张单显示不同状态、tooltip 还说着反话。 -->
-        <template #cell-purchase_status="{ row }">
-          <el-tag :style="statusStyle(row.fulfillment_status)">
-            {{ row.fulfillment_status }}
-          </el-tag>
-        </template>
-        <!-- 灰显=物品名与商品标题相同（无独立物品详情） -->
-        <template #cell-name="{ row }">
-          <span :class="{ 'auto-txt': isTitleItem(row) }" :title="isTitleItem(row) ? '物品名与商品标题相同（无独立物品详情）' : ''">{{ row.name }}</span>
-        </template>
-        <!-- 编辑：打开该物品所属订单的编辑弹窗（复用商品订单同一套物品编辑，不跳转） -->
-        <template #actions="{ row }">
-          <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
-        </template>
-      </NotionTable>
+      <!-- 彩色标签（只读），配色与订单列表一致：账号用持久化色序、来源/状态用语义色 -->
+      <template #cell-platform_account="{ row }">
+        <el-tag v-if="row.platform_account" :style="tagStyleAt(acctColor[row.platform_account] ?? -1, row.platform_account)">{{ row.platform_account }}</el-tag>
+        <span v-else class="ph">—</span>
+      </template>
+      <template #cell-platform="{ row }">
+        <el-tag v-if="row.platform" :style="platformSemanticStyle(row.platform)">{{ row.platform }}</el-tag>
+        <span v-else class="ph">—</span>
+      </template>
+      <!-- 与商品订单页同一口径：挂了集运单就显示继承来的集运状态。
+           ⚠️ 这里必须自己取 fulfillment_status —— 列配置里的 col.display 对**有插槽的列无效**
+           （NotionTable 的插槽分支优先于 GotionCell，而 display 只在 GotionCell 里被调用），
+           曾因此让两个页面对同一张单显示不同状态、tooltip 还说着反话。 -->
+      <template #cell-purchase_status="{ row }">
+        <el-tag :style="statusStyle(row.fulfillment_status)">
+          {{ row.fulfillment_status }}
+        </el-tag>
+      </template>
+      <!-- 灰显=物品名与商品标题相同（无独立物品详情） -->
+      <template #cell-name="{ row }">
+        <span :class="{ 'auto-txt': isTitleItem(row) }" :title="isTitleItem(row) ? '物品名与商品标题相同（无独立物品详情）' : ''">{{ row.name }}</span>
+      </template>
+      <!-- 编辑：打开该物品所属订单的编辑弹窗（复用商品订单同一套物品编辑，不跳转） -->
+      <template #actions="{ row }">
+        <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
+      </template>
+    </NotionTable>
 
-      <el-pagination class="pager" layout="prev, pager, next, total" :total="total"
-                     :page-size="pageSize" :current-page="page" @current-change="onPage" />
-    </el-card>
-
+    <el-pagination class="pager" layout="prev, pager, next, total" :total="total"
+                   :page-size="pageSize" :current-page="page" @current-change="onPage" />
+    
     <!-- 物品编辑：改的是该物品所属的整张商品订单（含其全部物品 + 邮费），复用订单页同一编辑组件与写入链 -->
     <el-dialog v-model="editVisible" :title="editTitle" width="640px" top="6vh" append-to-body @closed="onEditClosed">
-      <div v-if="editingOrder">
-        <div class="edit-ctx">
-          <span class="ec-shop">{{ editingOrder.title || '（无标题）' }}</span>
-          <el-tag :style="statusStyle(editingOrder.purchase_status)">{{ editingOrder.purchase_status }}</el-tag>
-          <span v-if="editingOrder.platform_account" class="ec-dim">账号 {{ editingOrder.platform_account }}</span>
-          <span class="ec-dim">下单 {{ editingOrder.date }}</span>
-          <span v-if="editingOrder.order_no" class="ec-dim">订单号 {{ editingOrder.order_no }}</span>
-        </div>
-        <OrderEditPanel :order="editingOrder" :shipments="shipmentOptions" :accounts="accountOptions" @saved="editDirty = true" @conflict="refetchEditing" />
+    <div v-if="editingOrder">
+      <div class="edit-ctx">
+        <span class="ec-shop">{{ editingOrder.title || '（无标题）' }}</span>
+        <el-tag :style="statusStyle(editingOrder.purchase_status)">{{ editingOrder.purchase_status }}</el-tag>
+        <span v-if="editingOrder.platform_account" class="ec-dim">账号 {{ editingOrder.platform_account }}</span>
+        <span class="ec-dim">下单 {{ editingOrder.date }}</span>
+        <span v-if="editingOrder.order_no" class="ec-dim">订单号 {{ editingOrder.order_no }}</span>
       </div>
-      <div v-else v-loading="true" style="height: 90px"></div>
+      <OrderEditPanel :order="editingOrder" :shipments="shipmentOptions" :accounts="accountOptions" @saved="editDirty = true" @conflict="refetchEditing" />
+    </div>
+    <div v-else v-loading="true" style="height: 90px"></div>
     </el-dialog>
   </div>
 </template>
 
 <script setup>
+import PageHeader from '@/components/PageHeader.vue'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { itemsApi, ordersApi, shipmentApi, tagsApi } from '@/api'
 import { ORDER_SOURCES, PURCHASE_STATUS, SHIPMENT_STATUS, platformSemanticStyle, statusStyle, tagStyleAt } from '@/constants'
@@ -218,8 +217,6 @@ onMounted(() => { loadAcctColors(); loadShipment(); load() })
 </script>
 
 <style scoped>
-.bar { margin-bottom: 10px; }
-.hint { color: var(--txt-3); font-size: 12px; }
 .auto-txt { color: var(--txt-3); font-style: italic; }
 .edit-ctx { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 0 20px 4px; font-size: 13px; }
 .edit-ctx .ec-shop { color: var(--txt-1); font-weight: 600; }

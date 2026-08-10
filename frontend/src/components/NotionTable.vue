@@ -395,7 +395,11 @@ function stopResize() {
    悄悄拉成 32px——同一行里两种高度，而且只在带日期筛选的页面上出现，很难联想到原因。 */
 .gtn-empty td { padding: 22px 12px; text-align: center; color: var(--txt-3); font-size: 13px; }
 .gtn-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
-.gtn-scroll { overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
+/* background 是**去掉外层 el-card 之后补的**：表格页现在不再套卡片，
+   这圈边框自己就是容器，行底色必须由它给，否则整表掉到页面底 --bg-page（深一档），
+   而表头（--bg-hover）还亮着，看起来像表头浮在一个洞上。 */
+.gtn-scroll { overflow: auto; border: 1px solid var(--border); border-radius: 8px;
+              background: var(--bg-card); }
 .gtn-table { border-collapse: collapse; font-size: 13px; color: var(--txt-body); table-layout: fixed; }
 
 .gtn-th {
