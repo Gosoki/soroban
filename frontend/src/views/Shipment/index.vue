@@ -18,7 +18,7 @@
       </template>
 
       <template #toolbar-right>
-        <OcrButton ref="pkgUpload" :pending="pkgPending" @pick="onPkgPick">
+        <OcrButton ref="pkgUpload" :pending="pkgPending" label="点击选图 OCR 建单，或拖「成品包裹」图到页面" @pick="onPkgPick">
           点「OCR」选图，或把图<b>拖到页面任意位置</b>松手，识别<b>「成品包裹」页</b>截图建集运单
           （集运单号、国际运单号、下单时间、渠道）。
           <br>另一种截图是<b>「内含快递」页</b>——那个要拖到某一行的「绑定快递单」格里，

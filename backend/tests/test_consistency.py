@@ -909,20 +909,32 @@ def test_all_list_toolbars_share_one_set_of_widths():
     assert not bad, "筛选栏控件宽度不统一：\n  " + "\n  ".join(bad)
 
 
-def test_ocr_entry_is_a_right_aligned_button_not_a_dropzone():
-    """OCR 收成右对齐的小按钮，说明进「?」。
+def test_ocr_entry_is_shared_and_right_aligned():
+    """OCR 入口两页共用一个组件，且靠右。
 
-    原先是筛选栏里**最宽**的一块（266~344px 的虚线投放区），里面写着一整句话——
-    而筛选才是每天要用的东西。两页各写一份，尺寸和文案已经不一样了。
+    形态是**虚线投放区**（不是实心按钮）：它既能点、又是整窗拖图的落点提示，
+    虚线边是「这里可以扔东西进来」的通用语言。
+    要钉的是另外两件事：
+      · 不许两页各写一份——改版前就是两份，尺寸和文案已经不一样了；
+      · 必须在 `#toolbar-right` 里，否则会挤在筛选栏最左边（原来订单页就是那样，
+        它是那一排里最宽的东西，而筛选才是每天要用的）。
     """
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[2] / "frontend" / "src"
-    assert (root / "components" / "OcrButton.vue").is_file(), "没有共用的 OCR 组件"
+    comp = root / "components" / "OcrButton.vue"
+    assert comp.is_file(), "没有共用的 OCR 组件"
+    # 配色与改版前逐字相同——这几个 token 就是「和之前一样」的定义
+    css = comp.read_text(encoding="utf-8").split("<style", 1)[-1]
+    for need in ("1px dashed var(--border-strong)", "var(--brand-soft)",
+                 "border-color: var(--brand)", "background: var(--brand-weak)"):
+        assert need in css, f"OCR 投放区的取值变了：缺 {need}"
+    # 高度跟着工具栏走，不许写死——写死就会比旁边那排高出一两像素
+    assert "var(--el-component-size-small" in css, "OCR 块的高度写死了，会和筛选栏错位"
+
     for name in ("Orders", "Shipment"):
         src = (root / "views" / name / "index.vue").read_text(encoding="utf-8")
-        assert "ocr-drop" not in src, f"{name} 还留着旧的投放区"
-        assert "<OcrButton" in src, f"{name} 没用共用的 OCR 组件"
+        assert "ocr-drop" not in src, f"{name} 又自己写了一份投放区（应当只在组件里）"
         assert "<OcrButton" in _toolbar(src, "toolbar-right"), \
             f"{name} 的 OCR 不在 #toolbar-right 里，不会靠右"
         assert "<OcrButton" not in _toolbar(src), f"{name} 的 OCR 还在左边的筛选栏里"
