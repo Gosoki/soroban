@@ -34,7 +34,7 @@
       </template>
 
       <template #toolbar-right>
-        <OcrButton ref="ocrUpload" :pending="ocrPending" label="点击选图 OCR 识别，或把图拖到页面" @pick="onOcrPick">
+        <OcrButton ref="ocrUpload" :pending="ocrPending" @pick="onOcrPick">
           点「OCR」选图，或把图<b>拖到页面任意位置</b>松手，都会识别并自动建单（支持一次多张）。
           认得淘宝/京东/闲鱼的订单截图；识别到的下单日期、商品、金额、快递号会填进新行，
           没认出来的格子留空等你补。

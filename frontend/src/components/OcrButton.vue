@@ -6,7 +6,10 @@
      悬停转 `--brand` 实线感 + `--brand-weak` 底。
 
      两页原先各写了一份，尺寸和文案已经开始不一样——收进这一个组件共用。
-     长说明（认哪些平台、拿错截图会怎样）进右边的「?」，正文只留一句够用的。
+     正文**写死在组件里**，不做成 prop：两页要显示的就是同一句
+     （商品订单页与集运订单页都是「订单」），做成 prop 等于把「同一句」交给
+     两个调用点各写一遍，而它们上一版正是这么漂开的。
+     两页真正不同的是长说明（认哪些平台、拿错截图会怎样），那个走插槽进右边的「?」。
 
      **拖拽入口一点没变**：整窗拖图仍然可用（各页自己的 window 监听），
      那句话现在写在「?」里，不是取消了功能。 -->
@@ -16,7 +19,7 @@
                accept="image/*" :on-change="(file, list) => emit('pick', file, list)">
       <div class="ocr-drop" :class="{ busy: !!pending }">
         <el-icon class="ocr-ic"><Camera /></el-icon>
-        <span>{{ pending ? `后台识别中 ${pending} 张…` : label }}</span>
+        <span>{{ pending ? `后台识别中 ${pending} 张…` : 'OCR识别订单' }}</span>
       </div>
     </el-upload>
 
@@ -37,9 +40,6 @@ defineProps({
   // 后台还在识别几张。>0 时正文换成张数——这是唯一会变的状态，
   // 不显示的话连点几张图之后完全看不出有没有在跑。
   pending: { type: Number, default: 0 },
-  // 正文。两页要说的不是一件事（订单是「识别建单」、集运是「识别成品包裹页」），
-  // 所以由页面给；组件只管长相一致。
-  label: { type: String, required: true },
 })
 const emit = defineEmits(['pick'])
 

@@ -931,12 +931,20 @@ def test_ocr_entry_is_shared_and_right_aligned():
         assert need in css, f"OCR 投放区的取值变了：缺 {need}"
     # 高度跟着工具栏走，不许写死——写死就会比旁边那排高出一两像素
     assert "var(--el-component-size-small" in css, "OCR 块的高度写死了，会和筛选栏错位"
+    # 正文写死在组件里、不做成 prop：两页显示的是同一句，交给两个调用点各写一遍
+    # 正是它们上一版漂开的原因（一处「OCR 识别」、一处「OCR 建单」）。
+    tpl = comp.read_text(encoding="utf-8").split("<script", 1)[0]
+    assert "'OCR识别订单'" in tpl, "OCR 的正文不在组件里"
+    assert "label:" not in comp.read_text(encoding="utf-8"), \
+        "正文又做成了 prop——两页迟早会写成两句"
 
     for name in ("Orders", "Shipment"):
         src = (root / "views" / name / "index.vue").read_text(encoding="utf-8")
         assert "ocr-drop" not in src, f"{name} 又自己写了一份投放区（应当只在组件里）"
         assert "<OcrButton" in _toolbar(src, "toolbar-right"), \
             f"{name} 的 OCR 不在 #toolbar-right 里，不会靠右"
+        assert not re.search(r"<OcrButton[^>]*\blabel=", src), \
+            f"{name} 又给 OCR 传了 label，绕开了组件里那一份唯一正文"
         assert "<OcrButton" not in _toolbar(src), f"{name} 的 OCR 还在左边的筛选栏里"
     nt = (root / "components" / "NotionTable.vue").read_text(encoding="utf-8")
     assert "toolbar-right" in nt and "gtn-tb-gap" in nt, "NotionTable 没有靠右的工具栏槽"
