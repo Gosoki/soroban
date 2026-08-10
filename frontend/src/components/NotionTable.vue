@@ -430,8 +430,8 @@ function stopResize() {
 .gtn-td-clickexp { cursor: pointer; }
 .gtn-slot { height: 36px; padding: 0 8px; display: flex; align-items: center; overflow: hidden; white-space: nowrap; }
 
-.gtn-exp-row > td { background: #10192c; border-bottom: 1px solid var(--border); }
-.gtn-new td { background: #10192c; border-bottom: 1px solid var(--border-soft); border-right: 1px solid var(--border); }
+.gtn-exp-row > td { background: var(--bg-sunken); border-bottom: 1px solid var(--border); }
+.gtn-new td { background: var(--bg-sunken); border-bottom: 1px solid var(--border-soft); border-right: 1px solid var(--border); }
 .gtn-new-num { color: #5c6b85; cursor: pointer; }
 .gtn-new-num:hover { color: var(--ok); background: var(--ok-faint); }
 /* 草稿已有内容 → ✓ 亮起，提示「可以提交了」 */

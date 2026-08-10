@@ -16,6 +16,11 @@
   --bg-head: #161f33;          /* 卡片头 / 表头 */
   --bg-hover: #18233a;         /* 悬停 / 填充 */
   --bg-row-hover: #1b2942;     /* 表格行悬停 */
+  /* 比卡片更**沉**的一档：表格里展开出来的明细区。
+     深下去而不是浮起来，读作「这一块是从上面那行里翻出来的」。
+     原先这个值以裸十六进制 `#10192c` 写在 NotionTable 里，而汇率页的展开区
+     用的是 --bg-head（比卡片浅）——同一种东西两个方向，谁抄谁都不对。 */
+  --bg-sunken: #10192c;        /* 展开明细区 */
 
   /* --- 文字三档。括号里是在 --bg-card 上的实测对比度 ---------------------- */
   --txt-1: #e6edf7;            /* 主文字（14.0:1） */
@@ -140,7 +145,9 @@ html.dark {
 
 /* 金额必须等宽：记账应用的核心视图是一列一列的钱，比例数字下 1 和 8 不等宽，
    整列上下对不齐。看板与计算器早就加了 tabular-nums，表格里反而没有。 */
-.gtn-disp, .derived, .item-tbl, .money, .el-table td .cell {
+/* .gtn-slot 是插槽渲染的格子（集运的「商品订单」、暂存的「物品」），
+   原先不在名单里 —— 同一张表里，普通格的数字等宽、插槽格的不等宽。 */
+.gtn-disp, .gtn-slot, .derived, .item-tbl, .money, .fx-tbl, .el-table td .cell {
   font-variant-numeric: tabular-nums;
 }
 

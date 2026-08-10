@@ -21,39 +21,44 @@
 
     <el-empty v-if="!loading && !rows.length" description="还没有任何汇率记录。装上汇率插件并授权，或去设置页手填一个。" />
 
-    <table v-else class="tbl">
+    <!-- .fx-scroll 与 NotionTable 的 .gtn-scroll 是同一件东西：1px 外框 + 8px 圆角 +
+         自身滚动。表格靠它拿到「一块有边界的面」，而不是几行字浮在卡片上。 -->
+    <div v-else class="fx-scroll">
+    <table class="fx-tbl">
       <thead>
         <tr>
           <!-- 百分比而不是像素：页宽放开之后，固定像素列会把多出来的宽度**全部**
                丢给最后一列，数据挤在左边、右边空 700px。按比例分配才跟着页宽走。 -->
-          <th style="width: 16%">日期</th>
-          <th style="width: 12%">采用</th>
-          <th style="width: 14%">来源</th>
-          <th style="width: 18%">当天区间</th>
-          <th style="width: 8%">条数</th>
-          <th style="width: 32%"></th>
+          <th style="width: 24%">日期</th>
+          <th style="width: 16%">采用</th>
+          <th style="width: 18%">来源</th>
+          <th style="width: 24%">当天区间</th>
+          <th style="width: 18%">条数</th>
         </tr>
       </thead>
       <tbody>
         <template v-for="r in rows" :key="r.date">
           <tr class="day" :class="{ open: openDay === r.date }" @click="toggle(r)">
             <td>
-              <el-icon class="caret"><component :is="openDay === r.date ? ArrowDown : ArrowRight" /></el-icon>
+              <!-- 与 NotionTable 的 .chev 同款：**同一个图标转 90°**，不是换一个图标。
+                   换图标没有中间态，展开/收起是「跳」过去的。 -->
+              <el-icon class="chev" :class="{ open: openDay === r.date }"><ArrowRight /></el-icon>
               {{ r.date }}
             </td>
-            <td class="num">{{ r.used ?? '—' }}</td>
+            <td>{{ r.used ?? '—' }}</td>
             <td>
               <el-tag :style="typeStyle(r.used_source === 'manual' ? 'info' : 'success')">
                 {{ FX_SOURCE_NAMES[r.used_source] || r.used_source }}
               </el-tag>
             </td>
             <!-- 只有一条时不显示区间：`23.36 ~ 23.36` 是噪音 -->
-            <td class="num sub">{{ r.count > 1 ? `${r.low} ~ ${r.high}` : '' }}</td>
-            <td class="sub">{{ r.count }}</td>
-            <td class="sub">{{ r.count > 1 ? '点开看当天各次' : '' }}</td>
+            <td class="dim">{{ r.count > 1 ? `${r.low} ~ ${r.high}` : '' }}</td>
+            <!-- 提示并进「条数」而不是单占一列：加了纵向网格线之后，一个只有
+                 count>1 才有字的列会常年空着，而空列在网格里是看得见的。 -->
+            <td class="dim">{{ r.count }}<span v-if="r.count > 1" class="tip"> · 点开看各次</span></td>
           </tr>
           <tr v-if="openDay === r.date" class="detail">
-            <td colspan="6">
+            <td colspan="5">
               <div v-if="!detail.length" class="sub">加载中…</div>
               <div v-for="x in detail" :key="x.id" class="hit" :class="{ used: x.used }">
                 <!-- 用后端给的 JST 时刻，不用浏览器本地时区：date 是 JST 日期，
@@ -71,13 +76,14 @@
         </template>
       </tbody>
     </table>
+    </div>
     </el-card>
   </div>
 </template>
 
 <script setup>
 import { onMounted, ref } from 'vue'
-import { ArrowDown, ArrowRight } from '@element-plus/icons-vue'
+import { ArrowRight } from '@element-plus/icons-vue'
 import { fxApi } from '@/api'
 import { FX_SOURCE_NAMES, typeStyle } from '@/constants'
 
@@ -129,19 +135,61 @@ onMounted(load)
 .lead { margin: 0 0 16px; color: var(--txt-3); font-size: 12px; line-height: 1.9; }
 .bar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
 .grow { flex: 1; }
-.sub { color: var(--txt-3); font-size: 12px; }
-.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
-.tbl th { text-align: left; font-weight: 600; color: var(--txt-2); padding: 8px 10px;
-          border-bottom: 1px solid var(--border); }
-.tbl td { padding: 8px 10px; border-bottom: 1px solid var(--border-dim); }
+/* ↓ 以下逐条对齐 components/NotionTable.vue 的取值。
+   这张表是手写的（只读 + 按天展开，用不上 NotionTable 的列宽持久化/单元格编辑/
+   幽灵新建行），但**看上去必须是同一个应用里的表**。差异原先有九处，
+   最扎眼的是：没有外框、表头没有底色、没有纵向网格线。 */
+.fx-scroll { overflow: auto; border: 1px solid var(--border); border-radius: var(--r-md); }
+.fx-tbl { width: 100%; border-collapse: collapse; font-size: 13px; color: var(--txt-body);
+          table-layout: fixed; }
+/* 表头：底色 + **2px** 下边框 + 12px/500 —— 与 .gtn-th 逐项相同。
+   ⚠️ `position: sticky` 与 .gtn-th 一样带着，但**两边现在都不生效**：
+   sticky 相对最近的滚动祖先定位，而 .fx-scroll / .gtn-scroll 只有 overflow:auto、
+   没有任何高度约束，永远不产生纵向滚动——真正在滚的是 Layout.vue 的 .content。
+   实测：订单页滚到底时表头 top 从 120 变成 -560，整条滚出屏幕。
+   留着是为了与 NotionTable 保持逐字一致（哪天给滚动框加了 max-height，两边一起生效），
+   但**别再写「能吸住」这种注释**——那正是这条注释上一版说的话。 */
+.fx-tbl th { background: var(--bg-hover); border-bottom: 2px solid var(--border);
+             border-right: 1px solid var(--border); padding: 8px; text-align: left;
+             font-weight: 500; font-size: 12px; color: var(--txt-body); white-space: nowrap;
+             position: sticky; top: 0; z-index: 2; }
+/* 单元格：36px 行高 + 横线 --border-soft + **纵向网格线** --border。
+   原先横线用的是 --border-dim（那是侧栏那一档），且完全没有竖线。
+   token 的注释写得很清楚：横线「刻意比竖线浅」——只有两条都在，那句话才成立。 */
+/* padding 横向 8px：NotionTable 的 padding 不在 td 上（那里是 0），而在内层
+   .gtn-disp / .gtn-slot 的 `padding: 0 8px`。数值要对齐的是那一层。
+   overflow/ellipsis/nowrap 三件套是 36px 行高的**前提**：没有它们，
+   窄屏下「当天区间」一折行，那一行就变成两行高，同屏出现两种行高。 */
+.fx-tbl td { height: 36px; padding: 0 8px; border-bottom: 1px solid var(--border-soft);
+             border-right: 1px solid var(--border);
+             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fx-tbl th:last-child, .fx-tbl td:last-child { border-right: none; }
 .day { cursor: pointer; }
-.day:hover { background: var(--bg-row-hover); }
-.day.open { background: var(--bg-hover); }
-.caret { font-size: 12px; color: var(--txt-3); margin-right: 4px; vertical-align: -1px; }
-.num { font-variant-numeric: tabular-nums; }
-.detail td { background: var(--bg-head); }
-.hit { display: flex; align-items: center; gap: 10px; padding: 4px 0 4px 26px; font-size: 13px; }
-.hit .t { color: var(--txt-3); width: 150px; font-variant-numeric: tabular-nums; }
-.hit .v { width: 90px; font-variant-numeric: tabular-nums; color: var(--txt-1); }
+.day:hover td { background: var(--bg-row-hover); }
+/* 「已展开」原先用 --bg-hover(#18233a)，比悬停色 --bg-row-hover(#1b2942) **还淡**——
+   而 tokens.css 自己写着「悬停必须比选中轻，否则分不出选没选上」，方向是反的。
+   底色维持不变，改用一条 2px 的品牌色竖条来标记，与 .gtn-th.dragover 的
+   `inset 2px 0 0 var(--brand)` 同一种「这个是选中的」语言——
+   它和悬停不是同一个维度，所以悬停一个已展开的行时两者都还在。 */
+.day.open td { background: var(--bg-hover); }
+.day.open td:first-child { box-shadow: inset 2px 0 0 var(--brand); }
+/* 与 .gtn-td-exp .chev 同款：转 90°，带 0.15s 过渡 */
+.chev { font-size: 12px; color: var(--txt-3); margin-right: 6px; vertical-align: -1px;
+        transition: transform 0.15s; }
+.chev.open { transform: rotate(90deg); }
+/* 弱化只改颜色、**不改字号**：NotionTable 整表统一 13px，没有任何单元格改字号。
+   原先「当天区间/条数」挂的是全局 .sub（12px），6 列里 3 列小一号，同一行里两种字号。 */
+.fx-tbl td.dim { color: var(--txt-3); }
+.tip { color: var(--txt-3); font-size: 12px; }
+/* 展开区：与 .gtn-exp-row 同一个面（--bg-sunken）与同一条下边框。
+   原先用的是 --bg-head——比卡片**浅**，读起来像浮起来的一层，方向正好反了。 */
+/* 12px/20px 与三个列表页的展开区（Shipment/Staging 的 .expand、OrderItemsEditor 的 .oie）
+   逐字相同。原先是 td 的 10px 再加 .hit 的 22px = 32px，比它们多缩 12px。
+   这里还要把 td 的三件套解掉：展开区是自由排版，不能被省略号和 36px 行高管着。 */
+.detail td { background: var(--bg-sunken); border-bottom: 1px solid var(--border);
+             height: auto; padding: 12px 20px; white-space: normal; overflow: visible; }
+.hit { display: flex; align-items: center; gap: 10px; padding: 4px 0; font-size: 13px; }
+.hit .t { color: var(--txt-3); width: 150px; }
+.hit .v { width: 90px; color: var(--txt-1); }
 .hit.used .v { font-weight: 700; }
 </style>

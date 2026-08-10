@@ -633,3 +633,74 @@ def test_field_grid_is_defined_once_globally():
     users = [f.parent.name for f in root.rglob("index.vue")
              if 'class="field-grid"' in f.read_text(encoding="utf-8")]
     assert set(users) >= {"Settings", "Database"}, f"没人用它了？当前使用者：{users}"
+
+
+def test_both_tables_share_one_expanded_row_surface():
+    """两张表的「展开明细区」必须是同一个面。
+
+    这里原本是两个方向相反的取值：NotionTable 写死 `#10192c`（比卡片**深**，
+    读作「从上面那行里翻出来的」），汇率表用 `--bg-head`（比卡片**浅**，读作「浮起来的一层」）。
+    同一种交互两种层次语言，而且其中一个还是裸十六进制——tokens.css 的开篇就写着
+    「新写样式一律取 var(--…)，不要再往 .vue 里写字面 hex」。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    tokens = (root / "styles" / "tokens.css").read_text(encoding="utf-8")
+    assert "--bg-sunken" in tokens, "展开区的面没有 token，两边只能各写各的"
+
+    nt = (root / "components" / "NotionTable.vue").read_text(encoding="utf-8")
+    fx = (root / "views" / "Fx" / "index.vue").read_text(encoding="utf-8")
+    for name, src, sel in (("NotionTable", nt, ".gtn-exp-row"), ("汇率表", fx, ".detail td")):
+        line = next((l for l in src.splitlines() if l.strip().startswith(sel)), None)
+        assert line and "var(--bg-sunken)" in line, \
+            f"{name} 的展开区没有用 --bg-sunken：{line!r}"
+    assert "#10192c" not in nt, "NotionTable 里又出现了裸色值 #10192c"
+
+
+def test_fx_table_matches_the_shared_table_language():
+    """汇率表是手写的（只读 + 按天展开，用不上 NotionTable 的列宽持久化/单元格编辑/
+    幽灵新建行），但**看上去必须是同一个应用里的表**。
+
+    钉住三处最扎眼的：外框、表头底色、纵向网格线。这三样原先一个都没有，
+    于是它看起来像「几行字浮在卡片上」，而其余五页都是有边界的表格。
+    """
+    from pathlib import Path
+
+    fx = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "views" / "Fx"
+          / "index.vue").read_text(encoding="utf-8")
+    import re
+
+    style = fx.split("<style", 1)[-1]
+
+    def rule(selector: str) -> str:
+        """取某条选择器的声明块。**必须按选择器取**，不能在整段样式里 substring 搜——
+        第一版就是那么写的：把表头底色改成 transparent 之后测试照样绿，
+        因为 `.day.open td` 那条里也有 `background: var(--bg-hover)`。
+        「在某处出现过」不等于「用在该用的地方」。"""
+        m = re.search(re.escape(selector) + r"\s*\{([^}]*)\}", style)
+        return m.group(1) if m else ""
+
+    checks = {
+        "外框（1px 边 + 圆角，同 .gtn-scroll）":
+            ("border: 1px solid var(--border)", rule(".fx-scroll")),
+        "表头底色（同 .gtn-th）":
+            ("background: var(--bg-hover)", rule(".fx-tbl th")),
+        "表头 2px 下边框（同 .gtn-th）":
+            ("border-bottom: 2px solid var(--border)", rule(".fx-tbl th")),
+        # 表头和表体**都要**有竖线。只查表体的话，把 th 上那条删掉测试照样绿，
+        # 而屏幕上是「表头没有竖线、表体有」——比两边都没有更扎眼。
+        "纵向网格线·表体（同 .gtn-td）":
+            ("border-right: 1px solid var(--border)", rule(".fx-tbl td")),
+        "纵向网格线·表头（同 .gtn-th）":
+            ("border-right: 1px solid var(--border)", rule(".fx-tbl th")),
+        "行高 36px（同 .gtn-td）":
+            ("height: 36px", rule(".fx-tbl td")),
+    }
+    missing = [k for k, (want, got) in checks.items() if want not in got]
+    assert not missing, f"汇率表与其余表格的共同视觉语言缺了：{missing}"
+    # 等宽数字走 tokens.css 的共享规则，不再各页自己加一个类
+    tokens = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "styles"
+              / "tokens.css").read_text(encoding="utf-8")
+    assert ".fx-tbl" in tokens.split("font-variant-numeric")[0].split("/* 金额必须等宽")[-1], \
+        "汇率表没被共享的 tabular-nums 规则覆盖到"
