@@ -140,11 +140,19 @@ def list_orders(
 
 
 @router.post("/ocr")
-async def ocr_order(file: UploadFile = File(...)):
+async def ocr_order(file: UploadFile = File(...), session: Session = Depends(get_session)):
     """识别订单详情截图，抽取快递公司/快递号/订单号/成交价供前端自动填表。"""
     from ..services.ocr import recognize_order
+    from .plugins import platform_provider
 
-    return await run_ocr(file, recognize_order)
+    fields = await run_ocr(file, recognize_order)
+    # 认出不是闲鱼时，顺带告诉前端「这台机器上有没有插件在管这个平台」。
+    # 判断放后端是因为答案取决于**用户装了什么、配了哪些账号**，前端无从得知；
+    # 而让前端去 GET /api/plugins 自己比对，就得在前端写一份平台↔插件的对应关系
+    # ——`test_frontend_does_not_hardcode_any_plugin_id` 正是不许这么做。
+    if fields.get("platform_warning"):
+        fields["platform_plugin"] = platform_provider(session, fields.get("platform") or "")
+    return fields
 
 
 @router.post("", response_model=OrderRead)

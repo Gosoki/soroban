@@ -112,12 +112,13 @@
 
 <script setup>
 import PageHeader from '@/components/PageHeader.vue'
-import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Camera, Loading, Upload } from '@element-plus/icons-vue'
 import { shipmentApi, ordersApi } from '@/api'
 import { checkImageSize } from '@/utils/imageGate'
+import { useWindowFileDrop } from '@/utils/windowFileDrop'
 import { handled } from '@/api/http'
 import { SHIPMENT_STATUS, longToast } from '@/constants'
 import { fmtJPY } from '@/utils/money'
@@ -250,9 +251,13 @@ const pkgUpload = ref(null)
 const pkgPending = ref(0)         // 队列中待处理 + 处理中的张数
 const pkgQueue = []
 let pkgRunning = false
-const dragActive = ref(false)     // 整窗有文件拖入：亮起各行投放区 + 顶部横幅
-let dragDepth = 0                 // dragenter/leave 会因子元素冒泡多次触发，用计数判断真正离开
-const dragOverId = ref(null)      // 正悬停其上的行 id
+// 整窗拖图走共享实现（见 utils/windowFileDrop.js：判据/preventDefault/注册/反注册
+// 是一整套，少一样就是静默故障——暂存页就漏过「注册」）。
+const { dragActive } = useWindowFileDrop(enqueuePkg)
+const dragOverId = ref(null)      // 正悬停其上的行 id（本页特有：每行一个投放区）
+// 拖拽一结束就清掉行内高亮。原先这一步写在 onWinDragLeave/onWinDrop 里，
+// 收进共享实现之后由这里接管——不清的话，松手后那一行会一直亮着。
+watch(dragActive, (on) => { if (!on) dragOverId.value = null })
 const bindingRowId = ref(null)    // **正在识别**内含快递的那一行 id（排队中的行见 isBinding）
 const rowFileInput = ref(null)
 let pickTargetRow = null          // 行内投放区「点击选图」的目标行
@@ -408,30 +413,6 @@ async function bindExpress(shipmentRow, file) {
   }
 }
 
-// --- 整窗拖拽（建单）。行内投放区的 drop 已 stopPropagation，不会冒泡到这里 ---
-function isFileDrag(e) {
-  return !!e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files')
-}
-function onWinDragEnter(e) {
-  if (!isFileDrag(e)) return          // 列头换序拖的是 text/plain，不会误触
-  e.preventDefault(); dragDepth++; dragActive.value = true
-}
-function onWinDragOver(e) {
-  if (!isFileDrag(e)) return
-  e.preventDefault()                  // 必须 preventDefault，否则不触发 drop
-  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
-}
-function onWinDragLeave(e) {
-  if (!isFileDrag(e)) return
-  dragDepth = Math.max(0, dragDepth - 1)
-  if (dragDepth === 0) { dragActive.value = false; dragOverId.value = null }
-}
-function onWinDrop(e) {
-  if (!isFileDrag(e)) return
-  e.preventDefault(); dragDepth = 0; dragActive.value = false; dragOverId.value = null
-  enqueuePkg(Array.from(e.dataTransfer.files || []))
-}
-
 async function detach(shipmentRow, tbRow) {
   try {
     const updated = await shipmentApi.detachOrder(shipmentRow.id, tbRow.id)
@@ -444,16 +425,6 @@ async function detach(shipmentRow, tbRow) {
 onMounted(() => {
   load()
   loadUnassigned()
-  window.addEventListener('dragenter', onWinDragEnter)
-  window.addEventListener('dragover', onWinDragOver)
-  window.addEventListener('dragleave', onWinDragLeave)
-  window.addEventListener('drop', onWinDrop)
-})
-onBeforeUnmount(() => {
-  window.removeEventListener('dragenter', onWinDragEnter)
-  window.removeEventListener('dragover', onWinDragOver)
-  window.removeEventListener('dragleave', onWinDragLeave)
-  window.removeEventListener('drop', onWinDrop)
 })
 </script>
 

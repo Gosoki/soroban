@@ -115,6 +115,13 @@ def list_staging(
     platform_account: Optional[str] = None,
     date_from: Optional[dt.date] = None,
     date_to: Optional[dt.date] = None,
+    order_no: Optional[str] = Query(
+        None, description="按订单号**精确**匹配（OCR 去重用，区别于模糊 q）。"
+             "与 routers/orders.py 上同名参数同一个用途：OCR 认出一张截图后要问"
+             "「这个单号是不是已经有了」，那必须是精确的一问一答——"
+             "走模糊 q 再在前端按等号过滤，会被 limit 截断（命中数超过一页时"
+             "真正那条排在后面就找不到），表现是**静默多建一条重复的暂存行**；"
+             "而且 q 走的是大小写不敏感的 ci_contains，与前端的 === 口径也对不上"),
     q: Optional[str] = Query(None, description="模糊搜：物品名/商品标题/订单号/快递号"),
     legacy_status: Optional[str] = Query(
         None, alias="status", include_in_schema=False,
@@ -138,6 +145,10 @@ def list_staging(
         conds.append(OrderStaging.order_date >= date_from)
     if date_to:
         conds.append(OrderStaging.order_date <= date_to)
+    if order_no:
+        # 精确：与写入端同一口径（schemas.norm_id 只去空格、不改大小写），
+        # 所以这里也用等值比较，不做归一。
+        conds.append(OrderStaging.order_no == order_no)
     if q:   # 统一模糊搜：物品名 / 商品标题 / 订单号 / 快递号（物品名用 EXISTS 子查询，不重复行）
         conds.append(
             ci_contains(OrderStaging.order_no, q, session)

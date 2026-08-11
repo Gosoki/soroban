@@ -33,14 +33,6 @@
         </el-tag>
       </template>
 
-      <template #toolbar-right>
-        <OcrButton ref="ocrUpload" :pending="ocrPending" @pick="onOcrPick">
-          点「OCR」选图，或把图<b>拖到页面任意位置</b>松手，都会识别并自动建单（支持一次多张）。
-          认得淘宝/京东/闲鱼的订单截图；识别到的下单日期、商品、金额、快递号会填进新行，
-          没认出来的格子留空等你补。
-          <br>拿错平台的截图（比如淘宝的）会提示改用爬虫插件，不会建出一张错单。
-        </OcrButton>
-      </template>
 
       <template #cell-shipment_order_id="{ row }">
         <el-select :model-value="row.shipment_order_id" filterable placeholder="未集运" class="ship-pick" popper-class="ship-pop"
@@ -92,36 +84,23 @@
     <el-pagination class="pager" layout="prev, pager, next, total" :total="total"
                    :page-size="pageSize" :current-page="page" @current-change="onPage" />
 
-    <!-- 整窗拖拽：把图片拖到浏览器任意位置即在中间浮出上传框，松手识别（支持多张）。
-       pointer-events:none 不拦截拖拽，drop 交给 window 监听统一处理，避免与工具栏重复触发。 -->
-    <Teleport to="body">
-    <div v-if="dragActive" class="ocr-overlay">
-      <div class="ocr-overlay-box">
-        <el-icon class="ocr-overlay-ic"><Camera /></el-icon>
-        <div class="ocr-overlay-title">松开鼠标，识别截图（OCR）</div>
-        <div class="ocr-overlay-sub">支持一次拖入多张 · 自动填单</div>
-      </div>
-    </div>
-    </Teleport>
   </div>
 </template>
 
 <script setup>
 import PageHeader from '@/components/PageHeader.vue'
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Camera, Check } from '@element-plus/icons-vue'
+import { Check } from '@element-plus/icons-vue'
 import { shipmentApi, ordersApi, tagsApi } from '@/api'
-import { checkImageSize } from '@/utils/imageGate'
 import { handled } from '@/api/http'
-import { ORDER_SOURCES, PRICE_HELP, PURCHASE_STATUS, SHIPMENT_STATUS, canAdvancePurchase, statusStyle, typeStyle } from '@/constants'
+import { ORDER_SOURCES, PRICE_HELP, PURCHASE_STATUS, SHIPMENT_STATUS, statusStyle, typeStyle } from '@/constants'
 import { fmtJPY } from '@/utils/money'
 import { applyRowUpdate, queueOrderWrite } from '@/utils/orderWrites'
 import { today } from '@/utils/datetime'
-import { afterCreate, afterDelete, sortByDateDesc } from '@/utils/listRows'
+import { afterCreate, afterDelete } from '@/utils/listRows'
 import NotionTable from '@/components/NotionTable.vue'
-import OcrButton from '@/components/OcrButton.vue'
 import OrderItemsEditor from '@/components/OrderItemsEditor.vue'
 
 
@@ -277,207 +256,6 @@ async function saveCell(row, key, value) {
 }
 
 // OCR 识别订单截图：抽取快递公司/快递号/订单号/成交价，识别到就新建一行并回填。
-// 后台并发：每张图各起一次请求、互不阻塞，识别中前端可继续拖入更多图；ocrPending 记在飞的张数。
-// 后台串行队列：拖入/选择的图片进队列，逐张识别。为何串行而非并发——
-// ① 后端 OCR 本就用锁串行，前端并发并不提速；② 浏览器每域名仅 ~6 个连接，一次性发出
-// 多个「慢 OCR」请求会占满连接、把随后的建单请求挤到超时 → 表现为「后续中断」。
-// 串行 + 每张独立 try/catch：单张失败或「订单号+来源」重复都只跳过该张，绝不打断后续。
-// 处理期间可继续拖入，新图追加到队列末尾。
-const ocrPending = ref(0)   // 队列中待处理 + 处理中的总张数（用于提示与状态）
-const ocrUpload = ref(null)
-const ocrQueue = []
-let ocrRunning = false
-const dragActive = ref(false)   // 整窗拖拽中：中间浮出上传框
-let dragDepth = 0               // dragenter/leave 会因子元素冒泡多次触发，用计数判断是否真正离开窗口
-
-function onOcrPick(uploadFile) { enqueueOcr(uploadFile?.raw ? [uploadFile.raw] : []) }   // el-upload 点选/多选
-
-function enqueueOcr(files) {
-  const imgs = files.filter((f) => f && (!f.type || f.type.startsWith('image/')))
-  const skipped = files.length - imgs.length
-  if (skipped) ElMessage.warning(`已跳过 ${skipped} 个非图片文件`)   // 拖拽不受 accept 约束
-  if (!imgs.length) return
-  ocrQueue.push(...imgs)
-  ocrPending.value += imgs.length
-  pumpOcr()
-}
-
-async function pumpOcr() {
-  if (ocrRunning) return          // 已有 worker 在跑；新入队的图会被同一循环取走
-  ocrRunning = true
-  try {
-    while (ocrQueue.length) {
-      const file = ocrQueue.shift()
-      try {
-        await processOcr(file)    // 单张：识别 → 建行；内部已吞错，任何失败都不中断队列
-      } finally {
-        ocrPending.value--
-      }
-    }
-  } finally {
-    ocrRunning = false
-    ocrUpload.value?.clearFiles?.()   // 队列排空后清 el-upload 内部列表，便于重复选同一张图
-  }
-}
-
-async function processOcr(file) {
-  // 分辨率超上限的在本机就拦下来：后端是硬拒绝（400），
-  // 传上去只是让用户在慢网络上白等一趟。判据与后端逐字节相同。
-  const tooBig = await checkImageSize(file)
-  if (tooBig) { ElMessage.warning(tooBig); return }
-  try {
-    const res = await ordersApi.ocr(file)
-    if (res.reject_reason) {   // 拿错平台截图（淘宝/京东）→ 提示改用爬虫，不建单
-      ElMessage.warning(`「${file.name}」${res.reject_reason}`)
-      return
-    }
-    const data = {}
-    if (res.order_date) data.date = res.order_date          // 下单时间 → 下单日期
-    if (res.platform) data.platform = res.platform
-    if (res.product) data.title = res.product               // 商品名称 →「商品」列(title)
-    if (res.express_company) data.express_company = res.express_company
-    if (res.express_no) data.express_no = res.express_no
-    if (res.order_no) data.order_no = res.order_no
-    if (res.price_cny != null && res.price_cny !== '') data.price_cny = res.price_cny
-    if (res.purchase_status) data.purchase_status = res.purchase_status                // 有快递单号→待收货，否则待发货
-    // status/platform 恒有值，故按「实质字段」判断是否真识别到内容
-    const recognized = res.order_no || res.express_no || res.order_date || res.product ||
-      (res.price_cny != null && res.price_cny !== '')
-    if (!recognized) {
-      ElMessage.warning(`未能从「${file.name}」识别到快递/订单信息，请手动填写`)
-      return
-    }
-    // 通过订单号匹配已存在订单：命中→更新（回填下单时间、补齐缺失字段），否则新建。
-    // 支持「同一单先后拍多张截图（物流页/详情页）」逐步补全同一行，而非重复建行。
-    if (data.order_no) {
-      const existing = await findByOrderNo(data.order_no)
-      if (existing) { await mergeByOrderNo(existing, data); return }
-    }
-    const created = await addRow(data)
-    if (!created) return   // 新建失败（如订单号+来源重复），addRow 已给提示，不再报成功
-    ElMessage.success(`已识别并新建订单 · ${ocrSummary(data)}`)
-  } catch (_) {
-    // 依赖未装(503)/图片错误(400)/超时 等由 http 拦截器统一提示；不抛出，避免中断队列
-  }
-}
-
-// 按订单号精确查已存在订单（用后端精确 order_no 参数，不用模糊 q——否则子串命中多、真身可能被 limit 截掉致漏判重复建单）
-async function findByOrderNo(orderNo) {
-  try {
-    const res = await ordersApi.list({ order_no: orderNo, limit: 1 })
-    return res.items[0] || null
-  } catch (_) { return null }
-}
-
-// 国内段生命周期序：只准前进（待付款→待发货→待收货→已签收），不回退；国际段由集运单表达。
-// 状态推进规则已收进 constants.js（canAdvancePurchase）：前后端各存一份必然漂移，
-// 上一轮「OCR 把退款单抹成待发货、看板金额凭空变大」的根因就是两份规则不一致。
-
-// 这单还「没有真实价格」吗？= 物品全是系统占位(auto) 且合计为 0。
-// 只有这种单才允许 OCR 回填成交价；用户手填过任一单价的单绝不覆盖。
-function hasNoRealPrice(base) {
-  const items = base.items || []
-  if (!items.length) return true
-  if (!items.every((it) => it.auto)) return false
-  const sum = items.reduce((s, it) => s + Number(it.unit_price_cny || 0) * (Number(it.quantity) || 1), 0)
-  return sum === 0 && Number(base.postage_cny || 0) === 0
-}
-
-// 命中同订单号：下单时间总回填；状态仅「推进」时更新（如补上快递单号→待收货）；
-// 其余字段仅在原值为空时补齐（对 base 版本重算，不覆盖已有数据）。
-function buildMergePatch(base, data) {
-  const patch = { version: base.version }
-  if (data.date) patch.date = data.date
-  if (canAdvancePurchase(base.purchase_status, data.purchase_status)) patch.purchase_status = data.purchase_status
-  for (const k of ['platform', 'title', 'express_company', 'express_no']) {
-    const cur = base[k]
-    if (data[k] != null && data[k] !== '' && (cur == null || cur === '')) patch[k] = data[k]
-  }
-  // 成交价要单独处理：price_cny 是**派生列**（= Σ单价×数量 + 邮费），单发它后端会直接忽略
-  // ——曾经就是这么写的，结果 OCR 补价永远落不进去，界面却报「已更新」。改价必须走物品：
-  // 把成交价当「种子价」连同一份**都不带单价**的物品一起发过去，由后端 build_items 用与
-  // 新建单同一套规则折成单价（种子价 → 第一条物品的单价）。
-  if (data.price_cny != null && data.price_cny !== '' && hasNoRealPrice(base)) {
-    patch.price_cny = data.price_cny
-    patch.items = (base.items || []).length
-      ? base.items.map((it) => ({ name: it.name, quantity: it.quantity, unit_price_cny: null, auto: true }))
-      : [{ name: patch.title || base.title || '未命名物品', quantity: 1, unit_price_cny: null, auto: true }]
-  }
-  return patch
-}
-
-async function mergeByOrderNo(existing, data) {
-  let base = existing
-  let patch = buildMergePatch(base, data)
-  if (Object.keys(patch).length <= 1) {   // 只有 version → 无新增信息
-    ElMessage.info(`订单号 ${data.order_no} 已存在，无新增信息`)
-    return
-  }
-  // 若这单正被用户在别处编辑而 version 变了，OCR 补的字段不该直接丢：拉最新版本、按新状态重算 patch，再试一次。
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      // 必须进 queueOrderWrite：本页所有对同一订单的写都排在一条链上（见 utils/orderWrites.js）。
-      // OCR 队列是后台跑的，用户很可能正在展开面板里改物品；不排队的话两边各读一份 version、
-      // 谁先落地谁赢——本函数自己有重试所以受损的总是**用户那笔**，正是那条串行链要消灭的场景。
-      const updated = await queueOrderWrite(base.id, () => ordersApi.update(base.id, patch))
-      const idx = rows.value.findIndex((r) => r.id === base.id)   // 在当前页则就地刷新
-      // 本次**送了** items（buildMergePatch 把 OCR 成交价当种子价一起发），后端已按它整体
-      // 重建物品并把成交价折进第一条的单价 → 响应才是真相，必须整体采纳。
-      // 照抄 saveCell 的「排除 items」会让页面停在合并前的「单价 0」，随后任何一次物品编辑
-      // 都会把这份陈旧数组 PATCH 回去，刚补进去的钱就没了。
-      if (idx >= 0) { applyRowUpdate(rows.value[idx], patch, updated); sortByDateDesc(rows.value) }
-      ElMessage.success(`已按订单号匹配更新 · 订单号 ${data.order_no}${patch.date ? ' · 下单时间 ' + patch.date : ''}`)
-      return
-    } catch (e) {
-      if (e.response?.status !== 409) return   // 非冲突：拦截器已提示
-      handled(e)   // 409 是本循环的正常分支：重试，不该再弹提示
-      const fresh = await findByOrderNo(data.order_no)
-      if (!fresh) break
-      base = fresh
-      patch = buildMergePatch(base, data)
-      if (Object.keys(patch).length <= 1) return   // 并发编辑已把这些字段补齐，无需再改
-    }
-  }
-  ElMessage.warning('数据已变，已刷新'); load()   // 两次仍冲突：兜底整表刷新
-}
-
-function ocrSummary(data) {
-  const parts = []
-  if (data.date) parts.push(`下单 ${data.date}`)
-  if (data.purchase_status) parts.push(`状态 ${data.purchase_status}`)
-  if (data.platform) parts.push(`来源 ${data.platform}`)
-  if (data.title) parts.push(`商品 ${data.title}`)
-  if (data.express_company) parts.push(`快递 ${data.express_company}`)
-  if (data.express_no) parts.push(`快递号 ${data.express_no}`)
-  if (data.order_no) parts.push(`订单号 ${data.order_no}`)
-  if (data.price_cny) parts.push(`成交价 ¥${data.price_cny}`)
-  return parts.join(' · ')
-}
-
-// —— 整窗拖拽上传：拖图进浏览器任意位置 → 中间浮出上传框，松手识别 ——
-function isFileDrag(e) {
-  return !!e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files')
-}
-function onWinDragEnter(e) {
-  if (!isFileDrag(e)) return
-  e.preventDefault(); dragDepth++; dragActive.value = true
-}
-function onWinDragOver(e) {
-  if (!isFileDrag(e)) return
-  e.preventDefault()                       // 必须 preventDefault，否则不触发 drop
-  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
-}
-function onWinDragLeave(e) {
-  if (!isFileDrag(e)) return
-  dragDepth = Math.max(0, dragDepth - 1)
-  if (dragDepth === 0) dragActive.value = false
-}
-function onWinDrop(e) {
-  if (!isFileDrag(e)) return
-  e.preventDefault(); dragDepth = 0; dragActive.value = false
-  enqueueOcr(Array.from(e.dataTransfer.files || []))   // 多张入队，后台逐张识别
-}
-
 async function addRow(data = {}, done) {
   try {
     // status 不写死：后端 OrderBase 默认「待发货」，避免枚举改名后前端残留非法值（曾用'已付'→422）
@@ -542,36 +320,13 @@ function clearFocus() { router.replace({ path: '/orders', query: {} }) }
 onMounted(() => {
   loadShipment()
   loadAccounts()
-  window.addEventListener('dragenter', onWinDragEnter)
-  window.addEventListener('dragover', onWinDragOver)
-  window.addEventListener('dragleave', onWinDragLeave)
-  window.addEventListener('drop', onWinDrop)
-})
-onBeforeUnmount(() => {
-  window.removeEventListener('dragenter', onWinDragEnter)
-  window.removeEventListener('dragover', onWinDragOver)
-  window.removeEventListener('dragleave', onWinDragLeave)
-  window.removeEventListener('drop', onWinDrop)
 })
 </script>
 
 <style scoped>
 /* OCR 上传：工具栏里的点选按钮（拖拽走整窗覆盖层，这里只负责点击选图）。 */
 
-/* 整窗拖拽覆盖层：居中的上传提示框，不拦截拖拽事件 */
-.ocr-overlay {
-  position: fixed; inset: 0; z-index: 9000; pointer-events: none;
-  display: flex; align-items: center; justify-content: center;
-  background: rgba(6, 12, 24, 0.72);
-}
-.ocr-overlay-box {
-  width: min(460px, 76vw); padding: 40px 32px; text-align: center;
-  border: 2px dashed var(--brand); border-radius: 16px;
-  background: rgba(16, 25, 44, 0.92); box-shadow: 0 12px 48px rgba(0, 0, 0, 0.5);
-}
-.ocr-overlay-ic { font-size: 44px; color: #6ea8ff; margin-bottom: 12px; }
-.ocr-overlay-title { font-size: 18px; font-weight: 600; color: #eaf1ff; }
-.ocr-overlay-sub { margin-top: 6px; font-size: 13px; color: #8a9ab8; }
+
 .focus-chip { font-weight: 500; }
 .focus-empty { color: var(--txt-2); font-size: 13px; padding: 16px; text-align: center; }
 .auto-txt { color: var(--txt-3); font-style: italic; }   /* 列表「物品」格：自动生成(名=标题)时灰显 */

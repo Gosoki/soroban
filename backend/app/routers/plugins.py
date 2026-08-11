@@ -1632,6 +1632,33 @@ async def scheduler_loop(interval: int = 60) -> None:
         await asyncio.sleep(interval)
 
 
+def platform_provider(session: Session, platform: str) -> str:
+    """这个来源平台（「淘宝」「京东」…）有没有插件在管。返回插件名，没有则空串。
+
+    判据是**插件自己配的账号上写的 platform**，不是插件 id——核心不认识任何具体插件
+    （`test_core_does_not_hardcode_any_plugin_id` 钉着这条）。
+    账号的平台是用户在插件页添加账号时选的，本来就是「这个号抓的是哪个平台」。
+
+    用途：OCR 认出截图不是闲鱼时，据此把提示写准。
+    「淘宝的截图，而你**已经装了**淘宝插件（更准、字段更全），确定还要 OCR 建单吗」
+    和「淘宝的截图，没有对应插件，OCR 是你唯一的路」——这两句话该说哪一句，
+    取决于这台机器上的实际情况，不能写死。
+    """
+    if not platform:
+        return ""
+    try:
+        for m in discover():
+            cfg = session.get(PluginConfig, m["_m"].id)
+            if not (cfg and cfg.enabled):
+                continue
+            for a in _account_list(cfg):
+                if a.get("enabled") and str(a.get("platform", "")).strip() == platform:
+                    return m["_m"].name
+    except Exception:                                   # noqa: BLE001  探测失败不该让 OCR 挂掉
+        pass
+    return ""
+
+
 def _bundled_plugin_root() -> Optional[Path]:
     """打进 exe 里的那份插件源码（只有冻结态才有）。"""
     base = getattr(sys, "_MEIPASS", None)

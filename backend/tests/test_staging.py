@@ -215,3 +215,37 @@ def test_tracking_number_written_after_import_reaches_the_ledger(client, mk):
         "补的快递号没写进账本——集运截图永远匹配不到这张单"
     # 暂存页读到的也该是账本那一份（_overlay），否则插件下一轮会以为还是空的、反复推
     assert _fetch(client, row["id"])["express_no"] == "773435263240616"
+
+
+def test_exact_order_no_lookup_is_not_the_fuzzy_search(client, mk):
+    """暂存列表要有**精确**的 order_no 参数，不能让调用方拿模糊 q 凑合。
+
+    OCR 认出一张截图后要问「这个单号是不是已经有了」——那必须是精确的一问一答。
+    走 `q` 再在前端按 `===` 过滤有两个静默的坑：
+      · q 是跨 订单号/标题/快递号/物品名 的模糊搜，命中数超过一页时真正那条排在后面
+        → 「没找到」→ 静默多建一条重复的暂存行（要等到点导入才撞唯一约束）；
+      · q 走 ci_contains（大小写不敏感），与前端的 `===` 口径对不上。
+    """
+    a = mk("/api/staging", {"order_date": "2026-03-01", "order_no": "EXACT-777", "title": "甲"})
+    mk("/api/staging", {"order_date": "2026-03-01", "order_no": "EXACT-7770", "title": "乙"})
+    # 再造一条**标题里含该单号**的：模糊搜会把它也捞出来，精确查不该
+    mk("/api/staging", {"order_date": "2026-03-01", "order_no": "OTHER-1", "title": "备注 EXACT-777"})
+
+    got = client.get("/api/staging", params={"order_no": "EXACT-777"}).json()
+    assert got["total"] == 1, f"精确查订单号却命中 {got['total']} 条"
+    assert got["items"][0]["id"] == a["id"]
+
+    fuzzy = client.get("/api/staging", params={"q": "EXACT-777"}).json()
+    assert fuzzy["total"] >= 3, "用例前提不成立：模糊搜应当把那三条都捞出来"
+
+
+def test_frontend_dedups_against_staging_with_the_exact_param():
+    """前端查重必须用精确参数。用 q 的话上面那两个坑就都回来了。"""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "views" / "Staging"
+           / "index.vue").read_text(encoding="utf-8")
+    fn = src[src.index("async function findStagingByOrderNo"):]
+    fn = fn[:fn.index("\n}")]
+    assert "order_no: orderNo" in fn, "暂存查重没走精确参数"
+    assert "q: orderNo" not in fn, "又用回模糊搜了——命中超过一页时会静默建重复行"

@@ -301,8 +301,8 @@ def test_platform_markers_dont_collide_with_couriers():
     """平台强标记不许与快递公司名相交。
 
     裸「京东」曾同时是 COMPANY_MAP 的键（→ 京东物流）和 `_JD_MARKERS` 的成员：闲鱼卖家用
-    京东快递发货时，同一次识别会既给出 express_company='京东物流'、又给出
-    reject_reason='疑似京东订单截图'，前端据此不建单——两个结论直接打架。
+    京东快递发货时，同一次识别会既给出 express_company='京东物流'、又判成「京东的截图」
+    ——两个结论直接打架，而用户会被问一句莫名其妙的「这好像不是闲鱼的截图」。
     """
     couriers = set(ocr.COMPANY_MAP) | set(ocr.COMPANY_MAP.values())
     # 方向很重要：会出事的是「标记是某个快递公司名的子串」——那样截图里只要提到该快递，
@@ -372,7 +372,7 @@ def _stub_recognize(monkeypatch, texts):
     monkeypatch.setattr(m, "_truck_present", lambda arr: False)
 
 
-def test_recognize_order_rejects_other_platform_without_crashing(monkeypatch):
+def test_recognize_order_warns_on_other_platform_without_crashing(monkeypatch):
     """含京东/淘宝强标记的截图走「拒识」分支——这条分支要用解码后的数组跑卡车模板匹配。
 
     抽 `_decode_image` 出来时把局部变量 `arr` 一并消掉过，于是 60 行之外那句
@@ -382,15 +382,20 @@ def test_recognize_order_rejects_other_platform_without_crashing(monkeypatch):
     """
     _stub_recognize(monkeypatch, ["京东自营 官方旗舰店", "订单编号 1234567890123456"])
     f = ocr.recognize_order(b"fake")
-    assert f["platform"] is None
-    assert "京东" in f["reject_reason"]
+    # 从「拒识」改成了「警示」：平台如实标出来（不再置空），结果照常给，
+    # 只是附一句提醒，由前端问一次「确定继续吗」。
+    # 置空 platform 的老做法有个副作用：用户确认继续之后建出来的是一张**没有来源**的单，
+    # 而我们明明认出来了。
+    assert f["platform"] == "京东"
+    assert "京东" in f["platform_warning"]
+    assert f["order_no"] == "1234567890123456", "警示归警示，字段该解析的还得解析出来"
 
 
 def test_recognize_order_accepts_xianyu(monkeypatch):
-    """反面：闲鱼截图正常识别，不该被拒。"""
+    """反面：闲鱼截图不该带任何警示（否则每张图都要确认一次，等于把功能废了）。"""
     _stub_recognize(monkeypatch, ["闲鱼", "订单编号 1234567890123456", "成交价 ¥88.00"])
     f = ocr.recognize_order(b"fake")
-    assert f["platform"] == "闲鱼" and f["reject_reason"] is None
+    assert f["platform"] == "闲鱼" and f["platform_warning"] is None
     assert f["order_no"] == "1234567890123456"
 
 
@@ -405,3 +410,118 @@ def test_recognize_order_passes_the_decoded_array_to_the_truck_matcher(monkeypat
     monkeypatch.setattr(m, "_truck_present", lambda arr: (seen.append(arr), False)[1])
     ocr.recognize_order(b"fake")
     assert seen == ["DECODED"], f"_truck_present 收到的不是解码结果：{seen}"
+
+
+# --- 拿错平台：提醒而不是拒收 ----------------------------------------------------
+
+def test_ocr_endpoint_tells_the_frontend_whether_a_plugin_covers_that_platform(
+        client, monkeypatch):
+    """认出不是闲鱼时，端点要顺带回答「这台机器上有没有插件在管这个平台」。
+
+    提示词分两种——「已经装了淘宝插件，用它更准，仍要 OCR 吗」与
+    「没有插件在管，OCR 是唯一的路」——该说哪一句取决于用户装了什么、配了哪些账号。
+    这件事**只有后端知道**；让前端自己去比对就得在前端写一份平台↔插件的对应关系，
+    而 `test_frontend_does_not_hardcode_any_plugin_id` 正是不许那么做。
+    """
+    from app.routers import orders as mod
+
+    async def fake_ocr(file, recognizer):
+        return {"platform": "淘宝", "platform_warning": "这看起来是淘宝的截图…",
+                "order_no": "TB-1"}
+
+    monkeypatch.setattr(mod, "run_ocr", fake_ocr)
+    got = client.post("/api/orders/ocr",
+                      files={"file": ("x.png", b"\x89PNG", "image/png")}).json()
+    assert got["platform"] == "淘宝", "平台被置空了——确认继续后会建出一张没有来源的单"
+    assert "platform_plugin" in got, "没告诉前端有没有插件在管，提示词只能靠猜"
+
+
+def test_platform_provider_reads_account_platforms_not_plugin_ids(session, monkeypatch):
+    """「谁在管这个平台」的判据是**账号上配的 platform**，不是插件 id。
+
+    核心不认识任何具体插件（test_core_does_not_hardcode_any_plugin_id 钉着这条）；
+    账号的平台本来就是用户添加账号时选的「这个号抓的是哪个平台」。
+    """
+    import json
+
+    from app.models import PluginConfig
+    from app.routers import plugins as mod
+
+    fake = {"_m": type("M", (), {"id": "demo", "name": "演示插件"})(), "_dir": None}
+    monkeypatch.setattr(mod, "discover", lambda: [fake])
+
+    # 账号存在 params_json 的 `accounts` 键里（不是单独一列）——
+    # 这一点写错的话，platform_provider 恒返回空串，而它是**沉默**的：
+    # 提示词会永远走「没有插件在管」那一支，用户装没装插件都一样。
+    cfg = PluginConfig(plugin_id="demo", enabled=True, params_json=json.dumps(
+        {"accounts": [{"name": "a", "platform": "淘宝", "enabled": True}]}))
+    session.add(cfg)
+    session.commit()
+    try:
+        assert mod.platform_provider(session, "淘宝") == "演示插件"
+        assert mod.platform_provider(session, "京东") == "", "不该给一个没人管的平台报插件名"
+        assert mod.platform_provider(session, "") == ""
+        # 插件停用了就不算「有人在管」——停用状态下它一次都不会跑
+        cfg.enabled = False
+        session.add(cfg)
+        session.commit()
+        assert mod.platform_provider(session, "淘宝") == "", "插件已停用却仍报它在管这个平台"
+    finally:
+        session.delete(session.get(PluginConfig, "demo"))
+        session.commit()
+
+
+@pytest.mark.parametrize("tokens,want_platform,want_warn", [
+    # ① 明确认出别的平台
+    (["京东自营 官方旗舰店", "订单编号 1234567890123456"], "京东", True),
+    # ② 有闲鱼线索 → 闲鱼，不警示
+    (["闲鱼", "订单编号 1234567890123456"], "闲鱼", False),
+    # ③ 两边证据都没有 → **承认不知道**，platform 留空
+    (["订单编号 1234567890123456", "签收时间 2026-03-01"], None, True),
+])
+def test_platform_has_three_outcomes_including_dont_know(
+        monkeypatch, tokens, want_platform, want_warn):
+    """平台判别有**三个**出口，不是两个。
+
+    原先只有「别的平台」和「闲鱼」：没有任何证据时无条件写死 platform="闲鱼"。
+    于是一张淘宝截图只要没出现 京豆/白条/天猫/旺旺/官方旗舰店 这几个词，
+    就会被**信誓旦旦地**标成闲鱼——用户在列表里看到「闲鱼」，没有任何理由去怀疑。
+    而来源是要进账本的，还参与订单唯一键（order_no + COALESCE(platform,'')）：
+    标错来源意味着将来插件抓回同一笔单会新建一行，同一笔交易变成两条。
+
+    「猜错了还一脸笃定」比「说不知道」贵得多——后者用户点一下就改了，
+    而留空是被支持的状态（唯一索引走 COALESCE，同订单号照样去重）。
+    """
+    _stub_recognize(monkeypatch, tokens)
+    f = ocr.recognize_order(b"fake")
+    assert f["platform"] == want_platform
+    assert bool(f["platform_warning"]) is want_warn
+    # 无论哪一支，字段该解析的都得解析出来——警示归警示，不是拒识
+    assert f["order_no"] == "1234567890123456"
+
+
+def test_ocr_writes_to_staging_not_straight_into_the_ledger():
+    """OCR 的识别结果必须先落**暂存**，不许直接写账本。
+
+    这是这套东西里唯一一条能一句话说完的规则：**机器认的一律先落暂存，人点导入才进账本。**
+    插件那边早就是这样了（权限里刻意不给 staging:promote，就是为了让卡片上
+    「插件只管抓取，抓到的单必须经人工确认才进账本」这句话是真的）；
+    而 OCR 是两个生产者里**更不可靠**的那个——来源会标错、非闲鱼版式上成交价和商品名
+    直接认不出来——却曾经绕过这道关卡直接写正式账本。
+
+    那条「拿错平台要不要继续」的确认框也随之取消了：整张暂存表就是复核界面，
+    在那儿改比在弹窗里选自然得多。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src" / "views"
+    staging = (root / "Staging" / "index.vue").read_text(encoding="utf-8")
+    orders = (root / "Orders" / "index.vue").read_text(encoding="utf-8")
+
+    assert "ordersApi.ocr(" in staging, "暂存页没有 OCR 入口"
+    assert "stagingApi.create" in staging or "addRow(" in staging, "暂存页的 OCR 没有写入口"
+    # 订单页不许再有任何 OCR 通路
+    for gone in ("OcrButton", "ordersApi.ocr(", "processOcr", "enqueueOcr"):
+        assert gone not in orders, f"订单页还留着 OCR 通路：{gone}（识别结果应当先落暂存）"
+    # 暂存页的落点必须是暂存，不能是账本
+    assert "ordersApi.create" not in staging, "暂存页的 OCR 直接建了账本单，绕过了人工确认"

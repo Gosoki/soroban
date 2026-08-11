@@ -51,7 +51,7 @@ _XIANYU_CUES = ("蚂蚁森林能量", "开箱视频", "担保账户", "担保交
 # 其页面也可能出现「淘宝」字样，用宽泛词会误伤闲鱼截图。
 # 同理**必须与 COMPANY_MAP 的快递公司名互不相交**：裸「京东」既是快递公司（京东物流）
 # 又当平台标记时，「闲鱼卖家用京东快递发货」的截图会被同一次识别既解析出
-# express_company='京东物流'、又打上 reject_reason='疑似京东订单截图'，前端据此不建单。
+# express_company='京东物流'、又打上「疑似京东订单截图」的警示——同一次识别两个结论打架。
 # 「自营」同样太宽（「原厂自营」之类的商品描述会命中），收紧成「京东自营」。
 # 这条不相交性由 test_platform_markers_dont_collide_with_couriers 守着。
 _JD_MARKERS = ("京东自营", "京东超市", "京豆", "白条", "PLUS会员", "京享值")
@@ -550,10 +550,16 @@ def _run_engine(engine, arr):
 
 
 def _stamp_platform(fields: dict, full_text: str, arr) -> None:
-    """判「是不是拿错了截图」，写进 `fields` 的 platform / reject_reason。
+    """判「这张截图是哪个平台的」，写进 `fields` 的 platform / platform_warning。
 
-    OCR 只产出闲鱼数据：来源恒为「闲鱼」。仅当截图有明确淘宝/京东强标记、且无任何闲鱼信号
-    （文案线索或卡通卡车）时，判为拿错截图 → 拒识并提示改用爬虫（reject_reason 非空）。
+    OCR 的解析规则是照闲鱼的版式写的，所以来源缺省判「闲鱼」。仅当截图有明确淘宝/京东
+    强标记、且无任何闲鱼信号（文案线索或卡通卡车）时，判为**不是闲鱼**。
+
+    ⚠️ 这一支从「拒识」改成了「**警示**」：以前置空 platform 并回一个 reject_reason，
+    前端据此**不建单**。但那等于替用户做了决定——他可能就是想手工补一张淘宝的单
+    （插件没装、或那一单插件抓不到）。现在照常给出识别结果、并把平台如实标成淘宝/京东，
+    只是附一句 `platform_warning`，由前端问一句「确定继续吗」。
+    字段名也跟着改了：`reject_reason` 是「我拒绝了」，而现在没有拒绝任何东西。
 
     **`arr`（解码后的图像）是显式参数，这一点是刻意的。**
     它原先是调用方的一个局部变量，被这段代码隔着几十行引用；
@@ -561,18 +567,36 @@ def _stamp_platform(fields: dict, full_text: str, arr) -> None:
     而它只在冷分支（含京东/淘宝标记的截图）触发，闲鱼截图一切正常，本地试不出来。
     做成参数之后，同样的疏忽会在**调用点**变成 TypeError，立刻炸、人人可见。
 
-    ⚠️ **不要**把 `_is_xianyu(...) or _truck_present(arr)` 提成变量提前算——
-    这里最初就是短路写法，是一次「改成拒识语义」的重构顺手提成变量才把短路弄丢的。
-    卡车是全图 8 尺度 matchTemplate，一张 1080×2400 就是 1 秒量级、长截图更久，
-    而绝大多数闲鱼截图 `other` 为 None，这笔钱纯属白付。短路必须留在分支里。
+    ⚠️ **卡通卡车匹配很贵，短路必须留着。** `_truck_present` 是全图 8 尺度 matchTemplate，
+    一张 1080×2400 就是 1 秒量级、长截图更久。所以每一支里都必须先问便宜的文案线索
+    （`_is_xianyu`），只有它答不上来才去看图。这里最初就是短路写法，
+    是一次「改成拒识语义」的重构顺手提成变量才把短路弄丢的——别再提。
     """
     other = _detect_other_platform(full_text)
-    if other and not (_is_xianyu(full_text) or _truck_present(arr)):
-        fields["platform"] = None
-        fields["reject_reason"] = f"疑似{other}订单截图；OCR 仅支持闲鱼，淘宝/京东请用爬虫抓取"
+    if other:
+        # 有别的平台的强标记：除非同时有闲鱼信号（闲鱼卖家发京东快递之类），否则就是它。
+        if _is_xianyu(full_text) or _truck_present(arr):
+            fields["platform"], fields["platform_warning"] = "闲鱼", None
+        else:
+            fields["platform"] = other
+            fields["platform_warning"] = (
+                f"这看起来是{other}的截图，而 OCR 的解析规则是照闲鱼的版式写的，"
+                f"金额/单号可能认错或认不全")
+        return
+
+    # 没有任何别的平台标记。**这里不再无条件判「闲鱼」。**
+    #
+    # 原先这一支直接写死 platform="闲鱼"：于是一张淘宝截图只要没出现
+    # 京豆/白条/天猫/旺旺/官方旗舰店 这几个词，就会被**信誓旦旦地**标成闲鱼——
+    # 用户在列表里看到「闲鱼」，没有任何理由去怀疑它，而来源是要进账本的。
+    # 「猜错了还一脸笃定」比「说不知道」贵得多：后者用户点一下就改了。
+    if _is_xianyu(full_text) or _truck_present(arr):
+        fields["platform"], fields["platform_warning"] = "闲鱼", None
     else:
-        fields["platform"] = "闲鱼"
-        fields["reject_reason"] = None
+        # 两边都没有证据 → 留空，由用户来定。空来源是**被支持的状态**：
+        # 唯一索引走 COALESCE(platform,'')，同订单号照样去重（见 models/order/order.py）。
+        fields["platform"] = None
+        fields["platform_warning"] = "认不出这是哪个平台的截图（没有闲鱼、也没有淘宝/京东的特征）"
 
 
 def recognize_order(image_bytes: bytes) -> dict:

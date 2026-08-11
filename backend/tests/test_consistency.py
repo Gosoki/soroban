@@ -155,10 +155,13 @@ def test_can_advance_only_moves_forward():
 
 def test_frontend_merge_uses_the_same_terminal_rule():
     """前端 OCR 合并有自己一份 rank（跨语言没法直接共用）。至少钉住：
-    它必须有终态保护、且不能再退回到「只比 rank」。"""
-    src = (_REPO / "frontend" / "src" / "views" / "Orders" / "index.vue").read_text(encoding="utf-8")
+    它必须有终态保护、且不能再退回到「只比 rank」。
+
+    合并现在发生在**暂存页**：OCR 认出的单先落暂存，同订单号只补空格；
+    状态那一格同样只许往前推，不许把「已签收」退回「待发货」。"""
+    src = (_REPO / "frontend" / "src" / "views" / "Staging" / "index.vue").read_text(encoding="utf-8")
     assert "canAdvancePurchase" in src, "前端合并没有走终态保护"
-    assert "canAdvancePurchase(base.purchase_status, data.purchase_status)" in src, \
+    assert "canAdvancePurchase(row.purchase_status, data.purchase_status)" in src, \
         "合并判定没走 canAdvancePurchase"
     # 不再断言「某串不存在」：改名之后那类否定断言会恒真（假绿）。
     # 真正的保护是行为级的 test_ocr_merge_never_downgrades_terminal_status。
@@ -578,8 +581,10 @@ def test_frontend_pre_checks_image_size_on_every_ocr_upload():
     assert str(MAX_OCR_PIXELS).replace("000000", "_000_000") in gate or \
         f"{MAX_OCR_PIXELS:,}".replace(",", "_") in gate, "前端上限与后端对不上"
 
+    # OCR 入口在**暂存页**与集运页（订单页已经没有了：识别结果先落暂存，
+    # 与爬虫抓回来的走同一条路，人点「导入」才进账本）。
     uploads = {
-        "views/Orders/index.vue": "ordersApi.ocr(",
+        "views/Staging/index.vue": "ordersApi.ocr(",
         "views/Shipment/index.vue": "shipmentApi.ocr(",
     }
     for rel, call in uploads.items():
@@ -938,7 +943,7 @@ def test_ocr_entry_is_shared_and_right_aligned():
     assert "label:" not in comp.read_text(encoding="utf-8"), \
         "正文又做成了 prop——两页迟早会写成两句"
 
-    for name in ("Orders", "Shipment"):
+    for name in ("Staging", "Shipment"):
         src = (root / "views" / name / "index.vue").read_text(encoding="utf-8")
         assert "ocr-drop" not in src, f"{name} 又自己写了一份投放区（应当只在组件里）"
         assert "<OcrButton" in _toolbar(src, "toolbar-right"), \
@@ -968,3 +973,90 @@ def test_toolbar_control_heights_are_overridden_in_all_three_places():
         ("按钮", ".el-button) { height: var(--el-component-size-small)"),
     ):
         assert need in style, f"筛选栏高度少了「{what}」那条：{need}"
+
+
+def test_window_file_drop_is_shared_not_copied_per_page():
+    """整窗拖图必须走共享实现，不许各页自己抄一份。
+
+    这套东西有五个必须同时存在的部分：判据 `isFileDrag`、四个处理函数、
+    `dragover` 里的 preventDefault、onMounted 注册、onBeforeUnmount 反注册。
+    少任何一个都是**静默**故障，其中「漏注册」最贵——浏览器按默认行为把当前页
+    **导航到那张图片**，整个 SPA 被顶掉，页面上没保存的编辑全丢，全程零报错。
+
+    这一条是踩出来的：OCR 从订单页搬到暂存页时，四个函数搬了、注册与反注册没跟着搬，
+    而 OcrButton 的说明里还写着「把图拖到页面任意位置松手」——提示是真的，功能是假的。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    shared = root / "utils" / "windowFileDrop.js"
+    assert shared.is_file(), "没有共享的整窗拖拽实现"
+    js = shared.read_text(encoding="utf-8")
+    for need in ("addEventListener", "removeEventListener", "preventDefault", "'Files'"):
+        assert need in js, f"共享实现缺了 {need}"
+
+    users = []
+    for f in sorted(root.rglob("*.vue")):
+        src = f.read_text(encoding="utf-8")
+        if "useWindowFileDrop" in src:
+            users.append(f.parent.name)
+        # 谁也不许再自己写一套
+        assert "function isFileDrag" not in src, \
+            f"{f.parent.name} 又自己抄了一份整窗拖拽——五个部分漏一个就是静默故障"
+        assert "window.addEventListener('drop'" not in src, \
+            f"{f.parent.name} 直接挂了 window drop 监听，绕过了共享实现"
+    assert set(users) >= {"Staging", "Shipment"}, f"用它的页面只有 {users}"
+
+
+def test_ocr_surfaces_the_platform_warning_the_backend_computed():
+    """后端算出来的「这不是闲鱼版式」必须在界面上说出来。
+
+    `_stamp_platform` 特意从「拒识」改成「警示」、`platform_provider` 特意去查
+    「这台机器上有没有插件在管那个平台」——两样都是**为了给用户看**的。
+    前端一个字不显示的话，用户拿淘宝截图跑完 OCR，得到的是一行没有金额、没有商品名的
+    暂存记录，而他不知道该去核对什么。
+
+    订单页那版本来有这条（`if (res.reject_reason) ElMessage.warning(...)`），
+    搬到暂存页时漏掉了。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "views" / "Staging"
+           / "index.vue").read_text(encoding="utf-8")
+    # **按结构判，不是全文搜串**：第一版写的是 `"res.platform_warning" in src`，
+    # 把那个分支整个改成 `if (false)` 之后测试照样绿——因为注释与另一支里还有这个词。
+    # 「某处出现过」不等于「用在了该用的地方」，这一轮已经栽过两次。
+    seg = src[src.index("const res = await ordersApi.ocr(file)"):src.index("const recognized")]
+    # 还要**剥掉注释**：解释「为什么要读这个字段」的那段注释里也写着这个词，
+    # 不剥的话把整个分支改成 `if (false)` 测试照样绿（我实测过）。
+    seg = re.sub(r"//.*$", "", seg, flags=re.M)
+    # 用 `&&` 把主分支与下面那条 `else if (res.platform_warning)` 区分开——
+    # 只搜 `if (res.platform_warning` 的话，把主分支改成 `if (false)` 仍会被 else 支匹配到。
+    assert "if (res.platform_warning &&" in seg, \
+        "识别之后没有按平台警示分支——字段被读了却没用来做任何事"
+    assert "res.platform_plugin" in seg, "「有插件在管这个平台」这条信息被丢掉了"
+    assert "offPlatform++" in seg, "警示没有计入批次统计，收尾时就说不出来"
+    # reportOcr 的**函数体**，不是「从它开始到文件末尾」——切到末尾会把后面
+    # processOcr 里的注释也算进来，删掉汇总里那句话也照样绿。
+    rep = src[src.index("async function reportOcr"):]
+    rep = rep[:rep.index("\nasync function ")]
+    assert "offPlatform" in rep and "不是闲鱼版式" in rep, "批次汇总里没把这件事说出来"
+
+
+def test_staging_table_shows_every_field_ocr_writes():
+    """OCR 往暂存写的字段，暂存表上都要看得见、改得了。
+
+    暂存的全部意义是「导入前人工核对」。写进去却不显示的字段等于没有被核对过——
+    它会一直到导入之后才在订单页第一次露面，而那时已经过了唯一一道确认关卡。
+    `express_company` 就是这么漏的：这一轮刚给它加了列和迁移，OCR 也在写，
+    唯独暂存表的 columns 里没有它。
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "views" / "Staging"
+           / "index.vue").read_text(encoding="utf-8")
+    cols = set(re.findall(r"\{ key: '(\w+)'", src))
+    written = set(re.findall(r"data\.(\w+) = res\.", src))
+    missing = written - cols - {"title"}          # title 的列 key 就叫 title，上面已匹配到
+    assert not missing, f"OCR 写了但暂存表上看不见的字段：{sorted(missing)}"

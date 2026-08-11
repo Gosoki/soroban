@@ -276,7 +276,6 @@ onMounted(loadStatus)
 <style scoped>
 /* 页宽不再自己设上限：这一页有两张**表格**（连接过的库），760px 下 DSN 那列会折行，
    而右边空着 600px。统一成「占满宽度 + 字段自动分列」，见 tokens.css 的 .field-grid。 */
-.title { margin: 0 0 16px; font-size: 20px; }
 .card { margin-bottom: 16px; }
 /* 刻意**不用** space-between：「当前使用」与它右边那个后端标签是标题和值，
    页宽放开后 space-between 会把它们推到相隔一千多像素的两端，读起来不像一组。
