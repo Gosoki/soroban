@@ -65,6 +65,19 @@ def constants_js() -> str:
     return _CONSTANTS_JS.read_text(encoding="utf-8")
 
 
+def test_frontend_order_sources_match_the_ocr_hint_choices(constants_js):
+    """前端下拉框里的来源，与后端 OCR 拒非法值时用的那份名单，必须逐字相同。
+
+    这是**两份手抄清单**：`constants.js` 的 ORDER_SOURCES 渲染「这批是什么平台的」
+    那个下拉框，`services/ocr.py` 的 PLATFORM_CHOICES 在路由里拒掉不认识的值。
+    漂开的表现是「下拉框里选得到、一提交就 422」，而且只在漂掉的那一项上出现——
+    要正好有人选到它才暴露，点不出来也测不出来。
+    """
+    from app.services.ocr import PLATFORM_CHOICES
+
+    assert tuple(_js_array(constants_js, "ORDER_SOURCES")) == PLATFORM_CHOICES
+
+
 def test_frontend_order_status_matches_backend(constants_js):
     assert _js_array(constants_js, "PURCHASE_STATUS") == [s.value for s in PurchaseStatus]
 
@@ -1033,7 +1046,9 @@ def test_ocr_surfaces_the_platform_warning_the_backend_computed():
     # **按结构判，不是全文搜串**：第一版写的是 `"res.platform_warning" in src`，
     # 把那个分支整个改成 `if (false)` 之后测试照样绿——因为注释与另一支里还有这个词。
     # 「某处出现过」不等于「用在了该用的地方」，这一轮已经栽过两次。
-    seg = src[src.index("const res = await ordersApi.ocr(file)"):src.index("const recognized")]
+    # 锚点只钉「调用了 ocr 端点」，**不钉参数列表**——加一个来源提示参数就让
+    # `src.index()` 抛 ValueError（不是断言失败，是错误），而那与这条守卫要保护的东西无关。
+    seg = src[src.index("await ordersApi.ocr("):src.index("const recognized")]
     # 还要**剥掉注释**：解释「为什么要读这个字段」的那段注释里也写着这个词，
     # 不剥的话把整个分支改成 `if (false)` 测试照样绿（我实测过）。
     seg = re.sub(r"//.*$", "", seg, flags=re.M)
@@ -1048,6 +1063,74 @@ def test_ocr_surfaces_the_platform_warning_the_backend_computed():
     rep = src[src.index("async function reportOcr"):]
     rep = rep[:rep.index("\nasync function ")]
     assert "offPlatform" in rep and "不是闲鱼版式" in rep, "批次汇总里没把这件事说出来"
+
+
+def test_the_platform_hint_actually_reaches_the_request_body():
+    """用户选的来源必须一路走到 **form-data 里**，而不是停在前端某一层。
+
+    这是整条链上最脆的一环：FastAPI 对 multipart 里**未声明**的字段直接忽略，
+    对声明了但没传的 `Form(None)` 也不报错。所以只要 `postImage` 忘了 append，
+    表现就是——对话框弹了、用户选了、图传上去了、HTTP 200、汇总照常显示，
+    而那句选择一路蒸发。没有任何一层会出声。
+
+    分三段钉死：① api 层真的把它塞进 FormData；② 页面调 ocr 时真的把平台传下去；
+    ③ 队列元素带着平台（不是只在入队时问一次就丢掉）。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    api = (root / "api" / "index.js").read_text(encoding="utf-8")
+    # ① postImage 必须真的 append 额外字段，且 ocr 必须把提示交给它
+    assert "form.append(k, v)" in api, "postImage 收了额外字段却没塞进 FormData"
+    assert re.search(r"ocr: \(file, \w+\) => postImage\('/orders/ocr', file, \{ platform_hint:",
+                     api), "ordersApi.ocr 没把来源提示传给 postImage"
+
+    src = (root / "views" / "Staging" / "index.vue").read_text(encoding="utf-8")
+    body = re.sub(r"//.*$", "", src, flags=re.M)     # 剥注释：注释里也写着这些词
+    # ② 调用点带着平台
+    assert re.search(r"ordersApi\.ocr\(file,\s*platform\)", body), \
+        "调 OCR 时没把这批选的来源传下去——选了等于没选"
+    # ③ 队列元素带着平台。只在 enqueue 时问一次、队列里仍是裸 File 的话，
+    #    混批（跑着跑着又拖进来一批）时后一批会用前一批的来源，或者干脆丢掉。
+    assert re.search(r"ocrQueue\.push\(\.\.\.imgs\.map\(", body), \
+        "队列元素没带上来源，混批时会串味"
+
+
+def test_the_platform_dialog_cannot_deadlock_the_queue():
+    """那个「这批是什么平台的」对话框必须在 **@closed** 上收尾，不能只在按钮上。
+
+    点遮罩、按 Esc、点右上角 × 都不走「取消」按钮。漏了的话 Promise 永远不 resolve：
+    队列一张都不会开始、`ocrPending` 也不会归零，按钮上永远显示「后台识别中 N 张…」。
+    ——这是个**只在用户用别的方式关窗时**才出现的死锁，正常点按钮永远试不出来。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "views" / "Staging"
+           / "index.vue").read_text(encoding="utf-8")
+    tpl = _template_of(Path(__file__).resolve().parents[2] / "frontend" / "src" / "views"
+                       / "Staging" / "index.vue")
+    assert 'v-model="ask.open"' in tpl, "没找到那个问平台的对话框"
+    assert '@closed="closeAsk"' in tpl, "对话框没在 @closed 上收尾——非按钮关窗会让队列静默卡死"
+    body = re.sub(r"//.*$", "", src, flags=re.M)
+    assert re.search(r"function closeAsk\(\)\s*\{\s*askResolve\?\.\(null\)", body), \
+        "closeAsk 没有 resolve 那个 Promise"
+
+
+def test_multi_pick_asks_only_once_for_the_whole_batch():
+    """el-upload 点选多张时**每个文件触发一次** on-change ——不许因此弹 N 次对话框。
+
+    选 10 张连弹 10 次「这批是什么平台的」，比不问还糟。
+    这里钉住那个攒批的写法：on-change 只往缓冲区里塞，由微任务合成一批再问一次。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "views" / "Staging"
+           / "index.vue").read_text(encoding="utf-8")
+    body = re.sub(r"//.*$", "", src, flags=re.M)
+    fn = body[body.index("function onOcrPick"):]
+    fn = fn[:fn.index("\nasync function ")]
+    assert "queueMicrotask" in fn and "pickBuf" in fn, \
+        "点选多张会逐个进 enqueueOcr —— 选 10 张就弹 10 次对话框"
 
 
 def test_staging_table_shows_every_field_ocr_writes():

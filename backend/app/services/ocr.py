@@ -604,8 +604,28 @@ def _run_engine(engine, arr):
     return result
 
 
-def _stamp_platform(fields: dict, full_text: str, arr) -> None:
+# 用户在上传时能选的来源。**中文显示名，不是 slug**：同一个字符串要同时对上三处——
+# 账本活跃行唯一键里的 COALESCE(platform,'')（models/order/order.py）、
+# platform_provider 里的 a["platform"] == platform（routers/plugins.py）、
+# 前端的平台色表（constants.js 的 ORDER_SOURCES）。
+# 插件清单里那个 `platform = "taobao"` 在这条链上没有任何消费者，别混进来。
+PLATFORM_CHOICES = ("闲鱼", "淘宝", "京东", "拼多多", "其他")
+
+
+def _stamp_platform(fields: dict, full_text: str, arr, hint: Optional[str] = None) -> None:
     """判「这张截图是哪个平台的」，写进 `fields` 的 platform / platform_warning。
+
+    `hint` 是用户在上传时自己选的来源。**它永远赢，绝不被图上的证据推翻。**
+    理由不是「尊重用户」这种客气话，是 platform 进的是账本活跃行的唯一键
+    （`ix_orders_order_no_platform_active` 含 `COALESCE(platform,'')`）：一张认不出的
+    淘宝截图落成 platform=NULL，淘宝插件之后抓到同一单写「淘宝」，**同一笔交易变成两行**。
+    让证据推翻用户不是气人，是直接制造重复行。
+
+    有 hint 时**仍然跑检测**，只是检测结果降级成一句提醒。两个原因：
+      · `platform_warning` 必须保持 truthy，否则路由不去查 platform_plugin、
+        前端的 offPlatform 统计与批次汇总整条链一起失效——「跳过检测」会静默拆掉现有功能；
+      · 冲突信息本身有用：批量选了淘宝、里面混进一张闲鱼截图，那张的解析其实是准的。
+    只跳过**贵的**那一半（卡通卡车模板匹配），文案线索是纯子串扫描、微秒级，白跑不亏。
 
     OCR 的解析规则是照闲鱼的版式写的，所以来源缺省判「闲鱼」。仅当截图有明确淘宝/京东
     强标记、且无任何闲鱼信号（文案线索或卡通卡车）时，判为**不是闲鱼**。
@@ -628,6 +648,24 @@ def _stamp_platform(fields: dict, full_text: str, arr) -> None:
     是一次「改成拒识语义」的重构顺手提成变量才把短路弄丢的——别再提。
     """
     other = _detect_other_platform(full_text)
+    if hint:
+        # 用户说了算。检测结果只用来补一句「但图上看着像别家」，不改 platform。
+        # ⚠️ 这里**故意不调 `_truck_present`**：它是全图 8 尺度 matchTemplate，
+        #    批量拖十几张时省下的就是十几秒。跳过只能写在这一支里——做成无条件短路
+        #    会让「闲鱼卡车必须被看一眼」那条守卫变红，而那条守卫是有道理的。
+        seen = None if (_is_xianyu(full_text) or other == hint) else other
+        fields["platform"] = hint
+        if hint == "闲鱼":
+            # 解析规则本来就是照闲鱼版式写的，不冲突就一个字都不说。
+            fields["platform_warning"] = (
+                f"你标了闲鱼，但截图上看到的是{seen}的特征，请复核这张图有没有传错" if seen else None)
+        else:
+            fields["platform_warning"] = (
+                f"你标了{hint}；OCR 的解析规则是照闲鱼的版式写的，"
+                f"成交价与商品名多半认不出来，请在暂存表里补"
+                + (f"。而截图上看到的是{seen}的特征" if seen else ""))
+        return
+
     if other:
         # 有别的平台的强标记：除非同时有闲鱼信号（闲鱼卖家发京东快递之类），否则就是它。
         if _is_xianyu(full_text) or _truck_present(arr):
@@ -654,15 +692,18 @@ def _stamp_platform(fields: dict, full_text: str, arr) -> None:
         fields["platform_warning"] = "认不出这是哪个平台的截图（没有闲鱼、也没有淘宝/京东的特征）"
 
 
-def recognize_order(image_bytes: bytes) -> dict:
-    """对上传的截图跑 OCR 并解析出订单字段。抛 OcrUnavailable 表示引擎不可用。"""
+def recognize_order(image_bytes: bytes, platform_hint: Optional[str] = None) -> dict:
+    """对上传的截图跑 OCR 并解析出订单字段。抛 OcrUnavailable 表示引擎不可用。
+
+    `platform_hint` 缺省 None ⇒ 行为与加这个参数之前**逐字节相同**（自动判别那三条出口）。
+    默认值不是可选的：好几处测试用单参 `recognize_order(b"...")` 调它。"""
     engine = _get_engine()
     arr = _decode_image(image_bytes)
     result = _run_engine(engine, arr)
     fields = parse_order_fields(result)
 
     full = "\n".join(item[1] for item in (result or []))
-    _stamp_platform(fields, full, arr)
+    _stamp_platform(fields, full, arr, platform_hint)
     # 交易状态：有快递单号（已发货）→ 待收货，否则待发货（另按头部状态语细分终态）
     fields["purchase_status"] = _detect_purchase_status(full, bool(fields.get("express_no")))
     # 注：旧版在「交易成功」时会清空快递公司/快递号（认为已完成的单不需要物流信息）。现在快递号

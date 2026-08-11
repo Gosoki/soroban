@@ -13,9 +13,13 @@ export const authApi = {
 }
 
 // 截图上传：首次调用要加载 OCR 模型，耗时可能超默认 15s，故单独放宽超时
-function postImage(url, file) {
+function postImage(url, file, extra) {
   const form = new FormData()
   form.append('file', file)
+  // 额外的表单字段（如 OCR 的来源平台）。**空值一律不 append**：
+  // FastAPI 的 Form(None) 收到空串是「传了个空的」而不是「没传」，
+  // 而「没传 = 保持自动判别」是那个参数的缺省语义。
+  Object.entries(extra || {}).forEach(([k, v]) => { if (v) form.append(k, v) })
   return http.post(url, form, {
     headers: { 'Content-Type': 'multipart/form-data' }, timeout: 60000,
   })
@@ -27,7 +31,7 @@ export const ordersApi = {
   create: (data) => http.post('/orders', data),
   update: (id, data) => http.patch(`/orders/${id}`, data),
   remove: (id) => http.delete(`/orders/${id}`),
-  ocr: (file) => postImage('/orders/ocr', file),
+  ocr: (file, platformHint) => postImage('/orders/ocr', file, { platform_hint: platformHint }),
 }
 
 export const shipmentApi = {

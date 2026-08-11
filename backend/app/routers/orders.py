@@ -3,7 +3,7 @@
 import datetime as dt
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy import func
 from sqlalchemy import update as sa_update
 from sqlalchemy.orm import selectinload
@@ -140,12 +140,29 @@ def list_orders(
 
 
 @router.post("/ocr")
-async def ocr_order(file: UploadFile = File(...), session: Session = Depends(get_session)):
+async def ocr_order(
+    file: UploadFile = File(...),
+    # 用户上传时自己选的来源。**不传 = 保持自动判别**，行为与加这个参数之前逐字节相同——
+    # 三条既有的上传测试都只发 files 不带它，那不是疏漏，是「缺省必须不变」的验收条件。
+    # 放 Form 不放 Query：这本来就是 multipart 请求，提示与图片同体不会错配；
+    # 中文值进 query 要 percent-encode，还会落进 access log 和浏览器历史。
+    platform_hint: Optional[str] = Form(None, description="用户指定的来源平台；不传=自动判别"),
+    session: Session = Depends(get_session),
+):
     """识别订单详情截图，抽取快递公司/快递号/订单号/成交价供前端自动填表。"""
-    from ..services.ocr import recognize_order
+    import functools
+
+    from ..services.ocr import PLATFORM_CHOICES, recognize_order
     from .plugins import platform_provider
 
-    fields = await run_ocr(file, recognize_order)
+    hint = (platform_hint or "").strip() or None
+    # 认不得的值**必须报错，不许静默忽略**。静默忽略的表现是：对话框弹了、用户选了、
+    # 图也传上去了、HTTP 200、汇总照常显示——而那句选择一路蒸发，没有任何人会发现。
+    # 同一个教训在这个文件里已经有先例（下面拒掉 legacy `status` 那段）。
+    if hint and hint not in PLATFORM_CHOICES:
+        raise HTTPException(422, f"来源平台只能是：{'、'.join(PLATFORM_CHOICES)}（收到「{hint}」）")
+
+    fields = await run_ocr(file, functools.partial(recognize_order, platform_hint=hint))
     # 认出不是闲鱼时，顺带告诉前端「这台机器上有没有插件在管这个平台」。
     # 判断放后端是因为答案取决于**用户装了什么、配了哪些账号**，前端无从得知；
     # 而让前端去 GET /api/plugins 自己比对，就得在前端写一份平台↔插件的对应关系

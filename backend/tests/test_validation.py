@@ -161,6 +161,33 @@ def test_ocr_rejects_empty_image(client):
     assert r.status_code == 400
 
 
+def test_ocr_rejects_an_unknown_platform_hint(client):
+    """来源平台传了名单外的值 → **响亮拒掉**，并把可选值列出来。
+
+    静默忽略的表现是：对话框弹了、用户选了、图也传上去了、HTTP 200、汇总照常显示，
+    而那句选择一路蒸发——没有任何人会发现。这个文件所在的路由里已经有同一个教训的
+    先例（列表接口专门拒掉改名前的 legacy `status`，就是为了不让「点了没反应」再发生）。
+
+    图是坏的没关系：校验在跑 OCR **之前**，所以这条不依赖 OCR 引擎装没装。
+    """
+    r = client.post("/api/orders/ocr", data={"platform_hint": "火星"},
+                    files={"file": ("a.png", b"\x89PNG\r\n\x1a\n", "image/png")})
+    assert r.status_code == 422, r.text
+    assert "闲鱼" in r.text and "淘宝" in r.text, r.text
+
+
+def test_ocr_without_a_platform_hint_is_still_accepted(client):
+    """反面：**不传**来源照样走到 OCR（缺省 = 自动判别）。
+
+    没有这条，把参数做成必填（`Form(...)`）也能让上面那条绿——而必填会让
+    上面三条只发 files 的用例全部变成 422，那才是真正的破坏。
+    这里断言的是「没有卡在参数校验上」：图确实是坏的，所以预期 400（图不合法），
+    而不是 422（参数不合法）。
+    """
+    r = client.post("/api/orders/ocr", files={"file": ("a.png", b"", "image/png")})
+    assert r.status_code == 400, r.text
+
+
 def test_ocr_rejects_oversized(client):
     big = b"\x89PNG\r\n\x1a\n" + b"0" * (10 * 1024 * 1024 + 1)
     r = client.post("/api/orders/ocr", files={"file": ("a.png", big, "image/png")})

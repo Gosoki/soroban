@@ -659,6 +659,9 @@ class StagingBase(PostageIn):
     express_no: Optional[str] = Field(default=None, max_length=_len(OrderStaging, "express_no"))
     express_company: Optional[str] = Field(
         default=None, max_length=_len(OrderStaging, "express_company"))
+    # 商品链接，Text 列，无长度上限——**不要**写 max_length=_len(...)：`_len` 取的是
+    # `.type.length`，在 TEXT 上是 None，写了等于给 Field 传 max_length=None，白费还误导。
+    url: Optional[str] = None
     purchase_status: Optional[str] = None    # 采购段交易状态（待发货/待收货/…），导入后与账本联动
 
     @field_validator("price_cny")

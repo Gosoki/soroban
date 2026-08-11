@@ -90,6 +90,25 @@
       </div>
     </div>
     </Teleport>
+
+    <!-- 这批截图是什么平台的。**整批一问**，不是逐张——一次拖十几张时逐张问是灾难。
+         @closed 而不是只在「取消」上收尾：点遮罩、按 Esc、点右上角 × 都不走那颗按钮，
+         漏了的话 Promise 永远不 resolve，整个队列静默卡死、按钮上永远显示「后台识别中」。 -->
+    <el-dialog v-model="ask.open" title="这批截图是什么平台的？" width="360px"
+               append-to-body @closed="closeAsk">
+      <div class="ask-lead">共 {{ ask.count }} 张。选了之后这一批全部按它记来源，不再自动判别。</div>
+      <el-select v-model="ask.platform" placeholder="让 OCR 自己判" clearable style="width: 100%">
+        <el-option v-for="s in ORDER_SOURCES" :key="s" :label="s" :value="s" />
+      </el-select>
+      <div class="ask-note">
+        留空 = 保持原来的自动判别（认不出就留空，由你在表里补）。
+        识别规则目前<b>只有闲鱼一套</b>，选别的平台只把来源标对、不会让识别变准。
+      </div>
+      <template #footer>
+        <el-button @click="ask.open = false">取消</el-button>
+        <el-button type="primary" @click="confirmAsk">开始识别</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -108,6 +127,7 @@ import NotionTable from '@/components/NotionTable.vue'
 import OcrButton from '@/components/OcrButton.vue'
 import { checkImageSize } from '@/utils/imageGate'
 import { useWindowFileDrop } from '@/utils/windowFileDrop'
+import { lastOcrPlatform } from '@/utils/uiPrefs'
 
 // 默认列顺序 + 统一列宽（≈ 刚好显示日期，取整多留一点 = 110）；用户可拖动改序/改宽，改动持久化
 const COL_W = 110
@@ -297,27 +317,62 @@ let ocrRunning = false
 // 这一页就漏过「注册」，表现是拖图进来浏览器直接把 SPA 换成那张图片。
 const { dragActive } = useWindowFileDrop(enqueueOcr)
 
-function onOcrPick(uploadFile) { enqueueOcr(uploadFile?.raw ? [uploadFile.raw] : []) }   // el-upload 点选/多选
+// el-upload 点选多张时**每个文件触发一次** on-change，所以这里不能直接进 enqueueOcr——
+// 那样选 10 张会连弹 10 次「这批是什么平台的」。攒到同一个微任务末尾合成一批再问一次。
+let pickBuf = []
+function onOcrPick(uploadFile) {
+  if (!uploadFile?.raw) return
+  pickBuf.push(uploadFile.raw)
+  if (pickBuf.length === 1) queueMicrotask(() => { const b = pickBuf; pickBuf = []; enqueueOcr(b) })
+}
 
-function enqueueOcr(files) {
+async function enqueueOcr(files) {
   const imgs = files.filter((f) => f && (!f.type || f.type.startsWith('image/')))
   const skipped = files.length - imgs.length
   if (skipped) ElMessage.warning(`已跳过 ${skipped} 个非图片文件`)   // 拖拽不受 accept 约束
   if (!imgs.length) return
-  ocrQueue.push(...imgs)
+  // **唯一收口点**：点选和整窗拖拽两个入口都过这里，问平台就得问在这儿。
+  // 先问再入队——用户点「取消」时什么都还没发生，不需要回滚 ocrPending。
+  const platform = await askPlatform(imgs.length)
+  if (platform === null) return                  // 取消（空串是「让它自己判」，不是取消）
+  ocrQueue.push(...imgs.map((file) => ({ file, platform })))
   ocrPending.value += imgs.length
   pumpOcr()
 }
 
+// 「这批是什么平台的」。整批一问，不是逐张——一次拖十几张时逐张问是灾难，
+// 而同一批截图来自同一个平台是压倒性的常见情形。
+// resolve 的值：平台名 / 空串（让 OCR 自己判，保持问之前的行为）/ null（取消整批）。
+const ask = reactive({ open: false, count: 0, platform: '' })
+let askResolve = null
+function askPlatform(count) {
+  ask.count = count
+  ask.platform = lastOcrPlatform.value
+  ask.open = true
+  return new Promise((resolve) => { askResolve = resolve })
+}
+function confirmAsk() {
+  lastOcrPlatform.value = ask.platform          // 记住这次的选择，下批默认它
+  ask.open = false
+  askResolve?.(ask.platform)
+  askResolve = null
+}
+// 用 @closed 收尾而不是只在「取消」按钮上 resolve：点遮罩、按 Esc、点右上角 ×
+// 都不会走那颗按钮，漏了的话 Promise 永远不 resolve，**整个队列静默卡死**
+// （ocrPending 也不会归零，按钮上永远显示「后台识别中」）。
+function closeAsk() {
+  askResolve?.(null)
+  askResolve = null
+}
+
 // 这一批的统计。**按批而不是按张**：一次拖十几张图，每张弹一条 toast 会刷屏，
 // 而真正要回答的问题只有一个——「这十几张里，几张真进去了、几张早就有了」。
-// `wrongPlatform` 记的是「本批是否已经就非闲鱼截图问过一次」：
-// null=还没问，true=用户说继续，false=用户说算了（后续同类一律跳过，不再打扰）。
+// `hintUsed` 记的是本批用了哪个用户指定的来源（空 = 走自动判别），汇总里要说出来。
 let ocrTally = null
 
 function newTally() {
   return { created: 0, merged: 0, nochange: 0, inLedger: 0, unread: 0, failed: 0,
-           offPlatform: 0, offHint: '' }
+           offPlatform: 0, offHint: '', hintUsed: '' }
 }
 
 async function pumpOcr() {
@@ -326,9 +381,10 @@ async function pumpOcr() {
   ocrTally = newTally()
   try {
     while (ocrQueue.length) {
-      const file = ocrQueue.shift()
+      const { file, platform } = ocrQueue.shift()
       try {
-        await processOcr(file)    // 单张：识别 → 建行；内部已吞错，任何失败都不中断队列
+        if (ocrTally && platform) ocrTally.hintUsed = platform
+        await processOcr(file, platform)   // 单张：识别 → 建行；内部已吞错，任何失败都不中断队列
       } finally {
         ocrPending.value--
       }
@@ -361,6 +417,11 @@ async function reportOcr(t) {
       ? `<br><b>其中 ${t.offPlatform} 张不是闲鱼版式</b>：${t.offHint}。`
         + '<br>这类截图上<b>成交价和商品名多半认不出来</b>（它们靠「成交价」这个闲鱼独有的标签定位），请在表里补。'
       : '',
+    // 本批按什么来源记的，必须可复核：选了淘宝、十几张全打上淘宝，
+    // 事后要能一眼看出这不是 OCR 自己判的。
+    t.hintUsed
+      ? `<br>本批来源按你选的<b>${t.hintUsed}</b>记，没有用自动判别。`
+      : '',
     '<br>核对无误后，在这张表上逐单点「导入」才进账本。',
   ].filter(Boolean)
   ElMessageBox.alert(lines.join('<br>'), `OCR 完成 · 共 ${total} 张`,
@@ -369,13 +430,13 @@ async function reportOcr(t) {
 
 
 // 一张截图 → 一条暂存行。与订单页原来那套的区别只有落点，判据一模一样。
-async function processOcr(file) {
+async function processOcr(file, platform) {
   const tooBig = await checkImageSize(file)
   if (tooBig) { ElMessage.warning(tooBig); if (ocrTally) ocrTally.failed++; return }
   try {
     // 用的是 orders 那个端点，但它**只识别、不写任何东西**（见 routers/orders.ocr_order）。
     // 为暂存再造一个返回完全相同数据的端点，只会多出一处要同步维护的地方。
-    const res = await ordersApi.ocr(file)
+    const res = await ordersApi.ocr(file, platform)
     // 后端认出「这不是闲鱼版式」时会给一句 platform_warning（外加 platform_plugin：
     // 这台机器上有没有插件在管那个平台）。**必须说出来**——解析规则是照闲鱼写的，
     // 非闲鱼版式上成交价和商品名多半是空的，而用户不知道该去核对什么。
@@ -484,6 +545,11 @@ onMounted(() => { loadAccounts(); load() })
 </script>
 
 <style scoped>
+/* 「这批是什么平台的」对话框。取值全走 token，与页面其它说明文字同号同色。 */
+.ask-lead { color: var(--txt-2); font-size: 13px; margin-bottom: 10px; }
+.ask-note { color: var(--txt-3); font-size: 12px; line-height: 1.8; margin-top: 10px; }
+.ask-note b { color: var(--txt-2); }
+
 /* 整窗拖拽覆盖层：居中的上传提示框，不拦截拖拽事件 */
 .ocr-overlay {
   position: fixed; inset: 0; z-index: 9000; pointer-events: none;

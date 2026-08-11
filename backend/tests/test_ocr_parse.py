@@ -514,7 +514,7 @@ def test_platform_provider_reads_account_platforms_not_plugin_ids(session, monke
 ])
 def test_platform_has_three_outcomes_including_dont_know(
         monkeypatch, tokens, want_platform, want_warn):
-    """平台判别有**三个**出口，不是两个。
+    """**不带 hint 时**平台判别有三个出口，不是两个。（用户指定来源那条第四路见下面几条。）
 
     原先只有「别的平台」和「闲鱼」：没有任何证据时无条件写死 platform="闲鱼"。
     于是一张淘宝截图只要没出现 京豆/白条/天猫/旺旺/官方旗舰店 这几个词，
@@ -634,3 +634,136 @@ def test_bare_price_label_does_not_kill_product_too():
             + row(320, "成交价", "¥88.00"))
     out = ocr.parse_order_fields(page)
     assert out["price_cny"] == "88.00", "成交价被空的标题行吃掉了"
+
+
+# --- 用户在上传时指定来源 -------------------------------------------------------
+
+@pytest.mark.parametrize("tokens,hint", [
+    (["京东自营 官方旗舰店", "订单编号 1234567890123456"], "闲鱼"),   # 图上是京东，人说闲鱼
+    (["闲鱼", "订单编号 1234567890123456"], "淘宝"),                  # 图上是闲鱼，人说淘宝
+    (["订单编号 1234567890123456"], "拼多多"),                       # 图上什么证据都没有
+])
+def test_user_hint_always_wins_over_the_evidence(monkeypatch, tokens, hint):
+    """用户在上传时选了来源 → **platform 一定是它**，图上的证据一律推翻不了。
+
+    这不是「尊重用户」的客气话，是因为 platform 进的是账本活跃行唯一键
+    （`ix_orders_order_no_platform_active` 含 `COALESCE(platform,'')`）。
+    一张认不出的淘宝截图落成 platform=NULL，淘宝插件之后抓到同一单写「淘宝」，
+    **同一笔交易变成两行**。让证据推翻用户不是气人，是直接制造重复行——
+    而消掉这类重复正是「上传时先问平台」这件事的第一价值。
+    """
+    _stub_recognize(monkeypatch, tokens)
+    assert ocr.recognize_order(b"fake", platform_hint=hint)["platform"] == hint
+
+
+def test_hint_conflicting_with_the_evidence_still_says_so(monkeypatch):
+    """人说闲鱼、图上却是京东 → 照样标闲鱼，但**得说一句**。
+
+    冲突信息有价值：批量选了某个平台、里面混进一张别家的截图，
+    这时候提醒一句就能让人回去核对，而不是等到账本里对不上账才发现。
+    """
+    _stub_recognize(monkeypatch, ["京东自营 官方旗舰店", "订单编号 1234567890123456"])
+    f = ocr.recognize_order(b"fake", platform_hint="闲鱼")
+    assert f["platform"] == "闲鱼"
+    assert "京东" in (f["platform_warning"] or ""), f["platform_warning"]
+
+
+def test_hint_of_xianyu_without_conflict_is_silent(monkeypatch):
+    """人说闲鱼、图上也是闲鱼 → 一个字都不说。
+
+    解析规则本来就是照闲鱼版式写的，这一支没有任何要提醒的。
+    没有这条，「凡是带 hint 就唠叨一句」也能让上面几条全绿，而那会让每一批
+    正常的闲鱼截图都无端多出一行警告——警告一旦变成常态就没人看了。
+    """
+    _stub_recognize(monkeypatch, ["闲鱼", "订单编号 1234567890123456"])
+    assert ocr.recognize_order(b"fake", platform_hint="闲鱼")["platform_warning"] is None
+
+
+def test_non_xianyu_hint_warns_that_the_rules_are_still_xianyu_shaped(monkeypatch):
+    """人说淘宝/京东 → 必须**如实说清**：解析规则今天只有闲鱼一套。
+
+    `parse_order_fields` 里零个平台分支，锚点全是写死的闲鱼字面量
+    （「成交价」是闲鱼独有的，淘宝/京东叫「实付款」；而商品名寄生在成交价锚点上，
+    价格丢了商品名一起丢）。所以选「淘宝」**不会**让识别变准。
+    这条守卫钉住的就是「别让那个下拉框看起来像是能加载淘宝解析规则」。
+    """
+    _stub_recognize(monkeypatch, ["订单编号 1234567890123456"])
+    w = ocr.recognize_order(b"fake", platform_hint="淘宝")["platform_warning"]
+    assert w and "闲鱼" in w, w
+
+
+def test_warning_stays_truthy_for_every_hint_that_is_not_xianyu(monkeypatch):
+    """带 hint 时 `platform_warning` 必须保持 truthy（闲鱼无冲突那一支除外）。
+
+    路由只有在它为真时才去查 `platform_plugin`，前端也只有在它为真时才计 offPlatform
+    并在批次汇总里出那一行。把它置成 None「省事」会**静默拆掉**整条既有链路：
+    插件推荐不再出现、汇总少一行，而没有任何测试直接盯着那句话。
+    """
+    _stub_recognize(monkeypatch, ["订单编号 1234567890123456"])
+    for hint in ("淘宝", "京东", "拼多多", "其他"):
+        assert ocr.recognize_order(b"fake", platform_hint=hint)["platform_warning"], hint
+
+
+def test_hint_skips_the_expensive_truck_match(monkeypatch):
+    """带 hint 时**不许**去跑卡通卡车模板匹配。
+
+    `_truck_present` 是全图 8 尺度 matchTemplate，一张 1080×2400 就是秒级。
+    用户已经说了这是什么平台，再花一秒去图里找卡车纯属白烧——批量拖十几张时
+    省下的就是十几秒。它只是用来**猜**闲鱼的，而猜这件事已经不需要了。
+    """
+    called = []
+    _stub_recognize(monkeypatch, ["订单编号 1234567890123456"])
+    # ⚠️ 探针必须设在 `_stub_recognize` **之后**——它自己就把 `_truck_present` 打了桩，
+    #    设在前面会被它当场覆盖，于是这条守卫永远不会红（第一版正是这样，
+    #    破坏性验证时「带 hint 还去跑模板匹配」纹丝不动才发现）。
+    monkeypatch.setattr(ocr, "_truck_present", lambda arr: called.append(1) or False)
+    ocr.recognize_order(b"fake", platform_hint="淘宝")
+    assert not called, "带 hint 还去跑了模板匹配"
+
+    # 反面：不带 hint 时它**必须**被调到。没有这一半，把 `_truck_present` 整个删掉
+    # 也能让上面那句绿——而它是闲鱼判别的第二根支柱。
+    called.clear()
+    ocr.recognize_order(b"fake")
+    assert called, "不带 hint 时反而不看图了——闲鱼的兜底信号没了"
+
+
+def test_no_hint_behaves_exactly_as_before(monkeypatch):
+    """不传 hint ⇒ 与加这个参数之前**逐字节相同**——三条自动判别的出口一条不少。
+
+    这是整条改动的验收条件：新参数是**加法**，不是改法。
+    上面那条参数化的三态测试是主证据，这里补的是「单参调用仍然合法」——
+    默认值一旦被拿掉，是 TypeError 而不是行为变化，红得早、也红得明白。
+    """
+    _stub_recognize(monkeypatch, ["闲鱼", "订单编号 1234567890123456"])
+    assert ocr.recognize_order(b"fake")["platform"] == "闲鱼"
+
+
+def test_the_route_actually_threads_the_hint_into_the_recogniser(client, monkeypatch):
+    """路由收下的 `platform_hint` 必须**真的传进识别函数**。
+
+    这是整条链上最安静的一处失败：对话框弹了、用户选了、图传上去了、HTTP 200、
+    批次汇总照常显示——而那句选择在路由里蒸发，识别照旧靠猜。没有任何东西会报错。
+    上面那些测试全都直接调 `recognize_order`，绕过了路由，**一条也盖不住这里**
+    （破坏性验证时把 `functools.partial(...)` 换回裸 `recognize_order`，全绿）。
+    """
+    from app.routers import orders as mod
+    from app.services import ocr as ocr_mod
+
+    seen = {}
+    def spy(image_bytes, platform_hint=None):
+        seen["hint"] = platform_hint
+        return {"order_no": "X"}
+
+    monkeypatch.setattr(ocr_mod, "recognize_order", spy)
+
+    async def fake_ocr(file, recognizer):
+        return recognizer(b"fake")     # 真的把路由造的那个 recognizer 调起来
+
+    monkeypatch.setattr(mod, "run_ocr", fake_ocr)
+    client.post("/api/orders/ocr", data={"platform_hint": "淘宝"},
+                files={"file": ("x.png", b"\x89PNG", "image/png")})
+    assert seen.get("hint") == "淘宝", f"来源在路由里蒸发了：{seen}"
+
+    seen.clear()
+    client.post("/api/orders/ocr", files={"file": ("x.png", b"\x89PNG", "image/png")})
+    assert seen.get("hint") is None, "没选来源却凭空传了一个进去"

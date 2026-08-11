@@ -34,3 +34,28 @@ watch(hidePageTitle, (v) => {
     else localStorage.removeItem(KEY)
   } catch (_) { /* 同上：存不住也只是下次打开恢复默认，不影响本次 */ }
 })
+
+
+// —— OCR 上次选的来源 ——
+// 与上面那个开关同一套写法（模块级 ref + try/catch 包 localStorage + watch 回写），
+// 只是它不在设置页露面：它是「上次怎么选的」这种顺手记住的东西，不是一项配置。
+// 记住它是为了常见情形——一个人一批一批地传，多半连着几批都是同一个平台。
+const SRC_KEY = 'ui.lastOcrPlatform'
+
+function readSrc() {
+  try {
+    return localStorage.getItem(SRC_KEY) || ''
+  } catch (_) {
+    return ''
+  }
+}
+
+/** 上一次在「这批截图是什么平台的」里选的值，空串 = 没选过。 */
+export const lastOcrPlatform = ref(readSrc())
+
+watch(lastOcrPlatform, (v) => {
+  try {
+    if (v) localStorage.setItem(SRC_KEY, v)
+    else localStorage.removeItem(SRC_KEY)
+  } catch (_) { /* 同上 */ }
+})

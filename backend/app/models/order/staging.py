@@ -42,6 +42,12 @@ class OrderStaging(SQLModel, table=True):
     # 账本两列都有；暂存少这一列时，插件从同一个响应里解析出来的公司名
     # 在跨表那一步被静默丢掉——不是被拒绝，是根本没有地方放。
     express_company: Optional[str] = Field(default=None, max_length=64)
+    # 与账本 `Order.url` 对齐。淘宝插件从列表接口的 orderItemInfo.item.itemUrl 里直接拿得到
+    # （零额外请求），此前暂存没有这一列，于是那个值在跨表那一步无处可放。
+    # 用 sa_type 而不是 sa_column=Column(Text)：DDL 完全相同，但 sa_column 会让 SQLModel
+    # 忽略 Field 层的 nullable/index/default（今天无害，将来有人加 index=True 会静默不生效），
+    # 且一个 Column 实例只能绑一张表，照抄 Order 那行更是绑错表。同文件 title 用的就是 sa_type。
+    url: Optional[str] = Field(default=None, sa_type=Text)     # 商品链接；Text 的理由同 title
     raw_json: Optional[str] = Field(default=None, sa_column=Column(Text))  # 原始留底
     # 一行上有两个「状态」，务必分清：import_status = 导入工作流（待处理/已导入/已忽略），
     # purchase_status = 淘宝那边的真实交易状态。旧名 status / order_status 看不出区别。

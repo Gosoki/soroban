@@ -46,6 +46,7 @@ _SHARED_TO_ORDER = {
     "order_date": "date",
     "order_no": "order_no",
     "title": "title",
+    "url": "url",
     "platform_account": "platform_account",
     "platform": "platform",
     "express_no": "express_no",
@@ -342,6 +343,7 @@ def import_staging(row_id: int, session: Session = Depends(get_session)):
         date=row.order_date or dt.datetime.now(JST).date(),
         order_no=row.order_no,
         title=row.title,
+        url=row.url,                         # 商品链接随单迁移
         platform_account=row.platform_account,
         platform=row.platform,               # 来源随单迁移到账本
         express_no=row.express_no,
