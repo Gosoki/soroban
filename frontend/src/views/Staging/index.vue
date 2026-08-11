@@ -420,7 +420,7 @@ async function reportOcr(t) {
     // 本批按什么来源记的，必须可复核：选了淘宝、十几张全打上淘宝，
     // 事后要能一眼看出这不是 OCR 自己判的。
     t.hintUsed
-      ? `<br>本批来源按你选的<b>${t.hintUsed}</b>记，没有用自动判别。`
+      ? `<br>本批来源已按你选的 <b>${t.hintUsed}</b> 记入，没有用自动判别。`
       : '',
     '<br>核对无误后，在这张表上逐单点「导入」才进账本。',
   ].filter(Boolean)
