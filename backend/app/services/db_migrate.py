@@ -18,7 +18,6 @@ import pymysql
 from sqlalchemy import func as sa_func
 from sqlmodel import Session, delete, select
 
-from ..database import build_engine
 from ..models import (
     ColumnLayout,
     FxRate,

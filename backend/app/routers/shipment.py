@@ -144,6 +144,21 @@ async def ocr_attach_express(
     if not shipment or shipment.is_delete:
         raise_not_found("集运订单")
 
+    # **推理之前把连接还回池里。** 上面那次 `session.get` 开了一个读事务，而 OCR 推理
+    # 要跑几秒到十几秒——期间这条连接就是「idle in transaction」，在 MySQL 上还一路攥着
+    # REPEATABLE READ 快照与 MDL，让并发的 DDL/迁移一起等。同时传几张图，池（20+20）
+    # 也更容易见底：`_OCR_CONCURRENCY` 只压住「同时在推理的」，**排队等它的请求照样占着连接**。
+    #
+    # 这么做不影响正确性，因为上面那次读**本来就只是 fail-fast**（别为一张不存在的集运单
+    # 白跑十几秒 OCR）；真正说了算的是下面那条 UPDATE 自带的 EXISTS 守卫
+    # （集运单仍在、未软删），它在写入的那一刻原子地复核一次。
+    # 换句话说：这一读握不握得住，从来就不是安全边界。
+    #
+    # 另外两条 OCR 路由不需要这一行——它们在推理前一个字节都不碰库
+    # （`ocr_shipment` 压根没有 session 参数；`ocr_order` 的 platform_provider 在推理之后才查）。
+    # 鉴权那一侧也已经还过一次（见 auth.get_current_user 末尾）。
+    session.rollback()
+
     fields = await run_ocr(file, recognize_shipment)
     express_nos = fields.get("express_nos") or []
 

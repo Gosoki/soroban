@@ -267,3 +267,66 @@ def test_in_memory_sqlite_still_builds():
 
     for url in ("sqlite://", "sqlite:///:memory:"):
         build_engine(url).dispose()
+
+
+# --- OCR 推理期间不许占着数据库连接 ---------------------------------------------
+
+def _checkedout():
+    from app.database import get_engine
+    return get_engine().pool.checkedout()
+
+
+def test_ocr_holds_no_db_connection_while_inferring(client, monkeypatch):
+    """OCR 推理的那几秒里，这个请求**不许**占着一条数据库连接。
+
+    为什么这是个真问题：推理是几秒到十几秒（首次还要加载模型），而鉴权依赖
+    `get_current_user` 会先 `session.get(User, ...)`。那笔读开的事务如果一直不结束，
+    这条连接在整个推理期间就是「idle in transaction」——在 MySQL 上还一路攥着
+    REPEATABLE READ 快照与 MDL，让并发的 DDL/迁移一起等。
+
+    **`_OCR_CONCURRENCY` 挡不住这件事**：它只压住「同时在解码/推理的」，
+    排队等这个闸的请求照样各占一条连接。池是 20+20，几十路并发上传就能见底，
+    而见底之后**整个应用**（不只是 OCR）都要等满 30 秒 pool_timeout 才抛错。
+
+    量的是真实请求路径上的 `pool.checkedout()`，不是推理这条链路「应该」怎么样——
+    这条曾经被推理成「rollback 只结束事务、不还连接」，而实测正好相反。
+    """
+    from app.services import ocr as ocr_mod
+
+    during = []
+
+    def slow_recognise(image_bytes, platform_hint=None):
+        during.append(_checkedout())      # 正在「推理」的这一刻，池里被占了几条
+        return {"order_no": "POOL-1", "raw_text": ""}
+
+    monkeypatch.setattr(ocr_mod, "recognize_order", slow_recognise)
+    r = client.post("/api/orders/ocr", files={"file": ("a.png", b"\x89PNG\r\n\x1a\n", "image/png")})
+    assert r.status_code == 200, r.text
+    assert during == [0], f"推理期间占着 {during} 条连接（应当是 0）"
+
+
+def test_shipment_express_ocr_releases_its_connection_before_inferring(client, monkeypatch):
+    """集运的「内含快递」OCR 同理——而它比另外两条更容易漏。
+
+    这条路由在推理**之前**就得先查一次集运单是否存在，那笔读会开事务、占住连接。
+    所以光靠鉴权那侧还回去不够，它必须自己再还一次。
+
+    这么做不影响正确性：那次读只是 fail-fast（别为一张不存在的集运单白跑十几秒 OCR），
+    真正说了算的是挂靠那条 UPDATE 自带的 EXISTS 守卫。删掉那句 `session.rollback()`
+    这条测试就会红，而**功能测试一条都不会红**——这正是它存在的理由。
+    """
+    from app.services import ocr as ocr_mod
+
+    sid = client.post("/api/shipment", json={"date": "2026-12-01",
+                                             "shipment_no": "POOL-SHIP-1"}).json()["id"]
+    during = []
+
+    def slow_recognise(image_bytes):
+        during.append(_checkedout())
+        return {"express_nos": []}
+
+    monkeypatch.setattr(ocr_mod, "recognize_shipment", slow_recognise)
+    r = client.post(f"/api/shipment/{sid}/ocr-express",
+                    files={"file": ("a.png", b"\x89PNG\r\n\x1a\n", "image/png")})
+    assert r.status_code == 200, r.text
+    assert during == [0], f"推理期间占着 {during} 条连接（应当是 0）"
