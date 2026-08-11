@@ -168,12 +168,19 @@ def test_frontend_merge_uses_the_same_terminal_rule():
 
 
 def test_ocr_recognises_refund_before_express():
-    """退款单同样带快递号。先判快递就会把退款单识别成「待收货」——之前正是这么错的。"""
+    """退款/关闭要排在快递之前判——退款单同样带快递号，先判快递会得出「待收货」。
+
+    顺序仍然重要，但**结论变了**：命中终态之后不再写这个状态，而是留空（None）。
+    终态不可逆（`can_advance_purchase` 对它一律 False），而判定是整页子串扫描，
+    一个「申请退款」按钮就能命中——这两件事凑在一起会把单永久钉死。
+    所以这里钉的是「有快递号也不会被判成待收货」，而不是「一定判成退款」。
+    """
     from app.services import ocr
 
-    assert ocr._detect_purchase_status("退款成功 买家已收到退款", False) == "退款"
-    assert ocr._detect_purchase_status("退款成功 买家已收到退款", True) == "退款", "有快递号也该判退款"
-    assert ocr._detect_purchase_status("交易关闭", True) == "交易关闭"
+    assert ocr._detect_purchase_status("退款成功 买家已收到退款", False) is None
+    assert ocr._detect_purchase_status("退款成功 买家已收到退款", True) is None, \
+        "有快递号时仍不该退回「待收货」——那会把一张退款单记成在途"
+    assert ocr._detect_purchase_status("交易关闭", True) is None
 
 
 def test_layout_table_whitelist_covers_frontend_tables():

@@ -17,7 +17,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
-from ..models import PurchaseStatus   # 状态枚举值的唯一真相，避免与后端漂移
+from ..models import PURCHASE_TERMINAL_STATUSES, PurchaseStatus   # 状态与终态集合的唯一真相，避免与后端漂移
 
 # 常见快递公司：关键词 → 规范全称。按「越具体越靠前」不重要（子串命中即可），
 # 但保证能覆盖淘宝寄件常见家；命中后统一输出规范名，便于「快递公司」列做标签归组。
@@ -198,6 +198,26 @@ def _to_tokens(ocr_result) -> list[dict]:
     return tokens
 
 
+def _first_anchor(tokens: list[dict], match, pick):
+    """逐个候选锚点尝试，**直到真的取到值**；返回 (锚点框, 值)，一个都取不到给 (None, None)。
+
+    为什么不能「命中第一个含关键词的框就 break」：同一个词在页面上往往出现多次——
+    列头「订单号」、筛选栏「按订单号搜索」、灰色分组标题，这些框同行都没有值。
+    在它们身上 break，真正那一行**永远轮不到**，字段静默为空。
+
+    这个坑集运侧早就踩过并修了（见 parse_shipment_fields 里原来的注释），
+    但商品订单侧的订单号 / 成交价 / 下单时间三段一直是「命中即 break」。
+    提到模块级共用，就不会再出现「一边修好了、另一边还留着」。
+
+    match: (token) -> bool      哪些框算候选锚点
+    pick:  (token) -> value|None 从锚点取值，取不到返回 None
+    """
+    for t in tokens:
+        if match(t) and (v := pick(t)) is not None:
+            return t, v
+    return None, None
+
+
 def _match_company(text: str) -> Optional[str]:
     for kw, canonical in COMPANY_MAP.items():
         if kw in text:
@@ -205,18 +225,30 @@ def _match_company(text: str) -> Optional[str]:
     return None
 
 
+_COMPANY_NEAR_ROWS = 2      # 「就近找公司名」最多跨几行（× row_tol）
+
+
 def _nearest_company(anchor: dict, tokens: list[dict], row_tol: float) -> Optional[str]:
-    """标签行本身不含公司名时，在它同行、再不行就上下最近处找一个。
+    """标签行本身不含公司名时，在它同行、再不行就**附近几行**里找一个。
 
     只在**已经由真标签定位到快递号**之后调用——此时公司名只是补充信息，取错的代价远小于
-    「整页第一个含公司词的框」那种把商品标题当锚点的做法。"""
+    「整页第一个含公司词的框」那种把商品标题当锚点的做法。
+
+    ⚠️ 第二段原先是**全页**按 y 距离排序取最近的一个，没有距离上限：
+    快递行不含公司名时，它会从页面另一头把商品标题里的「顺丰包邮」捞回来，
+    而结果看起来跟真的一样。加 `_COMPANY_NEAR_ROWS` 行的上限——超出这个范围的
+    「最近」已经不构成同一条信息，宁可留空。
+    """
+    def near(t):
+        return t is not anchor and abs(t["cy"] - anchor["cy"]) <= row_tol * _COMPANY_NEAR_ROWS
+
     same_row = [t for t in tokens
                 if t is not anchor and abs(t["cy"] - anchor["cy"]) <= row_tol]
     for t in sorted(same_row, key=lambda t: abs(t["cy"] - anchor["cy"])):
         if (c := _match_company(t["text"])):
             return c
-    for t in sorted(tokens, key=lambda t: abs(t["cy"] - anchor["cy"])):
-        if t is not anchor and (c := _match_company(t["text"])):
+    for t in sorted([t for t in tokens if near(t)], key=lambda t: abs(t["cy"] - anchor["cy"])):
+        if (c := _match_company(t["text"])):
             return c
     return None
 
@@ -364,12 +396,27 @@ _STATUS_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
 )
 
 
-def _detect_purchase_status(full_text: str, has_express: bool) -> str:
-    """判交易状态：按 `_STATUS_RULES` 自上而下取第一条命中；都不命中兜底「待发货」。"""
+def _detect_purchase_status(full_text: str, has_express: bool) -> Optional[str]:
+    """判交易状态：按 `_STATUS_RULES` 自上而下取第一条命中；都不命中兜底「待发货」。
+
+    ⚠️ **命中终态（退款 / 交易关闭）时返回 None，不写这个字段。**
+
+    为什么：判定是在整页拼起来的 `full_text` 上做**无锚点子串扫描**，而规则表第一条
+    含裸「退款」——页面上任何位置出现这两个字（「申请退款」「退款/售后」这类按钮、
+    甚至商品标题里的「支持七天退款」）都会命中。而终态是**不可逆**的：
+    `can_advance_purchase` 对终态一律返回 False，这张单从此再也不会被任何自动流程更新，
+    爬虫之后抓到真实状态也推不动它。
+
+    「猜错一个中间态」代价是下一轮自动纠正；「猜错一个终态」代价是这张单永久钉死。
+    两者不对称到这个程度，就不该由一个子串扫描来决定。返回 None 之后字段留空，
+    由人在暂存表上确认——这正是「机器认的先落暂存」那条规则要解决的事。
+
+    刻意**不**退而求其次去猜一个非终态：截图真是退款单时，硬写成「待发货」是另一种错。
+    """
     for patterns, status in _STATUS_RULES:
         for p in patterns:
             if (has_express if p is _EXPRESS else p in full_text):
-                return status
+                return None if status in PURCHASE_TERMINAL_STATUSES else status
     return PurchaseStatus.paid.value               # 兜底：待发货
 
 
@@ -468,37 +515,45 @@ def parse_order_fields(ocr_result) -> dict:
             if no:
                 out["express_company"], out["express_no"] = canonical, no
                 break
-            if out["express_company"] is None:
-                out["express_company"] = canonical    # 只认出公司、没有单号：仍然报公司
+            # **刻意不再「只认出公司名就报公司」。** 那一支没有锚点约束：
+            # 页面上根本没有物流行时，商品标题里的「顺丰包邮」、英文标题里的
+            # it`ems`/syst`ems`、京东截图上的「京东自营」（COMPANY_MAP 里有「京东」）
+            # 都会凭空填出一个快递公司——看起来完全合理，实际是从装饰词猜的，
+            # 而它会落进「快递公司」列并参与标签归组。
+            # 没有快递号就是没认出物流信息，留空比编一个强。
 
-    # 订单号：锚点为含「订单编号/订单号」的框；值为本框或同行最长数字（多为 15~20 位）
-    for t in tokens:
-        if "订单编号" in t["text"] or "订单号" in t["text"]:
-            run = _longest_digit_run(t["text"], 10)
-            out["order_no"] = run or _same_row_value(t, tokens, row_tol, 10)
-            break
+    # 订单号：锚点为含「订单编号/订单号」的框；值为本框或同行最长数字（多为 15~20 位）。
+    # 用 _first_anchor 而不是「命中即 break」：页面上第一个含「订单号」的框很可能是
+    # 列头/筛选栏/灰色分组标题，它们同行没有值——在那儿 break，真正那一行永远轮不到。
+    _, out["order_no"] = _first_anchor(
+        tokens,
+        lambda t: "订单编号" in t["text"] or "订单号" in t["text"],
+        lambda t: _longest_digit_run(t["text"], 10) or _same_row_value(t, tokens, row_tol, 10),
+    )
 
-    # 成交价：锚点为含「成交价」的框；同行取 ¥ 金额
-    price_anchor = None
-    for t in tokens:
-        if "成交价" in t["text"]:
-            price_anchor = t
-            price = _parse_price(t, tokens, row_tol)
-            if price is not None:
-                try:
-                    out["price_cny"] = str(Decimal(price))
-                except Exception:
-                    out["price_cny"] = price
-            break
+    # 成交价：锚点为含「成交价」的框；同行取 ¥ 金额。同样逐个锚点试到取到值为止。
+    # ⚠️ 商品名寄生在这个锚点上（_parse_product 靠「成交价上方那行挂牌价」定位），
+    # 所以锚点选错不只丢金额，连商品名一起丢。
+    price_anchor, price = _first_anchor(
+        tokens,
+        lambda t: "成交价" in t["text"],
+        lambda t: _parse_price(t, tokens, row_tol),
+    )
+    if price is not None:
+        try:
+            out["price_cny"] = str(Decimal(price))
+        except Exception:
+            out["price_cny"] = price
 
     # 商品名称：成交价上方挂牌价所在行的中文标题
     out["product"] = _parse_product(tokens, row_tol, price_anchor)
 
     # 下单时间：锚点为含「下单时间」的框；同行取日期（区别于付款/发货时间）
-    for t in tokens:
-        if "下单时间" in t["text"]:
-            out["order_date"] = _parse_order_date(t, tokens, row_tol)
-            break
+    _, out["order_date"] = _first_anchor(
+        tokens,
+        lambda t: "下单时间" in t["text"],
+        lambda t: _parse_order_date(t, tokens, row_tol),
+    )
 
     return out
 
@@ -651,13 +706,10 @@ def parse_shipment_fields(ocr_result) -> dict:
     heights = [t["h"] for t in tokens if t["h"] > 0]
     row_tol = (sum(heights) / len(heights) * 0.8) if heights else 12.0
 
-    # 同一个词可能在页面上出现多次（如「订单时间」既是灰色分组标题、又是数据行标签，标题那行
-    # 同行没有值），故逐个锚点尝试直到取到值，而不是在首个锚点上 break。
+    # 逐个锚点尝试直到取到值（理由见模块级的 _first_anchor）。这里原先是本函数内的一个
+    # 局部 _first——而商品订单那侧一直是「命中即 break」，同一个坑修了一半。现已共用。
     def _first(keyword: str, pick):
-        for t in tokens:
-            if keyword in t["text"] and (v := pick(t)) is not None:
-                return t, v
-        return None, None
+        return _first_anchor(tokens, lambda t: keyword in t["text"], pick)
 
     # 国际单号：值为本框或同行的 tracking（EB861624386CN 含 9 位数字，min_len=8 可命中）
     anchor, value = _first(

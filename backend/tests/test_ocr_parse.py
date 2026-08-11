@@ -101,7 +101,7 @@ def test_parse_order_fields_empty():
 
 def test_detect_status_lifecycle():
     assert ocr._detect_purchase_status("交易成功", False) == "已签收"   # 闲鱼「交易成功」= 国内快递签收
-    assert ocr._detect_purchase_status("交易关闭", False) == "交易关闭"
+    assert ocr._detect_purchase_status("交易关闭", False) is None       # 终态不写，见下面那条
     assert ocr._detect_purchase_status("等待卖家发货", False) == "待发货"
     assert ocr._detect_purchase_status("卖家已发货", False) == "待收货"
     assert ocr._detect_purchase_status("随便什么", True) == "待收货"    # 有快递号即已发货
@@ -110,10 +110,43 @@ def test_detect_status_lifecycle():
 
 def test_detect_status_values_are_valid_enum():
     from app.models import PurchaseStatus
-    valid = {s.value for s in PurchaseStatus}
+    valid = {s.value for s in PurchaseStatus} | {None}   # None = 终态，刻意不写
     for text in ("交易成功", "交易关闭", "等待卖家发货", "卖家已发货", "无信息"):
         for has_express in (True, False):
             assert ocr._detect_purchase_status(text, has_express) in valid
+
+
+@pytest.mark.parametrize("text", [
+    "退款成功 买家已收到退款",
+    "交易关闭",
+    "商品详情 支持七天无理由退款",        # ← 一个按钮/说明文案就够
+    "申请退款  联系卖家  查看物流",
+])
+def test_ocr_never_sets_a_terminal_status(text):
+    """OCR **绝不**把订单设成终态（退款 / 交易关闭）。
+
+    判定是在整页拼起来的 full_text 上做**无锚点子串扫描**，而规则表第一条含裸「退款」——
+    页面上任何位置出现这两个字都会命中，包括「申请退款」按钮和「支持七天无理由退款」
+    这类商品说明。而终态是**不可逆**的：`can_advance_purchase` 对终态一律 False，
+    这张单从此再也不会被任何自动流程更新，爬虫之后抓到真实状态也推不动它。
+
+    「猜错一个中间态」下一轮就自动纠正了；「猜错一个终态」是永久钉死。
+    不对称到这个程度，就不该由子串扫描来决定——留空，人在暂存表上确认。
+    """
+    from app.models import PURCHASE_TERMINAL_STATUSES
+
+    for has_express in (True, False):
+        got = ocr._detect_purchase_status(text, has_express)
+        assert got not in PURCHASE_TERMINAL_STATUSES, f"{text!r} 被判成了终态 {got}"
+
+
+def test_terminal_is_left_blank_not_downgraded_to_a_guess():
+    """命中终态时留空，**不退而求其次猜一个非终态**。
+
+    截图真是退款单时，硬写成「待发货」是另一种错——而且那个错会被当成真值用。
+    """
+    assert ocr._detect_purchase_status("退款成功", False) is None
+    assert ocr._detect_purchase_status("退款成功", True) is None, "有快递号也不该改判"
 
 
 def test_reject_other_platform():
@@ -525,3 +558,79 @@ def test_ocr_writes_to_staging_not_straight_into_the_ledger():
         assert gone not in orders, f"订单页还留着 OCR 通路：{gone}（识别结果应当先落暂存）"
     # 暂存页的落点必须是暂存，不能是账本
     assert "ordersApi.create" not in staging, "暂存页的 OCR 直接建了账本单，绕过了人工确认"
+
+
+# --- 快递公司：宁可留空，不许从装饰词猜出来 --------------------------------------
+
+@pytest.mark.parametrize("page_text", [
+    "顺丰包邮 全新未拆",          # 商品标题里的「顺丰」
+    "京东自营 官方旗舰店",         # COMPANY_MAP 里有「京东」→ 京东物流
+    "cute items for systems",     # 英文标题里的裸子串 ems → EMS
+    "菜鸟驿站代收",               # 实际承运可能是别家
+])
+def test_company_is_not_invented_without_a_tracking_number(page_text):
+    """页面上没有物流行时，**不许**只凭一个公司词就填出快递公司。
+
+    原先兜底那一支写着「只认出公司、没有单号：仍然报公司」，没有任何锚点约束：
+    商品标题里的「顺丰包邮」、英文标题里的 it`ems`/syst`ems`、京东截图上的「京东自营」
+    都会凭空造出一个 express_company——看起来完全合理，实际是从装饰词猜的，
+    而它会落进「快递公司」列并参与标签归组。
+
+    没有快递号就是没认出物流信息。留空比编一个强——留空看得出来，编的看不出来。
+    """
+    page = row(50, page_text) + row(120, "订单编号", "1234567890123456")
+    out = ocr.parse_order_fields(page)
+    assert out["express_no"] is None, "用例前提不成立：这一页不该有快递号"
+    assert out["express_company"] is None, f"从 {page_text!r} 里猜出了快递公司"
+
+
+def test_company_still_comes_along_when_there_is_a_real_tracking_row():
+    """反面：有真的物流行时，公司名照常取——这道闸不是把功能关掉。"""
+    page = row(50, "快递单号", "顺丰速运 SF1234567890123")
+    out = ocr.parse_order_fields(page)
+    assert out["express_no"] == "SF1234567890123"
+    assert out["express_company"] == "顺丰速运"
+
+
+def test_nearest_company_does_not_reach_across_the_page():
+    """标签行不含公司名时，只在**附近几行**里找，不许从页面另一头捞。
+
+    第二段原先是全页按 y 距离排序取最近的一个、没有距离上限：
+    一张只有单号没有公司名的物流行，会把几百像素外商品标题里的「顺丰包邮」认成承运商。
+    """
+    page = (row(50, "顺丰包邮 全新未拆")                      # 页面顶部的商品标题
+            + row(900, "快递单号", "78912345678901"))         # 很远的地方才是真物流行
+    out = ocr.parse_order_fields(page)
+    assert out["express_no"] == "78912345678901"
+    assert out["express_company"] is None, "从页面另一头把标题里的公司词捞回来了"
+
+
+# --- 锚点：取不到值要继续找下一个，不能在第一个上 break ---------------------------
+
+@pytest.mark.parametrize("field,head,value_row,want", [
+    ("order_no", "订单号", ("订单编号", "1234567890123456"), "1234567890123456"),
+    ("order_date", "下单时间", ("下单时间", "2026-03-01"), "2026-03-01"),
+])
+def test_a_bare_label_row_does_not_swallow_the_anchor(field, head, value_row, want):
+    """页面上第一个含该关键词的框是**列头/筛选栏/分组标题**（同行没有值）时，
+    必须继续找下一个，不能在它身上 break。
+
+    在那儿 break 的话真正那一行永远轮不到，字段静默为空。
+    集运侧早就用 `_first` 修过这个坑并写了注释，商品订单侧三段却一直留着——
+    现在两边共用 `_first_anchor`。
+    """
+    page = row(40, head) + row(200, *value_row)      # 第一行是光秃秃的标题，没有值
+    out = ocr.parse_order_fields(page)
+    assert out[field] == want, f"{field} 被空的标题行吃掉了"
+
+
+def test_bare_price_label_does_not_kill_product_too():
+    """成交价的锚点被空标题行吃掉时，**商品名会跟着一起丢**——
+    `_parse_product` 靠「成交价上方那行挂牌价」定位，没有锚点就直接返回 None。
+    所以这一段的 break 比另外两段更贵。"""
+    page = (row(40, "成交价")                                  # 分组标题，同行无金额
+            + row(200, "全新未拆 星星灯")
+            + row(260, "挂牌价", "¥99.00")
+            + row(320, "成交价", "¥88.00"))
+    out = ocr.parse_order_fields(page)
+    assert out["price_cny"] == "88.00", "成交价被空的标题行吃掉了"
