@@ -22,7 +22,14 @@ rem soroban.exe and leaves the ledger exactly where it was.
 set RELEASE=%ROOT%Releases\soroban
 set VENV_PY=%BACKEND%\.venv\Scripts\python.exe
 
-rem ===== Pick Python: prefer backend venv (start.bat creates it), else system =====
+rem ===== Pick Python: prefer backend venv, else whatever is on PATH =====
+rem NOTE ON WINDOWS: start.bat does NOT create backend\.venv -- it creates/activates the
+rem conda env "soroban" (see start.bat: CONDA_ENV_NAME, python=3.12). backend\.venv is what
+rem start.sh makes on Linux/macOS. So on a Windows box the check below almost always falls
+rem through to `where python`, and the right way to run this script is from an Anaconda
+rem Prompt with the soroban env activated -- then `where python` resolves to that env.
+rem (Three messages here used to say "run start.bat to create the venv". On Windows that
+rem instruction can never succeed; it was pointing at a file start.bat never writes.)
 rem NOTE: always call PyInstaller via "python -m PyInstaller" (NOT bare "pyinstaller").
 rem This script is named pyinstaller.bat; cmd would resolve "pyinstaller" to THIS file
 rem (current dir before PATH) and recurse into an infinite loop.
@@ -35,13 +42,16 @@ rem parentheses around them) so each `if errorlevel` sees the real, current valu
 if exist "%VENV_PY%" goto have_venv_py
 where python >nul 2>&1
 if errorlevel 1 (
-    echo ERROR: python not found and backend\.venv missing.
-    echo        Run start.bat once to create the venv, or install Python 3.11+.
+    echo ERROR: no python on PATH, and backend\.venv does not exist.
+    echo        Either: open an Anaconda Prompt and run  conda activate soroban
+    echo        (that is the env start.bat uses on Windows), then re-run this script;
+    echo        or install Python 3.11 or 3.12 and put it on PATH.
+    echo        NOT 3.13 -- rapidocr_onnxruntime has no wheel for it, so OCR cannot install.
     pause
     exit /b 1
 )
 set "PY=python"
-echo Using system python ^(backend\.venv not found; run start.bat first for a clean env^)
+echo Using python from PATH ^(no backend\.venv; on Windows that is normal -- start.bat uses a conda env^)
 goto py_ready
 :have_venv_py
 set "PY=%VENV_PY%"
@@ -56,6 +66,13 @@ rem The sentinel must cover the OCR deps too. collect_data_files/collect_submodu
 rem WARN when a package is missing and return an empty list, so PyInstaller happily ships an
 rem exe whose OCR is dead -- a failure that only shows up on the user's machine.
 rem (soroban.spec now hard-fails on this as well; this check just fixes it earlier.)
+rem Version gate, same lower bound as start.bat plus the upper bound start.bat only mentions
+rem in a comment: rapidocr_onnxruntime ships no wheel for 3.13, so on 3.13 the dependency
+rem install below fails halfway and the build stops with a pip error that says nothing about
+rem the real cause. Check it up front and say what to do.
+"%PY%" -c "import sys; sys.exit(0 if (3,11) <= sys.version_info < (3,13) else 1)"
+if errorlevel 1 goto bad_python_version
+
 "%PY%" -c "import fastapi, uvicorn, sqlmodel, alembic, rapidocr_onnxruntime, PIL" >nul 2>&1
 if not errorlevel 1 goto backend_deps_ok
 echo Backend deps missing, installing from requirements.txt ...
@@ -208,6 +225,15 @@ pause
 exit /b 0
 
 rem ===== Failure exits (kept flat so `if errorlevel` reads the real value) =====
+:bad_python_version
+echo ERROR: unsupported Python version for this build.
+"%PY%" -c "import sys; print('       found:', sys.version.split()[0], 'at', sys.executable)"
+echo        Need 3.11 or 3.12. rapidocr_onnxruntime publishes no wheel for 3.13,
+echo        so OCR cannot be installed and the packaged exe would ship with OCR dead.
+echo        On Windows: open an Anaconda Prompt, run  conda activate soroban  (python=3.12),
+echo        then re-run this script.
+pause
+exit /b 1
 :deps_fail
 echo ERROR: backend deps install failed
 pause

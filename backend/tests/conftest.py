@@ -33,6 +33,29 @@ ADMIN_USER = "admin"
 ADMIN_PASS = "admin12345"
 
 
+@pytest.fixture(autouse=True)
+def _reset_plugin_process_state():
+    """每条用例前后清掉插件的两张进程级全局表。
+
+    `_INFLIGHT`（互斥键）与 `_ALIVE_PROCS`（在飞进程注册表）都是模块级的，
+    而清理它们的是**收割线程**——某条用例走真的 `_launch` 起了个进程、自己先跑完了，
+    残留就会留到下一条用例。两种表现都是「单独跑绿、整套跑红」，而且红的是**无关的**那条：
+      · `_INFLIGHT` 残留 → 后面的用例点同一个命令吃 409；
+      · `_ALIVE_PROCS` 残留 → `shutdown_plugins()` 会去 poll 上一条用例的假进程。
+    与 test_maintenance 里的 `barrier.reset()` 同一个道理：模块级状态必须在用例之间归零。
+    """
+    from app.routers import plugins as mod
+
+    def clear():
+        with mod._PROCS_LOCK:
+            mod._INFLIGHT.clear()
+            mod._ALIVE_PROCS.clear()
+
+    clear()
+    yield
+    clear()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _schema():
     """建库 + 建 admin + 灌一条基准汇率（很多路由在缺汇率时行为不同，固定它以免测试飘）。"""

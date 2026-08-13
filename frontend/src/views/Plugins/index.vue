@@ -515,17 +515,26 @@ async function doToggle(p, a, enabled) {
 }
 
 async function doLogin(p, account) {
+  // `_busy` 不是装饰：它是连点的第一道闸。这两个按钮原先都没设它（只有卡片头的命令按钮有），
+  // 于是连点三下就是三个有头浏览器同时登同一个账号——项目自己把这写成风控红线。
+  // 后端现在也有互斥（重复请求 409），但让按钮当场变灰比让用户吃一个 409 好。
+  p._busy = true
   try {
     await pluginsApi.login(p.id, account)
     ElMessage.success(`已启动 ${account} 的登录，请在弹出的浏览器完成登录后点「刷新」`)
-  } catch (_) { /* 拦截器已提示 */ }
+  } catch (_) { /* 拦截器已提示 */ } finally { p._busy = false }
 }
 
 async function doFetch(p, account) {
+  p._busy = true
   try {
-    await pluginsApi.fetch(p.id, account)
-    ElMessage.success(account ? `已触发抓取：${account}` : '已触发抓取（全部启用账号）')
-  } catch (_) { /* 拦截器已提示 */ }
+    const r = await pluginsApi.fetch(p.id, account)
+    // 被互斥挡掉的账号要说出来。只报「已触发抓取」而其中几个根本没起来，是半句假话。
+    const skipped = r?.skipped_running || []
+    ElMessage.success(
+      (account ? `已触发抓取：${account}` : '已触发抓取（全部启用账号）')
+      + (skipped.length ? `；${skipped.join('、')} 上一次还在跑，本次跳过` : ''))
+  } catch (_) { /* 拦截器已提示 */ } finally { p._busy = false }
 }
 
 async function doRenameAccount(p, account) {

@@ -5,8 +5,13 @@
 """
 from __future__ import annotations
 
+import io
+import itertools
 import json
+import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -1257,3 +1262,319 @@ def test_a_still_running_command_does_show_running(client, fake_plugin, monkeypa
 
     got = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["last_run"]
     assert got["outcome"] == "running" and not got["at"]
+
+
+def test_the_card_finishes_when_the_process_ends_after_the_request(
+        client, fake_plugin, monkeypatch):
+    """**真实时序**：请求先返回，子进程稍后才结束——卡片必须收尾，不能永久「执行中」。
+
+    上面那条 `test_a_fast_failing_plugin_does_not_stay_running` 用的桩是**同步**调
+    `on_done`（「进程比请求还快」），那是刻意造的极端。可 `_launch` 是 fire-and-forget：
+    Popen 之后由收割线程等进程退出，所以**日常路径恰恰相反**——扇出循环 `finally`
+    里的 `seal_and_report` 一定跑在所有回调之前。
+
+    那条路径上曾经是这样断的：`_batch_seal` 发现 `_BATCHES` 里还没有这个批次
+    （回调一个都还没到），就 `return total <= 0, []` —— **把 total 整个丢掉**；
+    之后回调用 `setdefault` 新建 `{"total": None}`，而 `_batch_text` 拿到
+    `total=None` 恒返回 `"running"`。于是每一次抓取都停在「执行中…」，
+    前端每 4 秒轮询一次不停，`_BATCHES` 每执行一次泄漏一条，只有重启后端才被
+    `reclaim_stale_runs` 刷成 failed（而且写的理由是假的：「soroban 在它跑完之前退出了」）。
+
+    两条测试的差别只有**回调的时机**，而那正是决定成败的那个变量——
+    只测同步那一支等于把唯一会出错的顺序排除在外。
+    """
+    from app.routers import plugins as mod
+
+    pending = []
+
+    def deferred_launch(manifest, command, extra, token=None, config=None, jti=None,
+                        on_done=None):
+        pending.append(on_done)           # 只登记，不调用 = 进程还在跑
+        return 4242
+
+    monkeypatch.setattr(mod, "_launch", deferred_launch)
+    # 只盯**本条自己**造出来的批次：同文件别的用例把 _launch 打桩成「永不回调」，
+    # 它们的批次本来就该留在表里（进程还在跑）。断言整张表为空是把别人的状态算到自己头上。
+    before = set(mod._BATCHES)
+    client.put("/api/plugins/demo/grants", json={"granted": ["fx:write"]})
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
+    assert client.post("/api/plugins/demo/run/run").status_code == 200
+
+    # 请求已经返回，进程还没结束——此刻显示「执行中」是对的
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["last_run"]
+    assert got["outcome"] == "running", "进程还在跑，这时候就不该是终态"
+
+    for cb in pending:                    # 进程陆续结束
+        cb(True, "抓到 3 单")
+
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["last_run"]
+    assert got["outcome"] == "ok", \
+        f"进程都跑完了，卡片却还是 {got['outcome']}——永久「执行中」"
+    assert got["at"], "没有结束时间，界面上仍会当成在跑"
+    leaked = set(mod._BATCHES) - before
+    assert not leaked, f"批次跑完了没被清掉，每执行一次泄漏一条：{leaked}"
+
+
+class _FakeProc:
+    """假子进程。**只替换 `subprocess.Popen`，让真的 `_launch` / `_reap` 跑起来。**
+
+    第一版这两条测试是把 `_launch` 整个 monkeypatch 掉、并在桩里**重写了一遍**互斥逻辑
+    （算 key → 查 `_INFLIGHT` → 抛 `PluginBusy`）。于是测的是桩不是产品代码：
+    把 `_launch` 里的查重删掉、把 `_reap` 里的放键删掉，两条**都不会红**。
+    守卫必须打在产品代码上，不能在桩里把被测逻辑再实现一遍。
+
+    `gate` 未 set = 进程还在跑（`wait` 超时）；set 之后 `_reap` 才会走到 finally 放键。
+    """
+
+    _pids = itertools.count(9000)
+
+    def __init__(self, gate):
+        self.pid = next(self._pids)
+        self.stdout = io.StringIO('{"ok": true, "created": 1}\n')
+        self.stderr = io.StringIO("")
+        self.returncode = None
+        self._gate = gate
+
+    def wait(self, timeout=None):
+        if not self._gate.wait(timeout):
+            raise subprocess.TimeoutExpired("demo", timeout)
+        self.returncode = 0
+        return 0
+
+    def poll(self):
+        # 关停路径会调它。假 Popen 就该把 Popen 的接口补全，
+        # 少一个方法的表现是**别的测试文件**报 AttributeError，看不出跟这里有关。
+        return self.returncode
+
+
+def _popen_gate(monkeypatch):
+    """把 Popen 换成假的，返回那个「进程什么时候结束」的开关。"""
+    from app.routers import plugins as mod
+
+    gate = threading.Event()
+    monkeypatch.setattr(mod.subprocess, "Popen", lambda *a, **k: _FakeProc(gate))
+    return gate
+
+
+def _grant_and_enable(client):
+    client.put("/api/plugins/demo/grants", json={"granted": ["fx:write"]})
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
+
+
+def test_the_same_account_cannot_be_launched_twice_at_once(
+        client, fake_plugin, monkeypatch):
+    """同一插件/命令/账号**同时只许有一个子进程**。
+
+    这不是「优化」，是这个项目自己写下的风控红线：并发多开有头浏览器登同一个淘宝账号，
+    正是最容易触发平台风控的动作（见 scheduler_loop 的说明与淘宝插件的
+    docs/风控与对策.md）。而此前核心一侧一道闸都没有——「授权登录」按钮的 `:disabled`
+    只判插件装没装，连点三下就是三个 chromium。
+
+    互斥原先被推给每个插件各自实现，那等于把一条安全边界交给第三方代码去记得；
+    而淘宝插件的 `_account_lock` 只包了 fetch，**login 恰恰没包**。
+    """
+    gate = _popen_gate(monkeypatch)
+    _grant_and_enable(client)
+    try:
+        assert client.post("/api/plugins/demo/run/run").status_code == 200
+        second = client.post("/api/plugins/demo/run/run")
+        assert second.status_code == 409, \
+            f"同一个命令被并发起了两次（{second.status_code}）——连点就是多开浏览器"
+        assert "已经在跑" in second.text, second.text
+    finally:
+        gate.set()          # 放收割线程走，别把它留在测试会话里干等
+
+
+def test_the_mutex_key_is_released_when_the_process_ends(
+        client, fake_plugin, monkeypatch):
+    """进程结束后互斥键必须放掉——否则这个账号**永久**再也起不来。
+
+    这一条是上一条的反面。只加闸不放闸的话，功能测试全绿（第一次照样能跑），
+    用户却在第二次点击时永远撞 409，而且重启才能恢复。
+    """
+    from app.routers import plugins as mod
+
+    gate = _popen_gate(monkeypatch)
+    _grant_and_enable(client)
+    assert client.post("/api/plugins/demo/run/run").status_code == 200
+
+    gate.set()                                  # 进程结束 → 真的 _reap 走 finally 放键
+    for _ in range(200):
+        if not mod._INFLIGHT:
+            break
+        time.sleep(0.02)
+    assert not mod._INFLIGHT, "进程结束了，互斥键还占着"
+
+    assert client.post("/api/plugins/demo/run/run").status_code == 200, \
+        "进程结束后互斥键没放掉——这个账号再也起不来了"
+    gate.set()
+
+
+def test_launch_itself_refuses_a_duplicate_even_when_the_route_check_passed(
+        client, fake_plugin, monkeypatch):
+    """`_launch` 自己那道闸必须独立成立——它才是**防并发**的那一道。
+
+    路由里还有一道预筛（「已经在跑的目标先摘掉，全在跑就 409」），但那只是为了给用户
+    一句人话。两个请求并发时会**双双通过预筛**，然后双双走到 `_launch`——
+    真正阻止「同时起两个 chromium」的是 `_launch` 里「查重与登记在同一把锁内」那三行。
+
+    这条测试是直接打在 `_launch` 上的，因为通过路由根本够不着它：
+    顺序发两个请求时预筛先返回 409，`_launch` 的第二次调用压根不会发生。
+    （删掉 `_launch` 里的查重、只留预筛，整套测试曾经全绿——那正是这条补上的原因。）
+    """
+    from app.routers import plugins as mod
+
+    gate = _popen_gate(monkeypatch)
+    m = mod._find_manifest("demo")
+    extra = ["--account", "甲"]
+    try:
+        assert mod._launch(m, "run", extra) > 0
+        with pytest.raises(mod.PluginBusy):
+            mod._launch(m, "run", extra)
+        # 换个账号不受影响：互斥键是「插件/命令 [账号]」，不是整个插件
+        assert mod._launch(m, "run", ["--account", "乙"]) > 0
+    finally:
+        gate.set()
+
+
+def test_a_busy_account_does_not_take_down_its_siblings(client, fake_plugin, monkeypatch):
+    """扇出时某个账号被互斥挡下 → **只跳过它**，兄弟照常起；令牌当场作废。
+
+    循环里没有 per-account 的 try 的话，一个 `PluginBusy` 会掀掉整个扇出——
+    「甲还在跑」变成「乙丙也别想跑」。而令牌是**为那个没起来的进程签的**，
+    没人会去 revoke 它，每被挡一次就泄漏一枚能用二十几分钟的凭据。
+    """
+    from app.routers import plugins as mod
+
+    gate = _popen_gate(monkeypatch)
+    m = mod._find_manifest("demo")
+    revoked = []
+    monkeypatch.setattr(mod.scopes, "revoke", lambda jti: revoked.append(jti))
+    try:
+        mod._launch(m, "run", [])                 # 先把「无账号」这个键占住
+        _grant_and_enable(client)
+        r = client.post("/api/plugins/demo/run/run")
+        assert r.status_code == 409, r.text       # 只有一个目标，全被挡 ⇒ 409
+        # 预筛在签发令牌**之前**就挡下了，所以这条路径上一枚令牌都不该签出去
+        assert not revoked, f"被挡下还签了令牌并且泄漏了：{revoked}"
+    finally:
+        gate.set()
+
+
+def test_a_failed_spawn_releases_the_key_instead_of_wedging_the_account(
+        client, fake_plugin, monkeypatch):
+    """`Popen` 抛错时必须把刚登记的互斥键放掉，否则这个账号**永久**起不来。
+
+    登记要在 Popen **之前**（否则两个并发请求会双双查到「没人在跑」再双双起进程），
+    代价就是：起失败的那条路径必须自己把键收回来。漏了不会有任何报错——
+    第一次点击如实报 500，之后每一次都撞 409「已经在跑」，而其实一个进程都没有，
+    只有重启后端才能恢复。功能测试一条都不会红。
+    """
+    from app.routers import plugins as mod
+
+    boom = {"on": True}
+
+    def popen(*a, **k):
+        if boom["on"]:
+            raise OSError("模拟 fork 失败")
+        return _FakeProc(threading.Event())
+
+    monkeypatch.setattr(mod.subprocess, "Popen", popen)
+    _grant_and_enable(client)
+    assert client.post("/api/plugins/demo/run/run").status_code == 500
+    assert not mod._INFLIGHT, f"进程没起来，键却占着：{mod._INFLIGHT}"
+
+    boom["on"] = False                      # 环境恢复了，应当能重新跑
+    assert client.post("/api/plugins/demo/run/run").status_code == 200, \
+        "启动失败一次之后这个账号再也起不来了"
+
+
+# 基名逐个不同：PluginConfig 跨用例存活，两轮共用一个名字的话第二轮建首个账号就 409，
+# 红在「前提没成立」而不是「守卫没生效」——看起来一样，含义完全不同。
+@pytest.mark.parametrize("first,second", [("abc", "ABC"), ("xyz", "xYz")])
+def test_account_names_that_differ_only_in_case_are_refused(client, fake_plugin, first, second):
+    """只有大小写不同的账号名必须挡掉——它们在 Windows/macOS 上**共用同一份会话文件**。
+
+    账号名同时是 `<state_dir>/<账号>.json` 的文件名，而 NTFS / APFS 大小写不敏感。
+    加得进去的话，两个账号共用一份 cookie：给其中一个注销，`delete_account` 的 unlink
+    删掉的是**另一个的真身会话**，而返回的 `removed_session: true` 看着完全正常，
+    用户只会发现「另一个账号莫名其妙掉登录了」。
+
+    这条闸在 Linux 上永远不会自己触发（ext4 区分大小写），所以只能靠守卫钉住。
+    """
+    assert client.post("/api/plugins/demo/account", params={"name": first}).status_code == 200
+    r = client.post("/api/plugins/demo/account", params={"name": second})
+    assert r.status_code == 409, f"{second} 被当成了新账号——它和 {first} 会共用一份会话文件"
+
+
+def test_the_ledger_column_keeps_its_case_sensitivity(client, fake_plugin):
+    """反面：**账本那一列的大小写敏感是刻意的**，不许被这条闸顺手折掉。
+
+    迁移 f2a3b4c5d6e7 专门把 `platform_account` 改成 `utf8mb4_0900_bin`，
+    理由就是不该把 Alice 和 alice 当成同一个人。两件事的约束来自不同的层：
+    账号名受**文件系统**约束，账本列受**业务语义**约束——
+    把它们一起折叠，就是拿一个理由去改另一件事。
+    """
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "app" / "routers" / "plugins.py"
+    body = src.read_text(encoding="utf-8")
+    i = body.index("def rename_account")
+    seg = body[i:body.index("\n@router", i)]
+    assert "tag_value_in_use(session, field, new)" in seg, \
+        "账本占用检查被改动了——它必须保持逐字节比较"
+    assert "casefold" not in seg.split("tag_value_in_use(session, field, new)")[1][:200], \
+        "账本那一半也被折叠了大小写"
+
+
+@pytest.mark.parametrize("toml,expect", [
+    # ① scope 名拼错：勾上后被 `& set(SCOPES)` 丢掉 → 「需要新授权」的黄标永远消不掉，
+    #    而前端还会弹「已授予「fx:wirte」」——一句明确的假话。
+    ('id = "demo"\npython = "inherit"\nentry = "-m demo"\nscopes = ["fx:wirte"]\n'
+     '[[commands]]\nname = "run"\nlabel = "跑"\nneeds = ["fx:wirte"]\n', "不认识"),
+    # ② 命令要了清单没声明的权限：blocked 恒含它，而权限区只按 declared 渲染——
+    #    悬停提示「先在下面勾选授权」指向一个**根本不存在**的勾选框。
+    ('id = "demo"\npython = "inherit"\nentry = "-m demo"\nscopes = ["fx:write"]\n'
+     '[[commands]]\nname = "run"\nlabel = "跑"\nneeds = ["fx:write", "staging:read"]\n', "没声明"),
+])
+def test_a_broken_scope_declaration_shows_up_as_a_manifest_error(
+        client, fake_plugin, toml, expect):
+    """清单里的 scope 写错，必须变成**界面上看得见**的清单错误。
+
+    两种写错的表现一模一样，而且都让用户**无路可解**：按钮永远灰着、
+    「需要新授权」永远消不掉，而没有任何一处提示说得出为什么。用户能做的只有猜。
+
+    仓库里那两个 plugin.toml 都写对了，所以这个洞至今没炸——那是运气不是防护。
+    而 `conftest.py` 把 PLUGIN_DIR 指向空目录，**没有任何测试解析真实 plugin.toml**：
+    把 `fx:write` 敲错一个字母，近千条测试照样全绿。
+    """
+    (fake_plugin / "plugin.toml").write_text(toml, encoding="utf-8")
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]
+    assert got["manifest_error"], "清单里的 scope 写错了，界面上却一点痕迹都没有"
+    assert expect in got["manifest_error"], got["manifest_error"]
+
+
+def test_the_real_plugin_manifests_in_this_repo_pass_the_scope_lint():
+    """仓库里**真实的** plugin.toml 必须过 lint。
+
+    上面两条用的是造出来的坏清单（测「坏的能不能被发现」）；这一条测「好的还是不是好的」。
+    没有它，把 `fx:write` 在真清单里敲错一个字母，整套测试依然全绿——
+    因为其它测试全都指着一个空的插件目录。
+    """
+    import tomllib
+
+    from app.plugins import manifest as pm
+    from app.routers.plugins import _scope_lint
+
+    root = Path(__file__).resolve().parents[2] / "plugins"
+    tomls = sorted(root.glob("soroban-plugin-*/plugin.toml")) if root.is_dir() else []
+    if not tomls:
+        import os
+        if os.environ.get("SOROBAN_NO_PLUGINS"):
+            pytest.skip("显式声明了本机没有插件仓（SOROBAN_NO_PLUGINS=1）")
+        raise AssertionError(
+            "找不到任何真实 plugin.toml。这条守卫钉的正是「真清单没人解析过」，"
+            "不能静默跳过——真没有插件仓请设 SOROBAN_NO_PLUGINS=1。")
+    for f in tomls:
+        mf = pm.parse(tomllib.loads(f.read_text(encoding="utf-8")), f.parent)
+        assert not _scope_lint(mf), f"{f.parent.name} 的 plugin.toml：{_scope_lint(mf)}"

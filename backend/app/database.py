@@ -220,10 +220,19 @@ def _wal_truncate() -> None:
 
 async def wal_checkpoint_loop(interval: int = 600) -> None:
     """后台循环：每 interval 秒截断一次 WAL，控制 -wal 体积。单轮异常不结束循环。"""
+    from starlette.concurrency import run_in_threadpool
+
     while True:
         await asyncio.sleep(interval)
         try:
-            _wal_truncate()
+            # **必须丢线程池。** 这是个协程，裸调 `_wal_truncate()` 就是在事件循环线程上
+            # 做同步 SQLite 调用——而 `PRAGMA wal_checkpoint(TRUNCATE)` 撞上写锁时
+            # 会一直等到 sqlite3 的 busy timeout，实测阻塞 5 秒。那 5 秒里整个事件循环停摆：
+            # 健康检查、前端轮询、静态资源全卡，而且**一行日志都不会有**——
+            # checkpoint 撞锁是返回 busy 而不是抛异常，下面这个 except 根本进不去。
+            # 现实触发路径：数据库页点「迁回本地 SQLite」，迁移在单事务里逐表 delete+insert，
+            # 全程握着写锁；600 秒一次的这一轮正好落进那段窗口。
+            await run_in_threadpool(_wal_truncate)
         except Exception as e:
             log.warning("周期性 WAL checkpoint 失败：%s", e)
 

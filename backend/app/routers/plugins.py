@@ -96,6 +96,29 @@ def plugin_roots() -> list[Path]:
     return roots
 
 
+def _scope_lint(mf) -> str:
+    """清单里的 scope 声明有没有硬伤。没有返回空串（调用方据此保留原有 error）。
+
+    三种都查，因为三种的表现一模一样——**按钮永远灰着，而且没有任何提示说得出为什么**：
+      ① 命令 needs 里的 scope 核心不认识（拼错）；
+      ② 清单 scopes 里的 scope 核心不认识（拼错）；
+      ③ 命令 needs 了一个清单自己没声明、也不是 baseline 的 scope。
+    ③ 尤其阴：`save_grants` 会 `& set(manifest.scopes)` 把它丢掉，
+    于是用户就算猜到要授权也授不了——他能勾的那些框里根本没有这一项。
+    """
+    known = set(scopes.SCOPES)
+    declared = set(mf.scopes)
+    needed = {n for c in mf.commands for n in c.needs}
+    problems = []
+    if bad := sorted((needed | declared) - known):
+        problems.append(f"核心不认识这些权限（拼错了？）：{'、'.join(bad)}")
+    baseline = {d["key"] for d in scopes.describe_baseline()}
+    if missing := sorted(needed - declared - baseline):
+        problems.append(f"命令要了清单没声明的权限：{'、'.join(missing)}"
+                        f"（把它们加进 plugin.toml 的 scopes）")
+    return "；".join(problems)
+
+
 def discover() -> list[dict]:
     """扫描插件目录，读各 plugin.toml。返回 manifest 列表（附 _dir）。坏的跳过。
 
@@ -132,6 +155,15 @@ def discover() -> list[dict]:
                     log.warning("插件目录 %s 的 plugin.toml 解析失败：%s", d.name, e)
                 else:
                     mf = pmanifest.parse(m, d)
+                    # 清单里的 scope 名写错 / 命令要了没声明的 scope，都要变成**可见的**清单错误。
+                    # 不校验的话这两种写错都零报错，而且用户在界面上**无路可解**：
+                    #   · needs 里有 scopes 没声明的 → blocked 恒含它，悬停提示「先在下面勾选授权」
+                    #     指向一个根本不存在的勾选框（权限区只按 declared 渲染）；
+                    #   · scope 名拼错（fx:wirte）→ 勾上后被 `& set(SCOPES)` 丢掉，
+                    #     「需要新授权」的黄标永远消不掉，而 toggleGrant 还会弹「已授予 fx:wirte」——
+                    #     一句明确的假话。
+                    # 放在这里而不是 manifest.py：那边不该反向依赖 scopes 模块。
+                    mf = mf._replace(error=mf.error or _scope_lint(mf))
                 if mf.id in seen:
                     continue
                 seen.add(mf.id)
@@ -585,6 +617,23 @@ _MAX_CAPTURE = 256 * 1024        # 每路输出最多留末尾 256KB
 # 内存里却还躺着几百 MB，而任务管理器里那个进程与 soroban 已经毫无关联，没人猜得到。
 _ALIVE_PROCS: dict[int, tuple] = {}
 _PROCS_LOCK = threading.Lock()
+# 在飞的「插件/命令 [账号]」键。同一个键同时只许有一个子进程——
+# 项目自己把「同账号并发多开浏览器」写成风控红线（见 scheduler_loop 的说明、
+# 以及淘宝插件仓的 docs/风控与对策.md），而此前**核心一侧一道闸都没有**：
+# 「授权登录」按钮连点三下就是三个有头 chromium 同时打开同一个淘宝账号。
+# 互斥原先被推给每个插件各自实现（淘宝插件的 _account_lock 只包 fetch，login 没包），
+# 那等于把一条安全边界交给第三方代码去记得。
+_INFLIGHT: set[str] = set()
+
+
+class PluginBusy(RuntimeError):
+    """同一插件/命令/账号已有一个进程在飞。由 run_command 决定是跳过还是 409。"""
+
+
+def _run_key(manifest: dict, command: str, extra: list[str]) -> str:
+    """互斥键 = 卡片上那个标签。两者共用同一个函数，免得哪天格式漂开、互斥悄悄失效。"""
+    acct = extra[1] if len(extra) >= 2 and extra[0] == "--account" else ""
+    return f"{manifest.get('id', '?')}/{command}" + (f" [{acct}]" if acct else "")
 
 
 def _drain(stream, sink: list) -> None:
@@ -720,6 +769,7 @@ def _reap(proc: subprocess.Popen, label: str, jti: Optional[str] = None, on_done
     finally:
         with _PROCS_LOCK:
             _ALIVE_PROCS.pop(proc.pid, None)
+            _INFLIGHT.discard(label)            # 释放互斥键，这个账号可以再跑了
         scopes.revoke(jti)          # 任务结束 → 令牌立即失效
         if on_done:
             on_done(ok, result or "已完成", warn)
@@ -773,6 +823,13 @@ def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str]
             env["SOROBAN_TOKEN"] = token
         if config:
             env["SOROBAN_CONFIG"] = json.dumps(config, ensure_ascii=False)
+    label = _run_key(manifest, command, extra)
+    # **登记必须在 Popen 之前**，且与查重在同一把锁里：分两步做的话，两个并发请求
+    # 会双双查到「没人在跑」，然后双双起进程——而这正是要防的那件事。
+    with _PROCS_LOCK:
+        if label in _INFLIGHT:
+            raise PluginBusy(label)
+        _INFLIGHT.add(label)
     try:
         proc = subprocess.Popen(
             cmd, cwd=str(manifest["_dir"]), env=env,
@@ -780,9 +837,9 @@ def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str]
             text=True, encoding="utf-8", errors="replace",
         )
     except (OSError, ValueError) as e:
+        with _PROCS_LOCK:                       # 没起来就别占着键，否则这个账号永久起不来
+            _INFLIGHT.discard(label)
         raise HTTPException(status_code=500, detail=f"启动插件失败：{e}")
-    acct = extra[1] if len(extra) >= 2 and extra[0] == "--account" else ""
-    label = f"{manifest.get('id', '?')}/{command}" + (f" [{acct}]" if acct else "")
     # jti 传给收割线程：进程一结束就把令牌作废。否则插件跑完之后那枚令牌还能用二十几分钟，
     # 而它此刻已经落在插件的日志/环境里了。
     with _PROCS_LOCK:
@@ -1144,8 +1201,20 @@ def add_account(
     _check_account_name(m, name)                        # 非空+无逗号+合法文件名（会话文件按此名存）
     cfg = _config_row(session, plugin_id)
     accs = _account_list(cfg)
-    if any(a["name"] == name for a in accs):
-        raise HTTPException(status_code=409, detail=f"账号已存在：{name}")
+    # **查重折叠大小写**：账号名同时是**会话文件名**（`<state_dir>/<账号>.json`），
+    # 而 NTFS / APFS 大小写不敏感——`abc` 与 `ABC` 在 Windows 上是同一个文件。
+    # 于是「加一个只有大小写不同的账号」会让两个账号共用一份 cookie：
+    # 给其中一个注销（`delete_account` 的 unlink）删掉的是另一个的真身会话，
+    # 而返回的 `removed_session: true` 看着完全正常。
+    #
+    # ⚠️ **只折叠这里，不折叠账本那一列。** `platform_account` 的大小写敏感是刻意的
+    # （迁移 f2a3b4c5d6e7 特意把它改成 utf8mb4_0900_bin，理由就是不该把 Alice/alice 折成一个人）。
+    # 这两件事的约束来自不同的层：一个是文件系统，一个是业务语义。
+    if any(a["name"].casefold() == name.casefold() for a in accs):
+        raise HTTPException(
+            status_code=409,
+            detail=f"账号已存在：{name}（账号名不区分大小写——它同时是本地会话文件名，"
+                   f"而 Windows/macOS 的文件系统不区分）")
     accs.append({"name": name, "platform": (platform or "").strip() or "淘宝", "enabled": True})
     _save_accounts(session, cfg, accs)
     session.commit()
@@ -1242,6 +1311,19 @@ def run_command(plugin_id: str, command: str, account: Optional[str] = None,
     # 而那时这个请求还没走到下面几行，紧接着就用 `"running"` 把它**盖掉并提交**。
     # 批次此刻已经从 `_BATCHES` 里弹掉了 ⇒ 再没有任何人会来改它 ⇒ 卡片永久停在「执行中…」。
     # 越是「一点就失败」的情形越稳定复现，而那恰恰是用户最想看到失败原因的时候。
+    # **已经在跑的目标先摘掉。** 全都在跑就直接 409 —— 此刻一个字节都还没写，
+    # 卡片上那次执行的进度不会被这次点击盖掉。
+    # 这只是「说人话」的那一半；真正的互斥在 `_launch` 里（查重与登记在同一把锁内），
+    # 因为这里到 `_launch` 之间仍有窗口。
+    with _PROCS_LOCK:
+        running = [w for extra, w in fan if _run_key(m, cmd.name, extra) in _INFLIGHT]
+        fan = [(extra, w) for extra, w in fan if _run_key(m, cmd.name, extra) not in _INFLIGHT]
+    if not fan:
+        raise HTTPException(
+            status_code=409,
+            detail=f"「{cmd.label}」已经在跑了" + (f"：{'、'.join(w for w in running if w)}" if any(running) else "")
+                   + "。等它跑完，或刷新看结果。")
+
     cfg.last_outcome, cfg.last_summary = "running", f"{cmd.label} 执行中…"
     cfg.last_finished_at = None
     cfg.updated_at = utcnow()
@@ -1253,16 +1335,26 @@ def run_command(plugin_id: str, command: str, account: Optional[str] = None,
             # `revoke(jti)`，还在跑的兄弟当场全部 401——它们已经抓到的订单再也回灌不进来，
             # 而且是静默的：插件那边只看到「soroban 拒绝了我」，用户只看到少了几单。
             token, jti = scopes.issue(current, plugin_id, cmd_scopes, timeout_s=_REAP_TIMEOUT)
-            pids.append(_launch(m, cmd.name, [*extra, "--soroban-url", _SELF_URL],
-                                token=token, config=conf, jti=jti,
-                                on_done=_result_writer(plugin_id, cmd.label,
-                                                       who=who, batch=batch)))
+            try:
+                pids.append(_launch(m, cmd.name, [*extra, "--soroban-url", _SELF_URL],
+                                    token=token, config=conf, jti=jti,
+                                    on_done=_result_writer(plugin_id, cmd.label,
+                                                           who=who, batch=batch)))
+            except PluginBusy:
+                # 上面那次筛选之后才抢进来的（并发点击）。跳过这个账号，别拖累兄弟——
+                # 而且**令牌必须当场作废**：它是为这个进程签的，进程没起来就没人会 revoke 它，
+                # 否则每被挡一次就泄漏一枚能用二十几分钟的凭据。
+                scopes.revoke(jti)
+                running.append(who)
     finally:
         # **finally**：中途抛异常（缺 venv、令牌签发失败）时，已经起来的兄弟仍会回调，
         # 而批次还在等一个永远到不了的计划数——卡片会永久停在「执行中…」。
         seal_and_report(batch, len(pids), plugin_id, cmd.label)
     return {"launched": True, "command": cmd.name, "pids": pids,
-            "targets": [w for _, w in fan if w], "scopes": sorted(cmd_scopes)}
+            "targets": [w for _, w in fan if w],
+            # 被互斥挡掉的目标也如实回报：前端那句「已触发抓取」否则是半句假话。
+            "skipped_running": [w for w in running if w],
+            "scopes": sorted(cmd_scopes)}
 
 
 # batch_id -> {"done": [(账号, ok, 摘要)], "total": 最终子进程数 or None（还没封口）}
@@ -1290,11 +1382,20 @@ def _batch_add(batch: str, who: str, ok: bool, summary: str,
 
 
 def _batch_seal(batch: str, total: int) -> tuple[bool, list]:
-    """扇出结束，告知最终有几个子进程。返回 (此刻是否已全部完成, 全部结果)。"""
+    """扇出结束，告知最终有几个子进程。返回 (此刻是否已全部完成, 全部结果)。
+
+    **登记用 setdefault 而不是 get。** `_launch` 是 fire-and-forget，所以日常路径上
+    这一句跑在**所有回调之前**——`_BATCHES` 里此刻还是空的。原先那句
+    `if b is None: return total <= 0, []` 于是把 total 整个丢掉，之后回调用 setdefault
+    新建 `{"total": None}`，而 `_batch_text` 拿到 total=None 恒返回 "running"：
+    **每一次执行都永久停在「执行中」**，前端 4 秒一轮询不停，批次每次泄漏一条。
+    （当时的三条回归测试全都用同步 `on_done` 的桩，把这个顺序反了过来，所以一直是绿的。）
+    """
     with _BATCH_LOCK:
-        b = _BATCHES.get(batch)
-        if b is None:
-            return total <= 0, []           # 一个都没起来，或子进程已全部跑完并清理过
+        if total <= 0:                      # 一个都没起来：没有回调会来，清干净直接收工
+            _BATCHES.pop(batch, None)
+            return True, []
+        b = _BATCHES.setdefault(batch, {"done": [], "total": None})
         b["total"] = total
         parts = list(b["done"])
         finished = len(parts) >= total
@@ -1430,7 +1531,10 @@ def rename_account(
         raise HTTPException(status_code=404, detail=f"没有这个账号：{old}")
     if new == old:
         return {"ok": True, "unchanged": True}
-    if new in _known_names(cfg, m) or tag_value_in_use(session, field, new):
+    # 账号名按 casefold 比（理由同 add_account：它是会话文件名）；
+    # 账本数据那一半仍然逐字节比，那一列的大小写敏感是刻意的。
+    if any(n.casefold() == new.casefold() for n in _known_names(cfg, m)) \
+            or tag_value_in_use(session, field, new):
         raise HTTPException(status_code=409, detail=f"新名字已被占用（已有账号/数据/授权）：{new}")
     # 1) 一个事务：数据 + 标签 + 配置一起改（只改昵称，平台/启用保留）
     raw = rename_tag_value(session, field, old, new)

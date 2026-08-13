@@ -28,8 +28,18 @@ export function queueOrderWrite(orderId, task) {
 // 两个方向都出过事：OCR 按单号合并**送了** items 却照抄「排除 items」的写法，
 // 页面上的物品停在合并前的「单价 0 / auto=true」，随后任何一次物品编辑都会把这份陈旧数组
 // 整体 PATCH 回去，刚补进去的钱就没了。判据只有一个——看 patch 里有没有 items。
-export function applyRowUpdate(target, patch, updated) {
-  if (patch && patch.items !== undefined) {
+// `itemsStale`：送出去之后、响应回来之前，本地的 items 又被人改过了。
+// 此时那份响应算的是**旧数组**，整体覆盖等于把用户这几百毫秒里敲的东西回滚掉——
+// 而且是当着他的面回滚：`el-input` 的 nativeInputValue watcher **没有聚焦豁免**
+// （唯一那条 activeElement 判断只在带 `.trim` 修饰符时生效），
+// 会直接改写正在输入的那个 DOM 节点、光标弹到末尾。用户多半没看出来，接着敲，
+// 于是拼出一个错名并在下一次保存时写进库。全程无提示、无撤销。
+//
+// 这种情况只采纳标量。代价是这一轮拿不到后端重折算的单价——但既然用户正在编辑，
+// 他下一次保存会把完整数组再送一遍，那时就对齐了。
+// 判据放在调用方：只有它知道自己送出去的是哪一份。
+export function applyRowUpdate(target, patch, updated, { itemsStale = false } = {}) {
+  if (patch && patch.items !== undefined && !itemsStale) {
     Object.assign(target, updated)
     return
   }

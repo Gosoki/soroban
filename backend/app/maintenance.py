@@ -46,6 +46,7 @@ class ReadOnlyBarrier:
         self._reason: Optional[str] = None
         self._deadline = 0.0
         self._inflight = 0                      # 已放行、尚未完成的写请求数
+        self._token: object = None              # 当前这次挂起的身份，见 hold 的 finally
 
     # --- 内部：调用方须持锁 ---
     def _expired(self) -> bool:
@@ -55,6 +56,7 @@ class ReadOnlyBarrier:
         if self._expired():
             log.error("只读屏障超时自愈（原因：%s）——迁移可能异常中断，请检查日志", self._reason)
             self._reason = None
+            self._token = None          # 连同身份一起清，否则原主收工时会误判成「还是我的」
         return self._reason
 
     # --- 查询 ---
@@ -90,6 +92,9 @@ class ReadOnlyBarrier:
                 raise RuntimeError(f"已有另一项维护操作在进行：{self._reason}")
             self._reason = reason
             self._deadline = time.monotonic() + timeout
+            # 这一次挂起的身份。出口靠它判「现在挂着的还是不是我这一次」——
+            # 见下面 finally 的理由。用 object() 而不是计数器：不会回绕，也不会被人当序号读。
+            self._token = tok = object()
         log.info("只读屏障已挂起：%s", reason)
         try:
             deadline = time.monotonic() + drain
@@ -106,9 +111,20 @@ class ReadOnlyBarrier:
             yield
         finally:
             with self._lock:
-                self._reason = None
-                self._deadline = 0.0
-            log.info("只读屏障已撤销：%s", reason)
+                # **只撤自己那一次。** 入口 `_reason_locked()` 自带过期自愈：屏障有硬上限
+                # （DEFAULT_TIMEOUT），到点后即便前一次还没收工，后来者也能拿到一个全新的屏障。
+                # 原先这里无条件 `self._reason = None`，于是 A 超时之后 B 挂上了自己的屏障，
+                # A 一收工就把**B 的**撤掉——B 的迁移在零保护下跑完，中间件放行一切写入，
+                # 而 B 的响应仍然是 {"ok": true}，日志只说「只读屏障已撤销」，不会说那是别人的。
+                # 现实窗口：前端给迁移配的 timeout 是 120 秒，屏障硬上限 900 秒，
+                # 用户以为失败再点一次即可复现（`_ALLOWED_WHILE_READONLY` 明确放行 /api/db/）。
+                if self._token is tok:
+                    self._reason = None
+                    self._deadline = 0.0
+                    self._token = None
+                    log.info("只读屏障已撤销：%s", reason)
+                else:
+                    log.warning("只读屏障已被别的维护操作接管，不撤销：%s", reason)
 
     # --- 测试用 ---
     def reset(self) -> None:
@@ -116,6 +132,7 @@ class ReadOnlyBarrier:
             self._reason = None
             self._deadline = 0.0
             self._inflight = 0
+            self._token = None
 
 
 barrier = ReadOnlyBarrier()

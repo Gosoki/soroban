@@ -434,3 +434,36 @@ def test_release_dir_does_not_carry_the_version():
         f"发布目录又带上版本号了：{m.group(1)}——升级会产出空账本"
     # 老用户的数据还在带版本号的旧目录里，那句一次性搬迁提示不能删
     assert "YOUR LEDGER IS NOT IN THIS FOLDER" in bat
+
+
+def test_pyinstaller_bat_does_not_point_windows_users_at_a_venv_start_bat_never_makes():
+    """打包脚本不许再叫 Windows 用户「跑 start.bat 建 venv」——那个 venv 它从来不建。
+
+    `start.bat` 在 Windows 上创建/激活的是 **conda 环境 `soroban`**（见它自己的
+    `CONDA_ENV_NAME` 与 `conda create -n ... python=3.12`）；`backend\\.venv` 是
+    `start.sh` 在 Linux/macOS 上的产物。所以「run start.bat once to create the venv」
+    这句指引在 Windows 上**永远不可能成立**——它指着一个 start.bat 不会写的路径。
+
+    这三句自 `ceee9b7` 起就是错的，而且在审计报告里被记过三次没人动。
+    改字符串成本为零，留着的成本是照文档走的人拿不到正确指引。
+    """
+    bat = (_REPO / "pyinstaller.bat").read_text(encoding="utf-8", errors="replace")
+    for wrong in ("start.bat once to create the venv",
+                  "run start.bat first for a clean env",
+                  "start.bat creates it"):
+        assert wrong not in bat, f"又出现了那句对 Windows 不成立的指引：{wrong}"
+    assert "conda activate soroban" in bat, "没告诉 Windows 用户真正该做什么"
+
+
+def test_pyinstaller_bat_gates_the_python_version_on_both_ends():
+    """打包脚本要有**上下界**的 Python 版本闸。
+
+    下界 3.11 与 start.bat 一致；上界是真正会咬人的那一头：`rapidocr_onnxruntime`
+    不发 3.13 的 wheel（start.bat 只在注释里提了一句，两个脚本都没有真的挡）。
+    在 3.13 上，依赖装到一半失败，pip 的报错完全不提这件事——而如果那步被跳过，
+    打出来的 exe 里 OCR 是死的，只在用户机器上才发现。
+    """
+    bat = (_REPO / "pyinstaller.bat").read_text(encoding="utf-8", errors="replace")
+    assert "(3,11) <= sys.version_info < (3,13)" in bat, "没有上下界都管的版本闸"
+    assert ":bad_python_version" in bat, "闸挡下之后没有可诊断的出口"
+    assert "3.13" in bat and "rapidocr" in bat, "没说清为什么 3.13 不行"

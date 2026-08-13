@@ -376,10 +376,34 @@ def test_notion_table_supports_row_level_lock():
 
 
 def test_panel_allows_typing_goods_amount():
-    """面板要能直接填货款（不想拆明细时的懒人入口）：折成「订单标题 × 1」的单条物品。"""
+    """面板要能直接填货款（不想拆明细时的懒人入口）：折成「× 1」的单条物品。
+
+    商品标题是**回落**，不是覆盖：已经有物品行时名字跟着那一行走（见下一条守卫）。
+    """
     src = (_REPO / "frontend" / "src" / "components" / "OrderItemsEditor.vue").read_text(encoding="utf-8")
     assert "async function applyGoods" in src
-    assert "quantity: 1" in src and "props.order.title" in src, "手填货款没绑成「订单名称×1」"
+    assert "quantity: 1" in src and "props.order.title" in src, "手填货款没绑成「× 1」的单条物品"
+
+
+def test_typing_the_goods_amount_keeps_a_name_the_user_already_gave():
+    """改「货款」不许把用户取好的物品名换回商品标题。
+
+    `isSingleUnitItem` 只数条数和数量，**不看名字、也不看 auto**，所以
+    「1 条 / 数量 1 / 用户亲手命名」这个**系统默认形态**（占位行被改名之后就是它）
+    下货款框仍然可编辑。原先改一次金额就把名字换回订单标题、顺带把 auto 打回 true，
+    物品列表页跟着一起变——而同一个数字在物品行的「单价」格里改，名字和 auto 都保得住。
+    **两个入口对同一份数据行为不一致**，而不一致的那个还是更顺手的那个。
+
+    按结构判：取 `applyGoods` 的函数体，要求名字与 auto 都**先看已有那一行**。
+    """
+    src = (_REPO / "frontend" / "src" / "components" / "OrderItemsEditor.vue").read_text(encoding="utf-8")
+    body = src[src.index("async function applyGoods"):]
+    body = body[:body.index("\nfunction ")]
+    body = re.sub(r"//.*$", "", body, flags=re.M)          # 剥注释，否则解释文字里的词也算命中
+    assert re.search(r"const cur = \(props\.order\.items \|\| \[\]\)\[0\]", body), \
+        "没有先取已有的那一行"
+    assert re.search(r"name = \(cur\??\.name", body), "物品名没有优先用已有的那个"
+    assert "auto: cur ?" in body, "auto 被无条件打回 true——用户确认过的行会重新变灰"
     assert ':disabled="!isSingleUnitItem"' in src, "拆过明细后仍允许从这里覆盖，会冲掉明细"
 
 
@@ -1150,3 +1174,102 @@ def test_staging_table_shows_every_field_ocr_writes():
     written = set(re.findall(r"data\.(\w+) = res\.", src))
     missing = written - cols - {"title"}          # title 的列 key 就叫 title，上面已匹配到
     assert not missing, f"OCR 写了但暂存表上看不见的字段：{sorted(missing)}"
+
+
+# --- applyRowUpdate 的**行为**测试：直接拿 node 跑那个纯函数 ---------------------
+
+_APPLY_ROW_HARNESS = r"""
+import { applyRowUpdate } from './frontend/src/utils/orderWrites.js'
+
+const results = {}
+
+// ① 送了 items、期间没人动过 → 整体采纳（含后端重折算的单价）。
+//    这一条是既有行为，OCR 合并那次就是因为**没有**采纳而丢过钱。
+{
+  const row = { id: 1, version: 1, items: [{ name: 'A', unit_price_cny: 0 }] }
+  applyRowUpdate(row, { items: [{ name: 'A' }] },
+                 { version: 2, items: [{ name: 'A', unit_price_cny: 12.3 }] })
+  results.fresh_adopts_items = row.items[0].unit_price_cny === 12.3 && row.version === 2
+}
+
+// ② 送了 items，但期间本地又被改过（itemsStale）→ 只采纳标量，items 保留本地的。
+{
+  const row = { id: 1, version: 1, items: [{ name: '用户正在敲的名字' }] }
+  applyRowUpdate(row, { items: [{ name: '旧名字' }] },
+                 { version: 2, items: [{ name: '旧名字' }] }, { itemsStale: true })
+  results.stale_keeps_local_items = row.items[0].name === '用户正在敲的名字'
+  results.stale_still_takes_scalars = row.version === 2
+}
+
+// ③ 没送 items → 一直都不该覆盖（既有行为）。
+{
+  const row = { id: 1, version: 1, items: [{ name: '本地未保存的编辑' }] }
+  applyRowUpdate(row, { postage_cny: 5 }, { version: 2, items: [{ name: '服务端的旧值' }] })
+  results.no_items_never_overwrites = row.items[0].name === '本地未保存的编辑'
+}
+
+// ④ 缺省不传第四个参数时行为与从前逐字节相同（不能因为加了个选项就改掉默认）。
+{
+  const row = { id: 1, version: 1, items: [{ name: 'A' }] }
+  applyRowUpdate(row, { items: [] }, { version: 2, items: [{ name: 'B' }] })
+  results.default_is_unchanged = row.items[0].name === 'B'
+}
+
+console.log(JSON.stringify(results))
+"""
+
+
+def test_apply_row_update_behaviour_under_node():
+    """`applyRowUpdate` 的**行为**测试——不是源码 grep，是真跑一遍。
+
+    它是纯函数（`orderWrites.js` 一个 import 都没有），所以 node 能直接跑。
+    这一轮已经有 6 处守卫栽在「按字符串判」上，凡是能真跑的就别去 grep 源码。
+
+    四条断言里，②是这次新加的：送出去之后本地 items 又被改过时，响应不许整体覆盖——
+    否则用户在那几百毫秒里敲进另一行的字会被回滚，而且是当着他的面回滚
+    （`el-input` 的 nativeInputValue watcher 没有聚焦豁免，会直接改写正在输入的 DOM 节点）。
+    ①③④保证这个新分支没有顺手改掉原有的三种行为。
+    """
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        import os
+        if os.environ.get("SOROBAN_NO_NODE"):
+            pytest.skip("显式声明了本机没有 node（SOROBAN_NO_NODE=1）")
+        raise AssertionError(
+            "找不到 node。这条是前端唯一的行为测试（其余全是源码守卫），不能静默跳过——"
+            "真没有 node 请设 SOROBAN_NO_NODE=1。")
+
+    harness = _REPO / "node-apply-row-update.test.mjs"
+    harness.write_text(_APPLY_ROW_HARNESS, encoding="utf-8")
+    try:
+        r = subprocess.run([node, str(harness)], cwd=_REPO, capture_output=True,
+                           text=True, timeout=60)
+    finally:
+        harness.unlink(missing_ok=True)
+    assert r.returncode == 0, f"node 跑挂了：{r.stderr[-800:]}"
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    failed = [k for k, v in got.items() if not v]
+    assert not failed, f"这些行为不成立：{failed}"
+
+
+def test_save_items_compares_against_what_it_actually_sent():
+    """`saveItems` 必须拿**送出去的那一份**跟响应回来时的本地数组比。
+
+    上面那条 node 测试盖住了 `applyRowUpdate` 本身；这一条盖的是**接线**——
+    判据只有调用方知道自己送了什么，函数本身无从判断。
+    另外钉住「两边归一化走同一个函数」：各写一份的话只要有一处漂了
+    （比如一边 trim 一边不 trim），比对就恒不相等，表现是「后端重折算的单价永远不生效」，
+    而不会有任何报错。
+    """
+    src = (_REPO / "frontend" / "src" / "components" / "OrderItemsEditor.vue").read_text(encoding="utf-8")
+    body = src[src.index("async function saveItems"):]
+    body = body[:body.index("\nasync function ")]
+    body = re.sub(r"//.*$", "", body, flags=re.M)
+    assert "const sent = JSON.stringify(items)" in body, "没有留下送出去的那一份"
+    assert re.search(r"itemsStale:\s*stale", body), "比对结果没有传给 applyRowUpdate"
+    assert body.count("toPayload(") == 2, \
+        "送出去和比对没有走同一个归一化函数（或者有人又各写了一份）"

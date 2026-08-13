@@ -93,16 +93,31 @@ watchEffect(() => {
     (sum, it) => sum + (Number(it.unit_price_cny) || 0) * (Number(it.quantity) || 1), 0)
 })
 
-// 手填货款 → 绑成「订单名称 × 1」的单条物品。auto=true 保持灰显，提示这是自动折算的、待复核。
+// 手填货款 → 绑成「× 1」的单条物品。
+//
+// **已经有名字就留着它**，别换回商品标题。`isSingleUnitItem` 只数条数和数量、
+// 不看名字也不看 auto，所以「1 条 / 数量 1 / 用户亲手命名」这个**系统默认形态**
+// （占位行被改过名之后就是它）下货款框仍然可编辑——原先改一次金额就把名字换回订单标题、
+// 顺带把 auto 打回 true，Items 页跟着一起变。
+// 同一个数字在物品行「单价」格里改则名字和 auto 都保住：两个入口对同一份数据行为不一致。
+// 名字与 auto 都跟着已有的那一行走，只有真的没有物品时才回落到商品标题。
 async function applyGoods(v) {
   if (!isSingleUnitItem.value) return               // 拆过明细的不该走到这（输入框已禁用），双保险
   const price = itemPrice(v)
-  const name = (props.order.title || '').trim() || '未命名物品'
-  props.order.items = [{ name, quantity: 1, unit_price_cny: price, auto: true }]
+  const cur = (props.order.items || [])[0]
+  const name = (cur?.name || '').trim() || (props.order.title || '').trim() || '未命名物品'
+  props.order.items = [{ name, quantity: 1, unit_price_cny: price, auto: cur ? !!cur.auto : true }]
   await saveItems()
 }
 
 function itemPrice(v) { return (v === '' || v === null || v === undefined) ? null : Number(v) }
+// 物品行 → 下推给后端的形状。**送出去和回来后比对必须走同一个函数**：
+// 两边各写一份归一化的话，只要有一处漂了（比如一边 trim 一边不 trim），
+// 比对就会恒不相等 —— 表现是「后端重折算的单价永远不生效」，而没有任何报错。
+function toPayload(rows) {
+  return rows.map((it) => ({ name: (it.name || '').trim(), quantity: Number(it.quantity) || 1,
+                             unit_price_cny: itemPrice(it.unit_price_cny), auto: !!it.auto }))
+}
 // 灰显 = 物品名与商品标题相同（无独立物品详情，多为自动占位）；有真实物品名即正常
 function isTitleItem(it) { return !!it.name && (it.name || '').trim() === (props.order.title || '').trim() }
 // 灰显 = 「这一行不是你亲手确认的」。两种来源，都该灰：
@@ -133,14 +148,20 @@ async function saveItems() {
     ElMessage.warning(`有 ${blank.length} 条物品还没填名字——先填上，或点右侧 🗑 删掉`)
     return false
   }
-  const items = all.map((it) => ({ name: it.name.trim(), quantity: Number(it.quantity) || 1,
-                                   unit_price_cny: itemPrice(it.unit_price_cny), auto: !!it.auto }))
+  const items = toPayload(all)
+  const sent = JSON.stringify(items)   // 送出去的那一份，回来时拿它比对（见下）
   try {
     // 整个「读 version→PATCH→回写」入队串行，避免与同订单的其它保存并发撞 version 互相 409
     await queueOrderWrite(props.order.id, async () => {
       const patch = { version: props.order.version, items }
       const updated = await ordersApi.update(props.order.id, patch)
-      applyRowUpdate(props.order, patch, updated)   // 送了 items → 整体采纳（含后端重折算的单价）
+      // **响应回来时，本地数组还是我送出去的那一份吗？** 不是就别整体覆盖。
+      // 典型序列：改 A 行数量 → 点进 B 行（A 失焦触发本次保存）→ 在这段网络往返里
+      // 往 B 行敲字 → 响应到达把整个数组换成「按旧快照算出来的」那份，B 行的字当场消失。
+      // 本机往返几十毫秒、人手点击到打字要 200-400ms，所以本地几乎复现不出来；
+      // 局域网 / MySQL / 账本变大之后窗口就张开了。
+      const stale = JSON.stringify(toPayload(props.order.items || [])) !== sent
+      applyRowUpdate(props.order, patch, updated, { itemsStale: stale })
       emit('saved', updated)
     })
     return true

@@ -350,3 +350,35 @@ def test_release_lets_the_next_instance_in(tmp_path):
     single_process.release()
     assert single_process.acquire(url) is True
     single_process.release()
+
+
+def test_a_finishing_hold_does_not_revoke_someone_elses_barrier():
+    """超时自愈之后，先来者收工时**不许**撤掉后来者的屏障。
+
+    屏障有硬上限（`DEFAULT_TIMEOUT`）：入口 `_reason_locked()` 到点会自愈，
+    于是 A 还没收工、B 也能拿到一个全新的屏障——这本身是对的（否则一次卡死的迁移
+    会把维护功能永久锁死）。错的是出口：原先 `finally` 无条件 `self._reason = None`，
+    **A 一收工就把 B 的屏障撤了**。
+
+    后果不是报错：B 的迁移在零保护下跑完，中间件放行一切写入，于是出现
+    「订单拷过去了、它的物品没拷」「子表引用了尚未拷贝的父行」这类跨表撕裂；
+    而 B 的响应仍然是 `{"ok": true}`，日志只说「只读屏障已撤销」，不会说那是别人的。
+
+    现实窗口不小：前端给迁移配的超时是 120 秒，屏障硬上限 900 秒，中间件又明确
+    放行 `/api/db/`——用户以为失败、再点一次就复现。
+    """
+    import time
+
+    from app.maintenance import ReadOnlyBarrier
+
+    b = ReadOnlyBarrier()
+    a = b.hold("A 的迁移", timeout=0.05, drain=0)
+    a.__enter__()
+    time.sleep(0.08)                              # A 的屏障过期，触发自愈
+
+    with b.hold("B 的迁移", timeout=60, drain=0):
+        assert b.blocked_reason() == "B 的迁移"
+        a.__exit__(None, None, None)              # A 这时候才收工
+        assert b.blocked_reason() == "B 的迁移", \
+            "A 收工时把 B 的屏障撤掉了——B 的迁移会在零保护下跑完"
+    assert b.blocked_reason() is None, "B 自己收工后屏障没撤干净"

@@ -330,3 +330,45 @@ def test_shipment_express_ocr_releases_its_connection_before_inferring(client, m
                     files={"file": ("a.png", b"\x89PNG\r\n\x1a\n", "image/png")})
     assert r.status_code == 200, r.text
     assert during == [0], f"推理期间占着 {during} 条连接（应当是 0）"
+
+
+def test_wal_checkpoint_does_not_run_on_the_event_loop_thread():
+    """周期性 WAL 截断必须在**线程池**里做，不能占着事件循环线程。
+
+    `PRAGMA wal_checkpoint(TRUNCATE)` 撞上写锁时会一直等到 sqlite3 的 busy timeout
+    （实测 5 秒），而它原先是在协程里裸调的——那 5 秒整个事件循环停摆：健康检查、
+    前端轮询、静态资源全卡。最坏的是**一行日志都不会有**：checkpoint 撞锁返回 busy
+    而不是抛异常，那圈 try/except 根本进不去，事后完全归因不到这里。
+
+    现实触发路径：数据库页点「迁回本地 SQLite」，迁移在单事务里逐表 delete+insert、
+    全程握着写锁，而 600 秒一轮的截断正好落进那段窗口。
+
+    **比对线程 id，不 grep 源码**：`await run_in_threadpool(...)` 与
+    `_wal_truncate()` 在源码里长得完全不同，但只有真跑一次才知道换没换线程。
+    """
+    import asyncio
+    import threading
+
+    from app import database as db
+
+    seen = {}
+
+    def spy():
+        seen["thread"] = threading.get_ident()
+
+    async def drive():
+        seen["loop"] = threading.get_ident()
+        orig, db._wal_truncate = db._wal_truncate, spy
+        try:
+            task = asyncio.create_task(db.wal_checkpoint_loop(interval=0))
+            for _ in range(200):                  # 等它跑完至少一轮
+                await asyncio.sleep(0.005)
+                if "thread" in seen:
+                    break
+            task.cancel()
+        finally:
+            db._wal_truncate = orig
+
+    asyncio.run(drive())
+    assert "thread" in seen, "循环一轮都没跑起来，这条测试没验到东西"
+    assert seen["thread"] != seen["loop"], "WAL 截断跑在事件循环线程上——整个服务会被它卡住"
