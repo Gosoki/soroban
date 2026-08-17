@@ -15,7 +15,7 @@ from sqlmodel import Field, Session, SQLModel
 
 from ..auth import get_current_user
 from ..database import get_session
-from ..plugins import scopes
+from ..plugins import runlog, scopes
 from ..services import ingest
 
 log = logging.getLogger("soroban.ingest")
@@ -88,9 +88,15 @@ def post_ingest(payload: IngestIn, session: Session = Depends(get_session),
     for r in results:
         summary[r["status"]] = summary.get(r["status"], 0) + 1
     if summary.get("rejected"):
+        first = next(r["message"] for r in results if r["status"] == "rejected")
         log.warning("插件 %s 写入「%s」：%s（被拒 %d 条，首条原因：%s）",
-                    plugin_id, handler.label, summary, summary["rejected"],
-                    next(r["message"] for r in results if r["status"] == "rejected"))
+                    plugin_id, handler.label, summary, summary["rejected"], first)
+        # **同时记进 runlog**：上面这行只进日志，而用户看的是卡片，
+        # 卡片显示的又是插件自报的那句话。一个不看回执的插件会把
+        # 「核心一条没写」显示成绿色的「已导入 30 单」。
+        # runlog 里这一笔在收尾时会被并进卡片文案，插件说什么都盖不掉。
+        runlog.note_rejected(ctx.run, plugin_id, handler.label,
+                             summary["rejected"], first)
     return {"kind": handler.kind, "summary": summary, "results": results}
 
 

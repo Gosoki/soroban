@@ -1578,3 +1578,126 @@ def test_the_real_plugin_manifests_in_this_repo_pass_the_scope_lint():
     for f in tomls:
         mf = pm.parse(tomllib.loads(f.read_text(encoding="utf-8")), f.parent)
         assert not _scope_lint(mf), f"{f.parent.name} 的 plugin.toml：{_scope_lint(mf)}"
+
+
+def test_the_card_says_so_when_the_core_rejected_everything(
+        client, fake_plugin, monkeypatch):
+    """插件自报成功、而核心逐条拒收时，卡片**不许**显示成绿色的成功。
+
+    这是最贵的一种「界面说假话」：插件推 30 条、核心一条没写、插件不看回执照常
+    `print({"ok": true, "created": 30})` 并 `exit 0` ⇒ 卡片绿字「已导入 30 单」，
+    而库里零写入。用户看到绿字就不会再点开摘要，唯一能发现的途径是翻后端日志。
+
+    拒收信息其实一直返回给插件了（`/api/ingest` 的 summary + 逐项 results），
+    核心也一直记着日志——问题在于**卡片显示的是插件自报的那句话**。
+    仓库里那个汇率插件被改成了会判回执，但那是**插件的自觉、不是核心的强制**：
+    换一个第三方插件，或者哪天有人重写它时忘了那段，同一个洞立刻复发。
+
+    修法是让核心自己记一笔（`plugins/runlog`），收尾时并进文案并压低颜色，
+    **插件说什么都盖不掉它**。
+    """
+    from app.plugins import runlog
+    from app.routers import plugins as mod
+
+    runlog.note_rejected("JTI-1", "demo", "汇率", 30, "缺少必填字段 rate")
+    done = mod._result_writer("demo", "抓取", run="JTI-1")
+    done(True, "已导入 30 单")                    # 插件自报：成功
+
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["last_run"]
+    assert got["outcome"] != "ok", \
+        "插件自报成功就显示成功——而核心一条都没写进去"
+    assert "核心拒收 30 条" in got["summary"], got["summary"]
+    assert "缺少必填字段 rate" in got["summary"], "没说清第一条为什么被拒"
+
+
+def test_a_clean_run_is_not_downgraded(client, fake_plugin):
+    """反面：核心没拒收任何东西时，绿色还是绿色。
+
+    没有这一条，「凡是收尾都降一档」也能让上面那条绿，而那会让每一次正常的抓取
+    都显示成黄色的警告——警告一旦变成常态就没人看了。
+    """
+    from app.routers import plugins as mod
+
+    done = mod._result_writer("demo", "抓取", run="JTI-CLEAN")
+    done(True, "已导入 5 单")
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["last_run"]
+    assert got["outcome"] == "ok", got
+    assert "核心拒收" not in got["summary"], got["summary"]
+
+
+def test_the_core_fact_is_not_consumed_while_the_batch_is_still_running(client, fake_plugin):
+    """批次还在跑时**不许**取走那条核心事实。
+
+    `runlog.take()` 是取走即清。在 running 那一刻并进去的话，文案会被下一次回调
+    整个盖掉，而记录已经被清了——这条事实就**永久丢失**，最后一次收尾时反而什么都不说。
+    """
+    from app.plugins import runlog
+    from app.routers import plugins as mod
+
+    runlog.note_rejected("JTI-2", "demo", "汇率", 7, "格式不对")
+    done = mod._result_writer("demo", "抓取", who="甲", batch="B-2", run="JTI-2")
+    done(True, "ok")                              # 批次未封口 ⇒ outcome=running
+    assert runlog.peek("JTI-2"), "running 时就把核心事实取走了——最后收尾时会丢"
+
+    mod._batch_seal("B-2", 2)          # 两个子进程，此刻只回来一个 ⇒ 仍未封口
+    done2 = mod._result_writer("demo", "抓取", who="乙", batch="B-2", run="JTI-2")
+    done2(True, "ok")
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["last_run"]
+    assert "核心拒收 7 条" in got["summary"], got["summary"]
+
+
+def test_runlog_drops_the_oldest_entry_not_the_newest():
+    """表满时丢**最早**的一条，不是最新的。
+
+    第一版用的是 `dict.popitem()`——它在 Python 3.7+ 是 **LIFO**，丢的是刚刚插进来的那条，
+    也就是「正在跑、马上要在卡片上报出来」的那一次，恰恰是最要紧的。
+    而当时注释和日志都写着「丢弃最早的」：**方向和说法双双错**，
+    而且从代码上看不出来——`popitem` 读起来完全像是「弹掉一个」。
+
+    这条守卫只能靠真跑：读代码时 `popitem()` 与 `next(iter())` 都很像「取一个」。
+    """
+    from app.plugins import runlog
+
+    orig = runlog._MAX_RUNS
+    runlog.reset()
+    try:
+        runlog._MAX_RUNS = 3
+        for i in range(3):
+            runlog.note_rejected(f"run{i}", "demo", "汇率", 1, "x")
+        runlog.note_rejected("run-new", "demo", "汇率", 1, "x")
+
+        assert runlog.peek("run-new"), "刚发生的那条被丢了——它才是马上要报到卡片上的"
+        assert runlog.peek("run0") is None, "该丢最早的那条"
+        assert runlog.peek("run1") and runlog.peek("run2"), "丢多了"
+    finally:
+        runlog._MAX_RUNS = orig
+        runlog.reset()
+
+
+def test_rejections_from_every_account_in_a_fanout_are_reported(client, fake_plugin):
+    """扇出时**每个账号**的核心拒收都要报出来，不能只报最后收尾那个。
+
+    这是「一个子进程一枚令牌」这条设计（见 run_command 的注释）带来的连带后果：
+    runlog 按 run（jti）聚合，而 jti 是**每账号各一枚**。
+    于是「批次未封口时不要 take」这条规则会漏掉先收尾的那些账号——
+      · 甲先跑完 → 批次还在 running → 跳过 take → 甲的拒收留在 runlog 里；
+      · 乙最后跑完 → 批次封口 → 只 take **乙自己那一枚**；
+      · 甲那条永远没人取，**它的拒收从此不会出现在任何地方**（只剩后端日志）。
+    表现是：3 个号里 2 个被核心全拒，卡片上只提 1 个——而且是随机的哪一个。
+    """
+    from app.plugins import runlog
+    from app.routers import plugins as mod
+
+    runlog.reset()
+    runlog.note_rejected("JTI-甲", "demo", "汇率", 3, "甲的原因")
+    runlog.note_rejected("JTI-乙", "demo", "汇率", 5, "乙的原因")
+
+    mod._batch_seal("B-FAN", 2)
+    mod._result_writer("demo", "抓取", who="甲", batch="B-FAN", run="JTI-甲")(True, "ok")
+    mod._result_writer("demo", "抓取", who="乙", batch="B-FAN", run="JTI-乙")(True, "ok")
+
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["last_run"]
+    assert got["outcome"] != "ok", got
+    assert "核心拒收 8 条" in got["summary"], \
+        f"只报了一部分账号的拒收（甲 3 + 乙 5 = 8）：{got['summary']}"
+    runlog.reset()

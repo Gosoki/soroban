@@ -9,9 +9,19 @@
          接口挂了 data 保持初值全 0，整屏渲染成「总支出 ¥0、0 单、暂无数据」，
          而拦截器那句 toast 3 秒后就没了——此后与「真的还没记过账」完全无法区分。
          对一个记账工具，「你的账全没了」是最不该让人误会的一句话。 -->
+    <!-- **两种失败得说两句不同的话。** 原先共用一句「下面显示的不是你的账本，只是初值」：
+         首次就失败时它是准的；但**加载成功过之后再失败**，页面上留着的恰恰**就是**用户的
+         账本（只是旧的），那句话就成了假话——用户会以为数据没了、或者以为这些数字是垃圾。
+         这条修复的初衷是「别让失败长得像空账本」，而这半句是反过来的同一类错误：
+         让「有点旧的真数据」长得像「不是你的数据」。记账工具在这两个方向上都不该说错。 -->
     <el-alert v-if="loadFailed" type="error" show-icon :closable="false" class="load-failed">
       <template #title>看板数据加载失败</template>
-      下面显示的<b>不是</b>你的账本，只是初值。请检查网络或后端后重试。
+      <template v-if="loadedAt">
+        下面是<b>{{ loadedAt }}</b> 那次加载的数据，可能已经过时；本次刷新没成功。
+      </template>
+      <template v-else>
+        下面显示的<b>不是</b>你的账本，只是初值。请检查网络或后端后重试。
+      </template>
       <el-button link type="primary" @click="load">重试</el-button>
     </el-alert>
     <!-- 有货款、却因为缺汇率算不出日元的行：SUM 会把 NULL 直接跳过，
@@ -109,14 +119,21 @@ const cards = computed(() => [
 ])
 
 const loadFailed = ref(false)   // 上一次加载是否失败：整屏据此说实话，见模板顶部
+// 上一次**成功**加载的时刻（空 = 从来没成功过）。失败时的文案二选一全靠它：
+// 有值 ⇒ 屏幕上是真数据只是旧了；没有 ⇒ 屏幕上是全 0 的初值。
+const loadedAt = ref('')
 
 async function load() {
   loading.value = true
   try {
     Object.assign(data, await dashboardApi.get())
     loadFailed.value = false
-  } catch (_) {
+    loadedAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+  } catch (e) {
     loadFailed.value = true     // 拦截器已弹过 toast；这里负责让**页面本身**留下痕迹
+    // 再往控制台记一条：toast 三秒就没了、alert 只说结论不说原因，
+    // 事后要查「到底是网络断了还是后端 500」就只剩这一条。
+    console.error('[看板] 数据加载失败', { hadDataBefore: !!loadedAt.value, error: e })
   } finally {
     loading.value = false
   }

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 from decimal import Decimal
 
 import pytest
@@ -600,3 +601,223 @@ def test_lifespan_reaps_before_disposing_the_pool():
 
     src = (Path(__file__).resolve().parents[1] / "app" / "main.py").read_text(encoding="utf-8")
     assert src.index("shutdown_plugins()") < src.index("checkpoint_and_dispose()")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows 没有进程组语义，走 taskkill 分支")
+def test_a_grandchild_is_not_orphaned_when_the_child_exits_first():
+    """**子进程先退、孙进程还在**时，孙进程必须被收掉。
+
+    这是真实的失败形状：插件跑完自己退了（或崩了），而它拉起的 chromium 还开着。
+    原先三层叠加把它漏得干干净净——
+      · `_reap` 一 wait 到子进程就把它移出 `_ALIVE_PROCS`；
+      · `shutdown_plugins` 的 `if proc.poll() is None` 判假 ⇒ 整个 `_kill_tree` 跳过；
+      · 就算调到 `_kill_tree`，它第一步 `os.getpgid(proc.pid)` 也已经 `[Errno 3]`，
+        走「只杀单个进程」的降级分支，而那个进程早没了。
+    结果是用户机器上留下一个与 soroban 已无任何关联的浏览器，没人猜得到该去杀谁。
+
+    修法靠的是「起进程时就把 pgid 记下来」——回收之后再查是查不到的。
+    """
+    import signal
+    import subprocess
+    import time
+
+    from app.routers import plugins as mod
+
+    # 子进程起完「浏览器」自己就退了；孙进程继续活着
+    child = subprocess.Popen(["sh", "-c", "sleep 60 & echo $!; exit 0"],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             start_new_session=True, text=True)
+    grandchild = int(child.stdout.readline().strip())
+
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    try:
+        with mod._PROCS_LOCK:
+            mod._ALIVE_PROCS[child.pid] = (child, "test/orphan")
+            mod._remember_group(child.pid, "test/orphan")
+        assert child.pid in mod._OWN_GROUP, "起进程时没把进程组记下来，后面全白搭"
+
+        child.wait(timeout=5)                       # 子进程退出并被回收
+        assert alive(grandchild), "用例前提不成立：孙进程应该还活着"
+
+        mod.shutdown_plugins(grace=0.5)
+        for _ in range(40):                         # 给信号一点时间落地
+            if not alive(grandchild):
+                break
+            time.sleep(0.05)
+        assert not alive(grandchild), \
+            f"孙进程 {grandchild} 成了孤儿——它与 soroban 已无关联，用户找不到该杀谁"
+    finally:
+        if alive(grandchild):
+            os.kill(grandchild, signal.SIGKILL)     # 只动我自己起的这一个 pid
+        with mod._PROCS_LOCK:
+            mod._ALIVE_PROCS.clear()
+            mod._OWN_GROUP.clear()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows 没有进程组语义")
+def test_the_reaper_sweeps_the_group_as_soon_as_the_child_exits():
+    """不必等到关停——收割线程发现子进程退出时就该扫一次它的进程组。
+
+    只在关停时扫是不够的：`_reap` 一 wait 到就把这条移出 `_ALIVE_PROCS`，
+    从那一刻起关停路径根本看不到它。**子进程退出的那一刻就是最后时机。**
+    """
+    import signal
+    import subprocess
+    import time
+
+    from app.routers import plugins as mod
+
+    child = subprocess.Popen(["sh", "-c", "sleep 60 & echo $!; exit 0"],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             start_new_session=True, text=True)
+    grandchild = int(child.stdout.readline().strip())
+
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    try:
+        with mod._PROCS_LOCK:
+            mod._ALIVE_PROCS[child.pid] = (child, "test/reaper-sweep")
+            mod._remember_group(child.pid, "test/reaper-sweep")
+        mod._reap(child, "test/reaper-sweep")       # 真的收割线程逻辑，不是桩
+        assert not alive(grandchild), \
+            f"收割完没扫进程组，孙进程 {grandchild} 活到了关停之外"
+        assert child.pid not in mod._ALIVE_PROCS, "注册表没清干净"
+    finally:
+        if alive(grandchild):
+            os.kill(grandchild, signal.SIGKILL)
+        with mod._PROCS_LOCK:
+            mod._ALIVE_PROCS.clear()
+            mod._OWN_GROUP.clear()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows 没有进程组语义")
+def test_launch_records_the_group_so_the_whole_chain_works(tmp_path, monkeypatch):
+    """整条链走一遍：`_launch` 起进程 → 记下 pgid → 子进程退出 → 收割线程扫掉孙进程。
+
+    上面两条各自打在 `_sweep_group` 的两个调用点上，但都是**手工**往
+    `_OWN_GROUP` 里塞的——把 `_launch` 里那句 `_remember_group` 删掉，它们照样绿。
+    这条从 `_launch` 进去，钉住「记 pgid」这个动作本身。
+
+    只替换 `subprocess.Popen`，让它返回一个**真的**子进程句柄：假 proc 没有真实的
+    进程组，测不出这件事。
+    """
+    import signal
+    import subprocess
+
+    from app.routers import plugins as mod
+
+    real = subprocess.Popen(["sh", "-c", "sleep 60 & echo $!; exit 0"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True, text=True)
+    grandchild = int(real.stdout.readline().strip())
+
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    try:
+        monkeypatch.setattr(mod.subprocess, "Popen", lambda *a, **k: real)
+        # 直接造一份清单：本文件没有插件夹具，而 Popen 已经被替换，
+        # 所以 argv/cwd 走不到真执行，只需要 `python = inherit`（解释器存在）与一个 _dir。
+        m = {"id": "grp", "name": "组测试", "python": "inherit", "entry": "-m x",
+             "_dir": tmp_path}
+        assert mod._launch(m, "run", []) == real.pid
+        assert real.pid in mod._OWN_GROUP, \
+            "起进程时没把 pgid 记下来——子进程被回收后就再也查不到了"
+        # 端到端那一半（收割线程真的扫掉孙进程）由
+        # test_the_reaper_sweeps_the_group_as_soon_as_the_child_exits 覆盖。
+        # 这里不重复等：`_drain` 里那两个 join(5) 会让收割慢十秒——
+        # 孙进程继承了 stdout 管道，EOF 要等它自己退出才来。
+    finally:
+        if alive(grandchild):
+            os.kill(grandchild, signal.SIGKILL)
+        with mod._PROCS_LOCK:
+            mod._ALIVE_PROCS.clear()
+            mod._OWN_GROUP.clear()
+            mod._INFLIGHT.clear()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows 没有进程组语义")
+def test_a_process_that_shares_our_group_is_never_recorded():
+    """`start_new_session` 万一没生效，**绝不能**把那个 pgid 记下来。
+
+    没生效时 pgid 是继承来的父进程组——也就是**后端自己所在的组**。
+    对它发 killpg 就是把 uvicorn 连同整个终端一起带走。
+    所以 `_remember_group` 必须验一次 `pgid == pid`，验不过就不记，
+    后续所有按组回收自动降级成不动。
+
+    这条闸在正常路径上永远不触发（`_launch` 一直带 start_new_session），
+    所以只能靠守卫钉住——而它的失败后果是**杀掉后端自己**，属于最贵的那一类。
+    """
+    import subprocess
+
+    from app.routers import plugins as mod
+
+    # 故意**不带** start_new_session：它会落在后端自己的进程组里
+    p = subprocess.Popen(["sleep", "5"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        assert os.getpgid(p.pid) != p.pid, "用例前提不成立：它应该继承父进程组"
+        with mod._PROCS_LOCK:
+            mod._remember_group(p.pid, "test/shared-group")
+        assert p.pid not in mod._OWN_GROUP, \
+            "把后端自己所在的进程组记下来了——按组杀会把 uvicorn 一起带走"
+        assert mod._sweep_group(p.pid, "test/shared-group", "守卫测试") == 0, \
+            "没记下来却仍然去动了那个组"
+        assert p.poll() is None, "它被误杀了"
+    finally:
+        p.kill()
+        p.wait(timeout=5)
+        with mod._PROCS_LOCK:
+            mod._OWN_GROUP.clear()
+
+
+def test_a_rejection_at_the_ingest_endpoint_reaches_the_card(client, session):
+    """**整条链**：插件推坏数据 → 核心逐条拒收 → 卡片如实说出来。
+
+    上面几条只测了 `runlog.note_rejected` 之后的半截；这一条从**真的 ingest 端点**
+    进去，钉住「拒收会不会被记下来」这个动作本身——漏了它，端点照样 200、
+    `summary` 里照样写着 rejected、日志照样有一行，而卡片什么都不会说。
+
+    这是 F03 的核心：拒收信息一直都返回给插件了，问题在于**卡片显示的是插件自报的**。
+    """
+    from app.plugins import runlog
+    from app.routers import plugins as mod
+
+    ingest.load_kinds()
+    if session.get(PluginConfig, "fx") is None:      # 卡片那一行，_write_outcome 要它存在
+        session.add(PluginConfig(plugin_id="fx"))
+        session.commit()
+    headers, jti = _plugin_client(client, session, {"fx:write"})
+    try:
+        r = client.post("/api/plugins/ingest", headers=headers, json={
+            "kind": "fx.rate", "items": [{"rate": "不是数字", "source": "boc"}]})
+        assert r.status_code == 200, r.text
+        assert r.json()["summary"].get("rejected") == 1, r.json()
+
+        rec = runlog.peek(jti)
+        assert rec and rec["rejected"] == 1, \
+            f"端点拒收了，核心却没记下来（runlog={rec}）——卡片将什么都不说"
+
+        # 插件这时自报「成功」：卡片必须以核心看到的为准
+        mod._result_writer("fx", "抓取", run=jti)(True, "已导入 1 条")
+        cfg = session.get(PluginConfig, "fx")
+        session.refresh(cfg)
+        assert cfg.last_outcome != "ok", "插件自报成功就显示成功"
+        assert "核心拒收 1 条" in (cfg.last_summary or ""), cfg.last_summary
+    finally:
+        scopes.revoke(jti)
+        runlog.reset()

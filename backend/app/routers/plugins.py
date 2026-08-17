@@ -35,7 +35,7 @@ from ..auth import get_current_user
 # 别名 pmanifest：本文件里 `manifest` 这个名字被多个函数的 dict 参数占着，
 # 模块同名会在那些函数体内被静默遮蔽（今天没用到只是运气）。
 from ..plugins import manifest as pmanifest
-from ..plugins import params as plugin_params, scopes
+from ..plugins import params as plugin_params, runlog, scopes
 from ..config import settings
 from ..database import get_engine, get_session
 from ..models import Order, PluginConfig, PluginRecord, User, utcnow
@@ -616,6 +616,20 @@ _MAX_CAPTURE = 256 * 1024        # 每路输出最多留末尾 256KB
 # 对浏览器类插件这意味着一个 chromium 永久留在后台：用户「关掉了 soroban」，
 # 内存里却还躺着几百 MB，而任务管理器里那个进程与 soroban 已经毫无关联，没人猜得到。
 _ALIVE_PROCS: dict[int, tuple] = {}
+# 起进程时**验证过**「它自己就是进程组组长」的那些 pid（pgid == pid）。
+#
+# 为什么必须在子进程还活着的时候验、并且记下来：一旦它被回收，`os.getpgid(pid)` 就
+# 查不到了（实测 `[Errno 3] No such process`）——而那恰恰是最需要这个信息的时刻。
+# 典型场景：插件跑完自己退了、或者崩了，而它拉起的 chromium 还开着。此时
+#   · `_reap` 已经 wait 到了子进程 ⇒ 它被移出 `_ALIVE_PROCS`；
+#   · `shutdown_plugins` 的 `if proc.poll() is None` 判假 ⇒ 整个 `_kill_tree` 跳过；
+#   · 就算调到 `_kill_tree`，它第一步 `os.getpgid(proc.pid)` 也已经失败，
+#     走的是「只杀单个进程」的降级分支，而那个进程早没了。
+# 三层叠加的结果是：孙进程从子进程退出的那一刻起彻底失联，**不只是关停时**。
+# 用户机器上留下一个与 soroban 已无任何关联的 chromium，没人猜得到该去杀谁。
+#
+# 进程组在还有成员时就一直存在，组长死了不影响——所以拿这个记下来的 pgid 照样杀得掉（已实测）。
+_OWN_GROUP: set[int] = set()
 _PROCS_LOCK = threading.Lock()
 # 在飞的「插件/命令 [账号]」键。同一个键同时只许有一个子进程——
 # 项目自己把「同账号并发多开浏览器」写成风控红线（见 scheduler_loop 的说明、
@@ -659,6 +673,81 @@ def _drain(stream, sink: list) -> None:
             stream.close()
         except Exception:                                        # noqa: BLE001
             pass
+
+
+def _remember_group(pid: int, label: str) -> None:
+    """记下「这个 pid 自己就是进程组组长」。调用方须持 `_PROCS_LOCK`，且**子进程必须还活着**。
+
+    `_launch` 用 `start_new_session=True` 起进程，所以这一条**本该**恒成立。
+    仍然要验一次：万一它在某个平台上没生效（老平台、被 patch、被 mock），
+    pgid 会是继承来的父进程组——那时对着这个 pgid 发 killpg 会把**后端自己**一起带走。
+    验不过就不记，后面所有按组回收的动作自动降级成只动单个进程。
+    """
+    if os.name == "nt":
+        return                          # Windows 没有进程组语义，见 _kill_tree
+    try:
+        pgid = os.getpgid(pid)
+    except OSError as e:                # 极短命的进程可能已经退了
+        log.warning("插件 %s 起来后取不到进程组（pid=%s）：%s"
+                    "——它拉起的孙进程将无法按组回收", label, pid, e)
+        return
+    if pgid != pid:
+        log.error("插件 %s 的进程组是 %s、不是它自己（pid=%s）：start_new_session 没生效。"
+                  "本次不按组回收——按组杀会波及后端自己所在的进程组。", label, pgid, pid)
+        return
+    _OWN_GROUP.add(pid)
+
+
+def _group_has_members(pgid: int) -> bool:
+    """这个进程组里还有活着的成员吗（信号 0 = 只探测不发信号）。"""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _sweep_group(pid: int, label: str, why: str) -> int:
+    """子进程已经退出之后，把它进程组里的**残余成员**（孙进程）收掉。返回收了几轮。
+
+    这是 `_kill_tree` 够不着的那一半：`_kill_tree` 要求直接子进程还活着
+    （它靠 `os.getpgid(proc.pid)` 定位组），而这里处理的正是「子进程先退、孙进程还在」。
+
+    **无论收没收到都留日志**：收到了要说清收了谁（否则用户永远不知道自己机器上
+    曾经躺过一个浏览器）；没收到也值得记一行 debug，好让「这条路径到底跑没跑过」可查。
+
+    ⚠️ pid 会被系统回收复用，所以这个 pgid **只在有界窗口内可用**：
+    收割线程一 wait 到就立刻用，以及关停时用一次。绝不长期挂着。
+    """
+    if pid not in _OWN_GROUP:
+        log.debug("插件 %s 没有已验证的进程组，跳过按组回收（%s）", label, why)
+        return 0
+    _OWN_GROUP.discard(pid)
+    if pid == os.getpgid(0):            # 双保险：永远不动后端自己所在的组
+        log.error("插件 %s 的 pgid 与后端自身相同（%s），拒绝按组回收", label, pid)
+        return 0
+    if not _group_has_members(pid):
+        log.debug("插件 %s 的进程组已空，无需回收（%s）", label, why)
+        return 0
+    log.warning("插件 %s 退出后其进程组 %s 里仍有存活进程（%s）——正在回收，"
+                "否则它们会变成与 soroban 无关联的孤儿", label, pid, why)
+    rounds = 0
+    for sig, wait in ((signal.SIGTERM, 1.5), (signal.SIGKILL, 0.5)):
+        try:
+            os.killpg(pid, sig)
+            rounds += 1
+        except OSError as e:            # 组刚好空了
+            log.info("插件 %s 的进程组 %s 已无成员（%s）", label, pid, e)
+            return rounds
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if not _group_has_members(pid):
+                log.info("插件 %s 的残余进程已被 %s 回收干净", label, sig.name)
+                return rounds
+            time.sleep(0.05)
+    if _group_has_members(pid):
+        log.error("插件 %s 的进程组 %s 在 SIGKILL 之后仍有成员——放弃", label, pid)
+    return rounds
 
 
 def _kill_tree(proc: subprocess.Popen, label: str) -> None:
@@ -770,6 +859,10 @@ def _reap(proc: subprocess.Popen, label: str, jti: Optional[str] = None, on_done
         with _PROCS_LOCK:
             _ALIVE_PROCS.pop(proc.pid, None)
             _INFLIGHT.discard(label)            # 释放互斥键，这个账号可以再跑了
+        # **子进程退出的这一刻，是回收它孙进程的最后时机。**
+        # 过了这里它就被移出注册表，关停时也不会再看它一眼——而它拉起的 chromium
+        # 可能还开着。放在锁外：扫一次最多等 2 秒，不该把别的启动/关停挡在门外。
+        _sweep_group(proc.pid, label, "子进程已退出")
         scopes.revoke(jti)          # 任务结束 → 令牌立即失效
         if on_done:
             on_done(ok, result or "已完成", warn)
@@ -844,6 +937,7 @@ def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str]
     # 而它此刻已经落在插件的日志/环境里了。
     with _PROCS_LOCK:
         _ALIVE_PROCS[proc.pid] = (proc, label)
+        _remember_group(proc.pid, label)
     threading.Thread(target=_reap, args=(proc, label, jti, on_done), daemon=True).start()
     return proc.pid
 
@@ -1339,7 +1433,7 @@ def run_command(plugin_id: str, command: str, account: Optional[str] = None,
                 pids.append(_launch(m, cmd.name, [*extra, "--soroban-url", _SELF_URL],
                                     token=token, config=conf, jti=jti,
                                     on_done=_result_writer(plugin_id, cmd.label,
-                                                           who=who, batch=batch)))
+                                                           who=who, batch=batch, run=jti)))
             except PluginBusy:
                 # 上面那次筛选之后才抢进来的（并发点击）。跳过这个账号，别拖累兄弟——
                 # 而且**令牌必须当场作废**：它是为这个进程签的，进程没起来就没人会 revoke 它，
@@ -1444,8 +1538,32 @@ def _write_outcome(plugin_id: str, outcome: str, text: str) -> None:
         log.warning("写回插件 %s 的运行结果失败：%s", plugin_id, e)
 
 
+def _apply_core_facts(run: Optional[str], plugin_id: str, outcome: str, text: str):
+    """把**核心侧看到的事实**并进卡片文案，覆盖插件的自报。
+
+    今天只有一件：核心逐项拒收了多少条（见 plugins/runlog）。
+    插件推 30 条、核心全拒、插件不看回执照样 print「已导入 30 单」并 exit 0 ——
+    没有这一步，卡片就是绿色的成功，而库里零写入，用户只能靠翻后端日志发现。
+
+    **只在终态生效**：running 时批次还没跑完，此刻并进去会被下一次回调盖掉，
+    而 `take()` 是取走即清，盖掉就等于永久丢了这条事实。
+    """
+    if outcome == "running":
+        return outcome, text
+    rec = runlog.take(run) if run else None
+    if not rec or not rec.get("rejected"):
+        return outcome, text
+    n, first = rec["rejected"], rec.get("first") or ""
+    # 成败仍以插件的退出码为准（那是跨进程契约），但**绝不允许显示成绿色的成功**：
+    # 用户看到绿字就不会再点开摘要，而那句话里写着出了什么事。
+    hard = outcome if outcome == "failed" else "warn"
+    log.warning("插件 %s 自报 %s，但核心本次拒收了 %d 条——卡片按 %s 显示",
+                plugin_id, outcome, n, hard)
+    return hard, f"{text}｜核心拒收 {n} 条（{first}）"
+
+
 def _result_writer(plugin_id: str, label: str, who: str = "",
-                   batch: Optional[str] = None):
+                   batch: Optional[str] = None, run: Optional[str] = None):
     """子进程收割完之后把结果写回 PluginConfig，供插件卡片显示。
 
     **开自己的 Session**：收割跑在 daemon 线程里，没有请求作用域的 session 可用。
@@ -1461,11 +1579,12 @@ def _result_writer(plugin_id: str, label: str, who: str = "",
     def done(ok: bool, summary: str, warn: bool = False) -> None:
         if not batch:
             outcome = "failed" if not ok else ("warn" if warn else "ok")
-            _write_outcome(plugin_id, outcome, f"{label}：{summary}")
+            _write_outcome(plugin_id, *_apply_core_facts(
+                run, plugin_id, outcome, f"{label}：{summary}"))
             return
         _, parts, total = _batch_add(batch, who, ok, summary, warn)
         outcome, text = _batch_text(label, parts, total)
-        _write_outcome(plugin_id, outcome, text)
+        _write_outcome(plugin_id, *_apply_core_facts(run, plugin_id, outcome, text))
     return done
 
 
@@ -1693,7 +1812,7 @@ def _run_due(session: Session) -> None:
                         # 那一次，而「上次触发」时间一直在走——定时失败在界面上完全不可见。
                         # 汇率取不到恰恰是账本会悄悄用兜底值的那类故障，最需要痕迹。
                         on_done=_result_writer(cfg.plugin_id, f"定时·{cmd.label}",
-                                               who=who, batch=batch))
+                                               who=who, batch=batch, run=jti))
                 launched += 1
             except HTTPException as e:
                 log.warning("定时任务 %s/%s 启动失败：%s", cfg.plugin_id, who or "-", e.detail)
@@ -1900,4 +2019,9 @@ def shutdown_plugins(grace: float = 3.0) -> int:
         if proc.poll() is None:
             log.warning("插件 %s 未在 %.1fs 内退出，强制终止其进程组", label, grace)
             _kill_tree(proc, label)
+        else:
+            # **原先这一支是空的**——直接子进程已经退了就当没事，
+            # 而它拉起的孙进程（浏览器）此刻还在，且从此再没有任何人管它。
+            log.info("插件 %s 的直接子进程已退出，检查其进程组有无残余", label)
+        _sweep_group(proc.pid, label, "关停")
     return len(alive)

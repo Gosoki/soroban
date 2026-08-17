@@ -50,6 +50,9 @@ def _reset_plugin_process_state():
         with mod._PROCS_LOCK:
             mod._INFLIGHT.clear()
             mod._ALIVE_PROCS.clear()
+            mod._OWN_GROUP.clear()
+        from app.plugins import runlog
+        runlog.reset()          # 同理：按 run 聚合的核心事实表也是模块级的
 
     clear()
     yield

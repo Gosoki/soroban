@@ -498,3 +498,30 @@ def test_humans_can_still_write_the_ledger_kinds(client):
     r = client.post("/api/plugins/ingest", json={
         "kind": "fx.rate", "items": [{"rate": "20.5000", "source": "manual-test"}]})
     assert r.status_code == 200, r.text
+
+
+def test_dashboard_tells_stale_data_apart_from_an_empty_ledger():
+    """看板加载失败时，**「从没成功过」与「成功过但这次失败」得说两句不同的话**。
+
+    `load()` 的 catch 分支一个字节都不改 `data`。所以：
+      · 首次就失败 → 屏幕上是全 0 的初值 → 「下面显示的不是你的账本」是准的；
+      · 成功过、重试又失败 → 屏幕上留着的**恰恰就是**用户的账本（只是旧的）
+        → 同一句话变成假话，用户会以为数据没了、或者以为这些数字是垃圾。
+
+    这条修复的初衷本来是「别让失败长得像空账本」，而那半句是**反过来的同一类错误**：
+    让「有点旧的真数据」长得像「不是你的数据」。记账工具在这两个方向上都不该说错。
+
+    另外钉住控制台留痕：toast 三秒就没了、alert 只说结论不说原因，
+    事后要查「是网络断了还是后端 500」就只剩这一条。
+    """
+    src = (_REPO / "frontend" / "src" / "views" / "Dashboard" / "index.vue").read_text(encoding="utf-8")
+    tpl = src[:src.index("<script")]
+    assert "loadedAt" in tpl, "模板里没有区分两种失败的分支"
+    assert re.search(r'v-if="loadedAt"', tpl), "没有按「以前成功过吗」分岔的条件"
+    assert "只是初值" in tpl and "可能已经过时" in tpl, "两种情形的文案不全"
+
+    body = src[src.index("async function load"):]
+    body = body[:body.index("\nonMounted")]
+    body = re.sub(r"//.*$", "", body, flags=re.M)
+    assert "loadedAt.value =" in body, "成功时没记下时刻——那两句话就分不出来"
+    assert "console.error" in body, "失败没有留下任何可事后排查的痕迹"
