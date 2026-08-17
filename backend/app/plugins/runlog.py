@@ -22,8 +22,14 @@ import threading
 
 log = logging.getLogger("soroban.plugins.runlog")
 
-# 同时最多记多少个 run。正常情况这里只有个位数（在飞的子进程数），
-# 上限是为了兜住「取的人没来取」——比如插件进程被 kill、`take` 永远不被调用。
+# 同时最多记多少个 run。正常情况这里只有个位数（在飞的子进程数）。
+# 上限兜的是两种「没人来取」：
+#   · `"manual"` 那个桶——人类令牌手工调 ingest 时没有 jti，也就没有对应的卡片，
+#     没有任何收尾流程会去取它；
+#   · take 之后迟到的 `note_rejected`（子进程已收尾、回灌请求还在路上），
+#     它会 setdefault 出一条新记录，同样没人再来取。
+# （原先这里举的例子是「插件进程被 kill」——那个不成立：kill 路径下
+#   `_reap` 的 finally 照样调 on_done，照样会 take。）
 _MAX_RUNS = 256
 
 _LOCK = threading.Lock()
@@ -38,6 +44,7 @@ def note_rejected(run: str, plugin_id: str, kind: str, count: int, first_message
     """
     if not run or count <= 0:
         return
+    dropped = None
     with _LOCK:
         if run not in _RUNS and len(_RUNS) >= _MAX_RUNS:
             # 满了就丢**最早**的一条：宁可丢一条旧记录，也不让这个表无限长。
@@ -48,11 +55,12 @@ def note_rejected(run: str, plugin_id: str, kind: str, count: int, first_message
             #    （第一版写的就是 popitem，而注释与日志都说「丢弃最早的」——方向和说法双双错。）
             dropped = next(iter(_RUNS))
             del _RUNS[dropped]
-            log.warning("runlog 已满（%d 条），丢弃最早的 run=%s", _MAX_RUNS, dropped)
         e = _RUNS.setdefault(run, {"rejected": 0, "first": "", "plugin_id": plugin_id})
         e["rejected"] += count
         if not e["first"]:
             e["first"] = f"{kind}：{first_message}"
+    if dropped:                             # 出锁再记，与下面那句一致（别在锁里做 I/O）
+        log.warning("runlog 已满（%d 条），丢弃最早的 run=%s", _MAX_RUNS, dropped)
     log.warning("核心拒收 插件=%s run=%s 类型=%s 共 %d 条，首条：%s",
                 plugin_id, run, kind, count, first_message)
 

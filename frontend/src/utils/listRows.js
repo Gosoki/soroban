@@ -42,9 +42,28 @@ export async function afterCreate(created, { rows, total, page, filters, load, d
     return true
   }
   page.value = 1
-  await load()
-  const shown = rows.value.some((r) => r.id === created.id)
-  if (!shown) ElMessage.info('已保存，但它不在当前筛选条件内，故未显示在列表中')
+  // **刷新失败 ≠ 新建失败。** 这一句原先是裸 await：列表页的 `load()` 只有 try/finally
+  // （没有 catch），所以刷新挂掉会一路抛出 `afterCreate`，被调用方的 catch 接住并
+  // `done(false)` ⇒ NotionTable **不清草稿**（那是「没保存成功」的语义）⇒
+  // 用户看着自己刚敲的字还在，以为没存上，再按一次回车。
+  // 而那一笔**已经落库了**：商品/暂存/集运撞唯一索引会得到一句莫名的「已存在」，
+  // 而**杂项支出没有任何唯一约束——同一笔钱会干干净净地记两遍。**
+  //
+  // 这条链上每一环单独看都合理，合起来才是数据错误。判据只有一条：
+  // 草稿该不该清，只取决于**新建成功没有**，与列表刷新得不得动无关。
+  let refreshed = true
+  try {
+    await load()
+  } catch (_) {
+    refreshed = false
+    // 拦截器已经提示过失败原因；这里补的是「你那笔存住了」——
+    // 这句话必须说，否则用户唯一的信息是一条报错，他会认为没存上。
+    ElMessage.warning('已保存，但列表没能刷新——请手动刷新查看')
+  }
+  // 刷新没成功时 rows 还是旧的，`some` 必然找不到新建那条；
+  // 此时那句「不在当前筛选条件内」是**假话**（它只是没被拉回来）。
+  const shown = refreshed && rows.value.some((r) => r.id === created.id)
+  if (refreshed && !shown) ElMessage.info('已保存，但它不在当前筛选条件内，故未显示在列表中')
   return shown
 }
 

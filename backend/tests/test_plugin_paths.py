@@ -661,11 +661,17 @@ def test_a_grandchild_is_not_orphaned_when_the_child_exits_first():
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows 没有进程组语义")
-def test_the_reaper_sweeps_the_group_as_soon_as_the_child_exits():
-    """不必等到关停——收割线程发现子进程退出时就该扫一次它的进程组。
+def test_the_reaper_sweeps_the_group_right_after_the_child_exits():
+    """不必等到关停——收割线程 wait 到子进程就该扫一次它的进程组。
 
     只在关停时扫是不够的：`_reap` 一 wait 到就把这条移出 `_ALIVE_PROCS`，
     从那一刻起关停路径根本看不到它。**子进程退出的那一刻就是最后时机。**
+
+    而且这一扫必须排在两个 `join(5)` **之前**。那两个 join 恰恰是因为
+    「孙进程还攥着管道、EOF 不来」才存在的——排在它们后面，回收实测要晚 **10.05 秒**
+    （原先的写法就是这样，而当时的函数名与 docstring 都写着「立刻」）。
+    那 10 秒里 `_INFLIGHT` 还攥着（用户点「再跑一次」吃 409）、卡片多顶 10 秒「执行中」、
+    令牌多活 10 秒。提前之后实测 0.05 秒，而插件的结果行一字不丢。
     """
     import signal
     import subprocess
@@ -714,6 +720,7 @@ def test_launch_records_the_group_so_the_whole_chain_works(tmp_path, monkeypatch
     """
     import signal
     import subprocess
+    import time
 
     from app.routers import plugins as mod
 
@@ -736,12 +743,16 @@ def test_launch_records_the_group_so_the_whole_chain_works(tmp_path, monkeypatch
         m = {"id": "grp", "name": "组测试", "python": "inherit", "entry": "-m x",
              "_dir": tmp_path}
         assert mod._launch(m, "run", []) == real.pid
-        assert real.pid in mod._OWN_GROUP, \
-            "起进程时没把 pgid 记下来——子进程被回收后就再也查不到了"
-        # 端到端那一半（收割线程真的扫掉孙进程）由
-        # test_the_reaper_sweeps_the_group_as_soon_as_the_child_exits 覆盖。
-        # 这里不重复等：`_drain` 里那两个 join(5) 会让收割慢十秒——
-        # 孙进程继承了 stdout 管道，EOF 要等它自己退出才来。
+        # **断言结果，不断言中间状态。** 第一版断言 `real.pid in mod._OWN_GROUP`，
+        # 而收割线程扫完组就会立刻把它摘掉——回收提前到 join 之前（0.05s）之后，
+        # 那句断言变成了在跟收割线程赛跑，而且它读的还是一个「本来就该被清掉」的状态。
+        # 要的东西其实是「孙进程有没有被收掉」，直接等它就行。
+        for _ in range(100):
+            if not alive(grandchild):
+                break
+            time.sleep(0.05)
+        assert not alive(grandchild), \
+            "孙进程没被收掉——起进程时没把 pgid 记下来，子进程一被回收就再也查不到了"
     finally:
         if alive(grandchild):
             os.kill(grandchild, signal.SIGKILL)
@@ -821,3 +832,47 @@ def test_a_rejection_at_the_ingest_endpoint_reaches_the_card(client, session):
     finally:
         scopes.revoke(jti)
         runlog.reset()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows 没有进程组语义")
+def test_the_group_sweep_happens_before_the_output_drains():
+    """按组回收必须排在两个 `join(5)` **之前**，而且不许吃掉插件的结果行。
+
+    那两个 join 存在的理由正是「孙进程还攥着管道、EOF 不来」——把回收排在它们后面，
+    就得先等满 10 秒。实测：排在后面 10.05s，排在前面 0.05s。
+    这 10 秒不是纯等待，期间 `_INFLIGHT` 还攥着（用户点「再跑一次」吃 409）、
+    卡片多顶 10 秒「执行中」、令牌多活 10 秒、那个浏览器也多开 10 秒。
+
+    **同时钉住「别为了快把结果吃掉」**：插件的 stdout 最后一行是结果 JSON，
+    收割靠它算 outcome。这条断言比时间那条更要紧——快而丢结果是净损失。
+    """
+    import subprocess
+    import time
+
+    from app.routers import plugins as mod
+
+    child = subprocess.Popen(
+        ["sh", "-c", 'sleep 60 & echo $!; echo \'{"ok": true, "created": 3}\'; exit 0'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, text=True)
+    grandchild = int(child.stdout.readline().strip())
+    got = []
+    try:
+        with mod._PROCS_LOCK:
+            mod._ALIVE_PROCS[child.pid] = (child, "test/drain-order")
+            mod._remember_group(child.pid, "test/drain-order")
+        t0 = time.monotonic()
+        mod._reap(child, "test/drain-order",
+                  on_done=lambda ok, summary, warn=False: got.append((ok, summary)))
+        spent = time.monotonic() - t0
+
+        assert spent < 5, f"回收排在 join(5) 后面了——实测 {spent:.2f}s"
+        assert got and got[0][0] is True, f"结果行被吃掉了：{got}"
+        assert "3" in got[0][1], f"插件报的数字没读到：{got}"
+    finally:
+        try:
+            os.kill(grandchild, 9)
+        except OSError:
+            pass
+        with mod._PROCS_LOCK:
+            mod._ALIVE_PROCS.clear()
+            mod._OWN_GROUP.clear()

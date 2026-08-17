@@ -717,10 +717,12 @@ def _sweep_group(pid: int, label: str, why: str) -> int:
     曾经躺过一个浏览器）；没收到也值得记一行 debug，好让「这条路径到底跑没跑过」可查。
 
     ⚠️ pid 会被系统回收复用，所以这个 pgid **只在有界窗口内可用**：
-    收割线程一 wait 到就立刻用，以及关停时用一次。绝不长期挂着。
+    收割线程 wait 到子进程就用一次、收尾时再兜一次，以及关停时用一次。绝不长期挂着。
     """
     if pid not in _OWN_GROUP:
-        log.debug("插件 %s 没有已验证的进程组，跳过按组回收（%s）", label, why)
+        # 正常路径上这一支**每次都会走到**：上面那次（"子进程刚退出"）已经扫过并摘牌，
+        # finally 里那次兜底就落在这里。所以措辞不能读着像出错。
+        log.debug("插件 %s 无需按组回收：已扫过或未验证过进程组（%s）", label, why)
         return 0
     _OWN_GROUP.discard(pid)
     if pid == os.getpgid(0):            # 双保险：永远不动后端自己所在的组
@@ -833,8 +835,16 @@ def _reap(proc: subprocess.Popen, label: str, jti: Optional[str] = None, on_done
             log.warning("插件 %s 结果回收异常：%s", label, e)
             result = f"结果回收异常：{e}"
             return
-        # 子进程已退出。给排空线程一点时间收尾，但**绝不无限等**——孙进程还攥着管道时
-        # 它们本就不会结束，那属于「拿不到输出」，不属于「不能收割」。
+        # **孙进程在这里就收掉，不要等到下面的 finally。**
+        # 下面两个 join(5) 恰恰是因为「孙进程还攥着管道、EOF 不来」才存在的——
+        # 于是 finally 里那次回收实测要晚 10.05 秒。那 10 秒里：`_INFLIGHT` 还攥着
+        # （用户点「再跑一次」吃 409）、卡片多顶 10 秒「执行中」、令牌多活 10 秒，
+        # 而那个孙进程（chromium）也多开 10 秒。
+        # 顺带把 join 变快：孙进程一走 EOF 就来了。
+        # `finally` 里那一句**必须保留**——超时支与异常支都从上面 return 出去，
+        # 那是它们唯一的按组回收点，也是 `_OWN_GROUP` 唯一的释放点。两次调用天然幂等。
+        _sweep_group(proc.pid, label, "子进程刚退出")
+        # 给排空线程一点时间收尾，但**绝不无限等**——拿不到输出不等于不能收割。
         t_out.join(5)
         t_err.join(5)
         out, err = "".join(outs), "".join(errs)
@@ -862,7 +872,7 @@ def _reap(proc: subprocess.Popen, label: str, jti: Optional[str] = None, on_done
         # **子进程退出的这一刻，是回收它孙进程的最后时机。**
         # 过了这里它就被移出注册表，关停时也不会再看它一眼——而它拉起的 chromium
         # 可能还开着。放在锁外：扫一次最多等 2 秒，不该把别的启动/关停挡在门外。
-        _sweep_group(proc.pid, label, "子进程已退出")
+        _sweep_group(proc.pid, label, "收尾兜底")
         scopes.revoke(jti)          # 任务结束 → 令牌立即失效
         if on_done:
             on_done(ok, result or "已完成", warn)
@@ -938,7 +948,20 @@ def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str]
     with _PROCS_LOCK:
         _ALIVE_PROCS[proc.pid] = (proc, label)
         _remember_group(proc.pid, label)
-    threading.Thread(target=_reap, args=(proc, label, jti, on_done), daemon=True).start()
+    try:
+        threading.Thread(target=_reap, args=(proc, label, jti, on_done), daemon=True).start()
+    except RuntimeError as e:               # OS 拒绝建线程（fd/线程数耗尽）
+        # **必须把互斥键放掉。** 全仓只有 `_reap` 的 finally 与上面 Popen 失败那一支会清它，
+        # 而这里两者都没走到——于是这个账号的键永久占着，此后每次点都是 409「已经在跑了」，
+        # 而其实一个进程都没有，只有重启才能恢复。
+        # 进程本身**留在 `_ALIVE_PROCS`/`_OWN_GROUP` 里交给关停收**：
+        # 回滚它们会丢掉刚验证过的 pgid，它拉起的孙进程从此失联。
+        # 也**绝不调 on_done**——那会让批次提前封口，卡片永久停在「执行中」（见 _batch_seal）。
+        with _PROCS_LOCK:
+            _INFLIGHT.discard(label)
+        log.error("插件 %s 起收割线程失败：%s（子进程 %s 已在跑，留给关停回收）",
+                  label, e, proc.pid)
+        raise HTTPException(status_code=500, detail=f"启动插件失败（无法创建收割线程）：{e}")
     return proc.pid
 
 
@@ -1466,7 +1489,7 @@ def _batch_add(batch: str, who: str, ok: bool, summary: str,
                warn: bool = False) -> tuple[bool, list, Optional[int]]:
     """登记一个子进程的结果。返回 (是否已全部完成, 当前全部结果, 最终数量或 None)。"""
     with _BATCH_LOCK:
-        b = _BATCHES.setdefault(batch, {"done": [], "total": None})
+        b = _BATCHES.setdefault(batch, {"done": [], "total": None, "core": None})
         b["done"].append((who, ok, summary, warn))
         total, parts = b["total"], list(b["done"])
         finished = total is not None and len(parts) >= total
@@ -1475,7 +1498,7 @@ def _batch_add(batch: str, who: str, ok: bool, summary: str,
     return finished, parts, total
 
 
-def _batch_seal(batch: str, total: int) -> tuple[bool, list]:
+def _batch_seal(batch: str, total: int) -> tuple[bool, list, Optional[dict]]:
     """扇出结束，告知最终有几个子进程。返回 (此刻是否已全部完成, 全部结果)。
 
     **登记用 setdefault 而不是 get。** `_launch` 是 fire-and-forget，所以日常路径上
@@ -1488,14 +1511,15 @@ def _batch_seal(batch: str, total: int) -> tuple[bool, list]:
     with _BATCH_LOCK:
         if total <= 0:                      # 一个都没起来：没有回调会来，清干净直接收工
             _BATCHES.pop(batch, None)
-            return True, []
-        b = _BATCHES.setdefault(batch, {"done": [], "total": None})
+            return True, [], None
+        b = _BATCHES.setdefault(batch, {"done": [], "total": None, "core": None})
         b["total"] = total
         parts = list(b["done"])
+        core = dict(b["core"]) if b.get("core") else None   # **必须在 pop 之前读**
         finished = len(parts) >= total
         if finished:
             _BATCHES.pop(batch, None)
-    return finished, parts
+    return finished, parts, core
 
 
 def _batch_text(label: str, parts: list, total: Optional[int]) -> tuple[str, str]:
@@ -1538,22 +1562,49 @@ def _write_outcome(plugin_id: str, outcome: str, text: str) -> None:
         log.warning("写回插件 %s 的运行结果失败：%s", plugin_id, e)
 
 
-def _apply_core_facts(run: Optional[str], plugin_id: str, outcome: str, text: str):
+def _collect_core_facts(batch: Optional[str], run: Optional[str]) -> Optional[dict]:
+    """把这一枚 run 的核心事实取过来。有批次的话累进批次，返回**批次累计**。
+
+    **必须每个账号收尾时立刻取自己那一枚**，不能等到批次封口时再取——
+    「一个子进程一枚令牌」（见 run_command 的注释）意味着 runlog 是按**账号**分开记的，
+    而封口那一次只知道自己那枚 jti。先跑完的账号那条从此没人取，
+    它的拒收**永久消失**（只剩后端日志）。表现是「3 个号里 2 个被全拒，卡片只提 1 个，
+    而且是随机的哪一个」。
+    """
+    rec = runlog.take(run) if run else None
+    if not batch:
+        return rec
+    with _BATCH_LOCK:
+        # **用 setdefault 而不是 get**，与 `_batch_add` 同一口径：`done()` 里取在登记之前，
+        # 所以第一个回调到来时批次条目**还不存在**。用 get 的话它拿到 None 就把
+        # 自己那一枚原样返回、不存进批次——而此刻 outcome 还是 running，返回值被丢掉，
+        # 于是**第一个账号的拒收永久消失**（实测：甲 3 + 乙 5，卡片只报 5）。
+        b = _BATCHES.setdefault(batch, {"done": [], "total": None, "core": None})
+        if rec and rec.get("rejected"):
+            cur = b.get("core") or {"rejected": 0, "first": ""}
+            cur["rejected"] += rec["rejected"]
+            if not cur["first"]:
+                cur["first"] = rec.get("first") or ""
+            b["core"] = cur
+        return dict(b["core"]) if b.get("core") else None
+
+
+def _apply_core_facts(core: Optional[dict], plugin_id: str, outcome: str, text: str):
     """把**核心侧看到的事实**并进卡片文案，覆盖插件的自报。
 
     今天只有一件：核心逐项拒收了多少条（见 plugins/runlog）。
     插件推 30 条、核心全拒、插件不看回执照样 print「已导入 30 单」并 exit 0 ——
     没有这一步，卡片就是绿色的成功，而库里零写入，用户只能靠翻后端日志发现。
 
-    **只在终态生效**：running 时批次还没跑完，此刻并进去会被下一次回调盖掉，
-    而 `take()` 是取走即清，盖掉就等于永久丢了这条事实。
+    **只在终态并进文案**：running 时并进去会被下一次回调盖掉。
+    但取（`_collect_core_facts`）必须在每个账号收尾时就做——取与用是两件事，
+    分开之后「先跑完的账号被漏掉」那个洞才补得上。
     """
     if outcome == "running":
         return outcome, text
-    rec = runlog.take(run) if run else None
-    if not rec or not rec.get("rejected"):
+    if not core or not core.get("rejected"):
         return outcome, text
-    n, first = rec["rejected"], rec.get("first") or ""
+    n, first = core["rejected"], core.get("first") or ""
     # 成败仍以插件的退出码为准（那是跨进程契约），但**绝不允许显示成绿色的成功**：
     # 用户看到绿字就不会再点开摘要，而那句话里写着出了什么事。
     hard = outcome if outcome == "failed" else "warn"
@@ -1579,12 +1630,18 @@ def _result_writer(plugin_id: str, label: str, who: str = "",
     def done(ok: bool, summary: str, warn: bool = False) -> None:
         if not batch:
             outcome = "failed" if not ok else ("warn" if warn else "ok")
+            core = _collect_core_facts(None, run)
             _write_outcome(plugin_id, *_apply_core_facts(
-                run, plugin_id, outcome, f"{label}：{summary}"))
+                core, plugin_id, outcome, f"{label}：{summary}"))
             return
+        # **顺序要紧，而且是这个顺序**：先取核心事实、再登记本次结果。
+        # 反过来的话，最后一个账号的 `_batch_add` 会因为凑齐而**把整条批次 pop 掉**，
+        # 此后 `_collect_core_facts` 拿不到那条批次，只能回落成「只用自己这一枚」——
+        # 前面几个账号累进去的拒收随那条一起消失。（第一版就是反的，测试当场抓到。）
+        core = _collect_core_facts(batch, run)
         _, parts, total = _batch_add(batch, who, ok, summary, warn)
         outcome, text = _batch_text(label, parts, total)
-        _write_outcome(plugin_id, *_apply_core_facts(run, plugin_id, outcome, text))
+        _write_outcome(plugin_id, *_apply_core_facts(core, plugin_id, outcome, text))
     return done
 
 
@@ -1601,9 +1658,15 @@ def seal_and_report(batch: str, launched: int, plugin_id: str, label: str) -> No
         _write_outcome(plugin_id, "failed", f"{label}：一个任务都没能启动")
         _batch_seal(batch, 0)
         return
-    finished, parts = _batch_seal(batch, launched)
+    finished, parts, core = _batch_seal(batch, launched)
     if finished and parts:
-        _write_outcome(plugin_id, *_batch_text(label, parts, launched)[0:2])
+        # **这条路径也要过 `_apply_core_facts`。** 它是「所有回调都比 seal 先到」时
+        # 唯一那次终态写入——而那正是 `run_command` 注释里讲的那条竞态
+        # （子进程可能毫秒级就结束）。漏了这里，各账号累进批次的核心拒收会随
+        # `_batch_seal` 把批次 pop 掉一起消失，卡片照样是绿色的「✓ ok」——
+        # 也就是 runlog 这整个模块存在的理由原样复发。
+        _write_outcome(plugin_id, *_apply_core_facts(
+            core, plugin_id, *_batch_text(label, parts, launched)))
 
 
 @router.delete("/{plugin_id}/account")

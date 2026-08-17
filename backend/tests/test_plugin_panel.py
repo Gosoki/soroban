@@ -1625,25 +1625,35 @@ def test_a_clean_run_is_not_downgraded(client, fake_plugin):
     assert "核心拒收" not in got["summary"], got["summary"]
 
 
-def test_the_core_fact_is_not_consumed_while_the_batch_is_still_running(client, fake_plugin):
-    """批次还在跑时**不许**取走那条核心事实。
+def test_a_core_fact_survives_the_running_phase(client, fake_plugin):
+    """批次还在跑的那一刻并不写进文案，但那条事实**不许因此丢掉**。
 
-    `runlog.take()` 是取走即清。在 running 那一刻并进去的话，文案会被下一次回调
-    整个盖掉，而记录已经被清了——这条事实就**永久丢失**，最后一次收尾时反而什么都不说。
+    这里有两件事必须分开看，第一版把它们混在一起而写错过：
+      · **用**（并进卡片文案）只能在终态做——running 时写进去会被下一次回调整个盖掉；
+      · **取**（从 runlog 拿出来）必须在**每个账号收尾时立刻**做，因为
+        「一个子进程一枚令牌」意味着 runlog 是按账号分开记的，
+        封口那一次只知道自己那枚 jti。晚取 = 先跑完的账号那条永远没人取。
+    所以取出来之后先累进批次，封口时再一次性并进文案。
     """
     from app.plugins import runlog
     from app.routers import plugins as mod
 
+    _grant_and_enable(client)
+    runlog.reset()
     runlog.note_rejected("JTI-2", "demo", "汇率", 7, "格式不对")
-    done = mod._result_writer("demo", "抓取", who="甲", batch="B-2", run="JTI-2")
-    done(True, "ok")                              # 批次未封口 ⇒ outcome=running
-    assert runlog.peek("JTI-2"), "running 时就把核心事实取走了——最后收尾时会丢"
+    mod._batch_seal("B-2", 2)                     # 两个子进程
+    mod._result_writer("demo", "抓取", who="甲", batch="B-2", run="JTI-2")(True, "ok")
 
-    mod._batch_seal("B-2", 2)          # 两个子进程，此刻只回来一个 ⇒ 仍未封口
-    done2 = mod._result_writer("demo", "抓取", who="乙", batch="B-2", run="JTI-2")
-    done2(True, "ok")
     got = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["last_run"]
-    assert "核心拒收 7 条" in got["summary"], got["summary"]
+    assert got["outcome"] == "running", "批次没跑完就写终态了"
+    assert "核心拒收" not in (got["summary"] or ""), \
+        "running 阶段就把核心事实写进文案了——会被下一次回调盖掉"
+
+    mod._result_writer("demo", "抓取", who="乙", batch="B-2", run="JTI-乙-无")(True, "ok")
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["last_run"]
+    assert "核心拒收 7 条" in got["summary"], \
+        f"甲的拒收在封口时丢了：{got['summary']}"
+    runlog.reset()
 
 
 def test_runlog_drops_the_oldest_entry_not_the_newest():
@@ -1688,6 +1698,7 @@ def test_rejections_from_every_account_in_a_fanout_are_reported(client, fake_plu
     from app.plugins import runlog
     from app.routers import plugins as mod
 
+    _grant_and_enable(client)          # 卡片那一行要先存在，_write_outcome 才写得进去
     runlog.reset()
     runlog.note_rejected("JTI-甲", "demo", "汇率", 3, "甲的原因")
     runlog.note_rejected("JTI-乙", "demo", "汇率", 5, "乙的原因")
@@ -1701,3 +1712,76 @@ def test_rejections_from_every_account_in_a_fanout_are_reported(client, fake_plu
     assert "核心拒收 8 条" in got["summary"], \
         f"只报了一部分账号的拒收（甲 3 + 乙 5 = 8）：{got['summary']}"
     runlog.reset()
+
+
+def test_core_facts_survive_when_every_callback_beats_the_seal(client, fake_plugin):
+    """**所有回调都比 `seal_and_report` 先到**时，核心拒收照样要报出来。
+
+    这是与上面那条相反的时序，而且是 `run_command` 自己的注释里讲的那条竞态——
+    子进程可能毫秒级就结束（会话过期的插件打印一行就退），于是回调全部先到、
+    `finally` 里的 seal 最后才跑。此时**唯一那次终态写入发生在 `seal_and_report` 里**。
+
+    第一版漏了它：各账号的拒收确实被取进了批次，但 `_batch_seal` 把批次整个 pop 掉、
+    而 seal 那一行直接 `_batch_text(...)` 写库、不过 `_apply_core_facts` ⇒
+    卡片写的是绿色的「甲 ✓ ok；乙 ✓ ok」，零提示。
+    核心拒了 8 条而界面说成功——正是 runlog 这个模块存在的唯一理由，原样复发。
+
+    我此前所有的批次测试都是**先 seal、后回调**，把这半边完全排除在外了；
+    这与 F16（永久「执行中」）是同一类错误：桩的时序掩盖了真实时序。
+    """
+    from app.plugins import runlog
+    from app.routers import plugins as mod
+
+    _grant_and_enable(client)
+    runlog.reset()
+    runlog.note_rejected("J-甲", "demo", "汇率", 3, "甲的原因")
+    runlog.note_rejected("J-乙", "demo", "汇率", 5, "乙的原因")
+
+    mod._result_writer("demo", "抓取", who="甲", batch="B-SEAL", run="J-甲")(True, "ok")
+    mod._result_writer("demo", "抓取", who="乙", batch="B-SEAL", run="J-乙")(True, "ok")
+    mod.seal_and_report("B-SEAL", 2, "demo", "抓取")     # ← 最后才封口
+
+    got = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["last_run"]
+    assert got["outcome"] != "ok", f"核心拒了 8 条，卡片却是绿色的成功：{got}"
+    assert "核心拒收 8 条" in got["summary"], got["summary"]
+    runlog.reset()
+
+
+def test_a_failed_reaper_thread_releases_the_mutex_key(client, fake_plugin, monkeypatch):
+    """起收割线程失败时，互斥键必须放掉——否则这个账号**只有重启才能再跑**。
+
+    全仓只有两处会清 `_INFLIGHT`：`_reap` 的 finally，和 Popen 抛错那一支。
+    `threading.Thread(...).start()` 抛 `RuntimeError`（OS 拒绝建线程）时两处都没走到，
+    于是那个键永久占着：此后每次点都是 409「已经在跑了」，而其实一个进程都没有。
+
+    **进程本身不回滚**：`_ALIVE_PROCS` / `_OWN_GROUP` 里那条留给关停收——
+    回滚它们会丢掉刚验证过的 pgid，它拉起的孙进程从此失联。
+    也**不调 on_done**：那会让批次提前封口，卡片永久停在「执行中」（见 _batch_seal）。
+    """
+    from app.routers import plugins as mod
+
+    gate = _popen_gate(monkeypatch)
+    m = mod._find_manifest("demo")
+
+    class Boom:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(mod.threading, "Thread", Boom)
+    try:
+        with pytest.raises(Exception) as e:
+            mod._launch(m, "run", ["--account", "甲"])
+        assert getattr(e.value, "status_code", None) == 500, e.value
+        assert not mod._INFLIGHT, \
+            f"起线程失败却把互斥键留下了，这个账号再也起不来：{mod._INFLIGHT}"
+        # 进程留着交给关停收——它的 pgid 已经验证过，丢了就再也定位不到孙进程
+        assert mod._ALIVE_PROCS, "进程被回滚了，它拉起的孙进程从此失联"
+    finally:
+        gate.set()
+        with mod._PROCS_LOCK:
+            mod._ALIVE_PROCS.clear()
+            mod._OWN_GROUP.clear()
+            mod._INFLIGHT.clear()

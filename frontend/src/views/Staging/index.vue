@@ -5,7 +5,7 @@
     </PageHeader>
 
     <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable
-                 table-name="staging" :actions-width="128" @save="saveCell" @add="addRow" @delete="doDelete" @reload="load">
+                 table-name="staging" :empty-text="loadFailed ? '加载失败——请检查网络或后端，然后重试' : '没有符合条件的记录'" :actions-width="128" @save="saveCell" @add="addRow" @delete="doDelete" @reload="load">
       <template #toolbar>
         <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="reload" />
         <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
@@ -182,6 +182,10 @@ function ensureItems(row) {
 // 请求序号：筛选/翻页可以在上一次响应回来前再发一次，慢的那次后到会把新数据整个覆盖掉
 // （表现为「清了筛选却只剩一部分」「内容是第2页、页码高亮第3页」）。只认最后一次发出的请求。
 let loadSeq = 0
+// 上一次加载是否失败：空态文案据此说实话。
+// 「请求挂了」与「真的没有记录」渲染成同一句「没有符合条件的记录」，是这个项目反复栽的那类
+// ——拦截器那句 toast 三秒就没了，此后这一屏与「真的还没记过账」完全无法区分。
+const loadFailed = ref(false)
 async function load() {
   const my = ++loadSeq
   loading.value = true
@@ -196,6 +200,10 @@ async function load() {
     if (my !== loadSeq) return          // 已有更新的请求发出，丢弃这次的结果
     rows.value = res.items
     total.value = res.total
+    loadFailed.value = false
+  } catch (_) {
+    // 拦截器已提示原因；这里负责让**页面本身**留下痕迹，否则空态在说假话。
+    if (my === loadSeq) loadFailed.value = true
   } finally {
     if (my === loadSeq) loading.value = false
   }

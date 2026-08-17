@@ -1273,3 +1273,86 @@ def test_save_items_compares_against_what_it_actually_sent():
     assert re.search(r"itemsStale:\s*stale", body), "比对结果没有传给 applyRowUpdate"
     assert body.count("toPayload(") == 2, \
         "送出去和比对没有走同一个归一化函数（或者有人又各写了一份）"
+
+
+def test_after_create_treats_a_failed_refresh_as_saved():
+    """新建成功、**刷新失败**时，`afterCreate` 不许把失败往外抛。
+
+    这条链上每一环单独看都合理，合起来是数据错误：
+      · 列表页的 `load()` 只有 try/finally（没有 catch）；
+      · `afterCreate` 里 `await load()` 于是把刷新失败抛给调用方；
+      · 各页 `addRow` 的 catch 接住 → `done(false)`；
+      · `NotionTable.finish(false)` **不清草稿**——那是「没保存成功」的语义；
+      · 用户看着自己刚敲的字还在，以为没存上，再按一次回车。
+    而那一笔**已经落库了**。商品/暂存/集运撞唯一索引会得到一句莫名的「已存在」，
+    而 **`MiscExpense` 没有任何唯一约束——同一笔钱干干净净地记两遍**。
+
+    判据只有一条：**草稿该不该清，只取决于新建成功没有**，与列表刷新得不得动无关。
+
+    直接拿 node 跑那个函数（它只依赖 ElMessage，用替身喂进去），
+    不 grep 源码——这一轮已经有 7 处守卫栽在「按字符串判」上。
+    """
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        import os
+        if os.environ.get("SOROBAN_NO_NODE"):
+            pytest.skip("显式声明了本机没有 node（SOROBAN_NO_NODE=1）")
+        raise AssertionError("找不到 node，而这是前端行为测试的唯一途径；"
+                             "真没有 node 请设 SOROBAN_NO_NODE=1。")
+
+    # 把 listRows.js 里那句 element-plus 的 import 换成本地桩，其余一字不改
+    src = (_REPO / "frontend" / "src" / "utils" / "listRows.js").read_text(encoding="utf-8")
+    assert "from 'element-plus'" in src, "listRows.js 的依赖变了，这条测试要跟着更新"
+    src = src.replace("import { ElMessage } from 'element-plus'",
+                      "const ElMessage = { info: (m) => globalThis.__m.push(m),"
+                      " warning: (m) => globalThis.__m.push(m) }")
+
+    harness = _REPO / "node-after-create.test.mjs"
+    harness.write_text(src + r"""
+globalThis.__m = []
+const out = {}
+
+// 有筛选 ⇒ 走「回到第 1 页重新拉」那一支；load 挂掉
+{
+  const rows = { value: [] }
+  let threw = false
+  try {
+    await afterCreate({ id: 7 }, {
+      rows, total: { value: 0 }, page: { value: 2 },
+      filters: { q: '找点什么' },
+      load: async () => { throw new Error('刷新挂了') },
+    })
+  } catch (_) { threw = true }
+  out.refresh_failure_is_not_thrown = !threw
+  out.user_is_told_it_was_saved = globalThis.__m.some((m) => m.includes('已保存'))
+  out.no_false_filter_claim = !globalThis.__m.some((m) => m.includes('不在当前筛选条件内'))
+}
+
+// 反面：刷新成功、而那条确实不在筛选内 ⇒ 那句提示必须照常出现
+{
+  globalThis.__m = []
+  const rows = { value: [] }
+  await afterCreate({ id: 8 }, {
+    rows, total: { value: 0 }, page: { value: 2 },
+    filters: { q: '找点什么' },
+    load: async () => { rows.value = [{ id: 999 }] },
+  })
+  out.real_filter_miss_still_reported =
+    globalThis.__m.some((m) => m.includes('不在当前筛选条件内'))
+}
+
+console.log(JSON.stringify(out))
+""", encoding="utf-8")
+    try:
+        r = subprocess.run([node, str(harness)], cwd=_REPO, capture_output=True,
+                           text=True, timeout=60)
+    finally:
+        harness.unlink(missing_ok=True)
+    assert r.returncode == 0, f"node 跑挂了：{r.stderr[-800:]}"
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    failed = [k for k, v in got.items() if not v]
+    assert not failed, f"这些行为不成立：{failed}"

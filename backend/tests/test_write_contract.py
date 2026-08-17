@@ -428,6 +428,10 @@ def test_item_editor_never_silently_drops_a_nameless_row():
 @pytest.mark.parametrize("page,loader", [
     ("Dashboard", "dashboardApi.get"),
     ("Items", "itemsApi.list"),
+    ("Orders", "ordersApi.list"),
+    ("Staging", "stagingApi.list"),
+    ("Shipment", "shipmentApi.list"),
+    ("Misc", "miscApi.list"),
 ])
 def test_list_pages_do_not_render_failure_as_emptiness(page, loader):
     """请求失败**不能**渲染成「空」。
@@ -441,8 +445,24 @@ def test_list_pages_do_not_render_failure_as_emptiness(page, loader):
     """
     src = (_REPO / "frontend" / "src" / "views" / page / "index.vue").read_text(encoding="utf-8")
     assert loader in src, f"{page} 的加载调用变了，这条测试要跟着更新"
-    assert "loadFailed" in src, f"{page} 没有把加载失败的状态留在页面上"
-    # 失败状态必须真的被模板用到，而不是定义了没用
+
+    # **按结构判，不是搜标识符。** 原先只有 `"loadFailed" in src` 与
+    # `"loadFailed" in tpl` 两句：把 `loadFailed.value = true` 那一行整个删掉，
+    # 标识符仍然留在模板的 `:empty-text` 里，**测试照样绿**——守卫在保护一个
+    # 永远为 false 的变量。三段各钉一环，缺一环这条链就断了。
+    body = re.sub(r"//.*$", "", src[src.index("<script"):], flags=re.M)   # 剥注释再判
+    # 锚点要带括号：Orders/Staging 里还有 `async function loadAccounts()`，
+    # 用 "async function load" 会切到那个（它自己带 catch，于是这条守卫在验别人的代码）。
+    m = re.search(r"^async function load\(\) \{", body, re.M)
+    assert m, f"{page} 里找不到 load()——这条测试要跟着更新"
+    fn = body[m.start():]
+    end = re.search(r"^(?:async )?function |^const |^onMounted", fn[1:], re.M)
+    fn = fn[:end.start() + 1] if end else fn
+    assert re.search(r"\}\s*catch\b", fn), f"{page} 的 load() 没有 catch——失败会被静默吞掉"
+    assert re.search(r"loadFailed\.value\s*=\s*true", fn), \
+        f"{page} 捕获了失败却没把状态留下来"
+    assert re.search(r"loadFailed\.value\s*=\s*false", fn), \
+        f"{page} 成功时没有清掉失败标志——失败一次就永远显示失败"
     tpl = src[:src.index("<script")]
     assert "loadFailed" in tpl, f"{page} 定义了 loadFailed 却没在模板里用——等于没修"
 
