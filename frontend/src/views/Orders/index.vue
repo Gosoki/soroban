@@ -321,7 +321,7 @@ async function addRow(data = {}, done) {
 
 async function delRow(row) {
   try {
-    await ElMessageBox.confirm(`删除订单 ${row.order_no || row.id}？`, '确认', { type: 'warning' })
+    await ElMessageBox.confirm(`删除订单「${row.order_no || row.id}」？`, '确认', { type: 'warning' })
   } catch (_) { return }
   try {
     await ordersApi.remove(row.id)

@@ -125,7 +125,7 @@
 
 <script setup>
 import PageHeader from '@/components/PageHeader.vue'
-import { onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Camera, Loading, Upload } from '@element-plus/icons-vue'
@@ -231,7 +231,7 @@ async function addRow(data = {}, done) {
 
 async function delRow(row) {
   try {
-    await ElMessageBox.confirm(`删除集运订单 ${row.shipment_no || row.id}？`, '确认', { type: 'warning' })
+    await ElMessageBox.confirm(`删除集运订单「${row.shipment_no || row.id}」？`, '确认', { type: 'warning' })
   } catch (_) { return }
   try {
     await shipmentApi.remove(row.id)

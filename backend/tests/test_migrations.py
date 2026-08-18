@@ -245,3 +245,44 @@ def test_other_failures_do_not_claim_a_newer_database(exc):
     from app.database import _looks_like_newer_db
 
     assert not _looks_like_newer_db(exc), f"{type(exc).__name__} 被误认成了新库"
+
+
+def test_mysql_users_are_not_told_to_delete_the_control_db(monkeypatch, caplog):
+    """MySQL 后端遇到「库比代码新」时，**不许**建议删 soroban.db。
+
+    「库比代码新」和「后端是什么」是两个正交的维度，原先却串成一条链
+    （先认 newer，认出来就走 SQLite 文案）。而 MySQL 上这个报错很常见——
+    另一台机器上的新版 soroban 连的是同一个库。
+
+    照那条建议做的后果特别恶劣：soroban.db 是**控制库**，里面只有 Fernet 加密的
+    MySQL 连接串，业务数据一行都不在其中。删了它 = 业务数据毫发无伤，
+    但再也连不回那个 MySQL，而用户以为自己是在「重建账本」。
+    """
+    import logging
+
+    import pytest
+    from alembic.util.exc import CommandError
+
+    from app import database as db
+
+    def boom(url):
+        raise CommandError("Can't locate revision identified by 'deadbeef'")
+
+    monkeypatch.setattr(db, "run_migrations", boom)
+    monkeypatch.setattr(db.control, "ensure_schema", lambda *a, **k: None)
+    monkeypatch.setattr(db, "current_backend", lambda: "mysql")
+    with caplog.at_level(logging.ERROR), pytest.raises(CommandError):
+        db.create_db_and_tables()
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "更新版本的 soroban" in text, f"没认出「库比代码新」：{text[:300]}"
+    assert "你的数据没有问题" in text, "没告诉用户数据是好的——那是他此刻最想知道的"
+    # 判据：凡是同时提到「删」和 soroban.db 的行，必须是**劝阻**而不是指示。
+    # 钉语义不钉措辞——第一版把排除写成 `"不要删" not in ln`，
+    # 结果被自己那句「**不要**删本地的 soroban.db」误伤（中间隔着 markdown 星号）。
+    negations = ("不要", "别", "无需", "不用", "并不")
+    offenders = [ln for ln in text.splitlines()
+                 if "删" in ln and "soroban.db" in ln and not any(n in ln for n in negations)]
+    assert not offenders, \
+        f"给 MySQL 用户出了删控制库的主意（业务数据不在里面，删了只会连不回去）：\n" + "\n".join(offenders)
+    assert "use-local-db" in text, "没给出「暂时改用本地账本」这条真正能照做的出路"

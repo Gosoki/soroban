@@ -163,18 +163,49 @@ def test_search_matches_item_name(client):
 
 
 def test_search_like_wildcards_are_escaped(client):
-    """搜索串里的 % 和 _ 必须当字面量（autoescape），否则 '%' 会匹配所有行。"""
-    mk_order(client, title="含百分号%的商品")
-    all_total = client.get("/api/orders", params={"limit": 1}).json()["total"]
-    r = client.get("/api/orders", params={"q": "%"})
-    assert r.json()["total"] < all_total, "LIKE 通配符未被转义，'%' 匹配到了全部行"
+    """搜索串里的 % 和 _ 必须当字面量（autoescape），否则 '%' 会匹配所有行。
+
+    **判据不能是「命中数 < 全库行数」**：那要求库里恰好还有别的行，而这条测试
+    自己只造一行 ⇒ `all_total` 就是 1 ⇒ `1 < 1` 恒假。它一直绿只是因为
+    前面的用例留下了订单，单独 `-k` 跑立刻红——而转义其实是好的。
+    （逐条单跑全套时抓到的。）
+
+    改成自足的一对：两行都带同一个随机 tag，只有一行的标题里**字面含 `%tag`**。
+    搜 `%tag` 时——转义生效只会命中 A；不生效则 `%` 是通配符，
+    `LIKE '%%tag%'` 把 B 也拉进来。判据因此只看「B 在不在结果里」，
+    既不依赖全库状态，也不受分页影响（能匹配的本来就只有这两行）。
+    """
+    import uuid
+
+    tag = uuid.uuid4().hex[:8]
+    a, b = f"通配测试%{tag}", f"通配测试X{tag}"
+    mk_order(client, title=a)
+    mk_order(client, title=b)
+    items = client.get("/api/orders", params={"q": f"%{tag}", "limit": 200}).json()["items"]
+    titles = [it["title"] for it in items]
+    assert a in titles, f"转义之后，字面含 % 的那行应该还搜得到：{titles}"
+    assert b not in titles, "LIKE 通配符未被转义，'%' 把不含它的行也匹配进来了"
 
 
 def test_search_underscore_escaped(client):
-    mk_order(client, title="a_b_c 测试下划线")
-    r = client.get("/api/orders", params={"q": "a_b"})
-    for it in r.json()["items"]:
-        assert "a_b" in (it["title"] or "")
+    """`_` 是 LIKE 的**单字符通配符**，同样必须当字面量。
+
+    **判据必须有诱饵行。** 原先只造 `a_b_c 测试下划线` 一行、再断言
+    「结果里每行都含 a_b」——而库里根本没有能被未转义的 `a_b` 通配到的行，
+    于是把 `autoescape=True` 整个去掉，这条**照样绿**（实测）。
+    诱饵 `aXb_c` 恰好落在「`_` 当通配符才会命中」的位置上：
+    转义生效 → 模式要求第 2 个字符**字面是** `_`，`X` 对不上，诱饵不该出现。
+    """
+    import uuid
+
+    tag = uuid.uuid4().hex[:8]
+    hit, bait = f"a_b_c-{tag}", f"aXb_c-{tag}"
+    mk_order(client, title=hit)
+    mk_order(client, title=bait)
+    items = client.get("/api/orders", params={"q": f"a_b_c-{tag}", "limit": 200}).json()["items"]
+    titles = [it["title"] for it in items]
+    assert hit in titles, f"字面匹配的那行反而搜不到：{titles}"
+    assert bait not in titles, "`_` 未被转义，它当成了单字符通配符"
 
 
 def test_exact_order_no_filter(client):

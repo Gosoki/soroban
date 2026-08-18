@@ -186,7 +186,7 @@ def _find_manifest(plugin_id: str) -> dict:
     for m in discover():
         if m.get("id") == plugin_id:
             return m
-    raise HTTPException(status_code=404, detail=f"未发现插件: {plugin_id}")
+    raise HTTPException(status_code=404, detail=f"未发现插件：{plugin_id}")
 
 
 def _load_params(cfg: Optional[PluginConfig]) -> dict:
@@ -287,7 +287,7 @@ def _check_account_name(manifest: dict, account: str) -> Path:
     """账号名合法性统一校验：非空、不含逗号（逗号是历史 accounts 分隔符），且不穿越 state 目录。
     add/login/fetch 共用同一把尺子，避免 login/fetch 收下 add 不允许的名字而产生孤儿会话文件。"""
     if not account or "," in account:
-        raise HTTPException(status_code=400, detail="账号昵称不能为空、且不能含逗号。")
+        raise HTTPException(status_code=400, detail="账号昵称不能为空、且不能含逗号")
     return _state_file(manifest, account)
 
 
@@ -654,16 +654,41 @@ _PROCS_LOCK = threading.Lock()
 # 「授权登录」按钮连点三下就是三个有头 chromium 同时打开同一个淘宝账号。
 # 互斥原先被推给每个插件各自实现（淘宝插件的 _account_lock 只包 fetch，login 没包），
 # 那等于把一条安全边界交给第三方代码去记得。
-_INFLIGHT: set[str] = set()
+_INFLIGHT: dict[str, str] = {}      # 互斥键 → 正占着它的那个标签（谁在跑）
 
 
 class PluginBusy(RuntimeError):
     """同一插件/命令/账号已有一个进程在飞。由 run_command 决定是跳过还是 409。"""
 
 
+def _run_account(extra: list[str]) -> str:
+    """这次调用针对哪个账号（`--account 甲`）。不是按账号跑的命令返回空串。"""
+    return extra[1] if len(extra) >= 2 and extra[0] == "--account" else ""
+
+
 def _run_key(manifest: dict, command: str, extra: list[str]) -> str:
-    """互斥键 = 卡片上那个标签。两者共用同一个函数，免得哪天格式漂开、互斥悄悄失效。"""
-    acct = extra[1] if len(extra) >= 2 and extra[0] == "--account" else ""
+    """互斥键。**按账号跑的命令，键里不带命令名——一个账号同时只能有一个进程。**
+
+    原先键是「插件/命令 [账号]」，于是 `fetch [甲]` 与 `login [甲]` 是两把不同的锁，
+    同一个账号可以同时起两个进程。它们抢的是同一份东西：`state/甲.json`（登录会话）。
+    实际后果是登录白做——login 写完新会话，正跑着的 fetch 拿的仍是启动时读到的旧的，
+    退出时又按自己那份覆盖回去；坏一点的时候两边同时写，会话文件直接损坏，
+    表现为「刚登录成功，抓取却说没登录」，而日志里两条命令各自都是成功的。
+    插件侧的 `_account_lock` 只包 fetch，挡不住这一对。
+
+    不按账号跑的命令（per 不是 account）沿用「插件/命令」，它们之间本来就无关。
+    """
+    acct = _run_account(extra)
+    return f"{manifest.get('id', '?')} [{acct}]" if acct else f"{manifest.get('id', '?')}/{command}"
+
+
+def _run_label(manifest: dict, command: str, extra: list[str]) -> str:
+    """给人看的标签（日志、卡片、409 文案）：带命令名，才说得清「谁占着」。
+
+    与 `_run_key` 分开是因为两者的粒度必须不同：键要粗到能互斥，标签要细到能读懂。
+    合成一个的话，要么互斥漏掉（原样），要么日志里所有账号级命令长得一模一样。
+    """
+    acct = _run_account(extra)
     return f"{manifest.get('id', '?')}/{command}" + (f" [{acct}]" if acct else "")
 
 
@@ -809,7 +834,8 @@ def _kill_tree(proc: subprocess.Popen, label: str) -> None:
         pass
 
 
-def _reap(proc: subprocess.Popen, label: str, jti: Optional[str] = None, on_done=None) -> None:
+def _reap(proc: subprocess.Popen, label: str, key: str,
+          jti: Optional[str] = None, on_done=None) -> None:
     """后台收割子进程：读取其 stdout 单行 JSON 结果并写日志（成功计数 / 失败原因都落 soroban 日志）。
     插件约定 stdout 只吐一行 JSON（见各插件的 run.py），量小不会撑爆管道；30min 上限防挂死。
 
@@ -885,7 +911,7 @@ def _reap(proc: subprocess.Popen, label: str, jti: Optional[str] = None, on_done
     finally:
         with _PROCS_LOCK:
             _ALIVE_PROCS.pop(proc.pid, None)
-            _INFLIGHT.discard(label)            # 释放互斥键，这个账号可以再跑了
+            _INFLIGHT.pop(key, None)            # 释放互斥键，这个账号可以再跑了
         # **子进程退出的这一刻，是回收它孙进程的最后时机。**
         # 过了这里它就被移出注册表，关停时也不会再看它一眼——而它拉起的 chromium
         # 可能还开着。放在锁外：扫一次最多等 2 秒，不该把别的启动/关停挡在门外。
@@ -943,13 +969,15 @@ def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str]
             env["SOROBAN_TOKEN"] = token
         if config:
             env["SOROBAN_CONFIG"] = json.dumps(config, ensure_ascii=False)
-    label = _run_key(manifest, command, extra)
+    label = _run_label(manifest, command, extra)
+    key = _run_key(manifest, command, extra)
     # **登记必须在 Popen 之前**，且与查重在同一把锁里：分两步做的话，两个并发请求
     # 会双双查到「没人在跑」，然后双双起进程——而这正是要防的那件事。
     with _PROCS_LOCK:
-        if label in _INFLIGHT:
-            raise PluginBusy(label)
-        _INFLIGHT.add(label)
+        holder = _INFLIGHT.get(key)
+        if holder:
+            raise PluginBusy(holder)        # 报**占着的那个**，不是自己——挡住 fetch 的可能是 login
+        _INFLIGHT[key] = label
     try:
         proc = subprocess.Popen(
             cmd, cwd=str(manifest["_dir"]), env=env,
@@ -958,7 +986,7 @@ def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str]
         )
     except (OSError, ValueError) as e:
         with _PROCS_LOCK:                       # 没起来就别占着键，否则这个账号永久起不来
-            _INFLIGHT.discard(label)
+            _INFLIGHT.pop(key, None)
         raise HTTPException(status_code=500, detail=f"启动插件失败：{e}")
     # jti 传给收割线程：进程一结束就把令牌作废。否则插件跑完之后那枚令牌还能用二十几分钟，
     # 而它此刻已经落在插件的日志/环境里了。
@@ -966,7 +994,7 @@ def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str]
         _ALIVE_PROCS[proc.pid] = (proc, label)
         _remember_group(proc.pid, label)
     try:
-        threading.Thread(target=_reap, args=(proc, label, jti, on_done), daemon=True).start()
+        threading.Thread(target=_reap, args=(proc, label, key, jti, on_done), daemon=True).start()
     except RuntimeError as e:               # OS 拒绝建线程（fd/线程数耗尽）
         # **必须把互斥键放掉。** 全仓只有 `_reap` 的 finally 与上面 Popen 失败那一支会清它，
         # 而这里两者都没走到——于是这个账号的键永久占着，此后每次点都是 409「已经在跑了」，
@@ -975,7 +1003,7 @@ def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str]
         # 回滚它们会丢掉刚验证过的 pgid，它拉起的孙进程从此失联。
         # 也**绝不调 on_done**——那会让批次提前封口，卡片永久停在「执行中」（见 _batch_seal）。
         with _PROCS_LOCK:
-            _INFLIGHT.discard(label)
+            _INFLIGHT.pop(key, None)
         log.error("插件 %s 起收割线程失败：%s（子进程 %s 已在跑，留给关停回收）",
                   label, e, proc.pid)
         raise HTTPException(status_code=500, detail=f"启动插件失败（无法创建收割线程）：{e}")
@@ -1447,7 +1475,7 @@ def run_command(plugin_id: str, command: str, account: Optional[str] = None,
 
     fan = _fan_targets(m, cfg, cmd, account)
     if not fan:
-        raise HTTPException(status_code=400, detail="没有可用账号：先添加账号并启用。")
+        raise HTTPException(status_code=400, detail="没有可用账号：先添加账号并启用")
 
     # **令牌只带这条命令声明要用的权限**，不是插件的全部授权。
     # `needs` 原先只用来禁按钮，令牌照发全量：于是一条 `needs = []`（「只测试、不写入」）
@@ -1484,6 +1512,7 @@ def run_command(plugin_id: str, command: str, account: Optional[str] = None,
     cfg.updated_at = utcnow()
     session.add(cfg)
     session.commit()
+    stolen = 0                      # 预筛之后被别的请求抢走的目标数，见下面 finally 的分支
     try:
         for extra, who in fan:
             # **一个子进程一枚令牌**。共用一枚的话，先跑完的那个账号在 `_reap` 里
@@ -1501,10 +1530,29 @@ def run_command(plugin_id: str, command: str, account: Optional[str] = None,
                 # 否则每被挡一次就泄漏一枚能用二十几分钟的凭据。
                 scopes.revoke(jti)
                 running.append(who)
+                stolen += 1
     finally:
         # **finally**：中途抛异常（缺 venv、令牌签发失败）时，已经起来的兄弟仍会回调，
         # 而批次还在等一个永远到不了的计划数——卡片会永久停在「执行中…」。
-        seal_and_report(batch, len(pids), plugin_id, cmd.label)
+        if pids or stolen != len(fan):
+            seal_and_report(batch, len(pids), plugin_id, cmd.label)
+        else:
+            # **全部目标都是在预筛之后被抢走的 ⇒ 这次点击当作没发生过。**
+            # 与 `_run_due` 的 `if not launched and busy: continue` 同源。
+            # 照常 seal 的话会写「一个任务都没能启动」+ failed，
+            # 而此刻真正在跑的是**抢走它的那次执行**——用户看到的是自己正在跑的卡片
+            # 突然变红说没启动起来，比什么都不显示更误导。
+            # 批次要主动丢掉：没有任何子进程会来填它，留着就是一条永不回收的记录。
+            _BATCHES.pop(batch, None)
+            log.info("插件 %s 的「%s」全部 %d 个目标在预筛后被抢占，本次点击不改卡片",
+                     plugin_id, cmd.label, stolen)
+    if not pids and stolen:
+        # 一个字节都没写。回 409 与「预筛就全被挡」那一支保持同一种回答——
+        # 前端据此提示「已经在跑了」，而不是把「launched: true、pids: []」当成成功。
+        raise HTTPException(
+            status_code=409,
+            detail=f"「{cmd.label}」已经在跑了" + (f"：{'、'.join(w for w in running if w)}" if any(running) else "")
+                   + "。等它跑完，或刷新看结果。")
     return {"launched": True, "command": cmd.name, "pids": pids,
             "targets": [w for _, w in fan if w],
             # 被互斥挡掉的目标也如实回报：前端那句「已触发抓取」否则是半句假话。
@@ -1739,11 +1787,11 @@ def rename_account(
     if not m["_m"].ledger_field:
         # 该操作要把账号名迁到账本的某一列上，清单没声明 accounts_ledger_field
         # 就说明这个插件的账号与账本无关（如汇率），不支持这类操作。
-        raise HTTPException(status_code=400, detail="该插件不支持账号改名。")
+        raise HTTPException(status_code=400, detail="该插件不支持账号改名")
     field = _ledger_field(m)            # 账号名落在账本的哪一列，由清单说了算
     new = new.strip()
     if not new or "," in new:
-        raise HTTPException(status_code=400, detail="新账号名不能为空、且不能含逗号（逗号是账号分隔符）。")
+        raise HTTPException(status_code=400, detail="新账号名不能为空、且不能含逗号（逗号是账号分隔符）")
     _state_file(m, new)                                     # 校验 new 是合法文件名（目录穿越/非法名 → 400）
     cfg = session.get(PluginConfig, plugin_id)
     # old 有效 = 配置/磁盘里的账号，或历史数据/标签里出现过（列头改名可能改一个只存在于旧订单的账号）
@@ -1783,7 +1831,7 @@ def _require_platform_account(m: dict, session: Session, account: str) -> None:
     if not m["_m"].ledger_field:
         # 同上：清单没声明 accounts_ledger_field 就说明这个插件的账号与账本无关，
         # 「按账号删单」无从谈起。核心不该知道任何具体插件的 id。
-        raise HTTPException(status_code=400, detail="该插件不支持按账号删除订单。")
+        raise HTTPException(status_code=400, detail="该插件不支持按账号删除订单")
     field = _ledger_field(m)
     cfg = session.get(PluginConfig, m["id"])
     if account not in _known_names(cfg, m) and not tag_value_in_use(session, field, account):

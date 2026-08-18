@@ -337,6 +337,17 @@ async function saveParams(p) {
     }
     const r = await pluginsApi.saveParams(p.id, patch)
     p.params = r.params
+    // **把服务端规范化后的值回灌到输入框。** 只写 `p.params` 是不够的——
+    // 输入框绑的是 `p._form.params`，两者会当场分叉：
+    // 清空一个整数参数（el-input-number 对 isNil 提前 return，`:min` 钳制根本走不到）
+    // 会提交 null，而后端 `params._coerce` 对非 str/secret/select 类型遇 None **折回默认值**
+    // ⇒ 屏幕上是空框、库里是 3，还配一句「参数已保存，下一次执行即按新值跑」。
+    // 刷新能自愈、落的值也正是默认值，所以今天不丢数据；
+    // **真正的理由是前瞻**：以后只要给参数加任何服务端规范化（trim、单位换算、区间钳制），
+    // 屏幕与库里就会各说各话，而这一句能让所有这类改动天然生效。
+    // secret 例外：后端只回 `'__set__'` 占位，填回输入框会把密钥真改成这个字符串。
+    p._form.params = Object.fromEntries(
+      (r.params || []).map((pa) => [pa.key, pa.value === '__set__' ? '' : pa.value]))
     ElMessage.success('参数已保存，下一次执行即按新值跑')
   } catch (_) { /* 422 会显示后端的具体原因 */ } finally { p._busy = false }
 }
@@ -449,6 +460,11 @@ let installTimer = null
 let runTimer = null
 function scheduleInstallPoll() {
   if (installTimer) return                    // 单例：多张卡同时装也只有一个轮询
+  // **重新开表就重新给满 _POLL_MAX_FAILS 次机会。** 不清零的话：连败 3 次停表 →
+  // 用户点「刷新」→ 计时器是新建的，计数却还是 3 → 下一次抖动（第 4 次）当场又停，
+  // 而且一次机会都不给。用户点第二下、第三下，每次都「刚点就又不动了」，
+  // 看起来像刷新按钮坏了。
+  installFails = 0
   installTimer = setInterval(async () => {
     try {
       const list = await pluginsApi.list()
@@ -483,6 +499,7 @@ function scheduleInstallPoll() {
 // 刚勾了一半的授权都会被冲掉（安装轮询那段的注释早就写着这一条）。
 function scheduleRunPoll() {
   if (runTimer) return                        // 单例：多张卡同时在跑也只有一个轮询
+  runFails = 0                                // 同上：重新开表 = 重新给满次数
   runTimer = setInterval(async () => {
     try {
       const list = await pluginsApi.list()

@@ -695,7 +695,7 @@ def test_the_reaper_sweeps_the_group_right_after_the_child_exits():
         with mod._PROCS_LOCK:
             mod._ALIVE_PROCS[child.pid] = (child, "test/reaper-sweep")
             mod._remember_group(child.pid, "test/reaper-sweep")
-        mod._reap(child, "test/reaper-sweep")       # 真的收割线程逻辑，不是桩
+        mod._reap(child, "test/reaper-sweep", "test/reaper-sweep")   # 真的收割线程逻辑，不是桩
         assert not alive(grandchild), \
             f"收割完没扫进程组，孙进程 {grandchild} 活到了关停之外"
         assert child.pid not in mod._ALIVE_PROCS, "注册表没清干净"
@@ -861,7 +861,7 @@ def test_the_group_sweep_happens_before_the_output_drains():
             mod._ALIVE_PROCS[child.pid] = (child, "test/drain-order")
             mod._remember_group(child.pid, "test/drain-order")
         t0 = time.monotonic()
-        mod._reap(child, "test/drain-order",
+        mod._reap(child, "test/drain-order", "test/drain-order",
                   on_done=lambda ok, summary, warn=False: got.append((ok, summary)))
         spent = time.monotonic() - t0
 

@@ -21,7 +21,7 @@
          之后 rows 保持 []，页面就断言「你还没有任何汇率记录，去装插件或手填一个」。
          照做去手填的话更贵——手填汇率在 pick_used 里**优先于抓来的**，
          此后建单按这个估值折算日元，账本里就是错的钱。 -->
-    <el-empty v-if="loadFailed" :description="'加载失败——请检查网络或后端，然后重试'" />
+    <el-empty v-if="loadFailed" description="加载失败——请检查网络或后端，然后重试" />
     <el-empty v-else-if="!loading && !rows.length"
               description="还没有任何汇率记录。装上汇率插件并授权，或去设置页手填一个。" />
 

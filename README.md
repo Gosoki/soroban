@@ -263,8 +263,10 @@ cd backend
 .venv/bin/python -m pytest
 ```
 
-跑在**临时库**上（`conftest.py` 在导入 app 前把 `DATABASE_URL` 指到临时目录、`SCRAPER_DIR`
-指到空目录），不碰 `soroban.db`、也不会启动真实爬虫插件。覆盖范围与各文件职责见
+跑在**临时库**上（`conftest.py` 在导入 app 前把 `DATABASE_URL` 指到临时目录，并把
+`PLUGIN_DIR` 与兼容别名 `SCRAPER_DIR` **两个都**指到空目录），不碰 `soroban.db`、
+也不会启动真实插件。两个都要设：只设旧名的话现名会回落到仓库里的 `plugins/`，
+测试就变成「取决于本机装了哪些插件」。覆盖范围与各文件职责见
 [backend/tests/README.md](backend/tests/README.md)。
 
 其中 `test_consistency.py` 值得单独一提：订单状态枚举、状态生命周期序、爬虫的状态映射、

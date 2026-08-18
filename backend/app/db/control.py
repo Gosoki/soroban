@@ -102,7 +102,9 @@ def ensure_schema(engine: Engine) -> None:
 
 
 def read_config(engine: Engine) -> dict:
-    """返回 {'backend', 'mysql_url', 'degraded'}。无配置时默认 sqlite。
+    # r""" 是必须的：下面提到了 Windows 路径 `Releases\<VERSION>`，而 `\<` 不是合法转义，
+    # 普通字符串里 Python 3.12 起会发 SyntaxWarning（将来是 SyntaxError）。
+    r"""返回 {'backend', 'mysql_url', 'degraded'}。无配置时默认 sqlite。
 
     `degraded` 非空 = **配置里写着 MySQL，但连接串解不开**，已经退回本地 SQLite。
     降级本身是对的（解不开就连不上，不能让应用起不来），但它**必须可见**：

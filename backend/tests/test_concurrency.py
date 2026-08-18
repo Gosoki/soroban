@@ -24,10 +24,31 @@ def test_guarded_bump_only_one_winner(client):
 
 
 def test_guarded_bump_refuses_soft_deleted(client):
+    """软删过的行不许再被 bump——**判据要用软删之后的 version**。
+
+    原先传的是删除**之前**那个 version，而 `soft_delete` 自己会把 version +1
+    （删除也是一次写）。于是这条测试是被「版本对不上」挡下的，
+    `guarded_bump` 里那句 `is_delete.is_(False)` **一次都没参与判定**：
+    把它整行去掉，1063 条测试没有一条会红（变异测试实测）。
+
+    这道条件是第二层防线：路由层会先 `session.get` + `if order.is_delete → 404`，
+    但那是在事务真正开始写之前读的。并发下（A 读完之后、bump 之前 B 删了这行）
+    只有 UPDATE 语句里带着的这个条件挡得住，因为它和自增 version 是同一条语句。
+    所以它必须自己被测到，而不是靠上一层遮住。
+    """
     o = client.post("/api/orders", json={"date": "2027-04-01", "title": "cc2"}).json()
     client.delete(f"/api/orders/{o['id']}")
     with Session(get_engine()) as s:
-        assert guarded_bump(s, Order, o["id"], o["version"]) is False
+        row = s.get(Order, o["id"])
+        assert row is not None and row.is_delete, "软删没生效，这条测试的前提不成立"
+        # 用**当前**版本号：这样唯一能挡住它的就只剩 is_delete 那一条
+        assert guarded_bump(s, Order, o["id"], row.version) is False, \
+            "软删过的行还能被 bump——UPDATE 语句里少了 is_delete 守卫"
+    # 反面：没删的行、版本对得上，就该成功。否则把条件写成恒 False 也能让上面绿。
+    live = client.post("/api/orders", json={"date": "2027-04-01", "title": "cc2-live"}).json()
+    with Session(get_engine()) as s:
+        assert guarded_bump(s, Order, live["id"], live["version"]) is True
+        s.rollback()
 
 
 def test_import_gate_claims_only_once(client):

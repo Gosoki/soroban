@@ -55,7 +55,7 @@ _FIELD_SOURCES = {
 
 def _check_field(field: str) -> None:
     if field not in _ALLOWED_FIELDS:
-        raise HTTPException(status_code=422, detail=f"未知标签字段: {field}")
+        raise HTTPException(status_code=422, detail=f"未知标签字段：{field}")
 
 
 def _data_values(session: Session, field: str) -> set[str]:
@@ -330,19 +330,36 @@ def remove_tag(field: str, value: str, session: Session = Depends(get_session)):
     return _list(session, field)
 
 
-def _plugin_owns_field(field: str) -> bool:
-    """有没有**已安装的插件**声明它的账号落在账本的这一列上（清单的 accounts_ledger_field）。
+def _plugin_owns_account(session: Session, field: str, value: str) -> bool:
+    """`value` 是不是**某个插件正在管的账号名**（而不只是「这一列归插件管」）。
 
+    判据从字段级收紧到值级，因为字段级会把手工录单的账号一起锁死：
+    只要装了任何一个声明 `accounts_ledger_field = "platform_account"` 的插件，
+    整列的所有值都被这里 400 打回、叫人「去插件管理页操作」——而插件卡片
+    **只列它自己的账号**（配置里的 ∪ state 目录里的），手工录入的名字在那页上
+    根本不存在，删又删不掉（DELETE 报 409 in_use）。于是那个名字改不了也删不掉，
+    界面上还没有任何地方解释为什么。
+
+    值级判据把两种情形分开了：
+      · 插件管的账号 → 仍然拒绝（改名要连磁盘会话与插件配置一起迁，只有插件端点会做）；
+      · 手工录的账号 → 正常改名，本来就没有别处的状态需要跟着动。
+
+    探测失败一律当「不归插件管」——最坏是本地改个名（数据自身仍然一致），
+    而反过来误判会把用户堵死在一个他打不开的端点上。
     惰性 import：`plugins.py` 已经 import 了本模块，顶层互相 import 会成环。
-    探测失败一律当「没有插件管这一列」——那样最多是本地改名（数据仍然一致），
-    而反过来（误判成有插件）会把用户堵死在一个他打不开的端点上。
     """
     try:
-        from .plugins import _ledger_field, discover
+        from .plugins import PluginConfig, _known_names, _ledger_field, discover
 
-        return any(_ledger_field(m) == field for m in discover())
+        for m in discover():
+            if _ledger_field(m) != field:               # 这个插件的账号不落在这一列上
+                continue
+            cfg = session.get(PluginConfig, m["id"])
+            if value in _known_names(cfg, m):           # 配置账号 ∪ 磁盘残留会话
+                return True
+        return False
     except Exception as e:                                   # noqa: BLE001
-        log.warning("判断字段 %s 是否由插件管理时出错，按「无插件」处理：%s", field, e)
+        log.warning("判断 %s=%s 是否由插件管理时出错，按「无插件」处理：%s", field, value, e)
         return False
 
 
@@ -359,19 +376,15 @@ def rename_tag(
     原先无条件对 `platform_account` 报 400、让人「走插件端点」，而前端那条路又把
     `taobao` 焊在 URL 里。于是插件目录不在时（源码安装、或自定 PLUGIN_DIR），
     手工录单产生的账号名**既删不掉也改不了名**：DELETE 返回 409（in_use）、
-    这里 400 让你走插件、插件端点 404「未发现插件: taobao」——
+    这里 400 让你走插件、插件端点 404「未发现插件：taobao」——
     而列头那颗改名笔对所有 tag 列无条件渲染，用户只会看到一句和操作毫不相干的
-    「未发现插件: taobao」。
+    「未发现插件：taobao」。
 
     判据必须是「**有没有插件声明这个字段**」（清单的 `accounts_ledger_field`），
     不能是「插件缺失就跳过迁移」——后者会在插件只是暂时没装好时，
     把账本改了而磁盘会话与插件配置留在旧名下，下一轮抓取又把旧名建回来。
     """
     _check_field(field)
-    if _plugin_owns_field(field):
-        raise HTTPException(
-            status_code=400,
-            detail="这个账号由插件管理，改名请在「插件管理」页操作（要一并迁移磁盘登录会话与插件配置）。")
     new = new.strip()
     old = old.strip()                               # 存库值都是 strip 过的，old 不 strip 会漏匹配→假 404
     if not new:
@@ -382,6 +395,16 @@ def rename_tag(
         return _list(session, field)
     if tag_value_in_use(session, field, new):
         raise HTTPException(status_code=409, detail=f"新名字已被占用：{new}")
+    # 两端都查，理由不同：改**插件账号**要连磁盘会话与插件配置一起迁（只有插件端点会做）；
+    # 改成插件账号名则会让手工数据和插件抓来的数据在账本里合流，插件下次抓取还会把它当自己的。
+    if _plugin_owns_account(session, field, old):
+        raise HTTPException(
+            status_code=400,
+            detail=f"「{old}」是插件管理的账号，改名请在「插件管理」页操作（要一并迁移磁盘登录会话与插件配置）")
+    if _plugin_owns_account(session, field, new):
+        raise HTTPException(
+            status_code=409,
+            detail=f"「{new}」是插件管理的账号，不能改成它（会和插件抓来的数据混在一起）")
     rename_tag_value(session, field, old, new)
     session.commit()
     return _list(session, field)

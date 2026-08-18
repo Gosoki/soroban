@@ -1704,3 +1704,294 @@ def test_a_filter_stuck_on_a_renamed_value_is_cleared():
             f"{page} 没有检查筛选值是否还在候选集里"
         assert "filters.platform_account = ''" in fn, f"{page} 没有清掉失效的筛选值"
         assert "ElMessage" in fn, f"{page} 清了筛选却没告诉用户，他会以为筛选自己乱了"
+
+
+def test_the_seven_list_pages_share_one_failure_sentence_verbatim():
+    """七个列表页的失败态文案必须**逐字相同**。
+
+    它们是同一种处境（请求挂了、列表拿不到），说两种话就是割裂。
+    这一条钉的是字面量本身——文案漂移不会有任何测试红，只能靠它。
+
+    **看板刻意不在此列**：它没有「空列表」这个形态（初值是全 0 的卡片而不是空表），
+    而且要分「从没成功过（显示的是初值）」与「成功过但这次刷新失败（显示的是旧数据）」
+    两句话——用同一句会在其中一种情形下说假话（见 `test_dashboard_tells_stale_data_apart`）。
+    差异有理由，不是遗漏。
+    """
+    SENTENCE = "加载失败——请检查网络或后端，然后重试"
+    root = _REPO / "frontend" / "src" / "views"
+    for page in ("Orders", "Staging", "Shipment", "Misc", "Items", "Fx", "Plugins"):
+        src = (root / page / "index.vue").read_text(encoding="utf-8")
+        assert SENTENCE in src, f"{page} 的失败态文案与其余几页不一致"
+
+    dash = (root / "Dashboard" / "index.vue").read_text(encoding="utf-8")
+    assert SENTENCE not in dash, \
+        "看板套用了列表页那句——它要分「初值」与「旧数据」两种情形，套用会在其中一种上说假话"
+
+
+def test_the_same_empty_state_is_written_the_same_way():
+    """同一句文案不许一处静态、一处动态绑定。
+
+    `:description="'…'"` 与 `description="…"` 渲染结果相同，但读代码的人会以为
+    前者是算出来的、去找它的来源。同一种东西两种写法，正是「割裂感」最常见的来源。
+    """
+    import re
+
+    root = _REPO / "frontend" / "src" / "views"
+    bad = []
+    for page in ("Fx", "Plugins"):
+        src = (root / page / "index.vue").read_text(encoding="utf-8")
+        if re.search(r':description="\'[^\']*\'"', src):
+            bad.append(page)
+    assert not bad, f"这些页面把常量文案写成了动态绑定：{bad}"
+
+
+_UNDEF_HARNESS = r"""
+import { createRequire } from 'node:module'
+import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { join } from 'node:path'
+
+const req = createRequire(import.meta.url)
+const { parse: parseSFC, compileScript } = req(process.env.SFC_PATH)
+const babel = req(process.env.BABEL_PATH)
+
+// 浏览器/ESM 里本来就有的东西。少列一个会误报，所以宁可列全。
+const GLOBALS = new Set(`
+globalThis window document console navigator location history screen
+Object Array String Number Boolean Symbol BigInt Function Math JSON Date RegExp Error
+TypeError RangeError SyntaxError ReferenceError EvalError URIError AggregateError
+Promise Proxy Reflect Map Set WeakMap WeakSet WeakRef ArrayBuffer DataView
+Int8Array Uint8Array Uint8ClampedArray Int16Array Uint16Array Int32Array Uint32Array
+Float32Array Float64Array BigInt64Array BigUint64Array
+parseInt parseFloat isNaN isFinite encodeURI encodeURIComponent decodeURI decodeURIComponent
+NaN Infinity undefined eval structuredClone queueMicrotask
+setTimeout clearTimeout setInterval clearInterval requestAnimationFrame cancelAnimationFrame
+fetch Request Response Headers AbortController AbortSignal URL URLSearchParams
+FormData Blob File FileReader FileList DataTransfer Image Audio Video Event CustomEvent
+MouseEvent KeyboardEvent DragEvent ClipboardEvent IntersectionObserver ResizeObserver
+MutationObserver localStorage sessionStorage indexedDB crypto performance
+alert confirm prompt open close getComputedStyle matchMedia
+HTMLElement Element Node NodeList Text DocumentFragment CSS
+arguments this import require module exports process __dirname __filename
+`.trim().split(/\s+/))
+
+function walk(dir, out = []) {
+  for (const name of readdirSync(dir)) {
+    const p = join(dir, name)
+    if (statSync(p).isDirectory()) walk(p, out)
+    else if (name.endsWith('.vue')) out.push(p)
+  }
+  return out
+}
+
+// 极简作用域分析。宁可漏报不可误报：拿不准的一律当已声明。
+function undeclared(code, filename) {
+  const ast = babel.parse(code, { sourceType: 'module', errorRecovery: true,
+                                  plugins: ['topLevelAwait', 'optionalChaining', 'nullishCoalescingOperator'] })
+  const scopes = [new Set()]
+  const problems = []
+  const declare = (n) => { if (n) scopes[scopes.length - 1].add(n) }
+
+  // 收集一个绑定模式（含解构）里的全部名字
+  function bindPattern(node) {
+    if (!node) return
+    switch (node.type) {
+      case 'Identifier': declare(node.name); break
+      case 'ObjectPattern': node.properties.forEach((p) =>
+        bindPattern(p.type === 'RestElement' ? p.argument : p.value)); break
+      case 'ArrayPattern': node.elements.forEach(bindPattern); break
+      case 'RestElement': bindPattern(node.argument); break
+      case 'AssignmentPattern': bindPattern(node.left); break
+      default: break
+    }
+  }
+
+  // 先把一个函数体/程序体里的**声明**全部登记（hoisting：函数与 var 先于使用）
+  function hoist(body) {
+    for (const st of body || []) {
+      if (!st) continue
+      if (st.type === 'VariableDeclaration') st.declarations.forEach((d) => bindPattern(d.id))
+      else if (st.type === 'FunctionDeclaration' || st.type === 'ClassDeclaration') declare(st.id?.name)
+      else if (st.type === 'ImportDeclaration') st.specifiers.forEach((sp) => declare(sp.local?.name))
+      else if (st.type === 'ExportNamedDeclaration' || st.type === 'ExportDefaultDeclaration')
+        hoist([st.declaration])
+      else if (st.type === 'LabeledStatement') hoist([st.body])
+      // 块内的 var 会提升到函数作用域——这里统一按「登记到当前作用域」处理，
+      // 偏保守（可能少报），符合「宁可漏报」的取向。
+      else if (st.type === 'BlockStatement') hoist(st.body)
+      else if (st.type === 'IfStatement') { hoist([st.consequent]); hoist([st.alternate]) }
+      else if (st.type === 'TryStatement') { hoist([st.block]); hoist([st.handler?.body]); hoist([st.finalizer]) }
+      else if (/^(For|While|DoWhile)/.test(st.type)) { hoist([st.body]); if (st.init) hoist([st.init]); if (st.left) hoist([st.left]) }
+      else if (st.type === 'SwitchStatement') st.cases.forEach((c) => hoist(c.consequent))
+    }
+  }
+
+  function known(name) {
+    if (GLOBALS.has(name)) return true
+    for (let i = scopes.length - 1; i >= 0; i--) if (scopes[i].has(name)) return true
+    return false
+  }
+
+  function visit(node, parent) {
+    if (!node || typeof node.type !== 'string') return
+    const opensScope = /Function|ArrowFunctionExpression|CatchClause|ClassMethod|ObjectMethod/.test(node.type)
+      || node.type === 'BlockStatement' || node.type === 'Program'
+      || /^For/.test(node.type)
+    if (opensScope) {
+      scopes.push(new Set())
+      if (node.params) node.params.forEach(bindPattern)
+      if (node.type === 'CatchClause') bindPattern(node.param)
+      if (node.id?.name) declare(node.id.name)
+      if (node.type === 'Program') hoist(node.body)
+      else if (node.body?.type === 'BlockStatement') hoist(node.body.body)
+      else if (node.type === 'BlockStatement') hoist(node.body)
+      if (/^For/.test(node.type)) { if (node.left) hoist([node.left]); if (node.init) hoist([node.init]) }
+    }
+    for (const key of Object.keys(node)) {
+      if (key === 'loc' || key === 'start' || key === 'end' || key === 'leadingComments'
+          || key === 'trailingComments' || key === 'innerComments' || key === 'extra') continue
+      const val = node[key]
+      if (Array.isArray(val)) val.forEach((c) => visit(c, node))
+      else if (val && typeof val.type === 'string') {
+        // 属性名、对象字面量的 key、label 名都不是「引用」
+        if (parentSkips(node, key)) continue
+        visit(val, node)
+      }
+    }
+    if (node.type === 'Identifier' && isReference(node, parent) && !known(node.name))
+      problems.push({ name: node.name, line: node.loc?.start.line })
+    if (opensScope) scopes.pop()
+  }
+
+  function parentSkips(node, key) {
+    if ((node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression')
+        && key === 'property' && !node.computed) return true
+    if ((node.type === 'ObjectProperty' || node.type === 'ClassProperty' || node.type === 'ClassMethod'
+         || node.type === 'ObjectMethod') && key === 'key' && !node.computed) return true
+    if ((node.type === 'BreakStatement' || node.type === 'ContinueStatement'
+         || node.type === 'LabeledStatement') && key === 'label') return true
+    if (node.type === 'ExportSpecifier' && key === 'exported') return true
+    if (node.type === 'ImportSpecifier' && key === 'imported') return true
+    return false
+  }
+  function isReference(node, parent) {
+    if (!parent) return false
+    if (parent.type === 'ObjectProperty' && parent.key === node && !parent.computed) return false
+    if (parent.type === 'MemberExpression' && parent.property === node && !parent.computed) return false
+    return true
+  }
+
+  visit(ast.program, null)
+  return problems
+}
+
+const bad = []
+for (const file of walk('src')) {
+  const src = readFileSync(file, 'utf8')
+  const { descriptor, errors } = parseSFC(src, { filename: file })
+  // **失败一律上报，不许 continue。** 静默跳过等于「这个文件我没查」被伪装成「这个文件没问题」——
+  // 而语法错误恰恰是最该红的那种。第一次做破坏性验证时正是被这个 continue 骗过：
+  // 注入的破坏含一个 JS 里非法的字符，compileScript 抛错，文件被跳过，守卫报「全都好」。
+  if (errors.length) { bad.push({ file, probs: [{ name: 'SFC 解析失败: ' + errors[0].message }] }); continue }
+  if (!descriptor.scriptSetup) continue
+  let compiled
+  try { compiled = compileScript(descriptor, { id: file }) }
+  catch (e) { bad.push({ file, probs: [{ name: '编译失败: ' + e.message }] }); continue }
+  let probs
+  try { probs = undeclared(compiled.content, file) }
+  catch (e) { bad.push({ file, probs: [{ name: '作用域分析失败: ' + e.message }] }); continue }
+  if (probs.length) bad.push({ file, probs })
+}
+console.log(JSON.stringify(bad, null, 1))
+"""
+
+
+def test_no_undefined_identifiers_in_script_setup():
+    """`<script setup>` 里不许引用**任何**没声明的标识符。
+
+    **这条守卫的由来是两次整页白屏，而 1000+ 条测试一条都没红。**
+      · 集运页加远程搜索时写了 `computed(...)` 却没在 import 里加它；
+      · 更早一次是拖拽绑定里的 `dragDepth = 0`——那个变量在 composable 抽出去之后
+        就不存在了。后果比前一个更隐蔽：拖图进来高亮正常消失、看着像收下了，
+        而 ReferenceError 让后面的 `enqueueBind` 永远到不了，一次请求都不发。
+
+    为什么现有的东西都拦不住：
+    · 后端测试只做**文本 grep**，看不出标识符有没有绑定；
+    · `vite build` **不做**未定义变量检查，照样 ✓ built；
+    · 项目没有 eslint（`package.json` devDeps 里没有），也没有 auto-import 插件。
+
+    做法：`@vue/compiler-sfc` 编译 SFC（两个包仓库里都已装），
+    `@babel/parser` 出 AST，再做一遍最小作用域分析——就是 eslint 的 no-undef，
+    只是不引入整个 eslint。分析**宁可漏报不可误报**：拿不准的语法一律当已声明，
+    全局名单列全。当前 src 下全部 .vue 零误报。
+
+    唯独**失败不许静默跳过**：解析失败/编译失败/分析失败一律计为问题。
+    第一版把它们写成 `continue`，破坏性验证当场被骗——注入的破坏含一个 JS 里
+    非法的字符，编译抛错、文件被跳过，守卫报「全都好」。
+    """
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        import os
+        if os.environ.get("SOROBAN_NO_NODE"):
+            pytest.skip("显式声明了本机没有 node（SOROBAN_NO_NODE=1）")
+        raise AssertionError("找不到 node；真没有请设 SOROBAN_NO_NODE=1。")
+
+    fe = _REPO / "frontend"
+    sfc = fe / "node_modules" / "@vue" / "compiler-sfc"
+    babel = fe / "node_modules" / "@babel" / "parser"
+    for pkg in (sfc, babel):
+        if not pkg.is_dir():
+            raise AssertionError(f"缺 {pkg.name}（{pkg}）——先 npm install")
+
+    harness = fe / "node-undef-scan.test.mjs"
+    harness.write_text(_UNDEF_HARNESS, encoding="utf-8")
+    try:
+        import os as _os
+        env = {**_os.environ, "SFC_PATH": str(sfc.resolve()), "BABEL_PATH": str(babel.resolve())}
+        r = subprocess.run([node, str(harness)], cwd=fe, capture_output=True,
+                           text=True, timeout=180, env=env)
+    finally:
+        harness.unlink(missing_ok=True)
+    assert r.returncode == 0, f"node 跑挂了：{r.stderr[-800:]}"
+    bad = json.loads(r.stdout)
+    assert not bad, "这些 .vue 引用了没声明的标识符（打开对应页面会 ReferenceError）：\n" + "\n".join(
+        f"  {b['file']}: " + "、".join(
+            f"{x['name']}" + (f"(第 {x['line']} 行)" if x.get("line") else "") for x in b["probs"])
+        for b in bad)
+
+
+def test_no_invalid_escape_sequences_anywhere():
+    """全仓不许有非法转义序列（`"\\<"` 这种）。
+
+    起因：`db/control.py` 的 docstring 里写了 Windows 路径 `Releases\\<VERSION>`。
+    普通字符串里 `\\<` 不是合法转义，**Python 3.12 起发 SyntaxWarning、将来会是 SyntaxError**。
+    它平时只在 `ast.parse` 源码的那两条守卫跑到时冒出来，而且报的位置是
+    `<unknown>:105`——既不说哪个文件，也不说真实行号，根本无从查起。
+
+    这类东西还有个更坏的可能：`"\\d"` 在字符串里能侥幸工作（Python 保留原样），
+    哪天有人把相邻字符改成 `\\n`、`\\t` 就**静默变成另一个字符**。
+    修法一律是给字符串加 `r` 前缀。
+    """
+    import warnings
+
+    bad = []
+    for f in sorted(_REPO.rglob("*.py")):
+        if any(part in (".venv", "node_modules", "build", "dist", "__pycache__") for part in f.parts):
+            continue
+        try:
+            src = f.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                compile(src, str(f), "exec")
+            except SyntaxError:
+                continue            # 语法错本身归别的守卫管（也可能是故意的样例文件）
+            for w in caught:
+                if issubclass(w.category, SyntaxWarning):
+                    bad.append(f"{f.relative_to(_REPO)}: {w.message}")
+    assert not bad, "这些文件有非法转义（加 r 前缀）：\n  " + "\n  ".join(bad)

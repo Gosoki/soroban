@@ -139,10 +139,24 @@ def test_staging_bad_order_status_rejected(client):
 
 
 def test_staging_search_escapes_wildcards(client):
-    mk_staging(client, order_no="S-PCT", title="百分之%百")
-    total_all = client.get("/api/staging", params={"limit": 1}).json()["total"]
-    r = client.get("/api/staging", params={"q": "%"})
-    assert r.json()["total"] < total_all
+    """暂存列表的 `q` 也要把 `%` 当字面量。
+
+    **判据不能是「命中数 < 全库行数」**：这条自己只造一行 ⇒ `total_all` 就是 1
+    ⇒ `1 < 1` 恒假。它一直绿只是因为前面的用例留下了暂存行，单独跑立刻红——
+    而转义其实是好的。（与 test_orders 里那条同源，逐条单跑全套时一起抓到的。）
+
+    改成自足的一对：两行都带同一个随机 tag，只有 A 的标题里**字面含 `%tag`**。
+    """
+    import uuid
+
+    tag = uuid.uuid4().hex[:8]
+    a, b = f"暂存通配%{tag}", f"暂存通配X{tag}"
+    mk_staging(client, order_no=f"S-PCT-{tag}", title=a)
+    mk_staging(client, order_no=f"S-PLAIN-{tag}", title=b)
+    items = client.get("/api/staging", params={"q": f"%{tag}", "limit": 200}).json()["items"]
+    titles = [it["title"] for it in items]
+    assert a in titles, f"转义之后，字面含 % 的那行应该还搜得到：{titles}"
+    assert b not in titles, "暂存列表的 LIKE 通配符未被转义"
 
 
 def _fetch(client, staging_id: int) -> dict:

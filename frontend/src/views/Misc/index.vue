@@ -97,7 +97,7 @@ async function addRow(data = {}, done) {
 
 async function delRow(row) {
   try {
-    await ElMessageBox.confirm(`删除杂项 ${row.name || row.id}？`, '确认', { type: 'warning' })
+    await ElMessageBox.confirm(`删除杂项「${row.name || row.id}」？`, '确认', { type: 'warning' })
   } catch (_) { return }
   try {
     await miscApi.remove(row.id)

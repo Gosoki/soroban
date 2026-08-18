@@ -2,6 +2,8 @@
 import datetime as dt
 from decimal import Decimal
 
+import pytest
+
 from sqlmodel import Session, delete, select
 
 from app.database import get_engine
@@ -92,39 +94,74 @@ def test_rename_to_empty_rejected(client):
                        params={"old": "待改空", "new": "   "}).status_code == 422
 
 
-# 分派判据（`_plugin_owns_field`）在这两条里**显式打桩**：
-# 测试环境的 PLUGIN_DIR 指向空目录，而真实环境看得到淘宝插件——
-# 依赖「环境恰好发现了什么」的话，同一条断言在两处会得到相反结果，
-# 而且哪一边都说不出自己在测分派本身。
-def test_rename_is_refused_when_a_plugin_claims_the_column(client, monkeypatch):
-    """有插件声明这一列时，改名要走插件端点（磁盘会话与插件配置得一起迁）。"""
-    from app.routers import tags as mod
+# 下面四条走**真的插件目录**（临时目录 + 一个 plugin.toml），不打桩。
+# 打桩只能证明「分派调了那个函数」，证明不了判据本身对不对——
+# 而 R2 恰恰是判据的粒度错了：函数被正确调用、返回值也「对」，用户照样被堵死。
+_OWNS_TOML = """
+id = "demo"
+name = "演示插件"
+python = "inherit"
+entry = "-m demo"
+accounts = true
+accounts_ledger_field = "platform_account"
+"""
 
-    client.post("/api/orders", json={"date": "2026-08-18", "order_no": "PLUGOWN-1",
-                                     "platform": "淘宝", "platform_account": "插件管的号"})
-    monkeypatch.setattr(mod, "_plugin_owns_field", lambda field: True)
+
+@pytest.fixture()
+def owns_plugin(tmp_path, monkeypatch):
+    """一个声明了 `accounts_ledger_field = "platform_account"` 的插件，并给它配一个账号。
+
+    返回那个**插件管的**账号名。同一列上的其他值都属于「手工录的」。
+    """
+    import json
+    import uuid
+
+    from app.models import PluginConfig
+    from app.routers import plugins as pmod
+
+    d = tmp_path / "plugins" / "soroban-plugin-demo"
+    d.mkdir(parents=True)
+    (d / "plugin.toml").write_text(_OWNS_TOML, encoding="utf-8")
+    monkeypatch.setattr(pmod.settings, "PLUGIN_DIR", str(tmp_path / "plugins"))
+    monkeypatch.setattr(pmod, "_SOROBAN_ROOT", tmp_path)
+    pmod._needs_cache.clear()
+
+    name = f"插件号-{uuid.uuid4().hex[:8]}"
+    with Session(get_engine()) as ses:
+        ses.merge(PluginConfig(plugin_id="demo",
+                               params_json=json.dumps({"accounts": [{"name": name}]},
+                                                      ensure_ascii=False)))
+        ses.commit()
+    yield name
+    with Session(get_engine()) as ses:                  # 这行会被后面的用例 discover 到，用完就清
+        row = ses.get(PluginConfig, "demo")
+        if row:
+            ses.delete(row)
+            ses.commit()
+
+
+def test_rename_is_refused_for_an_account_the_plugin_manages(client, owns_plugin):
+    """插件管的账号：改名要走插件端点（磁盘会话与插件配置得一起迁）。"""
+    client.post("/api/orders", json={"date": "2026-08-18", "order_no": f"PLUGOWN-{owns_plugin}",
+                                     "platform": "淘宝", "platform_account": owns_plugin})
     r = client.post("/api/tags/platform_account/rename",
-                    params={"old": "插件管的号", "new": "新名"})
+                    params={"old": owns_plugin, "new": owns_plugin + "-新"})
     assert r.status_code == 400, f"{r.status_code} {r.text[:200]}"
     assert "插件管理" in r.text, "报错没告诉用户该去哪儿改"
 
 
-def test_the_same_column_can_be_renamed_locally_when_no_plugin_claims_it(client, monkeypatch):
-    """**没有插件声明这一列时，必须能本地改名**——原先这里是一条死路。
+def test_a_hand_typed_account_on_the_same_column_can_still_be_renamed(client, owns_plugin):
+    """**同一列上、插件不认识的名字必须能改名**——原先这里是一条死路。
 
-    原判据是「列名 == platform_account 就拒绝」，而前端那条替代路径又把 `taobao`
-    焊在 URL 里。于是插件目录不在时（源码安装、自定 PLUGIN_DIR），
-    手工录单产生的账号名**既删不掉也改不了名**：
-    DELETE 返回 409（in_use）、这里 400 让你走插件、插件端点 404「未发现插件: taobao」。
-    而列头那颗改名笔对所有 tag 列无条件渲染——用户只会看到一句
-    「未发现插件: taobao」，和他正在做的事毫无关系。
+    判据原本是字段级的：「有插件声明了 platform_account」→ 整列全拒。
+    可插件卡片只列它自己的账号（配置里的 ∪ state 目录里的），手工录单产生的名字
+    在那页上根本不存在；DELETE 又因 in_use 返回 409。于是那个名字**改不了也删不掉**，
+    而列头那颗改名笔对所有 tag 列无条件渲染——用户只会得到一句
+    「去插件管理页操作」，去了却找不到要操作的东西。
 
-    判据改成「**有没有插件声明这个字段**」（清单的 `accounts_ledger_field`）。
-    注意**不能**写成「插件缺失就跳过迁移」：那会在插件只是暂时没装好时，
+    注意判据**不能**退回成「插件缺失就跳过迁移」：那会在插件只是暂时没装好时，
     把账本改了而磁盘会话与插件配置留在旧名下，下一轮抓取又把旧名建回来。
     """
-    from app.routers import tags as mod
-
     # 账号名带随机后缀 + 按 **id** 回查：整套跑时别的用例也在造订单，
     # 用固定值 + 列表查询会拿到别人的行（这一条第一次写就是这么红的，
     # 而红的信息是「platform_account is None」，完全看不出是拿错了行）。
@@ -132,30 +169,76 @@ def test_the_same_column_can_be_renamed_locally_when_no_plugin_claims_it(client,
     acct = f"手工录的-{uuid.uuid4().hex[:8]}"
     oid = client.post("/api/orders", json={"date": "2026-08-18", "order_no": f"NOPLUG-{acct}",
                                            "platform": "闲鱼", "platform_account": acct}).json()["id"]
-    monkeypatch.setattr(mod, "_plugin_owns_field", lambda field: False)
     r = client.post("/api/tags/platform_account/rename", params={"old": acct, "new": acct + "-新"})
-    assert r.status_code == 200, f"没有插件时仍然改不了名，用户被堵死：{r.status_code} {r.text[:200]}"
+    assert r.status_code == 200, \
+        f"插件不认识的账号也被堵死了（这正是 R2）：{r.status_code} {r.text[:200]}"
 
     got = client.get(f"/api/orders/{oid}").json()
     assert got["platform_account"] == acct + "-新", got
 
 
-def test_the_dispatch_is_by_declaration_not_by_column_name():
-    """分派判据必须是「有插件声明这个字段」，不是写死的列名。
+def test_renaming_onto_a_plugin_account_is_refused(client, owns_plugin):
+    """反向也要拦：把手工账号改成插件账号名 = 让两份数据在账本里合流。
 
-    写死列名的话，将来第二个声明 `accounts_ledger_field` 的插件出现时，
-    它管的那一列会被当成普通标签本地改名——账本改了、那个插件的磁盘会话没动。
+    只拦 old 不拦 new 的话，手工行会并进插件账号名下，而插件下次抓取
+    会把它们当成自己的数据一并处理（对账、软删都按账号名走）。
     """
-    import inspect
+    import uuid
+    acct = f"手工录的-{uuid.uuid4().hex[:8]}"
+    client.post("/api/orders", json={"date": "2026-08-18", "order_no": f"MERGE-{acct}",
+                                     "platform": "闲鱼", "platform_account": acct})
+    r = client.post("/api/tags/platform_account/rename",
+                    params={"old": acct, "new": owns_plugin})
+    assert r.status_code == 409, f"{r.status_code} {r.text[:200]}"
 
-    from app.routers import tags as mod
 
-    src = inspect.getsource(mod.rename_tag)
-    assert "_plugin_owns_field(field)" in src, "分派没有走「按声明判」"
-    assert 'field == "platform_account"' not in src, "还在按列名写死"
+def test_the_dispatch_is_by_declaration_not_by_column_name(client, tmp_path, monkeypatch):
+    """判据要按清单声明的那一列，不是写死 `platform_account`。
 
-    owns = inspect.getsource(mod._plugin_owns_field)
-    assert "_ledger_field(m) == field" in owns, "没有按清单的 accounts_ledger_field 判"
+    插件声明成 `platform` 时，它的账号名落在 **platform** 列上；
+    此时同名的值在 platform_account 列上只是个普通标签，必须能本地改名。
+    写死列名的话这两列会正好反过来。
+    """
+    import json
+    import uuid
+
+    from app.models import PluginConfig
+    from app.routers import plugins as pmod
+
+    d = tmp_path / "plugins" / "soroban-plugin-demo"
+    d.mkdir(parents=True)
+    (d / "plugin.toml").write_text(_OWNS_TOML.replace(
+        'accounts_ledger_field = "platform_account"', 'accounts_ledger_field = "platform"'),
+        encoding="utf-8")
+    monkeypatch.setattr(pmod.settings, "PLUGIN_DIR", str(tmp_path / "plugins"))
+    monkeypatch.setattr(pmod, "_SOROBAN_ROOT", tmp_path)
+    pmod._needs_cache.clear()
+
+    name = f"跨列-{uuid.uuid4().hex[:8]}"
+    with Session(get_engine()) as ses:
+        ses.merge(PluginConfig(plugin_id="demo",
+                               params_json=json.dumps({"accounts": [{"name": name}]},
+                                                      ensure_ascii=False)))
+        ses.commit()
+    try:
+        oid = client.post("/api/orders", json={
+            "date": "2026-08-18", "order_no": f"XCOL-{name}",
+            "platform": "闲鱼", "platform_account": name}).json()["id"]
+        # platform_account 列上的同名值不归这个插件管 → 可以改
+        r = client.post("/api/tags/platform_account/rename", params={"old": name, "new": name + "-新"})
+        assert r.status_code == 200, f"按列名写死了：{r.status_code} {r.text[:200]}"
+        assert client.get(f"/api/orders/{oid}").json()["platform_account"] == name + "-新"
+        # 而它声明的 platform 列上，同名值要被拦下
+        client.post("/api/orders", json={"date": "2026-08-18", "order_no": f"XCOL2-{name}",
+                                         "platform": name, "platform_account": "别的"})
+        r2 = client.post("/api/tags/platform/rename", params={"old": name, "new": name + "-x"})
+        assert r2.status_code == 400, f"声明的那一列没拦住：{r2.status_code} {r2.text[:200]}"
+    finally:
+        with Session(get_engine()) as ses:
+            row = ses.get(PluginConfig, "demo")
+            if row:
+                ses.delete(row)
+                ses.commit()
 
 
 def test_rename_bumps_version(client):
@@ -247,6 +330,30 @@ def test_items_list_hides_deleted_orders(client):
     assert client.get("/api/items", params={"q": "乙"}).json()["total"] == 1
     client.delete(f"/api/orders/{o['id']}")
     assert client.get("/api/items", params={"q": "乙"}).json()["total"] == 0
+
+
+def test_items_search_escapes_like_wildcards(client):
+    """物品列表的 `q` 也要转义 LIKE 通配符——**这条路径原先一道守卫都没有**。
+
+    `routers/items.py` 里那四个 `contains(..., autoescape=True)` 是对的，
+    但把 `autoescape=True` 全部去掉，1063 条测试**没有一条会红**（实测）。
+    订单列表那边有守卫、物品列表这边没有，而两处是各写一份的同一件事。
+
+    判据与订单那边同源：造一对只差一个字符的行，只有 A 字面含 `%tag`。
+    转义生效 → 搜 `%tag` 只命中 A；不生效 → `%` 是通配符，B 也会被拉进来。
+    """
+    import uuid
+
+    tag = uuid.uuid4().hex[:8]
+    a, b = f"物品通配%{tag}", f"物品通配X{tag}"
+    for name in (a, b):
+        client.post("/api/orders", json={"date": "2026-08-18", "title": name,
+                                         "items": [{"name": name, "quantity": 1,
+                                                    "unit_price_cny": "1"}]})
+    rows = client.get("/api/items", params={"q": f"%{tag}", "limit": 200}).json()["items"]
+    names = [r["name"] for r in rows]
+    assert a in names, f"转义之后，字面含 % 的那行应该还搜得到：{names}"
+    assert b not in names, "物品列表的 LIKE 通配符未被转义"
 
 
 def test_items_total_matches_rows(client):

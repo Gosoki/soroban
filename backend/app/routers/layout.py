@@ -20,7 +20,7 @@ _TABLES = {"orders", "shipment", "misc", "staging", "items"}
 
 def _check_table(name: str):
     if name not in _TABLES:
-        raise HTTPException(status_code=422, detail=f"未知表名: {name}")
+        raise HTTPException(status_code=422, detail=f"未知表名：{name}")
 
 
 @router.get("/{table_name}", response_model=LayoutRead)

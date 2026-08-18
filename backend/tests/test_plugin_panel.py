@@ -6,8 +6,9 @@
 from __future__ import annotations
 
 import io
-import itertools
 import json
+import os
+import pathlib
 import subprocess
 import sys
 import threading
@@ -15,7 +16,9 @@ import time
 from pathlib import Path
 
 import pytest
+from sqlmodel import Session
 
+from app.database import get_engine
 from app.models import PluginConfig
 from app.plugins import manifest as pmanifest
 from app.plugins import params as plugin_params
@@ -619,7 +622,9 @@ def test_each_account_gets_its_own_token(client, session, tmp_path, monkeypatch)
     monkeypatch.setattr(mod, "_launch",
                         lambda *a, **kw: seen.append((kw.get("token"), kw.get("jti"))) or 1234)
 
-    for name in ("甲号", "乙号"):
+    import uuid
+    sfx = uuid.uuid4().hex[:6]                  # demo 的账号在整套里是共享的，固定名会撞 409
+    for name in (f"甲号-{sfx}", f"乙号-{sfx}"):
         assert client.post("/api/plugins/demo/account", params={"name": name}).status_code == 200
     client.put("/api/plugins/demo/grants", json={"granted": ["staging:write"]})
     client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
@@ -1315,6 +1320,94 @@ def test_the_card_finishes_when_the_process_ends_after_the_request(
     assert not leaked, f"批次跑完了没被清掉，每执行一次泄漏一条：{leaked}"
 
 
+def _only_accounts(names: list[str]):
+    """把 demo 的账号列表**换成**给定的这几个，返回一个恢复原状的函数。
+
+    `PluginConfig` 是按 plugin_id 存的**一行**，整套跑时前面的用例会不断往 demo 上
+    加账号（实测积到 9 个）。扇出是按这一行展开的，于是「只抢占我自己那两个」
+    根本挡不住——别人的账号照样起进程，断言 409 的那条当场看到 200，
+    而且真的 spawn 了七个子进程（`No module named demo` 立刻退出，但那是运气）。
+    加随机后缀只解决**撞名**，解决不了**多出来的账号**，两件事要分开修。
+    """
+    import json
+
+    from app.models import PluginConfig
+    from app.routers import plugins as mod
+
+    with Session(get_engine()) as ses:
+        cfg = ses.get(PluginConfig, "demo") or PluginConfig(plugin_id="demo")
+        before = cfg.params_json
+        params = json.loads(before or "{}")
+        params["accounts"] = [{"name": n} for n in names]
+        cfg.params_json = json.dumps(params, ensure_ascii=False)
+        ses.add(cfg)
+        ses.commit()
+
+    def restore():
+        with Session(get_engine()) as s2:
+            row = s2.get(PluginConfig, "demo")
+            if row:
+                row.params_json = before
+                s2.add(row)
+                s2.commit()
+    return restore
+
+
+def _dead_pid(_used: set = set()) -> int:
+    """返回一个**当前系统上确定不存在**的 pid。
+
+    假子进程原先用 `itertools.count(9000)` 发号，而 pid 是全局的：9000 这种低位号
+    在长跑的机器上极可能正被某个真实进程占着。产品代码只验「pgid == pid」
+    （挡的是 start_new_session 没生效、别误杀后端自己），而一个 setsid 起来的守护进程
+    ——tmux server 就是——恰好满足这个条件。于是它会被记进 `_OWN_GROUP`，
+    随后 `_sweep_group` 朝它发 SIGTERM，收不到就 SIGKILL。
+    **跑一次单元测试杀掉用户的 tmux 会话**，而测试全绿、日志里只有一句「回收残余进程」。
+
+    改用高位空闲号之后，`os.getpgid` 抛 ProcessLookupError → `_remember_group`
+    走它的 except 分支不记录 → 按组回收自动降级成空操作。安全性来自「这个 pid 不存在」，
+    不是来自「但愿没人用这个号」。
+    """
+    if os.name == "nt" or not hasattr(os, "getpgid"):
+        n = 900000 + len(_used)                 # Windows 没有进程组语义，产品代码直接 return
+        _used.add(n)
+        return n
+    try:
+        hi = int(pathlib.Path("/proc/sys/kernel/pid_max").read_text().strip())
+    except Exception:                            # noqa: BLE001  非 Linux / 读不到
+        hi = 32768
+    for cand in range(hi - 1, max(hi - 100000, 1), -1):
+        if cand in _used:
+            continue
+        try:
+            os.getpgid(cand)
+        except ProcessLookupError:               # 就要这个：确认它不存在
+            _used.add(cand)
+            return cand
+        except OSError:                          # EPERM = 存在但不归我管，同样要躲开
+            continue
+    raise RuntimeError("找不到空闲 pid——假子进程不能用可能存在的号")
+
+
+class _Gate(threading.Event):
+    """`set()` 之后**顺带等收割线程真的收完**。
+
+    原先 `gate.set()` 只是让假进程的 `wait` 返回，测试当场就结束了，
+    而 `_reap` 那个 daemon 线程还在跑。它会活到下一个用例中间，然后去 pop 互斥键、
+    动 `_ALIVE_PROCS`——清掉的是**别人的**键。表现是随机一条插件测试莫名 409 或
+    莫名断言不到在飞进程，重跑又好了。
+    做成 Event 的子类是为了不改十几处调用点：`gate.set()` 原样，语义自动升级成「等收完」。
+    """
+
+    def set(self) -> None:
+        super().set()
+        from app.routers import plugins as mod
+
+        for _ in range(400):                     # 最多等 4 秒；等不到也不失败，那由各自的断言去说
+            if not mod._ALIVE_PROCS and not mod._INFLIGHT:
+                return
+            time.sleep(0.01)
+
+
 class _FakeProc:
     """假子进程。**只替换 `subprocess.Popen`，让真的 `_launch` / `_reap` 跑起来。**
 
@@ -1326,10 +1419,8 @@ class _FakeProc:
     `gate` 未 set = 进程还在跑（`wait` 超时）；set 之后 `_reap` 才会走到 finally 放键。
     """
 
-    _pids = itertools.count(9000)
-
     def __init__(self, gate):
-        self.pid = next(self._pids)
+        self.pid = _dead_pid()          # **绝不能用可能存在的 pid**，见 _dead_pid
         self.stdout = io.StringIO('{"ok": true, "created": 1}\n')
         self.stderr = io.StringIO("")
         self.returncode = None
@@ -1351,7 +1442,7 @@ def _popen_gate(monkeypatch):
     """把 Popen 换成假的，返回那个「进程什么时候结束」的开关。"""
     from app.routers import plugins as mod
 
-    gate = threading.Event()
+    gate = _Gate()
     monkeypatch.setattr(mod.subprocess, "Popen", lambda *a, **k: _FakeProc(gate))
     return gate
 
@@ -1431,34 +1522,122 @@ def test_launch_itself_refuses_a_duplicate_even_when_the_route_check_passed(
         assert mod._launch(m, "run", extra) > 0
         with pytest.raises(mod.PluginBusy):
             mod._launch(m, "run", extra)
-        # 换个账号不受影响：互斥键是「插件/命令 [账号]」，不是整个插件
+        # 换个账号不受影响：互斥键按**账号**分，不是整个插件锁死
         assert mod._launch(m, "run", ["--account", "乙"]) > 0
     finally:
         gate.set()
 
 
-def test_a_busy_account_does_not_take_down_its_siblings(client, fake_plugin, monkeypatch):
-    """扇出时某个账号被互斥挡下 → **只跳过它**，兄弟照常起；令牌当场作废。
+def test_one_account_allows_only_one_process_across_all_commands(
+        client, fake_plugin, monkeypatch):
+    """**同一个账号，任何命令之间都要互斥**——不只是同名命令之间。
 
-    循环里没有 per-account 的 try 的话，一个 `PluginBusy` 会掀掉整个扇出——
-    「甲还在跑」变成「乙丙也别想跑」。而令牌是**为那个没起来的进程签的**，
-    没人会去 revoke 它，每被挡一次就泄漏一枚能用二十几分钟的凭据。
+    互斥键原先是「插件/命令 [账号]」，于是 `fetch [甲]` 与 `login [甲]` 是两把不同的锁，
+    一个账号可以同时起两个进程。它们抢的是同一份东西：`state/甲.json`（登录会话）。
+    实测后果是登录白做——login 写入新会话，正跑着的 fetch 拿的仍是启动时读到的旧的，
+    退出时按自己那份覆盖回去；同时写还会把文件写坏。用户看到的是
+    「刚登录成功，抓取却说没登录」，而两条命令各自的日志都是成功的。
+    插件侧的 `_account_lock` 只包了 fetch，挡不住这一对。
+
+    并发多开有头浏览器登同一个账号，本来就是这个项目写下的风控红线
+    （见 scheduler_loop 的说明与淘宝插件的 docs/风控与对策.md）。
     """
     from app.routers import plugins as mod
 
     gate = _popen_gate(monkeypatch)
     m = mod._find_manifest("demo")
-    revoked = []
-    monkeypatch.setattr(mod.scopes, "revoke", lambda jti: revoked.append(jti))
     try:
-        mod._launch(m, "run", [])                 # 先把「无账号」这个键占住
-        _grant_and_enable(client)
-        r = client.post("/api/plugins/demo/run/run")
-        assert r.status_code == 409, r.text       # 只有一个目标，全被挡 ⇒ 409
-        # 预筛在签发令牌**之前**就挡下了，所以这条路径上一枚令牌都不该签出去
-        assert not revoked, f"被挡下还签了令牌并且泄漏了：{revoked}"
+        assert mod._launch(m, "run", ["--account", "甲"]) > 0
+        with pytest.raises(mod.PluginBusy) as ei:
+            mod._launch(m, "login", ["--account", "甲"])
+        assert "run" in str(ei.value),             f"409 该说出**是谁**占着（此刻是 run），而不是回显调用方自己：{ei.value}"
+        # 同一个插件的不同账号仍各跑各的——粒度是账号，不是插件
+        assert mod._launch(m, "login", ["--account", "乙"]) > 0
     finally:
         gate.set()
+
+
+def test_commands_without_an_account_still_mutex_per_command():
+    """不按账号跑的命令（per 不是 account）之间互不相干，键仍带命令名。
+
+    没有这一条，把键一刀切成「只有插件 id」也能让上面那条绿——
+    而那会让插件的两个无关命令（比如「装依赖」和「查版本」）互相排队。
+    """
+    from app.routers import plugins as mod
+
+    m = {"id": "demo"}
+    assert mod._run_key(m, "a", []) != mod._run_key(m, "b", [])
+    assert mod._run_key(m, "a", ["--account", "甲"]) == mod._run_key(m, "b", ["--account", "甲"])
+    assert mod._run_key(m, "a", ["--account", "甲"]) != mod._run_key(m, "a", ["--account", "乙"])
+    # 标签必须仍分得清是哪个命令，否则日志里所有账号级命令长得一模一样
+    assert mod._run_label(m, "a", ["--account", "甲"]) != mod._run_label(m, "b", ["--account", "甲"])
+
+
+def test_a_busy_account_does_not_take_down_its_siblings(
+        client, session, tmp_path, monkeypatch):
+    """扇出时某个账号被互斥挡下 → **只跳过它**，兄弟照常起；它的令牌当场作废。
+
+    循环里没有 per-account 的 try 的话，一个 `PluginBusy` 会掀掉整个扇出——
+    「甲还在跑」变成「乙丙也别想跑」。而令牌是**为那个没起来的进程签的**，
+    没人会去 revoke 它，每被挡一次就泄漏一枚能用二十几分钟的凭据。
+
+    **要落到 `except PluginBusy` 那一支，就必须让占用发生在预筛之后。**
+    这条测试上一版是「只有一个账号、开跑前先占住键」，那走的是路由开头的预筛
+    （全被挡 ⇒ 409），`except PluginBusy` 那几行一次都没执行过——
+    把它们连同 `scopes.revoke(jti)` 整段删掉，测试照样绿。
+    这一版用「起甲的那一刻，另一个并发请求抢占了乙的键」来复现真实时序：
+    预筛时乙是空闲的，轮到它 `_launch` 时才发现被抢。
+    """
+    from app.routers import plugins as mod
+
+    d = tmp_path / "plugins" / "soroban-plugin-demo"
+    d.mkdir(parents=True)
+    (d / "plugin.toml").write_text(_ACCT_TOML + '\nscopes = ["staging:write"]\n', encoding="utf-8")
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "plugins"))
+    monkeypatch.setattr(mod, "_SOROBAN_ROOT", tmp_path)
+    monkeypatch.setattr(mod, "_python", lambda m: Path(sys.executable))
+    mod._needs_cache.clear()
+
+    # **账号名带随机后缀。** PluginConfig 是按 plugin_id 存的一行，整套跑时
+    # 别的用例也往 demo 上加账号，固定名会撞 409（这条第一次写就是这么红的）。
+    import uuid
+    sfx = uuid.uuid4().hex[:6]
+    jia, yi, bing = f"甲号-{sfx}", f"乙号-{sfx}", f"丙号-{sfx}"
+    for name in (jia, yi, bing):
+        assert client.post("/api/plugins/demo/account", params={"name": name}).status_code == 200
+    client.put("/api/plugins/demo/grants", json={"granted": ["staging:write"]})
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
+
+    restore = _only_accounts([jia, yi, bing])   # 扇出只对这三个，见 _only_accounts
+    m = mod._find_manifest("demo")
+    gate = _Gate()
+    stolen = []
+
+    def popen(*a, **k):
+        # 第一个账号刚要起进程时，模拟「另一个并发请求」抢占了乙号的键。
+        # 抢在这里而不是循环之前，才越得过路由开头那道预筛。
+        if not stolen:
+            stolen.append(True)
+            with mod._PROCS_LOCK:
+                mod._INFLIGHT[mod._run_key(m, "fetch", ["--account", yi])] = f"demo/login [{yi}]"
+        return _FakeProc(gate)
+
+    monkeypatch.setattr(mod.subprocess, "Popen", popen)
+    revoked = []
+    real_revoke = mod.scopes.revoke
+    monkeypatch.setattr(mod.scopes, "revoke", lambda jti: (revoked.append(jti), real_revoke(jti))[0])
+    try:
+        r = client.post("/api/plugins/demo/run/fetch")
+        assert r.status_code == 200, f"一个账号被挡就掀翻了整个扇出：{r.status_code} {r.text[:300]}"
+        assert stolen, "抢占没发生，这条测试没测到该测的时序"
+        assert len(revoked) == 1, \
+            f"被挡下的那个账号的令牌没当场作废（泄漏一枚可用二十几分钟的凭据）：{revoked}"
+        assert yi in r.text, f"没告诉用户是哪个账号被跳过了：{r.text[:300]}"
+    finally:
+        with mod._PROCS_LOCK:                   # 抢占是测试自己塞的，自己收
+            mod._INFLIGHT.pop(mod._run_key(m, "fetch", ["--account", yi]), None)
+        gate.set()
+        restore()
 
 
 def test_a_failed_spawn_releases_the_key_instead_of_wedging_the_account(
@@ -1599,6 +1778,11 @@ def test_the_card_says_so_when_the_core_rejected_everything(
     from app.plugins import runlog
     from app.routers import plugins as mod
 
+    # **必须自己建出 PluginConfig 行**：`_write_outcome` 查不到行就静默 return
+    # （那条路径本身是对的——没配置过的插件不该被凭空写出一行）。
+    # 少了这一句，这条测试只在「前面某个用例恰好留下了 demo 行」时才绿，
+    # 单独跑 `-k` 立刻红成 `assert '核心拒收 30 条' in ''`。
+    _grant_and_enable(client)
     runlog.note_rejected("JTI-1", "demo", "汇率", 30, "缺少必填字段 rate")
     done = mod._result_writer("demo", "抓取", run="JTI-1")
     done(True, "已导入 30 单")                    # 插件自报：成功
@@ -1618,6 +1802,7 @@ def test_a_clean_run_is_not_downgraded(client, fake_plugin):
     """
     from app.routers import plugins as mod
 
+    _grant_and_enable(client)                   # 同上：没有 PluginConfig 行就什么都写不进去
     done = mod._result_writer("demo", "抓取", run="JTI-CLEAN")
     done(True, "已导入 5 单")
     got = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["last_run"]
@@ -1922,5 +2107,176 @@ def test_plugin_polling_survives_a_transient_failure():
         after = blk[blk.index("} catch"):]
         assert re.search(rf"\+\+{name}\s*>=\s*_POLL_MAX_FAILS", after), \
             f"{name} 没有在失败路径上按上限判"
+    # 第四环：**重新开表要重新给满次数**。计数是模块级变量，跟着页面活，
+    # 不是跟着计时器活：连败停表后用户点「刷新」→ 计时器是新建的、计数却还是上限，
+    # 下一次抖动当场又停，一次机会都不给。用户点第二下第三下都「刚点就又不动了」，
+    # 看起来像刷新按钮坏了。判据钉在「`setInterval` 之前」这个位置上，不是钉写法。
+    for name, poll, fn in (("installFails", "installTimer", "scheduleInstallPoll"),
+                           ("runFails", "runTimer", "scheduleRunPoll")):
+        head = body[body.index(f"function {fn}("):body.index(f"{poll} = setInterval")]
+        assert re.search(rf"{name}\s*=\s*0", head), \
+            f"{fn} 重新开表时没把 {name} 清零——停表后点刷新，再错一次就又停"
+
     # 停表时必须说一句，否则用户只看到一个卡住的界面、毫无线索
     assert body.count("已停止刷新") >= 2, "停表时没有告诉用户"
+
+
+def test_saved_params_are_written_back_to_the_form():
+    """参数保存后，**服务端规范化过的值要回灌到输入框**。
+
+    只写 `p.params` 不够——输入框绑的是 `p._form.params`，两者会当场分叉：
+    清空一个整数参数（`el-input-number` 对 `isNil` 提前 return，`:min` 钳制根本走不到）
+    会提交 null，而后端 `params._coerce` 对非 str/secret/select 类型遇 None
+    **折回默认值** ⇒ 屏幕上是空框、库里是 3，还配一句「参数已保存，下一次执行即按新值跑」。
+
+    今天不丢数据（刷新自愈、落的值正是默认值）；**理由是前瞻**：
+    以后只要给参数加任何服务端规范化（trim、单位换算、区间钳制），
+    屏幕与库里就会各说各话，而这一句让所有那类改动天然生效。
+
+    secret 必须例外：后端只回 `'__set__'` 占位，填回输入框会把密钥真改成这个字符串。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "views" / "Plugins" / "index.vue").read_text(encoding="utf-8")
+    body = re.sub(r"//.*$", "", src[src.index("<script"):], flags=re.M)
+    fn = body[body.index("async function saveParams"):]
+    fn = fn[:fn.index("\n}") + 2]
+    assert "p._form.params =" in fn, "保存后没有回灌输入框，屏幕与库里会各说各话"
+    assert "'__set__'" in fn, "回灌时没有排除 secret 占位——那会把密钥改成 '__set__' 这个字符串"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows 没有进程组语义")
+def test_fake_child_pids_must_not_belong_to_a_real_process():
+    """假子进程的 pid **必须是系统上不存在的号**。
+
+    这条守卫防的不是产品 bug，是**测试本身会不会误伤这台机器上的别人**。
+
+    链条：`_launch` 无条件调 `_remember_group(proc.pid, label)` → 它只验
+    「pgid == pid」（挡的是 start_new_session 没生效、按组杀会带走后端自己）→
+    验过就记进 `_OWN_GROUP` → `_sweep_group` 朝这个组发 SIGTERM，收不到再 SIGKILL。
+    换成假 Popen 之后 `proc.pid` 是测试自己编的号，而 pid 是全局的：
+    编的号一旦落在某个 **setsid 起来的真实进程**上（tmux server、各种守护进程），
+    上面每一步都会「正常」通过，然后杀掉它。测试全绿，日志里只有一句「回收残余进程」。
+
+    下半段用**测试自己 setsid 起的 sleep** 证明这条链是真的通的——
+    只碰自己起的进程，用完当场收掉。
+    """
+    import signal
+    import subprocess as sp
+
+    from app.routers import plugins as mod
+
+    for _ in range(8):
+        pid = _dead_pid()
+        with pytest.raises(ProcessLookupError):
+            os.getpgid(pid)
+
+    # 反面：真实的 setsid 组长确实会被记进回收名单——所以上面那条不是形式主义。
+    child = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    try:
+        assert os.getpgid(child.pid) == child.pid, "setsid 没生效，这段证明不成立"
+        mod._remember_group(child.pid, "证明用")
+        assert child.pid in mod._OWN_GROUP, \
+            "真实的 setsid 组长没被记住？那说明 _remember_group 变了，这条守卫要重写"
+    finally:
+        mod._OWN_GROUP.discard(child.pid)       # 立刻摘掉，绝不让 _sweep_group 碰它
+        child.send_signal(signal.SIGKILL)       # 只杀自己刚起的这一个 pid
+        child.wait(timeout=5)
+
+
+def test_losing_every_target_to_a_race_does_not_paint_the_card_red(
+        client, session, tmp_path, monkeypatch):
+    """预筛之后**全部**目标被抢走 ⇒ 409，且卡片一个字节都不改。
+
+    路由开头那道预筛只在「点的时候就已经在跑」时挡人；预筛与 `_launch` 之间还有窗口，
+    并发点两下就会双双越过预筛、后一次在 `_launch` 里全部撞上 `PluginBusy`。
+    那时 `pids` 是空的，而收尾原先无条件 `seal_and_report(batch, 0, ...)`——
+    写下「一个任务都没能启动」+ failed。**此刻真正在跑的是抢走它的那一次**，
+    于是用户看到的是自己正跑着的卡片突然变红说没起来，比什么都不显示更误导。
+    `_run_due` 早就有对应的 `if not launched and busy: continue`，手动这条没有。
+
+    另外批次必须主动丢掉：没有任何子进程会来填它，留着就是一条永不回收的记录。
+    """
+    from app.plugins import scopes as sc
+    from app.routers import plugins as mod
+
+    d = tmp_path / "plugins" / "soroban-plugin-demo"
+    d.mkdir(parents=True)
+    (d / "plugin.toml").write_text(_ACCT_TOML + '\nscopes = ["staging:write"]\n', encoding="utf-8")
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "plugins"))
+    monkeypatch.setattr(mod, "_SOROBAN_ROOT", tmp_path)
+    monkeypatch.setattr(mod, "_python", lambda m: Path(sys.executable))
+    mod._needs_cache.clear()
+
+    import uuid
+    sfx = uuid.uuid4().hex[:6]                  # 同上：整套跑时 demo 的账号是共享的
+    names = [f"甲号-{sfx}", f"乙号-{sfx}"]
+    for name in names:
+        assert client.post("/api/plugins/demo/account", params={"name": name}).status_code == 200
+    client.put("/api/plugins/demo/grants", json={"granted": ["staging:write"]})
+    client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
+
+    restore = _only_accounts(names)             # 扇出只对这两个，见 _only_accounts
+    m = mod._find_manifest("demo")
+    keys = [mod._run_key(m, "fetch", ["--account", n]) for n in names]
+    real_issue, raced = sc.issue, []
+
+    def issue(*a, **k):
+        # 签令牌发生在预筛之后、`_launch` 之前——正是那个窗口。
+        if not raced:
+            raced.append(True)
+            with mod._PROCS_LOCK:
+                for key in keys:
+                    mod._INFLIGHT[key] = "demo/login [并发的那次]"
+        return real_issue(*a, **k)
+
+    monkeypatch.setattr(mod.scopes, "issue", issue)
+    revoked = []
+    monkeypatch.setattr(mod.scopes, "revoke", lambda jti: revoked.append(jti))
+    try:
+        r = client.post("/api/plugins/demo/run/fetch")
+        assert r.status_code == 409, f"全被抢走却报成功：{r.status_code} {r.text[:300]}"
+        after = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["last_run"]
+        assert after["outcome"] != "failed", \
+            f"把用户正在跑的卡片刷成了失败：{after}"
+        assert "一个任务都没能启动" not in (after["summary"] or ""), after
+        assert len(revoked) == 2, f"没起来的令牌没作废，每次泄漏一枚：{revoked}"
+        leaked = [b for b, v in mod._BATCHES.items() if v.get("total") is None and not v.get("done")]
+        assert not leaked, f"批次没人会来填，却留着不回收：{leaked}"
+    finally:
+        with mod._PROCS_LOCK:
+            for key in keys:
+                mod._INFLIGHT.pop(key, None)
+        restore()
+
+
+def test_the_batch_finishes_even_though_seal_runs_before_any_callback(client, fake_plugin):
+    """**日常顺序是「先封口、再回调」**——`_launch` 是 fire-and-forget。
+
+    `_batch_seal` 必须用 `setdefault` 把 total **存进表里**。写成 `get` 的话，
+    封口那一刻 `_BATCHES` 还是空的 ⇒ 拿到一个不在表里的新 dict ⇒ total 丢掉 ⇒
+    回调再 setdefault 建一条 `total=None` ⇒ `_batch_text` 恒返回 `"running"`：
+    **每一次执行都永久停在「执行中…」**，前端 4 秒一轮询不停，批次每次泄漏一条。
+
+    这个 bug 修过，却一直没有守卫——把 `setdefault` 改回 `get`，1063 条测试
+    **没有一条会红**（变异测试实测）。原因写在 `_batch_seal` 的 docstring 里：
+    当时那三条回归测试都用同步 `on_done` 的桩，**把顺序反了过来**（先回调后封口），
+    而那个顺序恰好绕开了这个 bug。所以这条守卫的关键不是断言什么，
+    是**顺序**：seal 必须排在所有回调之前。
+    """
+    from app.routers import plugins as mod
+
+    _grant_and_enable(client)
+    batch = "B-SEAL-BEFORE-CALLBACKS"
+    try:
+        mod._batch_seal(batch, 2)               # ← 封口在前，日常路径就是这样
+        for who in ("甲", "乙"):
+            mod._result_writer("demo", "抓取", who=who, batch=batch)(True, "ok")
+
+        got = {p["id"]: p for p in client.get("/api/plugins").json()}["demo"]["last_run"]
+        assert got["outcome"] != "running", \
+            f"两个子进程都回来了，卡片还停在「执行中」——total 在封口时丢了：{got}"
+        assert "甲" in got["summary"] and "乙" in got["summary"], got["summary"]
+        assert batch not in mod._BATCHES, "批次凑齐了没回收，每执行一次泄漏一条"
+    finally:
+        mod._BATCHES.pop(batch, None)

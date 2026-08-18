@@ -219,7 +219,34 @@ def create_db_and_tables() -> None:
         # 不认这条的话，用户看到的是一行英文 CommandError——既不知道数据有没有事
         # （其实完好无损），也不知道该往前装还是往后退。
         # 判据用 alembic 自己的异常类型 + 那句 revision 特征，不按整句文案匹配。
-        if _looks_like_newer_db(e):
+        newer, on_mysql = _looks_like_newer_db(e), current_backend() == "mysql"
+        if newer and on_mysql:
+            # **这一支必须排在 SQLite 那支前面。** 「库比代码新」和「后端是什么」是
+            # 两个正交的维度，原先却按「先认 newer」串成一条链，于是 MySQL 用户
+            # （另一台机器上的新版 soroban 升级了同一个库，很常见）拿到的是
+            # 「删掉 soroban.db」——那是**控制库**，存着 Fernet 加密的 MySQL 连接串。
+            # 照做的结果：业务数据一个字节没动，却再也连不回去了，
+            # 而他要修的问题压根不在那个文件里。
+            log.error(
+                "这个 MySQL 账本被**更新版本的 soroban** 升级过，当前程序认不出它的数据库版本：%s\n"
+                "  你的数据没有问题，一个字节都没动——只是这个版本的程序读不了它。\n"
+                "  多半是另一台机器（或另一个 exe）上装了新版，连的是同一个库。\n"
+                "  两条路，选一条：\n"
+                "    · 把这台也升到那个（或更新的）版本，账本照常打开；\n"
+                "    · 暂时改用本地账本记账（**不会动 MySQL 里的数据**）：\n"
+                "        源码运行： cd backend && .venv/bin/python -m tools.use_local_db\n"
+                "        打包版　： soroban.exe --use-local-db      （在 exe 所在目录开命令行执行）\n"
+                "  **不要**删本地的 soroban.db——那里面只有连接配置，删了就连不回这个 MySQL 了，"
+                "而它并不是报错的原因。",
+                e,
+            )
+        elif newer:
+            # **「库比代码新」要单独说。** 这一支与「连不上数据库」是完全不同的处境，
+            # 而它恰好落在**分发版唯一的形态**（SQLite）上：用户装了新版建过库，
+            # 又退回旧版 exe，alembic 就报 `Can't locate revision identified by 'xxx'`。
+            # 不认这条的话，用户看到的是一行英文 CommandError——既不知道数据有没有事
+            # （其实完好无损），也不知道该往前装还是往后退。
+            # 判据用 alembic 自己的异常类型 + 那句 revision 特征，不按整句文案匹配。
             log.error(
                 "这个账本是**更新版本的 soroban** 建的，当前程序认不出它的数据库版本：%s\n"
                 "  你的数据没有问题，一个字节都没动——只是这个版本的程序读不了它。\n"
@@ -230,7 +257,7 @@ def create_db_and_tables() -> None:
                 "  **不要**在没有备份的情况下删——那一步不可逆。",
                 e,
             )
-        elif current_backend() == "mysql":
+        elif on_mysql:
             log.error(
                 "连接当前数据库（MySQL）失败：%s\n"
                 "  soroban 不会自动退回本地 SQLite——那份数据停在切换当天，"
