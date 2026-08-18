@@ -3,6 +3,7 @@
 用 SQLAlchemy 的 before_cursor_execute 事件数 SQL 条数。断言用「上界」而非精确值——
 只要不随行数线性增长即可，避免为无关的实现细节反复改测试。
 """
+import time
 import contextlib
 
 import pytest
@@ -372,3 +373,75 @@ def test_wal_checkpoint_does_not_run_on_the_event_loop_thread():
     asyncio.run(drive())
     assert "thread" in seen, "循环一轮都没跑起来，这条测试没验到东西"
     assert seen["thread"] != seen["loop"], "WAL 截断跑在事件循环线程上——整个服务会被它卡住"
+
+
+def test_plugin_list_releases_its_connection_before_probing(client):
+    """`GET /api/plugins` 做依赖探测时**不许**占着数据库连接。
+
+    探测要在插件自己的解释器里 spawn 子进程（缓存过期时每个插件最多 30-60 秒），
+    而原先的循环是「先 `session.get(PluginConfig)`、后 `needs_cached(m)`」——
+    第一轮就 checkout 一条连接，然后跨所有探测一直握着。
+    `database.py` 自己立的规矩是「任何在 session 生命周期内做慢活的路由都要先还连接」，
+    `shipment.py` / `staging.py` 已经按这条先例显式 rollback 过；
+    这个端点是仅剩的违反者，而且还在被前端**秒级轮询**。
+
+    量的是真实请求路径上的 `pool.checkedout()`，不是「应该怎么样」——
+    这一轮里「rollback 到底还不还连接」已经被推理错过一次（见审计报告 §40）。
+    """
+    from pathlib import Path as _Path
+
+    from app.plugins import manifest as pmanifest
+    from app.routers import plugins as mod
+
+    during = []
+    orig_disc, orig_probe = mod.discover, mod.needs_cached
+
+    def fake_discover():
+        # **用真的 `manifest.parse` 造**，不要手搓一个假对象：手搓的会随产品加字段而漂
+        # （第一版就因为缺 `params` 属性红了两轮），而这条守卫要验的根本不是清单形状。
+        out = []
+        for i in (1, 2):
+            mf = pmanifest.parse({"id": f"probe{i}", "name": "探测占位",
+                                  "python": "inherit", "entry": "-m x"}, _Path("."))
+            out.append({"id": mf.id, "name": mf.name, "_dir": _Path("."),
+                        "_m": mf, "python": "inherit", "entry": "-m x",
+                        "scopes": list(mf.scopes), "settings": list(mf.settings),
+                        "accounts": mf.accounts})
+        return out
+
+    mod.discover = fake_discover
+    mod.needs_cached = lambda m: during.append(_checkedout()) or []
+    try:
+        client.get("/api/plugins")
+    finally:
+        mod.discover, mod.needs_cached = orig_disc, orig_probe
+
+    assert len(during) == 2, f"探测没被调到，这条守卫没验到东西：{during}"
+    assert during == [0, 0], f"探测期间占着 {during} 条连接（应当是 0）"
+
+
+def test_dependency_probe_is_single_flight():
+    """依赖探测按插件**单飞**：缓存冷时并发只该探一次。
+
+    原先是裸的「先查后写」，缓存一过期，同一瞬间到达的每个请求都各 spawn 一整套探测
+    子进程（审计实测：6 路并发冷缓存 → `probe_needs` 被调 8 次，而插件只有 2 个）。
+    而这个接口正是前端秒级轮询的那个——缓存在轮询间隙过期是常态，不是边缘情形。
+    """
+    import threading
+
+    from app.routers import plugins as mod
+
+    calls = []
+    orig = mod.probe_needs
+    mod.probe_needs = lambda m: (calls.append(m["id"]), time.sleep(0.15), [])[2]
+    mod._needs_cache.clear()
+    try:
+        m = {"id": "probe-single-flight", "_dir": ".", "python": "inherit"}
+        ts = [threading.Thread(target=mod.needs_cached, args=(m,)) for _ in range(6)]
+        [t.start() for t in ts]
+        [t.join(5) for t in ts]
+    finally:
+        mod.probe_needs = orig
+        mod._needs_cache.clear()
+        mod._NEEDS_LOCKS.clear()
+    assert len(calls) == 1, f"6 路并发把探测跑了 {len(calls)} 次——每次都是一组子进程"

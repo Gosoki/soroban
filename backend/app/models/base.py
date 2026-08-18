@@ -159,7 +159,9 @@ def guard_cny(p: Decimal) -> Decimal:
     if p is None:
         return p
     d = Decimal(p)
-    if not d.is_finite() or abs(d) > CNY_MAX:
+    # copy_abs 而非 abs：abs(Decimal) 在超大指数上抛 decimal.Overflow（非 ValueError），
+    # 会绕过所有兜底变成裸 500——而这一行正是防极端量级的那道闸。
+    if not d.is_finite() or d.copy_abs() > CNY_MAX:
         raise ValueError(f"货款金额超出可接受范围（上限 {CNY_MAX}）")
     return d
 
@@ -243,6 +245,8 @@ class LedgerBase(SQLModel):
             auto = extra_jpy
         else:
             auto = None
+        # 这里是 int（日元），Python 的 int 任意精度、abs() 永不抛——**不要**跟着改 copy_abs
+        # （int 没有那个方法）。copy_abs 只对 Decimal 有意义，见 schemas._q_decimal。
         if auto is not None and abs(auto) > JPY_MAX:
             raise ValueError(f"结算日元超出可接受范围（货款×汇率 超过 {JPY_MAX}），请降低货款或汇率")
         self.jpy_auto = auto

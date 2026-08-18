@@ -1785,3 +1785,142 @@ def test_a_failed_reaper_thread_releases_the_mutex_key(client, fake_plugin, monk
             mod._ALIVE_PROCS.clear()
             mod._OWN_GROUP.clear()
             mod._INFLIGHT.clear()
+
+
+def _due_plugins(*ids):
+    """造 N 个「到点该跑」的插件清单。用真的 manifest.parse，别手搓。"""
+    import pathlib
+
+    from app.plugins import manifest as pm
+
+    out = []
+    for pid in ids:
+        mf = pm.parse({"id": pid, "name": pid, "python": "inherit", "entry": "-m x",
+                       "commands": [{"name": "fetch", "label": "抓取", "primary": True}]},
+                      pathlib.Path("."))
+        out.append({"id": mf.id, "name": mf.name, "_dir": pathlib.Path("."), "_m": mf,
+                    "python": "inherit", "entry": "-m x", "scopes": [], "settings": [],
+                    "accounts": False})
+    return out
+
+
+def test_a_busy_target_does_not_wipe_the_whole_scheduled_round(session, monkeypatch):
+    """定时轮里有一个目标被互斥挡下时，**别的插件的 last_run_at 不许跟着丢**。
+
+    `PluginBusy` 是 `RuntimeError`，而这条循环原先只写了 `except HTTPException`——
+    它会**逃出两层循环**，末尾的 `session.commit()` 永不执行，于是本轮**已经成功起了
+    进程的插件**，它们的 `last_run_at` 一起回滚。
+
+    而触发条件是常态：`last_run_at` 全仓唯一写入点就在这个函数里，**手动抓取不推进它**，
+    所以「手动那次还在飞（最长 30 分钟）时定时到点」没有任何东西挡住——
+    `_run_due` 连手动路径那道 `_INFLIGHT` 预筛都没有。
+
+    后果：`select(PluginConfig)` 没有 order_by，只要汇率插件排在忙着的淘宝前面，
+    汇率（6 小时一次、秒级跑完）就会**每 60 秒被重起一次**，每次往汇率表追加一行——
+    约 30 倍，而用户侧唯一痕迹是 scheduler_loop 兜底的一行日志。
+    """
+    import datetime as dt
+
+    from app.models import PluginConfig
+    from app.routers import plugins as mod
+
+    for pid in ("aaa-ok", "zzz-busy"):
+        if session.get(PluginConfig, pid) is None:
+            session.add(PluginConfig(plugin_id=pid, enabled=True, schedule_minutes=1))
+    session.commit()
+
+    started, revoked = [], []
+    monkeypatch.setattr(mod, "discover", lambda: _due_plugins("aaa-ok", "zzz-busy"))
+    monkeypatch.setattr(mod.scopes, "revoke", lambda jti: revoked.append(jti))
+
+    def launch(m, cmd, extra, **kw):
+        if m["id"] == "zzz-busy":
+            raise mod.PluginBusy("zzz-busy/fetch")      # 手动那次还在飞
+        started.append(m["id"])
+        return 4242
+
+    monkeypatch.setattr(mod, "_launch", launch)
+    mod._run_due(session)                                # 不许外抛
+
+    assert started == ["aaa-ok"], started
+    session.rollback()                                   # 只认已提交的
+    assert session.get(PluginConfig, "aaa-ok").last_run_at is not None, \
+        "被挡下的那个把已经跑起来的兄弟的 last_run_at 一起冲掉了——它会被每 60 秒重起一次"
+    assert session.get(PluginConfig, "zzz-busy").last_run_at is None, \
+        "被互斥挡下却推进了 last_run_at——那会让它白等一个完整周期"
+    assert revoked, "被挡下的目标没有作废令牌——每挡一次泄漏一枚能用 30 分钟的凭据"
+
+
+def test_an_all_busy_round_does_not_paint_the_manual_card_red(session, monkeypatch):
+    """**全部目标都在跑**时，定时轮不许写「一个任务都没能启动」把卡片刷红。
+
+    那张卡片此刻显示的是**用户自己点的那次手动抓取正在跑**。
+    `seal_and_report(batch, 0, ...)` 会写 failed + 「一个任务都没能启动」，
+    而定时是每 60 秒一轮——等于每分钟把用户正在跑的任务刷成红色失败。
+    比悬空更误导：他会以为抓取挂了，去点第二次。
+
+    这一轮本来就没有任何事发生，正确做法是什么都不写。
+    """
+    from app.models import PluginConfig
+    from app.routers import plugins as mod
+
+    if session.get(PluginConfig, "all-busy") is None:
+        session.add(PluginConfig(plugin_id="all-busy", enabled=True, schedule_minutes=1,
+                                 last_outcome="running", last_summary="抓取 执行中…"))
+        session.commit()
+    cfg = session.get(PluginConfig, "all-busy")
+    cfg.last_outcome, cfg.last_summary = "running", "抓取 执行中…"
+    session.commit()
+
+    monkeypatch.setattr(mod, "discover", lambda: _due_plugins("all-busy"))
+    monkeypatch.setattr(mod.scopes, "revoke", lambda jti: None)
+    monkeypatch.setattr(mod, "_launch",
+                        lambda *a, **k: (_ for _ in ()).throw(mod.PluginBusy("all-busy/fetch")))
+    written = []
+    monkeypatch.setattr(mod, "_write_outcome", lambda *a: written.append(a))
+
+    mod._run_due(session)
+    assert not written, f"把用户正在跑的卡片改写了：{written}"
+
+
+def test_plugin_polling_survives_a_transient_failure():
+    """插件页那两个轮询**不许错一次就永久停**。
+
+    两处 catch 吃的是**任何**错误，而最现实的是 `main.py` 那条连接池繁忙时的 503
+    （它写出来就是为了应付繁忙时刻），以及 WiFi 抖动 / 睡眠唤醒。
+    后者这个应用专门修过恢复路径（离线遮罩 + 健康轮询），页面上除了这两个计时器之外的
+    一切都能自愈——**唯独它们停了就再也不回来**：
+
+    · run poll 死掉 → 卡片永久停在「执行中…」，而它连收尾的 `load()` 都没有；
+      而且它恰好跑在「抓取可以是十几分钟」的最繁忙那一段。
+    · install poll 死掉 → 装完那次用来整体刷新的 `await load()` 永不执行，按钮一直禁着。
+
+    切路由或 F5 能恢复（onMounted 会按 running 状态重新起轮询），所以不是数据问题——
+    是**界面对状态说假话**。
+
+    按结构判三环：有连败计数、成功时清零、到上限才停并且说一句。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "views" / "Plugins" / "index.vue").read_text(encoding="utf-8")
+    body = re.sub(r"//.*$", "", src[src.index("<script"):], flags=re.M)
+    # **查值，不只查名字。** 第一版只断言「这几个标识符存在」，于是把上限改成 1
+    # （等于错一次就停）、或把「成功时清零」整行删掉，测试都照样绿——
+    # 而那两种改动恰好各自还原了这个 bug 的一半。
+    m = re.search(r"_POLL_MAX_FAILS\s*=\s*(\d+)", body)
+    assert m and int(m.group(1)) >= 2, \
+        f"连败上限是 {m and m.group(1)}——设成 1 就等于错一次就永久停表"
+
+    for name, poll in (("installFails", "installTimer"), ("runFails", "runTimer")):
+        # 清零必须在**成功路径**上：拿 try 块（到 catch 之前）来判，
+        # 写在 catch 里或函数外都不算——那是「永远清不掉」或「每次都清」。
+        blk = body[body.index(f"{poll} = setInterval"):]
+        blk = blk[:blk.index("}, ")]
+        success = blk[:blk.index("} catch")]
+        assert re.search(rf"{name}\s*=\s*0", success), \
+            f"{name} 没有在成功路径上清零——偶发失败会累积，跑够 3 次照样停表"
+        after = blk[blk.index("} catch"):]
+        assert re.search(rf"\+\+{name}\s*>=\s*_POLL_MAX_FAILS", after), \
+            f"{name} 没有在失败路径上按上限判"
+    # 停表时必须说一句，否则用户只看到一个卡住的界面、毫无线索
+    assert body.count("已停止刷新") >= 2, "停表时没有告诉用户"

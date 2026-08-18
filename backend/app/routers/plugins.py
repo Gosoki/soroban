@@ -372,6 +372,9 @@ def _plugin_argv(manifest: dict, command: str, extra: list[str]) -> list[str]:
 
 
 _needs_cache: dict[str, tuple[float, list[dict]]] = {}
+# 探测的单飞锁，按插件 id 一把。`setdefault` 建锁本身是原子的（GIL 下 dict 操作不会
+# 交错出两把锁），所以不需要再套一把全局锁去保护它。
+_NEEDS_LOCKS: dict[str, "threading.Lock"] = {}
 _NEEDS_TTL = 60.0                                    # 秒
 
 
@@ -385,14 +388,28 @@ def needs_cached(manifest: dict) -> list[dict]:
     必须缓存：探测依赖要在**插件自己的解释器**里 `import`（每个模块一次子进程）再问一次
     Playwright 浏览器路径。而 GET /api/plugins 是前端**轮询**的接口——不缓存的话，每次轮询
     都要 spawn 三四个进程，装依赖时前端还在秒级轮询，直接把机器拖垮。
-    安装结束会显式失效（见 _install_worker），所以不会拿着过期结论不放。"""
+    安装结束会显式失效（见 _install_worker），所以不会拿着过期结论不放。
+
+    **按插件单飞**：原先是裸的「先查后写」，缓存一过期，同一瞬间到达的每个请求都会
+    各 spawn 一整套探测子进程（实测 6 路并发冷缓存 → `probe_needs` 被调 8 次，插件才 2 个）。
+    而这个接口正是前端秒级轮询的那个——缓存刚好在轮询间隙过期是常态，不是边缘情形。
+    锁按插件 id 分，不同插件之间照常并行；拿到锁之后**再查一次缓存**，
+    因为等锁期间前一个持有者多半已经把结果填好了。"""
     key = manifest["id"]
-    hit = _needs_cache.get(key)
-    now = time.monotonic()
-    if hit and now - hit[0] < _NEEDS_TTL:
-        return hit[1]
-    val = probe_needs(manifest)
-    _needs_cache[key] = (now, val)
+
+    def _fresh():
+        hit = _needs_cache.get(key)
+        return hit[1] if hit and time.monotonic() - hit[0] < _NEEDS_TTL else None
+
+    val = _fresh()
+    if val is not None:
+        return val
+    with _NEEDS_LOCKS.setdefault(key, threading.Lock()):
+        val = _fresh()                      # 等锁期间别人可能已经探好了
+        if val is not None:
+            return val
+        val = probe_needs(manifest)
+        _needs_cache[key] = (time.monotonic(), val)
     return val
 
 
@@ -1106,11 +1123,32 @@ def install_plugin(
 
 @router.get("")
 def list_plugins(session: Session = Depends(get_session)):
+    # **先把探测全做完，再碰数据库。**
+    # 依赖探测要在插件自己的解释器里 spawn 子进程（缓存过期时每个插件最多 30-60 秒），
+    # 而原先的循环是「先 `session.get(PluginConfig)`、后 `needs_cached(m)`」——
+    # 第一轮就 checkout 一条连接，然后**跨所有探测一直握着**。
+    # `database.py` 自己立的规矩就是「任何在 session 生命周期内做慢活的路由
+    # （插件执行、爬虫、汇率抓取都算）都要先把连接还回去」，而 `shipment.py`、
+    # `staging.py` 已经按这条先例显式 rollback 了——这个端点是仅剩的、
+    # 而且还在被前端**秒级轮询**的违反者。
+    #
+    # 用「重排」而不是「循环中间插一句 rollback」：后者会 expire 掉已经读出来的 `cfg`，
+    # 之后每读一个属性都重新 checkout，行要是被并发删掉还会 ObjectDeletedError。
+    # 这个端点全程只读，重排是安全的。
+    plugins = list(discover())
+    # 这一句是**冗余的保险，不是机制本身**：`get_current_user` 末尾已经 rollback 过
+    # （见 auth.py 的说明），所以此刻本来就没占着连接——删掉它那条守卫也不会红，我验过。
+    # 留着是因为「探测之前不许有任何 DB 读」这件事，靠的是上面那次重排，
+    # 而重排是脆的：谁在这行上面加一句 `session.get(...)`，连接就又被攥住了。
+    # 有它在，那种改动最多多一次 checkout，不会退回「跨探测一直握着」。
+    session.rollback()
+    probed = {m["_m"].id: needs_cached(m) for m in plugins}
+
     out, seen_ids = [], set()
-    for m in discover():
+    for m in plugins:
         seen_ids.add(m["_m"].id)
         cfg = session.get(PluginConfig, m["_m"].id)
-        need = needs_cached(m)
+        need = probed[m["_m"].id]
         with _install_lock:
             st = dict(_install_state.get(m["_m"].id) or {})
         # 真正生效的那组权限：声明 ∩ 授权 ∩ 核心已知。命令的 blocked 与下面的
@@ -1865,7 +1903,12 @@ def _run_due(session: Session) -> None:
         targets = _fan_targets(m, cfg, cmd)
         cmd_scopes = granted & set(cmd.needs)
         batch = uuid.uuid4().hex
+        busy = 0
         for extra, who in targets:
+            # **jti 必须先置空**：它在 try 里赋值，而 `scopes.issue` 自己也可能抛。
+            # 不置空的话 except 里的 `revoke(jti)` 要么撞未绑定，要么**吊销上一个账号的令牌**
+            # ——那个账号的进程还在飞，它后续回灌会全部 401，而且是静默的。
+            jti = None
             try:
                 tok, jti = scopes.issue(user, cfg.plugin_id, cmd_scopes,
                                         timeout_s=_REAP_TIMEOUT)
@@ -1877,8 +1920,28 @@ def _run_due(session: Session) -> None:
                         on_done=_result_writer(cfg.plugin_id, f"定时·{cmd.label}",
                                                who=who, batch=batch, run=jti))
                 launched += 1
+            except PluginBusy:
+                # **这一支原先不存在，而它是常态**：`last_run_at` 全仓唯一的写入点就在下面，
+                # 手动抓取**不推进它**——所以「手动那次还在飞（最长 30 分钟）时定时到点」
+                # 没有任何东西挡住，而 `_run_due` 也没有手动路径那道 `_INFLIGHT` 预筛。
+                # 漏掉它的后果不是少跑一次：`PluginBusy` 是 RuntimeError，会**逃出两层循环**
+                # ⇒ 末尾的 `session.commit()` 不执行 ⇒ 本轮**已经成功起了进程的插件**，
+                # 它们的 last_run_at 一起丢。而 `select(PluginConfig)` 没有 order_by，
+                # 只要 fx 排在忙着的 taobao 前面，fx（6 小时一次、秒级跑完）就会
+                # **每 60 秒被重起一次**，每次往汇率表追加一行——约 30 倍。
+                scopes.revoke(jti)                      # 进程没起来，这枚令牌没人会 revoke
+                busy += 1
+                log.info("定时任务 %s/%s 跳过：同目标已有一个在跑", cfg.plugin_id, who or "-")
             except HTTPException as e:
+                scopes.revoke(jti)                      # 同上：起不来就别把令牌漏在外面
                 log.warning("定时任务 %s/%s 启动失败：%s", cfg.plugin_id, who or "-", e.detail)
+        if not launched and busy:
+            # **全部目标都被互斥挡下 ⇒ 什么都不做，直接看下一个插件。**
+            # 不能走下面的 seal_and_report：它在 launched==0 时会写
+            # 「定时·抓取：一个任务都没能启动」+ failed，把用户**正在跑的那张手动卡片**
+            # 每 60 秒刷成红色——比悬空更误导。这一轮本来就没有任何事发生。
+            log.info("定时任务 %s：%d 个目标都在跑，本轮跳过", cfg.plugin_id, busy)
+            continue
         # 按**实际起来的**数量封口。这条路径最容易命中：它自己吞掉单个账号的启动失败，
         # 于是「计划 2 个、只起来 1 个」是常态，而按计划数等就永远等不齐。
         seal_and_report(batch, launched, cfg.plugin_id, f"定时·{cmd.label}")

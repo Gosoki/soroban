@@ -2,7 +2,13 @@
 目标是「绝不 500」——要么正常处理、要么干净的 4xx。"""
 import pytest
 
-BAD_NUMBERS = ["NaN", "Infinity", "-Infinity", "1e400", "9" * 40, "-1", "abc", ""]
+# **这份清单就是「绝不 500」这条不变量的载体**，加一档就多守一类输入。
+# "1e1000000" 是刻意的：Decimal 的默认 Emax 是 999999，指数越过它之后
+# `abs(Decimal)` 会抛 decimal.Overflow——它继承 ArithmeticError **不是** ValueError，
+# pydantic 不转 422、main.py 的 ValueError 兜底也接不住，一路裸 500。
+# 而抛它的那一行正是「防极端量级」的闸本身。原先最大只到 1e400，恰好卡在 Emax 下面。
+BAD_NUMBERS = ["NaN", "Infinity", "-Infinity", "1e400", "1e1000000", "-1e1000000",
+               "9" * 40, "-1", "abc", ""]
 
 
 @pytest.mark.parametrize("val", BAD_NUMBERS)
@@ -17,7 +23,10 @@ def test_misc_price_bad_numbers_never_500(client, val):
     assert r.status_code == 422, f"{val!r} → {r.status_code}"
 
 
-@pytest.mark.parametrize("val", ["NaN", "Infinity", "1e400", "0", "0.0001", "4.9999", "50.0001", "-20"])
+# "1e1000000" 走的是与价格字段**不同的一条**校验路径（_q_fx），而两条路上都有那句
+# 量级闸——只在价格那条加档，汇率这条的 abs() 退化回去时不会有任何测试红。
+@pytest.mark.parametrize("val", ["NaN", "Infinity", "1e400", "1e1000000", "-1e1000000",
+                                 "0", "0.0001", "4.9999", "50.0001", "-20"])
 def test_fx_rate_out_of_range_rejected(client, val):
     r = client.post("/api/orders", json={"date": "2026-04-01", "fx_rate": val})
     assert r.status_code == 422, f"{val!r} → {r.status_code}"

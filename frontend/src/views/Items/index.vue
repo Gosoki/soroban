@@ -6,7 +6,7 @@
 
     <NotionTable :columns="columns" :rows="rows" :loading="loading" :actions-width="60"
                  :empty-text="loadFailed ? '加载失败——请检查网络或后端，然后重试' : '没有符合条件的记录'"
-                 table-name="items" hide-id :addable="false" :deletable="false" @reload="load">
+                 table-name="items" hide-id :addable="false" :deletable="false" @reload="load" @tags-changed="onTagsChanged">
       <template #toolbar>
         <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="reload" />
         <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
@@ -120,6 +120,11 @@ const filters = reactive({ q: '', platform: '', fulfillmentStatus: '', platform_
 // 账号标签的持久化配色（与其它页同一套色序，保证同一账号处处同色）+ 账号候选（编辑弹窗下拉用）
 const acctColor = reactive({})
 const accountOptions = ref([])
+// 表格里改了账号标签之后，本页那份候选集要跟着变——编辑面板的 `:accounts` 吃的就是它。
+// 不同步的话，新加的账号在编辑面板里永远选不到，直到切页回来才自愈。
+function onTagsChanged({ field, values }) {
+  if (field === 'platform_account') accountOptions.value = values
+}
 async function loadAcctColors() {
   try {
     const tags = await tagsApi.list('platform_account')

@@ -197,3 +197,51 @@ def test_every_create_table_pins_engine_and_charset():
                 bad.append(f"{f.name}:{node.lineno} 缺 {sorted(missing)}")
     assert not bad, ("这些建表没钉死引擎/字符集，表的默认排序规则会跟着目标库走：\n  "
                      + "\n  ".join(bad))
+
+
+def test_a_newer_database_gets_its_own_message(caplog, monkeypatch):
+    """库里的版本比代码新时，要给一条**能照做**的中文指引，不是一行英文 CommandError。
+
+    这条路径落在**分发版唯一的形态**（SQLite）上：用户装过新版（库被 upgrade 到新
+    revision），又换回旧版 exe。原先只有 `current_backend() == "mysql"` 分支有中文指引，
+    SQLite 走的是裸 `raise` → `alembic.util.exc.CommandError: Can't locate revision
+    identified by 'xxx'`。用户既不知道数据有没有事（其实完好无损），
+    也不知道该往前装还是往后退。
+
+    **按异常类型 + revision 特征判，不按整句文案**：alembic 的措辞会随版本变，
+    而错认成「连不上数据库」会给出南辕北辙的指引（去查 MySQL 有没有起）。
+    """
+    import logging
+
+    from alembic.util.exc import CommandError
+
+    from app import database as db
+
+    def boom(url):
+        raise CommandError("Can't locate revision identified by 'deadbeef'")
+
+    monkeypatch.setattr(db, "run_migrations", boom)
+    monkeypatch.setattr(db.control, "ensure_schema", lambda *a, **k: None)
+    with caplog.at_level(logging.ERROR), pytest.raises(CommandError):
+        db.create_db_and_tables()
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "更新版本的 soroban" in text, f"没认出「库比代码新」：{text[:300]}"
+    assert "你的数据没有问题" in text, "没告诉用户数据是好的——那是他此刻最想知道的"
+    assert "备份" in text, "给了删库的建议却没强调先备份"
+    assert "MySQL" not in text, "错认成了连不上数据库，给出南辕北辙的指引"
+
+
+@pytest.mark.parametrize("exc", [
+    OSError("Connection refused"),                       # 连不上
+    __import__("alembic.util.exc", fromlist=["x"]).CommandError("Target database is not up to date."),
+])
+def test_other_failures_do_not_claim_a_newer_database(exc):
+    """反面：别的迁移失败不许被认成「库比代码新」。
+
+    没有这一条，把判据写成「只要是 CommandError 就算」也能让上面那条绿——
+    而那会在真正连不上数据库时告诉用户「你的数据没问题，去装新版」。
+    """
+    from app.database import _looks_like_newer_db
+
+    assert not _looks_like_newer_db(exc), f"{type(exc).__name__} 被误认成了新库"

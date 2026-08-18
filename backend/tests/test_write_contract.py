@@ -432,6 +432,10 @@ def test_item_editor_never_silently_drops_a_nameless_row():
     ("Staging", "stagingApi.list"),
     ("Shipment", "shipmentApi.list"),
     ("Misc", "miscApi.list"),
+    # 这两页的空态**在断言用户的系统状态**（「装上汇率插件」/「plugins 下没有目录」），
+    # 请求失败时照样显示的话，给出的是一条错误的行动指令——比单纯的假空态更贵。
+    ("Fx", "fxApi.history"),
+    ("Plugins", "pluginsApi.list"),
 ])
 def test_list_pages_do_not_render_failure_as_emptiness(page, loader):
     """请求失败**不能**渲染成「空」。

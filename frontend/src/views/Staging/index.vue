@@ -5,7 +5,7 @@
     </PageHeader>
 
     <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable
-                 table-name="staging" :empty-text="loadFailed ? '加载失败——请检查网络或后端，然后重试' : '没有符合条件的记录'" :actions-width="128" @save="saveCell" @add="addRow" @delete="doDelete" @reload="load">
+                 table-name="staging" :empty-text="loadFailed ? '加载失败——请检查网络或后端，然后重试' : '没有符合条件的记录'" :actions-width="128" @save="saveCell" @add="addRow" @delete="doDelete" @reload="load" @tags-changed="onTagsChanged">
       <template #toolbar>
         <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="reload" />
         <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
@@ -158,6 +158,22 @@ const pageSize = 30
 // 默认只看「待处理」（抓进来待逐单导入的）；清空筛选或切状态即可看全部/已导入/已忽略
 const filters = reactive({ q: '', platform: '', importStatus: '待处理', platform_account: '', range: null })
 const accountOptions = ref([])   // 账号昵称下拉候选（标签接口）
+// 表格里改了标签（改名/新增/删除/改色）之后，工具栏那份候选集要跟着变。
+// **还要管仍停在旧名的筛选值**：改名时旧名在库里已经不存在了，
+// 拿它精确匹配会查回 0 行，空态显示「没有符合条件的记录」——
+// 用户刚改完名就看到「单子没了」。清掉筛选比留着一个查不到东西的值好，
+// 而且要说一句，否则他会以为筛选自己乱了。
+function onTagsChanged({ field, values }) {
+  if (field === 'platform_account') {
+    accountOptions.value = values
+    if (filters.platform_account && !values.includes(filters.platform_account)) {
+      filters.platform_account = ''
+      ElMessage.info('筛选里那个账号已改名或删除，已为你清掉筛选')
+      reload()
+    }
+  }
+}
+
 async function loadAccounts() {
   try { accountOptions.value = (await tagsApi.list('platform_account')).map((t) => t.value) } catch (_) { /* 已提示 */ }
 }
@@ -257,7 +273,10 @@ async function savePostage(row) {
 async function addRow(data = {}, done) {
   try {
     const created = await stagingApi.create({ ...data })
-    await afterCreate(created, { rows, total, page, filters, load, dateKey: 'order_date' })
+    // `dateKey` 用 scraped_at：与后端 staging.py 的 order_by 同一列。
+    // 不能用 order_date——它可以为 NULL（OCR 认不出「下单时间」就不下发这个键），
+    // 而空值会让比较器失去传递性，本地插入的顺序与刷新后的对不上（见 sortByDateDesc）。
+    await afterCreate(created, { rows, total, page, filters, load, dateKey: 'scraped_at' })
     done?.(true)
     // **必须把新建的行回传**：OCR 那条路径靠返回值判成败（`if (!created) 记失败`）。
     // 不回传的话建成功了也拿到 undefined，整批统计会把每一张都记成「失败」，
@@ -352,25 +371,40 @@ async function enqueueOcr(files) {
 // 而同一批截图来自同一个平台是压倒性的常见情形。
 // resolve 的值：平台名 / 空串（让 OCR 自己判，保持问之前的行为）/ null（取消整批）。
 const ask = reactive({ open: false, count: 0, platform: '' })
-let askResolve = null
+// **等待者是一个数组，不是单槽。** 弹窗开着的时候整窗拖拽照样收图：
+// `windowFileDrop` 的监听挂在 window 上、`dragover` 无条件 preventDefault，
+// 而 element-plus 的遮罩只拦 mousedown——drop 会一路冒泡上去。
+// 更糟的是那层「松开鼠标，识别截图」的提示（Teleport 到 body、z-index 9000）
+// 正盖在弹窗之上，**主动邀请用户这么做**。
+// 单槽的后果：第二次 askPlatform 直接覆盖 resolver，第一批的 Promise 永不 settle，
+// 那几张图卡在 await 上——**一次请求都不发、ocrPending 没加过、零报错**，
+// 唯一痕迹是弹窗正文的「共 3 张」悄悄变成「共 2 张」，而最后那个批次汇总少算。
+let askWaiters = []
 function askPlatform(count) {
-  ask.count = count
-  ask.platform = lastOcrPlatform.value
-  ask.open = true
-  return new Promise((resolve) => { askResolve = resolve })
+  if (askWaiters.length) {
+    ask.count += count                          // 已经在问了 → 合批，别把前一批甩掉
+  } else {
+    ask.count = count
+    ask.platform = lastOcrPlatform.value
+    ask.open = true
+  }
+  return new Promise((resolve) => { askWaiters.push(resolve) })
+}
+function settleAsk(value) {
+  const ws = askWaiters
+  askWaiters = []
+  ws.forEach((r) => r(value))
 }
 function confirmAsk() {
   lastOcrPlatform.value = ask.platform          // 记住这次的选择，下批默认它
   ask.open = false
-  askResolve?.(ask.platform)
-  askResolve = null
+  settleAsk(ask.platform)
 }
 // 用 @closed 收尾而不是只在「取消」按钮上 resolve：点遮罩、按 Esc、点右上角 ×
 // 都不会走那颗按钮，漏了的话 Promise 永远不 resolve，**整个队列静默卡死**
 // （ocrPending 也不会归零，按钮上永远显示「后台识别中」）。
 function closeAsk() {
-  askResolve?.(null)
-  askResolve = null
+  settleAsk(null)
 }
 
 // 这一批的统计。**按批而不是按张**：一次拖十几张图，每张弹一条 toast 会刷屏，

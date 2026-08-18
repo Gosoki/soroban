@@ -6,6 +6,7 @@
 - 正在被数据使用中的标签**不可删除**（前端隐藏删除按钮，后端亦拒绝）——避免删掉在用的值。
 """
 
+import logging
 from collections import Counter
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -31,6 +32,8 @@ from ..schemas import TagIn, TagOut
 router = APIRouter(
     prefix="/api/tags", tags=["tags"], dependencies=[Depends(get_current_user)]
 )
+
+log = logging.getLogger("soroban")
 
 _ALLOWED_FIELDS = {"platform_account", "recipient", "platform"}
 _N_COLORS = 10   # 与前端 TAG_PALETTE 长度一致
@@ -327,6 +330,22 @@ def remove_tag(field: str, value: str, session: Session = Depends(get_session)):
     return _list(session, field)
 
 
+def _plugin_owns_field(field: str) -> bool:
+    """有没有**已安装的插件**声明它的账号落在账本的这一列上（清单的 accounts_ledger_field）。
+
+    惰性 import：`plugins.py` 已经 import 了本模块，顶层互相 import 会成环。
+    探测失败一律当「没有插件管这一列」——那样最多是本地改名（数据仍然一致），
+    而反过来（误判成有插件）会把用户堵死在一个他打不开的端点上。
+    """
+    try:
+        from .plugins import _ledger_field, discover
+
+        return any(_ledger_field(m) == field for m in discover())
+    except Exception as e:                                   # noqa: BLE001
+        log.warning("判断字段 %s 是否由插件管理时出错，按「无插件」处理：%s", field, e)
+        return False
+
+
 @router.post("/{field}/rename", response_model=list[TagOut])
 def rename_tag(
     field: str,
@@ -335,10 +354,24 @@ def rename_tag(
     session: Session = Depends(get_session),
 ):
     """标签改名：把用到该值的订单迁到新值、并保留标签颜色。
-    platform_account 牵连插件磁盘会话/配置，须走插件端点（/api/plugins/taobao/account/rename），此处拒绝。"""
+
+    **有插件声明这一列时才拒绝，而不是按列名写死。**
+    原先无条件对 `platform_account` 报 400、让人「走插件端点」，而前端那条路又把
+    `taobao` 焊在 URL 里。于是插件目录不在时（源码安装、或自定 PLUGIN_DIR），
+    手工录单产生的账号名**既删不掉也改不了名**：DELETE 返回 409（in_use）、
+    这里 400 让你走插件、插件端点 404「未发现插件: taobao」——
+    而列头那颗改名笔对所有 tag 列无条件渲染，用户只会看到一句和操作毫不相干的
+    「未发现插件: taobao」。
+
+    判据必须是「**有没有插件声明这个字段**」（清单的 `accounts_ledger_field`），
+    不能是「插件缺失就跳过迁移」——后者会在插件只是暂时没装好时，
+    把账本改了而磁盘会话与插件配置留在旧名下，下一轮抓取又把旧名建回来。
+    """
     _check_field(field)
-    if field == "platform_account":
-        raise HTTPException(status_code=400, detail="淘宝账号改名请走插件端点（含磁盘会话/配置迁移）。")
+    if _plugin_owns_field(field):
+        raise HTTPException(
+            status_code=400,
+            detail="这个账号由插件管理，改名请在「插件管理」页操作（要一并迁移磁盘登录会话与插件配置）。")
     new = new.strip()
     old = old.strip()                               # 存库值都是 strip 过的，old 不 strip 会漏匹配→假 404
     if not new:

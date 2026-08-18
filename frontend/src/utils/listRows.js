@@ -25,14 +25,31 @@ export function anyFilterActive(filters) {
   )
 }
 
-/** 与后端 order_by 一致：日期降序，同日按 id 降序。 */
+/** 与后端 order_by 一致：日期降序，同日按 id 降序。
+ *
+ * **空值必须先挑出来**，不能直接丢进 `<` / `>`：JS 里 `null < 'x'` 与 `null > 'x'` **都是 false**，
+ * 于是含空值的行对会一路落到 `b.id - a.id`，而那与「按日期排」不是同一个序——
+ * 结果是比较器**不满足传递性**，`Array.sort` 的行为随输入顺序而变。
+ * 实测（node）：同一批 6 行只改输入顺序得到 **3 种不同结果**，而且**连非空行都会排错**
+ * （08-03 被排到 08-02 前面这种本来正确的对，被环带歪）。
+ * 空的排末尾：它们在后端也排在最后（NULL 在 desc 里靠后），口径一致。
+ */
 export function sortByDateDesc(rows, dateKey = 'date') {
-  rows.sort((a, b) => (a[dateKey] < b[dateKey] ? 1 : a[dateKey] > b[dateKey] ? -1 : b.id - a.id))
+  rows.sort((a, b) => {
+    const x = a[dateKey], y = b[dateKey]
+    if (x == null && y == null) return b.id - a.id
+    if (x == null) return 1                    // 空的往后
+    if (y == null) return -1
+    return x < y ? 1 : x > y ? -1 : b.id - a.id
+  })
 }
 
 /**
  * 新建成功后同步列表。返回这条记录当前是否显示在列表里。
- * `dateKey` 是该页的排序日期列（暂存页是 order_date）。
+ * `dateKey` 是该页的排序日期列——**必须与那一页后端的 order_by 同一列**。
+ * 暂存页是 `scraped_at`（后端 `staging.py` 排的就是它），不是 order_date：
+ * 后者可以为 NULL（OCR 认不出「下单时间」就不下发这个键、幽灵行也不预填），
+ * 拿它排序会让本地插入的顺序与刷新后的顺序对不上。
  */
 export async function afterCreate(created, { rows, total, page, filters, load, dateKey = 'date' }) {
   if (!anyFilterActive(filters) && page.value === 1) {

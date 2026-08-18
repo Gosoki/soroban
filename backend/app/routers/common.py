@@ -35,8 +35,33 @@ def goods_seed(price_cny, postage_cny):
 
     订单价 = Σ(单价×数量) + 邮费，而 sync_from_items 事后会自己再加一次邮费；所以喂给
     build_items 的种子必须是**已扣邮费**的货款，否则邮费被算两遍。这个换算在建单/改单/
-    导入/暂存共 6 处出现过，各写一份就迟早有一处忘了减——收敛到这里。"""
-    return None if price_cny is None else price_cny - (postage_cny or 0)
+    导入/暂存共 6 处出现过，各写一份就迟早有一处忘了减——收敛到这里。
+
+    **邮费大于订单价时在这里拒绝，而不是往下夹零。**
+    `build_items` 对负种子的处理是 `if seed_goods < 0: seed_goods = 0`——
+    于是「价 10、邮费 100」不会报错，而是把物品单价全记成 0，
+    再由 `sync_from_items` 得出「订单价 = 0 + 邮费 = 100」：
+    **一张原价 200 的单被静默改成 100，物品单价 0.00，全程 200 OK。**
+
+    这条闸原先只挂在 `OrderCreate` / `StagingCreate` 的 model_validator 上，
+    于是同一份 body：POST → 422（对），PATCH → 200 + 静默改写（实测）。
+    而生产者是真的：淘宝插件在「单价全解析失败」的降级分支下推
+    `price_cny=实付` + 全部 `unit_price_cny=None`，未导入的暂存行走整体更新——
+    只要实付 < 解析出的邮费（运费券、红包、部分退款），同一批抓取里
+    **新单 422 进 failed 桶、老单被静默改成「订单价 = 邮费」**。
+
+    放在这里而不是各个 schema 上，是因为这七个调用点里两个值的来源各不相同
+    （有的两个都来自请求体、有的一个来自请求体一个来自库里的现存行），
+    只有这里两个值必然同时在手。抛 ValueError 而不是 HTTPException：
+    这是业务层校验，`main.py` 有全局兜底把它转成干净的 422（见那里的说明）。"""
+    if price_cny is None:
+        return None
+    postage = postage_cny or 0
+    if postage > price_cny:
+        raise ValueError(
+            f"邮费（{postage}）不能大于订单总价（{price_cny}）——"
+            f"订单价 = 商品单价×数量 + 邮费。请先改总价，或把邮费调小。")
+    return price_cny - postage
 
 
 _RESIDUAL_SUFFIX = "（金额尾差）"

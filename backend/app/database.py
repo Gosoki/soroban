@@ -186,6 +186,22 @@ def switch_to_local() -> None:
     set_data_engine(_control_engine, _control_url())
 
 
+def _looks_like_newer_db(exc: Exception) -> bool:
+    """这个迁移失败是不是「库里的版本号，当前代码不认识」。
+
+    典型来源：用户装过新版（库被 upgrade 到新 revision），又换回旧版 exe。
+    alembic 抛的是 `CommandError: Can't locate revision identified by 'xxx'`。
+
+    **按异常类型 + revision 特征判，不按整句文案**：alembic 的措辞会随版本变，
+    而把它错认成「连不上数据库」会给出一条完全南辕北辙的指引（去查 MySQL 有没有起）。
+    认不出时回落到原有分支，只是少一条更贴切的提示，不会更糟。
+    """
+    if type(exc).__name__ != "CommandError":
+        return False
+    t = str(exc).lower()
+    return "revision" in t and ("locate" in t or "not found" in t or "no such" in t)
+
+
 def create_db_and_tables() -> None:
     """启动/seed/demo 调用：保证控制表存在，并把**当前数据后端**迁移到最新。
 
@@ -197,7 +213,24 @@ def create_db_and_tables() -> None:
     try:
         run_migrations(_data_url)
     except Exception as e:
-        if current_backend() == "mysql":
+        # **「库比代码新」要单独说。** 这一支与「连不上数据库」是完全不同的处境，
+        # 而它恰好落在**分发版唯一的形态**（SQLite）上：用户装了新版建过库，
+        # 又退回旧版 exe，alembic 就报 `Can't locate revision identified by 'xxx'`。
+        # 不认这条的话，用户看到的是一行英文 CommandError——既不知道数据有没有事
+        # （其实完好无损），也不知道该往前装还是往后退。
+        # 判据用 alembic 自己的异常类型 + 那句 revision 特征，不按整句文案匹配。
+        if _looks_like_newer_db(e):
+            log.error(
+                "这个账本是**更新版本的 soroban** 建的，当前程序认不出它的数据库版本：%s\n"
+                "  你的数据没有问题，一个字节都没动——只是这个版本的程序读不了它。\n"
+                "  两条路，选一条：\n"
+                "    · 装回你之前用的那个（或更新的）版本，账本照常打开；\n"
+                "    · 确实要用当前这个旧版本：先把账本目录整个备份一份，再删掉其中的\n"
+                "      soroban.db（连同 -wal / -shm），当前版本会建一个全新的空账本。\n"
+                "  **不要**在没有备份的情况下删——那一步不可逆。",
+                e,
+            )
+        elif current_backend() == "mysql":
             log.error(
                 "连接当前数据库（MySQL）失败：%s\n"
                 "  soroban 不会自动退回本地 SQLite——那份数据停在切换当天，"

@@ -76,15 +76,28 @@
           </el-table>
           <div v-else class="ph">暂无关联商品订单</div>
           <div class="add-line">
-            <el-select :model-value="null" filterable placeholder="＋ 添加商品订单（未挂靠）" class="tb-pick" @change="(id) => attach(row, id)">
-              <el-option v-for="t in unassignedOptions" :key="t.id" :label="t.order_no || ('#' + t.id)" :value="t.id">
+            <!-- 远程搜索：本地那 200 条只是**默认展示**，输订单号能搜到更旧的。
+                 原先只有客户端 filterable + `limit:200` 顶格（后端 `le=200` 就是硬上限），
+                 而排序是 `date desc`——被砍掉的**恰好是日期最旧、最该发出去的那批**，
+                 且下拉不给任何「还有 N 条」的痕迹，输订单号只会得到「无匹配数据」。 -->
+            <el-select :model-value="null" filterable placeholder="＋ 添加商品订单（未挂靠）" class="tb-pick"
+                       remote :remote-method="searchUnassigned" :loading="pickSearching"
+                       remote-show-suffix reserve-keyword
+                       :no-data-text="pickHits === null ? '输入订单号可搜索更早的单' : '没有匹配的未挂靠订单'"
+                       @visible-change="onPickDropdown" @change="(id) => attach(row, id)">
+              <el-option v-for="t in pickOptions" :key="t.id" :label="t.order_no || ('#' + t.id)" :value="t.id">
                 <div class="tb-opt">
                   <b>{{ t.order_no || ('#' + t.id) }}</b>
                   <span class="tb-meta">{{ itemSummary(t) }} · {{ fmtJPY(t.jpy_settled) }}</span>
                 </div>
               </el-option>
             </el-select>
-            <span v-if="!unassignedOptions.length" class="ph small">没有未挂靠的商品订单</span>
+            <!-- **只有真的一条都没有时才这么说。** 之前它在「被 200 截断」时也会出现，
+                 把用户骗去以为不存在，而其实还有更旧的、以及另外两条可用路径。 -->
+            <span v-if="!unassignedOptions.length && unassignedTotal === 0" class="ph small">没有未挂靠的商品订单</span>
+            <span v-else-if="unassignedTotal > unassignedOptions.length" class="ph small">
+              仅列出最近 {{ unassignedOptions.length }} 条（共 {{ unassignedTotal }}），输订单号可搜更早的
+            </span>
           </div>
         </div>
       </template>
@@ -156,6 +169,7 @@ const page = ref(1)
 const pageSize = 30
 const filters = reactive({ range: null, shipmentStatus: '', q: '' })
 const unassignedOptions = ref([])
+const unassignedTotal = ref(0)   // 后端说共有多少条未挂靠；用来判断本地这 200 条是不是被截断了
 
 // 请求序号：筛选/翻页可以在上一次响应回来前再发一次，慢的那次后到会把新数据整个覆盖掉
 // （表现为「清了筛选却只剩一部分」「内容是第2页、页码高亮第3页」）。只认最后一次发出的请求。
@@ -239,7 +253,33 @@ async function loadUnassigned() {
   try {
     const res = await ordersApi.list({ unassigned: true, limit: 200 })
     unassignedOptions.value = res.items
+    unassignedTotal.value = res.total          // 截断了没有，只有它说得清
   } catch (_) { /* 拦截器已提示；避免 onMounted 里未捕获的 promise 拒绝 */ }
+}
+
+// 远程搜索未挂靠订单。照 OrderEditPanel 的 searchShipment 同一形状（seq 防乱序）。
+// **`pickHits` 用 null 区分「没在搜」与「搜了但零命中」**——合成一个值的话，
+// 零命中时会走到「非搜索态」的文案上去，这个坑本仓已经记过一次。
+const pickHits = ref(null)
+const pickSearching = ref(false)
+let pickSeq = 0
+const pickOptions = computed(() => pickHits.value ?? unassignedOptions.value)
+
+async function searchUnassigned(kw) {
+  const q = (kw || '').trim()
+  if (!q) { pickHits.value = null; pickSearching.value = false; return }
+  const my = ++pickSeq
+  pickSearching.value = true
+  try {
+    // `unassigned` 与 `q` 在后端是各自独立 append 到 conds 的，可以组合——不用改后端
+    const res = await ordersApi.list({ unassigned: true, q, limit: 50 })
+    if (my === pickSeq) pickHits.value = res.items          // 迟到的响应不覆盖新结果
+  } catch (_) { /* 拦截器已提示 */ } finally {
+    if (my === pickSeq) pickSearching.value = false
+  }
+}
+function onPickDropdown(visible) {
+  if (!visible) { pickHits.value = null; pickSeq++ }        // 关下拉即回到默认列表
 }
 async function attach(shipmentRow, tbId) {
   if (!tbId) return
@@ -261,7 +301,7 @@ const pkgQueue = []
 let pkgRunning = false
 // 整窗拖图走共享实现（见 utils/windowFileDrop.js：判据/preventDefault/注册/反注册
 // 是一整套，少一样就是静默故障——暂存页就漏过「注册」）。
-const { dragActive } = useWindowFileDrop(enqueuePkg)
+const { dragActive, reset: resetWindowDrag } = useWindowFileDrop(enqueuePkg)
 const dragOverId = ref(null)      // 正悬停其上的行 id（本页特有：每行一个投放区）
 // 拖拽一结束就清掉行内高亮。原先这一步写在 onWinDragLeave/onWinDrop 里，
 // 收进共享实现之后由这里接管——不清的话，松手后那一行会一直亮着。
@@ -351,12 +391,25 @@ function pickForRow(row) {
 }
 function onRowPick(e) {
   const file = e.target.files?.[0]
-  if (file && pickTargetRow) bindExpress(pickTargetRow, file)
+  // **走队列，不要直接调 bindExpress。** 拖拽那条路（onRowDrop）是排队的，
+  // 而点选这条原先直接发请求——A 行识别中点 B 行选图就是两个请求并发，
+  // 而 `bindingRowId` 是**单槽**：B 一开始就把它改写，A 的「识别中…」当场消失、
+  // 格子恢复可点，用户以为没提交、再拖一次；先回来的那个在 finally 里清成 null，
+  // 另一行的忙态也跟着没了而请求还在飞。
+  // 后端不会写脏数据（OCR 有 _infer_lock、挂靠 UPDATE 带 EXISTS 守卫），
+  // 坏的是**界面对「谁在跑」说假话**，外加重复的多秒 OCR。
+  if (file && pickTargetRow) enqueueBind(pickTargetRow, file)
 }
 function onRowDrop(row, e) {
   dragOverId.value = null
-  dragActive.value = false
-  dragDepth = 0
+  // **这一行不能省，也不能自己写。** 模板上是 `@drop.prevent.stop`，`.stop` 挡住了冒泡，
+  // 所以整窗那个 drop 处理器不会触发——它的内部计数器得由这里复位，
+  // 否则下次拖完提示层就下不去了。
+  // 原先这里写的是 `dragActive.value = false; dragDepth = 0`：后半句引用了一个
+  // composable 抽出去之后就不存在的变量，ESM 严格模式当场 ReferenceError，
+  // 于是**下面的 enqueueBind 永远到不了**——拖图进来高亮正常消失、看着像收下了，
+  // 而实际上一次请求都不发，整条「拖图绑定内含快递」的路径静默死掉。
+  resetWindowDrag()
   const files = Array.from(e.dataTransfer?.files || []).filter((f) => !f.type || f.type.startsWith('image/'))
   if (!files.length) return
   if (files.length > 1) ElMessage.warning('一行一次只处理一张「内含快递」截图，已取第一张')

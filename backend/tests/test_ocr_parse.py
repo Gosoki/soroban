@@ -767,3 +767,103 @@ def test_the_route_actually_threads_the_hint_into_the_recogniser(client, monkeyp
     seen.clear()
     client.post("/api/orders/ocr", files={"file": ("x.png", b"\x89PNG", "image/png")})
     assert seen.get("hint") is None, "没选来源却凭空传了一个进去"
+
+
+# --- 闲鱼卡车模板匹配：此前**零测试**覆盖真实匹配 -------------------------------
+
+def _truck_canvas(seed, w=1080, h=2400, paste=None):
+    """造一张「像截图」的灰度图：浅底 + 横向文本条。paste=(尺度) 时贴一只卡车进去。
+
+    不用纯白：纯白上任何模板的相关分都是 0，测不出噪声底——而噪声底正是这里的要害。
+    固定 seed 重建，保证同一条断言每次跑的是同一张图。
+    """
+    import cv2
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    g = np.full((h, w), 245, np.uint8)
+    for y in range(0, h, 37):
+        g[y:y + 2, 20:w - 20] = rng.integers(60, 200)
+    for _ in range(h // 20):
+        y, x = rng.integers(0, h - 12), rng.integers(0, max(1, w - 90))
+        g[y:y + 11, x:x + 80] = rng.integers(30, 120)
+    if paste:
+        ref = ocr._load_truck_ref()
+        t = cv2.resize(ref, (int(ref.shape[1] * paste), int(ref.shape[0] * paste)),
+                       interpolation=cv2.INTER_AREA)
+        g[100:100 + t.shape[0], 50:50 + t.shape[1]] = t
+    return g
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.6, 0.4, 0.25])
+def test_truck_is_found_at_every_declared_scale(scale):
+    """`_TRUCK_SCALES` 里声明的每个尺度都必须真能认出卡车。
+
+    这条链此前**一条测试都没有**：`_truck_score` 是「截图是不是闲鱼」的第二根支柱
+    （文案线索答不上来时才问它），而它的阈值、尺度表、下界三个常数从来没被任何东西钉住。
+    改动它们（比如为了提速缩图）会不会把真卡车漏掉，以前只能靠肉眼。
+    """
+    pytest.importorskip("cv2")
+    g = _truck_canvas(7, paste=scale)
+    got = ocr._truck_score(g)
+    assert got >= ocr._TRUCK_MATCH_THRESHOLD, \
+        f"尺度 {scale} 的卡车没认出来：{got:.3f} < {ocr._TRUCK_MATCH_THRESHOLD}"
+
+
+def test_a_screenshot_without_a_truck_stays_below_the_threshold():
+    """反面：没有卡车的截图不许越过阈值。
+
+    **假阳比慢贵得多**：`_stamp_platform` 里卡车命中会**压过**明确的淘宝/京东标记，
+    把 platform 定成「闲鱼」且 `platform_warning=None`（自信地错、且不给任何提示），
+    随后路由按 warning 判是否推荐插件 → 跳过；而「闲鱼」还会写进
+    `COALESCE(platform,'')` 唯一键，插件之后抓同一单就变成重复行。
+    """
+    pytest.importorskip("cv2")
+    for seed in (7, 11, 42):
+        got = ocr._truck_score(_truck_canvas(seed))
+        assert got < ocr._TRUCK_MATCH_THRESHOLD, f"seed={seed} 无卡车却判命中：{got:.3f}"
+    # 余量也要钉住，不然阈值被人调回去时这条依然绿。
+    # `_truck_canvas` 造的是**等间距横条**——负样本里最凶的一类（周期结构与模板共振，
+    # 实测 0.555/0.579/0.608，而类文本行只有 0.550、卡片色块 0.469、纯噪声 0.07）。
+    worst = max(ocr._truck_score(_truck_canvas(s)) for s in (7, 11, 42))
+    assert ocr._TRUCK_MATCH_THRESHOLD - worst >= 0.15, \
+        f"阈值 {ocr._TRUCK_MATCH_THRESHOLD} 距最凶的负样本只剩 {ocr._TRUCK_MATCH_THRESHOLD - worst:.3f}"
+
+
+@pytest.mark.slow
+def test_the_noise_floor_on_a_huge_screenshot_is_measured_not_assumed():
+    """**超大图上的噪声底几乎贴着阈值**——这条把那个事实钉下来，别再靠猜。
+
+    `TM_CCOEFF_NORMED` 取的是全图窗口的**最大**相关分，窗口数随面积线性涨，
+    于是「最大值」的噪声底也跟着涨。实测 2000×20000（= `MAX_OCR_PIXELS` 上限）的
+    合成负样本：**0.591 ~ 0.609**，而阈值是 0.60——余量只有 0.01 量级，已经有一个种子越线。
+
+    这直接否掉了一类「为了提速先把图缩小再匹配」的改法：同图 A/B 实测（三个种子一致）
+    缩到 4 Mpx 后耗时 17.7s → 1.5s，**但负样本分从 0.591~0.609 涨到 0.656~0.661**——
+    图缩了模板也跟着缩，小模板更容易匹配噪声。快了 12 倍，代价是把仅剩的余量吃光。
+    要提速得另想办法（提高阈值、只在没有文案线索时才跑、或换特征而不是模板匹配）。
+
+    标 slow：单次约 18 秒。默认不跑，改动那三个常数时手动跑
+    `pytest -m slow tests/test_ocr_parse.py -k noise_floor`。
+    """
+    pytest.importorskip("cv2")
+    got = ocr._truck_score(_truck_canvas(7, w=2000, h=20000))
+    assert got < 0.75, f"超大图噪声底已经高到 {got:.3f}，模板匹配这条路要重新设计"
+
+
+def test_the_smallest_declared_scale_stays_above_the_sanity_bound():
+    """尺度表里最小的那一档，缩出来的模板必须还在「太小无意义」那道下界之上。
+
+    现状：最小尺度 0.25 × 参考图 317×243 = 79×60，而下界是 24×18——**那道下界目前不可达**，
+    是给将来加更小尺度时留的。这条把两者的关系钉住：谁往 `_TRUCK_SCALES` 里加一档
+    小到会被下界砍掉的尺度，就会在这里被告知「加了也不会跑」，
+    而不是让它静默地不生效（那种失败方式在这个仓库已经出现过很多次）。
+
+    **不要**为了让小尺度跑起来而去调低下界：模板越小越容易匹配噪声，
+    实测负样本噪声底会随之抬高，而阈值那 0.19 的余量经不起这么花（见上一条的说明）。
+    """
+    rh, rw = ocr._load_truck_ref().shape[:2]
+    s = min(ocr._TRUCK_SCALES)
+    w, h = int(rw * s), int(rh * s)
+    assert w >= 24 and h >= 18, \
+        f"最小尺度 {s} 缩出 {w}×{h}，会被 _truck_score 里那道 24×18 的下界直接跳过——加了等于没加"

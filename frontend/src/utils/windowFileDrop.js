@@ -18,7 +18,8 @@
  * 让每个页面自己抄一遍，就是让每个页面各有一次机会漏掉其中一样。
  *
  * @param {(files: File[]) => void} onFiles 松手时拿到的文件列表
- * @returns {{ dragActive: import('vue').Ref<boolean> }} 拖拽中（页面据此浮出提示层）
+ * @returns {{ dragActive: import('vue').Ref<boolean>, reset: () => void }}
+ *   dragActive = 拖拽中（页面据此浮出提示层）；reset = 手动复位，见其上方说明。
  */
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 
@@ -44,9 +45,17 @@ export function useWindowFileDrop(onFiles) {
     depth = Math.max(0, depth - 1)
     if (depth === 0) dragActive.value = false
   }
+  // 手动复位。**页面上有子元素 `.stop` 掉 drop 时必须调它**：
+  // 那种情况下下面这个 window 级处理器根本不触发，`depth` 就一直停在非零，
+  // 于是下一次拖拽结束时 `dragActive` 再也回不到 false——整窗提示层永久挂在屏幕上。
+  // 计数器是闭包私有的，页面自己够不着，所以只能由这里交出去。
+  // （集运页原先在自己那边写 `dragDepth = 0` 想清它——那个名字在 composable 抽出去之后
+  //   就不存在了，ESM 严格模式下当场 ReferenceError，把它下面那半个函数一起打断。）
+  const reset = () => { depth = 0; dragActive.value = false }
+
   const drop = (e) => {
     if (!isFileDrag(e)) return
-    e.preventDefault(); depth = 0; dragActive.value = false
+    e.preventDefault(); reset()
     onFiles(Array.from(e.dataTransfer.files || []))
   }
 
@@ -54,5 +63,5 @@ export function useWindowFileDrop(onFiles) {
   onMounted(() => pairs.forEach(([k, fn]) => window.addEventListener(k, fn)))
   onBeforeUnmount(() => pairs.forEach(([k, fn]) => window.removeEventListener(k, fn)))
 
-  return { dragActive }
+  return { dragActive, reset }
 }

@@ -166,7 +166,7 @@ const props = defineProps({
   hideId: { type: Boolean, default: false },   // 隐藏最左「ID」列的编号与表头（仍保留该窄列的新建/删除操作）
   emptyText: { type: String, default: '没有符合条件的记录' },   // 零结果时的一行文案
 })
-const emit = defineEmits(['save', 'add', 'delete', 'reload'])
+const emit = defineEmits(['save', 'add', 'delete', 'reload', 'tags-changed'])
 const slots = useSlots()
 
 // 空态那一行要横跨整表。列数 = ID 列 + 可选展开列 + 数据列 + 操作列，
@@ -254,6 +254,17 @@ function cellCol(col) {
 function applyTags(field, list) {   // list: [{value, color, in_use}]
   tagOptions[field] = list.map((t) => t.value)
   tagMeta[field] = Object.fromEntries(list.map((t) => [t.value, t]))
+  // **所有标签变更的唯一汇合点，事件就发在这里。**
+  // 表格自己那份 `tagOptions` 刷新了，但父页往往还各存一份同样的候选集
+  // （工具栏的筛选下拉、编辑面板的 `:accounts`）——那些不会自动跟着变。
+  // 后果分两种，都很难自己想明白：
+  //   · 改名：`tags.py` 会 `UPDATE ... SET col=新 WHERE col=旧`，**旧名在库里彻底消失**。
+  //     若工具栏筛选此刻正停在旧名，紧接着的 `load()` 拿一个不存在的值精确匹配 → 0 行 →
+  //     空态显示「没有符合条件的记录」——**刚改完名就像把单子改没了**。
+  //   · 新增/删除/改色：原先**一个事件都不发**，新加的账号在工具栏筛选和编辑面板里
+  //     永远选不到，直到组件重挂载（切页回来才自愈）。
+  // 只发 `reload` 不够——它只让父页重拉**行**，既不刷新候选集、也不管仍停在旧名的筛选值。
+  emit('tags-changed', { field, values: tagOptions[field] })
 }
 async function loadTag(field) {   // 单字段拉取；失败保留旧值/置空，供列头弹窗 @show 重试
   try { applyTags(field, await tagsApi.list(field)) } catch (_) { if (!tagOptions[field]) { tagOptions[field] = []; tagMeta[field] = {} } }

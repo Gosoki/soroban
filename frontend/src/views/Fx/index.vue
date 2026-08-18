@@ -13,10 +13,17 @@
       <el-radio-group v-model="days" @change="load">
         <el-radio-button v-for="d in [7, 30, 90, 365]" :key="d" :value="d">近 {{ d }} 天</el-radio-button>
       </el-radio-group>
-      <span class="sub">共 {{ rows.length }} 天有记录</span>
+      <span v-if="!loadFailed" class="sub">共 {{ rows.length }} 天有记录</span>
     </div>
 
-    <el-empty v-if="!loading && !rows.length" description="还没有任何汇率记录。装上汇率插件并授权，或去设置页手填一个。" />
+    <!-- **三分支，顺序要紧**：失败 → 真空 → 表格。
+         原先只有「真空」一支：5xx / 503 / axios 15s 超时（ECONNABORTED 不被 isNetworkError 拦）
+         之后 rows 保持 []，页面就断言「你还没有任何汇率记录，去装插件或手填一个」。
+         照做去手填的话更贵——手填汇率在 pick_used 里**优先于抓来的**，
+         此后建单按这个估值折算日元，账本里就是错的钱。 -->
+    <el-empty v-if="loadFailed" :description="'加载失败——请检查网络或后端，然后重试'" />
+    <el-empty v-else-if="!loading && !rows.length"
+              description="还没有任何汇率记录。装上汇率插件并授权，或去设置页手填一个。" />
 
     <!-- .fx-scroll 与 NotionTable 的 .gtn-scroll 是同一件东西：1px 外框 + 8px 圆角 +
          自身的面。表格页不套 el-card，这圈框自己就是容器。 -->
@@ -100,6 +107,10 @@ const detail = ref([])
 // 六处同一个写法。少了它，连点「近 7 天/近 30 天」或快速换行展开时，
 // A 天的明细会画在 B 天下面——没有任何提示，看上去就是数据错了。
 let loadSeq = 0
+// 上一次加载是否失败：空态文案据此说实话。
+// 这一页的空态**在断言用户的系统状态**（「装上汇率插件」/「plugins 下没有目录」），
+// 而请求失败时它照样会显示——那不只是没信息，是给了一条错误的行动指令。
+const loadFailed = ref(false)
 let daySeq = 0
 
 async function load() {
@@ -108,8 +119,11 @@ async function load() {
   openDay.value = ''
   try {
     const res = await fxApi.history(days.value)
-    if (my === loadSeq) rows.value = res.items
-  } catch (_) { /* 拦截器已提示 */ } finally {
+    if (my === loadSeq) { rows.value = res.items; loadFailed.value = false }
+  } catch (_) {
+    // 拦截器已提示原因；这里负责让**页面本身**留下痕迹，否则空态在说假话。
+    if (my === loadSeq) loadFailed.value = true
+  } finally {
     if (my === loadSeq) loading.value = false
   }
 }

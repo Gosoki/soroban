@@ -7,7 +7,7 @@
     </PageHeader>
 
     <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable hide-id :open-id="focusId"
-                 table-name="orders" :empty-text="loadFailed ? '加载失败——请检查网络或后端，然后重试' : '没有符合条件的记录'" @save="saveCell" @add="addRow" @delete="delRow" @reload="load">
+                 table-name="orders" :empty-text="loadFailed ? '加载失败——请检查网络或后端，然后重试' : '没有符合条件的记录'" @save="saveCell" @add="addRow" @delete="delRow" @reload="load" @tags-changed="onTagsChanged">
       <template #toolbar>
         <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="reload" />
         <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
@@ -146,6 +146,22 @@ const focusId = ref(null)   // 跳转定位的订单 id（?focus=）
 const filters = reactive({ q: '', platform: '', fulfillmentStatus: '', platform_account: '', range: null })
 const shipmentOptions = ref([])
 const accountOptions = ref([])   // 账号昵称下拉候选（标签接口）
+// 表格里改了标签（改名/新增/删除/改色）之后，工具栏那份候选集要跟着变。
+// **还要管仍停在旧名的筛选值**：改名时旧名在库里已经不存在了，
+// 拿它精确匹配会查回 0 行，空态显示「没有符合条件的记录」——
+// 用户刚改完名就看到「单子没了」。清掉筛选比留着一个查不到东西的值好，
+// 而且要说一句，否则他会以为筛选自己乱了。
+function onTagsChanged({ field, values }) {
+  if (field === 'platform_account') {
+    accountOptions.value = values
+    if (filters.platform_account && !values.includes(filters.platform_account)) {
+      filters.platform_account = ''
+      ElMessage.info('筛选里那个账号已改名或删除，已为你清掉筛选')
+      reload()
+    }
+  }
+}
+
 async function loadAccounts() {
   try { accountOptions.value = (await tagsApi.list('platform_account')).map((t) => t.value) } catch (_) { /* 已提示 */ }
 }

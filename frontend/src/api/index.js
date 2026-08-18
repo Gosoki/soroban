@@ -132,11 +132,13 @@ export const tagsApi = {
   add: (field, value) => http.post(`/tags/${field}`, { value }),
   remove: (field, value) => http.delete(`/tags/${field}/${encodeURIComponent(value)}`),
   setColor: (field, value, color) => http.put(`/tags/${field}/color`, null, { params: { value, color } }),
-  // 改名：platform_account 牵连插件磁盘会话/配置 → 走插件全链路端点；其它字段走通用标签改名
+  // 改名一律走通用端点。**由后端按「有没有插件声明这一列」分派**，前端不认插件 id——
+  // 原先这里把 `taobao` 焊在 URL 里：插件目录不在时（源码安装、自定 PLUGIN_DIR），
+  // 手工录单产生的账号名既删不掉（409 in_use）也改不了名（404「未发现插件: taobao」），
+  // 而那句报错和用户正在做的事毫无关系。
+  // 真正由插件管理的字段，后端会回 400 并让用户去「插件管理」页——那里才有磁盘会话迁移。
   rename: (field, oldVal, newVal) =>
-    field === 'platform_account'
-      ? http.post(`/plugins/taobao/account/rename`, null, { params: { old: oldVal, new: newVal } })
-      : http.post(`/tags/${field}/rename`, null, { params: { old: oldVal, new: newVal } }),
+    http.post(`/tags/${field}/rename`, null, { params: { old: oldVal, new: newVal } }),
 }
 
 // 运行期设置（存库、「设置」页上改）。与 backend/.env 的部署配置是两回事。

@@ -152,3 +152,65 @@ def test_orders_page_displays_shipment_no_from_the_row():
     assert "row" in m.group(1), "shipNo 拿不到行，就只能回去查下拉（上限之外必然显示成 #id）"
     body = m.group(2)
     assert "shipment_no" in body.split("shipById")[0], "shipNo 应先取行上的 shipment_no，再回落查下拉"
+
+
+def test_unassigned_search_reaches_beyond_the_dropdown_cap(client):
+    """**反向那个下拉**（集运单 → 添加商品订单）同样要能越过 200 条上限。
+
+    这一条与上面那条是镜像：上面测的是「订单 → 挑集运单」，这条测「集运单 → 挑订单」。
+    后者原先只有客户端 `filterable` + `limit:200` 顶格（后端 `le=200` 就是硬上限），
+    而排序是 `date desc, id desc`——被砍掉的**恰好是日期最旧、最该发出去的那批**。
+    更糟的是它不给任何「还有 N 条」的痕迹，`unassignedOptions.length` 恒为 200，
+    于是那句「没有未挂靠的商品订单」也不会出现 → 用户合理推断「已挂过 / 不存在」，
+    **不会去找另外两条其实可用的路径**（拖内含快递截图、从订单侧反向挂靠）。
+
+    关键点：`unassigned` 与 `q` 在后端是各自独立 append 到 conds 的，**可以组合**——
+    所以前端接远程搜索不需要改后端。这条把那个组合钉住。
+    """
+    # **造完必须清掉。** 这些行会挤占别的用例的默认分页——`test_staging_mirror`
+    # 就是用 `limit:200` 找自己那一行的，塞 205 张进去它当场 StopIteration。
+    # 「单独跑绿、整套跑红」这种失败方式在本仓已经出现过好几次，而且红的总是无关的那条。
+    made = []
+    for i in range(205):
+        r = client.post("/api/orders", json={
+            "date": f"2026-11-{(i % 28) + 1:02d}", "order_no": f"UN-{i:04d}", "platform": "淘宝",
+            "items": [{"name": "x", "quantity": 1, "unit_price_cny": "1"}]})
+        made.append(r.json()["id"])
+
+    batch = client.get("/api/orders", params={"unassigned": True, "limit": 200}).json()
+    assert len(batch["items"]) == 200, "造数没超出上限，这条测试没在测东西"
+    assert batch["total"] >= 205, "total 要能说出「其实还有更多」——前端靠它判断截断"
+
+    nos = {o["order_no"] for o in batch["items"]}
+    missing = [f"UN-{i:04d}" for i in range(205) if f"UN-{i:04d}" not in nos]
+    assert missing, "造数没能超出上限"
+
+    # unassigned + q 组合：这是前端远程搜索依赖的行为
+    hit = client.get("/api/orders", params={"unassigned": True, "q": missing[0], "limit": 50}).json()
+    ok = [o["order_no"] for o in hit["items"]] == [missing[0]]
+
+    for oid in made:                     # 清场：别把 205 张留给后面的用例
+        client.delete(f"/api/orders/{oid}")
+
+    assert ok, "unassigned 与 q 不能组合，前端那个远程搜索就落空了"
+
+
+def test_the_unassigned_picker_tells_the_truth_about_truncation(client):
+    """截断时下拉必须说出来，而且**不许**再说「没有未挂靠的商品订单」。
+
+    这句话原先在「被 200 截断」时也会出现（因为它只看 `unassignedOptions.length`，
+    而那个值恒为 200……不对，恒非空——所以它其实不出现，而**问题正在这里**：
+    用户得不到任何「还有更多」的提示，只会以为下拉里就是全部）。
+    修法用 `total > 已列出条数` 判截断，用 `total === 0` 判真空。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "views" / "Shipment" / "index.vue").read_text(encoding="utf-8")
+    tpl = src[:src.index("<script")]
+    assert "unassignedTotal > unassignedOptions.length" in tpl, "没有按 total 判截断"
+    assert "unassignedTotal === 0" in tpl, "真空态没有按 total 判——会把「被截断」说成「没有」"
+    body = re.sub(r"//.*$", "", src[src.index("<script"):], flags=re.M)
+    assert "unassignedTotal.value = res.total" in body, "没有记住后端给的 total"
+    # 零命中与非搜索态必须分得开
+    assert "pickHits === null" in tpl, \
+        "no-data-text 没有区分「没在搜」与「搜了但零命中」——本仓记过这个坑"

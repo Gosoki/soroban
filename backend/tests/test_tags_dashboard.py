@@ -92,9 +92,70 @@ def test_rename_to_empty_rejected(client):
                        params={"old": "待改空", "new": "   "}).status_code == 422
 
 
-def test_platform_account_rename_must_go_through_plugin(client):
-    assert client.post("/api/tags/platform_account/rename",
-                       params={"old": "a", "new": "b"}).status_code == 400
+# 分派判据（`_plugin_owns_field`）在这两条里**显式打桩**：
+# 测试环境的 PLUGIN_DIR 指向空目录，而真实环境看得到淘宝插件——
+# 依赖「环境恰好发现了什么」的话，同一条断言在两处会得到相反结果，
+# 而且哪一边都说不出自己在测分派本身。
+def test_rename_is_refused_when_a_plugin_claims_the_column(client, monkeypatch):
+    """有插件声明这一列时，改名要走插件端点（磁盘会话与插件配置得一起迁）。"""
+    from app.routers import tags as mod
+
+    client.post("/api/orders", json={"date": "2026-08-18", "order_no": "PLUGOWN-1",
+                                     "platform": "淘宝", "platform_account": "插件管的号"})
+    monkeypatch.setattr(mod, "_plugin_owns_field", lambda field: True)
+    r = client.post("/api/tags/platform_account/rename",
+                    params={"old": "插件管的号", "new": "新名"})
+    assert r.status_code == 400, f"{r.status_code} {r.text[:200]}"
+    assert "插件管理" in r.text, "报错没告诉用户该去哪儿改"
+
+
+def test_the_same_column_can_be_renamed_locally_when_no_plugin_claims_it(client, monkeypatch):
+    """**没有插件声明这一列时，必须能本地改名**——原先这里是一条死路。
+
+    原判据是「列名 == platform_account 就拒绝」，而前端那条替代路径又把 `taobao`
+    焊在 URL 里。于是插件目录不在时（源码安装、自定 PLUGIN_DIR），
+    手工录单产生的账号名**既删不掉也改不了名**：
+    DELETE 返回 409（in_use）、这里 400 让你走插件、插件端点 404「未发现插件: taobao」。
+    而列头那颗改名笔对所有 tag 列无条件渲染——用户只会看到一句
+    「未发现插件: taobao」，和他正在做的事毫无关系。
+
+    判据改成「**有没有插件声明这个字段**」（清单的 `accounts_ledger_field`）。
+    注意**不能**写成「插件缺失就跳过迁移」：那会在插件只是暂时没装好时，
+    把账本改了而磁盘会话与插件配置留在旧名下，下一轮抓取又把旧名建回来。
+    """
+    from app.routers import tags as mod
+
+    # 账号名带随机后缀 + 按 **id** 回查：整套跑时别的用例也在造订单，
+    # 用固定值 + 列表查询会拿到别人的行（这一条第一次写就是这么红的，
+    # 而红的信息是「platform_account is None」，完全看不出是拿错了行）。
+    import uuid
+    acct = f"手工录的-{uuid.uuid4().hex[:8]}"
+    oid = client.post("/api/orders", json={"date": "2026-08-18", "order_no": f"NOPLUG-{acct}",
+                                           "platform": "闲鱼", "platform_account": acct}).json()["id"]
+    monkeypatch.setattr(mod, "_plugin_owns_field", lambda field: False)
+    r = client.post("/api/tags/platform_account/rename", params={"old": acct, "new": acct + "-新"})
+    assert r.status_code == 200, f"没有插件时仍然改不了名，用户被堵死：{r.status_code} {r.text[:200]}"
+
+    got = client.get(f"/api/orders/{oid}").json()
+    assert got["platform_account"] == acct + "-新", got
+
+
+def test_the_dispatch_is_by_declaration_not_by_column_name():
+    """分派判据必须是「有插件声明这个字段」，不是写死的列名。
+
+    写死列名的话，将来第二个声明 `accounts_ledger_field` 的插件出现时，
+    它管的那一列会被当成普通标签本地改名——账本改了、那个插件的磁盘会话没动。
+    """
+    import inspect
+
+    from app.routers import tags as mod
+
+    src = inspect.getsource(mod.rename_tag)
+    assert "_plugin_owns_field(field)" in src, "分派没有走「按声明判」"
+    assert 'field == "platform_account"' not in src, "还在按列名写死"
+
+    owns = inspect.getsource(mod._plugin_owns_field)
+    assert "_ledger_field(m) == field" in owns, "没有按清单的 accounts_ledger_field 判"
 
 
 def test_rename_bumps_version(client):

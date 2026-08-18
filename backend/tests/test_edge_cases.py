@@ -318,3 +318,57 @@ def test_user_named_item_ending_in_the_suffix_is_not_eaten(client):
     ])
     assert [i["name"] for i in o["items"]] == ["手写（金额尾差）"]
     assert Decimal(o["price_cny"]) == Decimal("7.00")
+
+
+@pytest.mark.parametrize("path,extra", [
+    ("orders", {"date": "2026-08-18", "platform": "闲鱼"}),
+    ("staging", {"platform": "闲鱼"}),
+])
+def test_postage_over_total_is_refused_on_patch_too(client, path, extra):
+    """「邮费不能大于订单价」这条闸**改单时也得成立**，不能只挂在建单上。
+
+    原先它只在 `OrderCreate` / `StagingCreate` 的 model_validator 上，于是同一份 body：
+      · POST → 422（对）
+      · PATCH → **200 OK**，而且悄悄把一张原价 200 的单改成 **100（就是邮费）**、
+        物品单价 0.00。
+
+    路径：`goods_seed(10, 100) = -90` → `build_items` 的 `if seed_goods < 0: seed_goods = 0`
+    → 物品全记 0.00 → `sync_from_items` 得出「订单价 = 0 + 邮费」。
+    **全程没有任何提示**，而这正是建单那条闸的注释里写着要拒绝的后果。
+
+    生产者是真的：淘宝插件在「单价全解析失败」的降级分支下推
+    `price_cny=实付` + 全部 `unit_price_cny=None`，未导入的暂存行走整体更新——
+    只要实付 < 解析出的邮费（运费券、红包、部分退款），同一批抓取里
+    **新单 422 进 failed 桶、老单被静默改成「订单价 = 邮费」**。
+
+    闸下沉到 `goods_seed`（七个调用点唯一交汇处，两个值必然同时在手），
+    所以建单/改单/导入/暂存四条路径一次覆盖。
+    """
+    body = dict(extra, order_no=f"POSTAGE-{path}",
+                items=[{"name": "A", "quantity": 1, "unit_price_cny": "200"}])
+    row = client.post(f"/api/{path}", json=body).json()
+    assert row["price_cny"] == "200.00", row
+
+    bad = {"price_cny": "10", "postage_cny": "100",
+           "items": [{"name": "A", "quantity": 1}], "version": row["version"]}
+    r = client.patch(f"/api/{path}/{row['id']}", json=bad)
+    assert r.status_code == 422, \
+        f"改单放行了邮费>总价：{r.status_code} → 价变成 {r.json().get('price_cny')}"
+    assert "邮费" in r.text, r.text
+
+    # 原来那张单一个字节都不许动
+    after = client.get(f"/api/{path}?order_no=POSTAGE-{path}").json()["items"][0]
+    assert after["price_cny"] == "200.00", f"被拒之后订单价还是被改了：{after}"
+
+
+def test_postage_equal_to_total_is_still_allowed(client):
+    """反面：邮费**等于**总价是合法的（纯运费单，货款为 0）。
+
+    没有这一条，把判据写成 `>=` 也能让上面那条绿——而那会把「只付了运费」这种
+    真实存在的单挡在门外。
+    """
+    r = client.post("/api/orders", json={
+        "date": "2026-08-18", "order_no": "POSTAGE-EQ", "platform": "闲鱼",
+        "price_cny": "100", "postage_cny": "100", "items": [{"name": "运费", "quantity": 1}]})
+    assert r.status_code == 200, r.text
+    assert r.json()["price_cny"] == "100.00", r.json()

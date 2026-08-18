@@ -116,7 +116,11 @@ def _q_decimal(v: Optional[Decimal], max_value: Decimal, quantum: Decimal,
     if v is None:
         return None
     v = Decimal(v)
-    if not v.is_finite() or abs(v) > max_value:
+    # `copy_abs()` 而不是 `abs()`：后者是走 context 的算术运算，指数超过 Emax（默认 999999）
+    # 抛 `decimal.Overflow`——它继承 ArithmeticError **不是** ValueError，
+    # 于是 pydantic 不转 422、main.py 的 ValueError 兜底也接不住，一路裸 500。
+    # 而这一行本身就是那道「防止极端量级」的闸。copy_abs 是拷贝操作，永不抛。
+    if not v.is_finite() or v.copy_abs() > max_value:
         raise ValueError(f"{label}数值超出可接受范围（上限 {max_value}）")
     v = v.quantize(quantum, rounding=ROUND_HALF_UP)
     if v < 0:
@@ -134,7 +138,7 @@ def _q_fx(v: Optional[Decimal]) -> Optional[Decimal]:
     if v is None:
         return None
     v = Decimal(v)
-    if not v.is_finite() or abs(v) > FX_MAX:
+    if not v.is_finite() or v.copy_abs() > FX_MAX:      # copy_abs 理由同上
         raise ValueError(f"汇率 {v} 不在合理区间 [{FX_MIN}, {FX_MAX}]（1元≈20円）")
     v = v.quantize(_FX_Q, rounding=ROUND_HALF_UP)
     if not (FX_MIN <= v <= FX_MAX):

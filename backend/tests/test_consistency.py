@@ -1136,8 +1136,13 @@ def test_the_platform_dialog_cannot_deadlock_the_queue():
     assert 'v-model="ask.open"' in tpl, "没找到那个问平台的对话框"
     assert '@closed="closeAsk"' in tpl, "对话框没在 @closed 上收尾——非按钮关窗会让队列静默卡死"
     body = re.sub(r"//.*$", "", src, flags=re.M)
-    assert re.search(r"function closeAsk\(\)\s*\{\s*askResolve\?\.\(null\)", body), \
-        "closeAsk 没有 resolve 那个 Promise"
+    # **按语义判，不钉具体写法**：这条守的是「非按钮关窗也要唤醒等待者」，
+    # 而等待者从单槽 resolver 换成数组之后，原先那句正则（`askResolve?.(null)`）就失配了——
+    # 守卫钉死实现细节，实现一动它就红，而它要保护的东西一点没变。
+    close = body[body.index("function closeAsk"):]
+    close = close[:close.index("\n}") + 2]
+    assert "settleAsk(null)" in close or "resolve" in close, \
+        "closeAsk 没有唤醒等待者——点遮罩/Esc/× 关窗时整个队列会静默卡死"
 
 
 def test_multi_pick_asks_only_once_for_the_whole_batch():
@@ -1356,3 +1361,346 @@ console.log(JSON.stringify(out))
     got = json.loads(r.stdout.strip().splitlines()[-1])
     failed = [k for k, v in got.items() if not v]
     assert not failed, f"这些行为不成立：{failed}"
+
+
+def test_window_file_drop_depth_can_be_reset_from_outside():
+    """整窗拖拽的内部计数器必须能被页面复位——**真跑一遍，不 grep**。
+
+    集运页在行上写的是 `@drop.prevent.stop`：`.stop` 挡住冒泡，于是 composable 那个
+    window 级 drop 处理器**根本不触发**，它的 `depth` 就一直停在非零。
+    下一次拖拽结束时 `depth` 回不到 0 ⇒ `dragActive` 再也不变 false ⇒
+    整窗提示层永久挂在屏幕上。计数器是闭包私有的，页面够不着，只能由 composable 交出来。
+
+    这条的由来是一个**整条功能静默死掉**的 bug：那一页原先自己写 `dragDepth = 0` 想清它，
+    而那个名字在 composable 抽出去之后就不存在了——`<script setup>` 是 ESM、严格模式，
+    赋值未声明变量当场 `ReferenceError`，把它下面的 `enqueueBind(...)` 一起打断：
+    拖图进来高亮正常消失、看着像收下了，实际一次请求都不发，全程零报错。
+    """
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        import os
+        if os.environ.get("SOROBAN_NO_NODE"):
+            pytest.skip("显式声明了本机没有 node（SOROBAN_NO_NODE=1）")
+        raise AssertionError("找不到 node，而这是前端行为测试的唯一途径；"
+                             "真没有 node 请设 SOROBAN_NO_NODE=1。")
+
+    src = (_REPO / "frontend" / "src" / "utils" / "windowFileDrop.js").read_text(encoding="utf-8")
+    assert "from 'vue'" in src, "windowFileDrop.js 的依赖变了，这条测试要跟着更新"
+    # 只把 vue 的三个 import 换成替身，composable 本身一字不改
+    src = src.replace("import { onBeforeUnmount, onMounted, ref } from 'vue'",
+                      "const ref = (v) => ({ value: v })\n"
+                      "const onMounted = (f) => globalThis.__mounted.push(f)\n"
+                      "const onBeforeUnmount = () => {}")
+
+    harness = _REPO / "node-window-drop.test.mjs"
+    harness.write_text(src + r"""
+globalThis.__mounted = []
+const listeners = {}
+globalThis.window = { addEventListener: (k, fn) => { listeners[k] = fn }, removeEventListener: () => {} }
+
+const got = []
+const { dragActive, reset } = useWindowFileDrop((files) => got.push(files.length))
+globalThis.__mounted.forEach((f) => f())
+
+const ev = (extra = {}) => Object.assign(
+  { dataTransfer: { types: ['Files'], files: [1] }, preventDefault() {} }, extra)
+
+const out = {}
+out.exposes_reset = typeof reset === 'function'
+
+// 拖进来（子元素冒泡会触发多次 enter）
+listeners.dragenter(ev()); listeners.dragenter(ev())
+out.active_while_dragging = dragActive.value === true
+
+// 子元素 .stop 掉了 drop ⇒ composable 的 drop 不触发；页面改调 reset()
+reset()
+out.reset_clears_active = dragActive.value === false
+
+// 关键：下一次拖拽必须还能正常结束（depth 已归零）
+listeners.dragenter(ev())
+listeners.dragleave(ev())
+out.next_drag_ends_cleanly = dragActive.value === false
+
+// 反面：正常的整窗 drop 仍然把文件交出去
+listeners.dragenter(ev())
+listeners.drop(ev())
+out.normal_drop_still_delivers = got.length === 1 && dragActive.value === false
+
+console.log(JSON.stringify(out))
+""", encoding="utf-8")
+    try:
+        r = subprocess.run([node, str(harness)], cwd=_REPO, capture_output=True,
+                           text=True, timeout=60)
+    finally:
+        harness.unlink(missing_ok=True)
+    assert r.returncode == 0, f"node 跑挂了：{r.stderr[-800:]}"
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    failed = [k for k, v in got.items() if not v]
+    assert not failed, f"这些行为不成立：{failed}"
+
+
+def test_no_page_assigns_to_an_undeclared_drag_counter():
+    """页面里不许再出现对未声明变量的赋值来「清计数器」。
+
+    `dragDepth` 是 composable 抽出去之前那一版留下的名字。它在 `<script setup>`（ESM、
+    严格模式）里是 `ReferenceError`，而抛点通常在函数中段——**后面半个函数直接不执行**，
+    Vue 把异常吞进 console，普通用户看不到任何东西。
+    这类「名字还在、东西没了」的残留只有靠守卫钉住。
+    """
+    import re
+    from pathlib import Path
+
+    root = _REPO / "frontend" / "src"
+    bad = []
+    for f in root.rglob("*.vue"):
+        body = f.read_text(encoding="utf-8")
+        body = body[body.index("<script"):] if "<script" in body else ""
+        body = re.sub(r"//.*$", "", body, flags=re.M)
+        for m in re.finditer(r"^\s*(dragDepth|depth)\s*=", body, re.M):
+            bad.append(f"{f.relative_to(_REPO)}: {m.group(1)}")
+    assert not bad, f"这些页面在给未声明的计数器赋值（严格模式会当场抛）：{bad}"
+
+
+def test_no_native_browser_dialogs():
+    """不许用原生 `window.confirm / alert / prompt`。
+
+    两个理由，第二个更实际：
+    ① 全站只有**暗色一套皮**（tokens.css 说明 main.js 无条件加 `.dark`、没有切换入口），
+       所以原生对话框那块系统白底每次都是异物；而它们承担的恰好是
+       「清理插件残留配置」这种不可逆删业务数据的操作，同一张卡片上的「删除账号」
+       用的却是 ElMessageBox——同一类操作两种长相。
+    ② 浏览器对反复弹原生对话框会给出「阻止此页面创建更多对话框」的勾选框，
+       用户勾上之后 `window.confirm` **直接返回 false**：按钮从此变成死键，
+       无 toast、无报错、表现成「按钮坏了」。ElMessageBox 没有这个失效模式。
+
+    只扫 `<script>` 段并剥掉注释——解释「为什么不用它」的注释本身不该触发守卫。
+    """
+    import re
+    from pathlib import Path
+
+    bad = []
+    for f in (_REPO / "frontend" / "src").rglob("*.vue"):
+        body = f.read_text(encoding="utf-8")
+        if "<script" not in body:
+            continue
+        body = re.sub(r"//.*$", "", body[body.index("<script"):], flags=re.M)
+        for m in re.finditer(r"window\.(confirm|alert|prompt)\s*\(", body):
+            bad.append(f"{f.relative_to(_REPO)}: window.{m.group(1)}")
+    assert not bad, f"这些地方用了原生浏览器对话框：{bad}"
+
+
+def test_plugin_supplied_text_is_never_rendered_as_html():
+    """插件清单里的自由文本**只能当纯文本渲染**。
+
+    `doRun` 的确认文案取自插件自己的 `plugin.toml`（`c.confirm`），
+    `doForget` 的标题里插了 `p.id`（清单缺 id 时会退回**目录名**，无格式校验）。
+    给这两处开 `dangerouslyUseHTMLString` 就是把第三方目录名/自由文本当 HTML 执行。
+    需要分行用 `h('div', { style: 'white-space: pre-line' }, text)`。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "views" / "Plugins" / "index.vue").read_text(encoding="utf-8")
+    body = re.sub(r"//.*$", "", src[src.index("<script"):], flags=re.M)
+    assert "dangerouslyUseHTMLString" not in body, \
+        "插件页开了 HTML 渲染——那里的文案来自第三方 plugin.toml"
+    assert body.count("white-space: pre-line") >= 2, \
+        "改用 h() 之后要保住换行，否则多行确认文案会挤成一行"
+
+
+def test_the_platform_dialog_batches_instead_of_dropping_the_earlier_drop():
+    """弹窗开着的时候再拖一批，**前一批不许静默蒸发**。
+
+    `windowFileDrop` 的监听挂在 window 上、`dragover` 无条件 preventDefault，
+    而 element-plus 的遮罩只拦 mousedown——drop 会一路冒泡上去。更糟的是那层
+    「松开鼠标，识别截图」的提示（Teleport 到 body、z-index 9000）正盖在弹窗之上，
+    **主动邀请用户这么做**。
+
+    resolver 原先是单槽：第二次 `askPlatform` 直接覆盖它，第一批的 Promise 永不 settle，
+    那几张图卡在 await 上——**一次请求都不发、`ocrPending` 没加过、零报错**。
+    唯一痕迹是弹窗正文的「共 3 张」悄悄变成「共 2 张」，而最后那个批次汇总少算
+    （这一页专门用 alert 而不是 toast，就是给用户对账的）。
+
+    按结构判 + 关键不变量：等待者是数组、合批时累加张数、settle 时一次清空。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "views" / "Staging" / "index.vue").read_text(encoding="utf-8")
+    body = re.sub(r"//.*$", "", src[src.index("<script"):], flags=re.M)
+    assert "askWaiters" in body and "let askResolve" not in body, \
+        "resolver 还是单槽——弹窗开着再拖一批，前一批会静默蒸发"
+    fn = body[body.index("function askPlatform"):]
+    fn = fn[:fn.index("\nfunction ")]
+    # 只在**合批那一支**里判，不在整个函数里搜 `+=`：
+    # 第一版就是在函数体里搜，而同一个函数外还有别处的 `+=`，把 `= count` 也放过去了。
+    branch = fn[fn.index("if (askWaiters.length)"):]
+    branch = branch[:branch.index("} else")]
+    assert "ask.count +=" in branch, "合批时没有累加张数，批次汇总会少算"
+    assert "askWaiters.push" in fn, "新的等待者没有入列"
+    settle = body[body.index("function settleAsk"):]
+    settle = settle[:settle.index("\nfunction ")]
+    assert "askWaiters = []" in settle and "forEach" in settle, \
+        "settle 时没有一次性清空并唤醒全部等待者"
+
+
+def test_shipment_row_pick_goes_through_the_queue():
+    """集运页「点击选图」必须走串行队列，不能直接发请求。
+
+    拖拽那条路（`onRowDrop`）是排队的，注释里专门解释了为什么必须排队；
+    而点选这条原先直接 `bindExpress` ⇒ A 行识别中点 B 行选图就是两个请求并发。
+    `bindingRowId` 是**单槽**：B 一开始就把它改写，A 的「识别中…」当场消失、
+    格子恢复可点（`.bind-drop.busy` 只改 color/cursor，没有 `pointer-events:none`），
+    用户以为没提交、再拖一次；先回来的那个在 finally 里把它清成 null，
+    另一行的忙态也跟着没了而请求还在飞。
+
+    后端不会写脏数据（OCR 有 `_infer_lock`、挂靠 UPDATE 带 EXISTS 守卫）——
+    坏的是**界面对「谁在跑」说假话**，外加重复的多秒 OCR。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "views" / "Shipment" / "index.vue").read_text(encoding="utf-8")
+    body = re.sub(r"//.*$", "", src[src.index("<script"):], flags=re.M)
+    fn = body[body.index("function onRowPick"):]
+    fn = fn[:fn.index("\nfunction ")]
+    assert "enqueueBind" in fn, "点选没有入队，会与在飞的那一行并发"
+    assert "bindExpress" not in fn, "点选还在直接调 bindExpress，绕过了队列"
+
+
+def test_sort_by_date_desc_is_a_total_order_even_with_nulls():
+    """排序比较器必须满足传递性——**含空值时也要**。
+
+    JS 里 `null < 'x'` 与 `null > 'x'` **都是 false**，所以含空值的行对会一路落到
+    `b.id - a.id`，而那与「按日期排」不是同一个序 ⇒ 比较器出现 A<C、C<B、B<A 的环 ⇒
+    `Array.sort` 的结果**随输入顺序而变**。实测：同一批 6 行只改输入顺序得到 **3 种不同结果**，
+    而且**连非空行都会被带歪**（08-03 排到 08-02 前面）。
+
+    暂存页最容易撞上：`order_date` 可以为 NULL（OCR 认不出「下单时间」就不下发这个键，
+    NotionTable 的幽灵新建行也不预填日期）。顺带那一页的 `dateKey` 本来就传错了——
+    后端排的是 `scraped_at`，四页里只有它和后端对不上。
+
+    真跑，不 grep：这是纯函数，node 直接能验。
+    """
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        import os
+        if os.environ.get("SOROBAN_NO_NODE"):
+            pytest.skip("显式声明了本机没有 node（SOROBAN_NO_NODE=1）")
+        raise AssertionError("找不到 node；真没有请设 SOROBAN_NO_NODE=1。")
+
+    src = (_REPO / "frontend" / "src" / "utils" / "listRows.js").read_text(encoding="utf-8")
+    src = src.replace("import { ElMessage } from 'element-plus'",
+                      "const ElMessage = { info() {}, warning() {} }")
+    harness = _REPO / "node-sort.test.mjs"
+    harness.write_text(src + r"""
+const mk = () => [
+  { id: 1, d: '2026-08-01' }, { id: 2, d: null }, { id: 3, d: '2026-08-03' },
+  { id: 4, d: null }, { id: 5, d: '2026-08-02' }, { id: 6, d: null }]
+const shuffle = (a, s) => { a = [...a]
+  for (let i = a.length - 1; i > 0; i--) { s = (s * 1103515245 + 12345) % 2147483648
+    const j = s % (i + 1); [a[i], a[j]] = [a[j], a[i]] } return a }
+
+const seen = new Set()
+for (const s of [1, 7, 42, 99, 123, 555]) {
+  const rows = shuffle(mk(), s)
+  sortByDateDesc(rows, 'd')
+  seen.add(rows.map((r) => r.id).join(','))
+}
+const out = { stable_regardless_of_input_order: seen.size === 1, got: [...seen] }
+// 非空的必须按日期降序，空的必须在末尾
+const rows = shuffle(mk(), 7); sortByDateDesc(rows, 'd')
+const dates = rows.filter((r) => r.d).map((r) => r.d)
+out.non_null_are_descending = JSON.stringify(dates) === JSON.stringify([...dates].sort().reverse())
+out.nulls_go_last = rows.slice(3).every((r) => r.d == null)
+console.log(JSON.stringify(out))
+""", encoding="utf-8")
+    try:
+        r = subprocess.run([node, str(harness)], cwd=_REPO, capture_output=True,
+                           text=True, timeout=60)
+    finally:
+        harness.unlink(missing_ok=True)
+    assert r.returncode == 0, f"node 跑挂了：{r.stderr[-600:]}"
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert got["stable_regardless_of_input_order"], \
+        f"比较器不满足传递性，同一批数据排出多种结果：{got['got']}"
+    assert got["non_null_are_descending"], "非空行没有按日期降序"
+    assert got["nulls_go_last"], "空值没有排在末尾（后端 NULL 在 desc 里也靠后）"
+
+
+def test_staging_sorts_by_the_same_column_the_backend_orders_by():
+    """暂存页本地插入用的排序列，必须与后端 `order_by` 同一列。
+
+    后端排 `scraped_at`，而前端原先传 `order_date`——四页里只有这页对不上，
+    于是「本地插入看到的顺序」与「刷新之后的顺序」不一致；
+    而 `order_date` 还可以为 NULL，正好触发上一条那个传递性问题。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "views" / "Staging" / "index.vue").read_text(encoding="utf-8")
+    body = re.sub(r"//.*$", "", src[src.index("<script"):], flags=re.M)
+    assert "dateKey: 'scraped_at'" in body, "暂存页的 dateKey 与后端 order_by 不是同一列"
+
+    be = (_REPO / "backend" / "app" / "routers" / "staging.py").read_text(encoding="utf-8")
+    assert "OrderStaging.scraped_at.desc()" in be, \
+        "后端换了排序列，前端那个 dateKey 要跟着改（这条守卫就是为了让它红）"
+
+
+def test_tag_changes_reach_every_page_that_keeps_its_own_copy():
+    """表格里改标签之后，**各页自己那份候选集必须跟着变**。
+
+    `tags.py` 的改名会 `UPDATE ... SET col=新 WHERE col=旧`——**旧名在库里彻底消失**。
+    而 NotionTable 原先只刷新自己那份 `tagOptions` 并 `emit('reload')`，
+    父页的 `@reload="load"` 只重拉**行**。于是：
+
+    · 工具栏筛选里选不到新名；
+    · 若筛选此刻正停在旧名，紧接着的 `load()` 拿一个不存在的值精确匹配 → 0 行 →
+      空态显示「没有符合条件的记录」——**刚改完名就像把单子改没了**；
+    · 更没救的是新增/删除/改色：那几条原先**一个事件都不发**，
+      新加的账号在工具栏筛选和编辑面板的 `:accounts` 里永远选不到，直到组件重挂载。
+
+    事件发在 `applyTags`——所有标签变更的唯一汇合点，四条路径一次覆盖。
+    """
+    import re
+
+    root = _REPO / "frontend" / "src"
+    nt = (root / "components" / "NotionTable.vue").read_text(encoding="utf-8")
+    body = re.sub(r"//.*$", "", nt[nt.index("<script"):], flags=re.M)
+    assert "'tags-changed'" in body, "NotionTable 没有声明 tags-changed 事件"
+    fn = body[body.index("function applyTags"):]
+    fn = fn[:fn.index("\nasync function ")]
+    assert "emit('tags-changed'" in fn, \
+        "事件没发在 applyTags 里——那是所有标签变更（改名/新增/删除/改色）的唯一汇合点，" \
+        "发在别处就会漏掉其中几条"
+
+    # 三个各存一份候选集的页面都要接上
+    for page in ("Orders", "Staging", "Items"):
+        src = (root / "views" / page / "index.vue").read_text(encoding="utf-8")
+        assert '@tags-changed="onTagsChanged"' in src, f"{page} 没接 tags-changed"
+        b = re.sub(r"//.*$", "", src[src.index("<script"):], flags=re.M)
+        assert "function onTagsChanged" in b, f"{page} 接了事件却没有处理函数"
+
+
+def test_a_filter_stuck_on_a_renamed_value_is_cleared():
+    """筛选停在一个**已经不存在**的值上时，必须清掉并说一句。
+
+    改名之后旧名在库里已经没有了，拿它精确匹配会查回 0 行，
+    空态显示「没有符合条件的记录」——用户刚改完名就看到「单子没了」。
+    留着一个查不到东西的筛选值，比清掉它更糟：他不会想到问题出在筛选上。
+    """
+    import re
+
+    for page in ("Orders", "Staging"):
+        src = (_REPO / "frontend" / "src" / "views" / page / "index.vue").read_text(encoding="utf-8")
+        b = re.sub(r"//.*$", "", src[src.index("<script"):], flags=re.M)
+        fn = b[b.index("function onTagsChanged"):]
+        fn = fn[:fn.index("\n}") + 2]
+        assert "!values.includes(filters.platform_account)" in fn, \
+            f"{page} 没有检查筛选值是否还在候选集里"
+        assert "filters.platform_account = ''" in fn, f"{page} 没有清掉失效的筛选值"
+        assert "ElMessage" in fn, f"{page} 清了筛选却没告诉用户，他会以为筛选自己乱了"

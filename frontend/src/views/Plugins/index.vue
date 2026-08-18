@@ -8,7 +8,15 @@
       </template>
     </PageHeader>
 
-    <el-empty v-if="!loading && !plugins.length" description="未发现插件（plugins/ 下没有 soroban-plugin-* 目录）" />
+    <!-- **三分支，顺序要紧**：失败 → 真空 → 卡片列表。
+         「plugins/ 下没有目录」是全应用唯一一句**断言用户磁盘**的空态，而它原先在请求失败时
+         照样显示——一个配好账号、授权、定时的人，首次进页面就被告知插件目录是空的，
+         自然反应是去查目录、重拷插件、重建 venv（重下 Playwright 浏览器）。
+         而这条路径特别容易撞上：GET /api/plugins 允许每个插件跑 30-60 秒的子进程探测，
+         客户端 axios 超时只有 15 秒，装完依赖后的第一次刷新几乎必然超时。 -->
+    <el-empty v-if="loadFailed" description="加载失败——请检查网络或后端，然后重试" />
+    <el-empty v-else-if="!loading && !plugins.length"
+              description="未发现插件（plugins/ 下没有 soroban-plugin-* 目录）" />
 
     <el-card v-for="p in plugins" :key="p.id" class="plugin" v-loading="p._busy">
       <template #header>
@@ -216,7 +224,7 @@
 
 <script setup>
 import PageHeader from '@/components/PageHeader.vue'
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, h, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, ArrowRight, ArrowUp, Refresh, QuestionFilled } from '@element-plus/icons-vue'
 import { pluginsApi, tagsApi } from '@/api'
@@ -225,6 +233,15 @@ import { longToast, tagStyleAt, typeStyle } from '@/constants'
 import { fmtDateTime } from '@/utils/datetime'
 
 const plugins = ref([])
+let loadSeq = 0
+// 轮询连续失败多少次才放弃。**不是 1**：一次 503 / 一次 WiFi 抖动就永久停表，
+// 而卡片会一直停在「执行中…」或「安装中…」对状态说假话。
+const _POLL_MAX_FAILS = 3
+let installFails = 0
+let runFails = 0
+// 上一次加载是否失败：空态文案据此说实话。这一页的空态在**断言用户的磁盘**，
+// 请求失败时照样显示的话，不只是没信息，是给了一条错误的行动指令（去重装插件）。
+const loadFailed = ref(false)
 const loading = ref(false)
 const platformTags = ref([])   // [{value,color}] 来源平台标签集（下拉选项 + 上色）
 
@@ -255,10 +272,22 @@ async function doForget(p) {
   // 文案里要点名**插件私有存储**：它跟授权/定时不一样，是插件自己写进去的业务数据
   // （`data:own` / PluginRecord）。不说的话，用户以为只是清掉几项配置，
   // 而实际上那些数据也一并没了——这一步是不可逆的。
-  if (!window.confirm(`清理「${p.id}」的残留配置？\n\n`
-    + `会删掉它的授权、定时、账号、上次结果，以及它写入的插件私有存储。\n`
-    + `这一步不可逆。\n\n`
-    + `留着的话，以后放一个同 id 的插件进来会直接继承这份授权与私有存储。`)) return
+  // 用 ElMessageBox 而不是 window.confirm：全站只有暗色一套皮（tokens.css 里 main.js
+  // 无条件加 .dark，没有切换入口），原生对话框那块白底每次都是异物——而它承担的
+  // 恰好是全站唯一一处不可逆删业务数据的操作，同一张卡片往下的「删除账号」用的就是 ElMessageBox。
+  // 还有一个更实际的理由：浏览器对反复弹原生对话框会给「阻止此页面创建更多对话框」，
+  // 勾上之后 window.confirm 直接返回 false——按钮变死键，无 toast、无报错。
+  // **不用 dangerouslyUseHTMLString**：下面 doRun 那处的文案来自第三方 plugin.toml，
+  // 这里也插值了 p.id（清单缺 id 时会退回目录名，无格式校验）。要分行就用 h()。
+  try {
+    await ElMessageBox.confirm(
+      h('div', { style: 'white-space: pre-line' },
+        `会删掉它的授权、定时、账号、上次结果，以及它写入的插件私有存储。\n`
+        + `这一步不可逆。\n\n`
+        + `留着的话，以后放一个同 id 的插件进来会直接继承这份授权与私有存储。`),
+      `清理「${p.id}」的残留配置？`,
+      { type: 'warning', confirmButtonText: '清理', cancelButtonText: '取消' })
+  } catch (_) { return }
   p._busy = true
   try {
     const r = await pluginsApi.forget(p.id)
@@ -271,7 +300,14 @@ async function doForget(p) {
   } catch (_) { /* 拦截器已提示 */ } finally { p._busy = false }
 }
 async function doRun(p, c) {
-  if (c.confirm && !window.confirm(c.confirm)) return
+  // 这句文案来自插件自己的 plugin.toml，是**第三方自由文本**——只能当纯文本渲染。
+  if (c.confirm) {
+    try {
+      await ElMessageBox.confirm(h('div', { style: 'white-space: pre-line' }, c.confirm),
+                                 `执行「${c.label}」`,
+                                 { type: 'warning', confirmButtonText: '继续', cancelButtonText: '取消' })
+    } catch (_) { return }
+  }
   p._busy = true
   try {
     const r = await pluginsApi.run(p.id, c.name)
@@ -347,9 +383,14 @@ async function toggleGrant(p, key, on) {
 function enabledCount(p) { return p.accounts.filter((a) => a.configured && a.enabled).length }
 
 async function load() {
+  // **序号门**：这一页的 load 会被 onMounted、安装轮询、执行轮询三处并发调用，
+  // 而 GET /api/plugins 每个插件允许 30-60 秒的子进程探测——先发的那次很可能后回来，
+  // 用一份旧快照盖掉新的。与其它列表页同一口径（见 Items/index.vue）。
+  const my = ++loadSeq
   loading.value = true
   try {
     const list = await pluginsApi.list()
+    if (my !== loadSeq) return
     const prev = Object.fromEntries(plugins.value.map((x) => [x.id, x]))
     plugins.value = list.map((p) => ({
       ...p, _busy: false,
@@ -382,8 +423,12 @@ async function load() {
     // 否则「执行中」要等用户自己想起来点刷新才会变。
     if (list.some((p) => p.last_run?.outcome === 'running')) scheduleRunPoll()
     try { platformTags.value = await tagsApi.list('platform') } catch (_) { /* 无所谓，下拉可自建 */ }
-  } catch (_) { /* 拦截器已提示 */ } finally {
-    loading.value = false
+    loadFailed.value = false
+  } catch (_) {
+    // 拦截器已提示原因；这里负责让**页面本身**留下痕迹，否则空态在说假话。
+    if (my === loadSeq) loadFailed.value = true
+  } finally {
+    if (my === loadSeq) loading.value = false
   }
 }
 
@@ -407,6 +452,7 @@ function scheduleInstallPoll() {
   installTimer = setInterval(async () => {
     try {
       const list = await pluginsApi.list()
+      installFails = 0                          // 成功一次就把连败清零
       if (!list.some((p) => p.install && p.install.running)) {
         clearInterval(installTimer); installTimer = null
         await load()                          // 装完整体刷新一次，状态与按钮一起就位
@@ -417,7 +463,18 @@ function scheduleInstallPoll() {
         const cur = plugins.value.find((x) => x.id === fresh.id)
         if (cur) { cur.install = fresh.install; cur.needs = fresh.needs; cur.installed = fresh.installed }
       }
-    } catch (_) { clearInterval(installTimer); installTimer = null }
+    } catch (_) {
+      // **不能错一次就永久停。** 这个 catch 吃的是**任何**错误，而最现实的是
+      // `main.py` 那条连接池繁忙时的 503（它写出来就是为了应付繁忙时刻），
+      // 以及 WiFi 抖动 / 睡眠唤醒——后者这个应用专门修过恢复路径
+      // （离线遮罩 + 健康轮询），页面上除了这两个计时器之外的一切都能自愈，
+      // 唯独它们停了就再也不回来：装完那次用来整体刷新的 load() 永不执行，按钮一直禁着。
+      // 连续失败到上限才停，并说一句——否则用户只看到一个卡住的界面，毫无线索。
+      if (++installFails >= _POLL_MAX_FAILS) {
+        clearInterval(installTimer); installTimer = null
+        ElMessage.warning('安装进度获取失败，已停止刷新——点「刷新」可继续查看')
+      }
+    }
   }, 2000)
 }
 // 有插件在跑就盯着，跑完自动把结果换上。**与安装轮询分开两个计时器**：
@@ -429,6 +486,7 @@ function scheduleRunPoll() {
   runTimer = setInterval(async () => {
     try {
       const list = await pluginsApi.list()
+      runFails = 0                              // 成功一次就把连败清零
       for (const fresh of list) {
         const cur = plugins.value.find((x) => x.id === fresh.id)
         if (cur) { cur.last_run = fresh.last_run; cur.config.last_run_at = fresh.config.last_run_at }
@@ -436,7 +494,14 @@ function scheduleRunPoll() {
       if (!list.some((x) => x.last_run?.outcome === 'running')) {
         clearInterval(runTimer); runTimer = null
       }
-    } catch (_) { clearInterval(runTimer); runTimer = null }
+    } catch (_) {
+      // 同上。这条更要紧：它跑在「抓取可以是十几分钟」的最繁忙那一段，
+      // 一次 503 就让卡片永久停在「执行中…」——而 run poll 连收尾的 load() 都没有。
+      if (++runFails >= _POLL_MAX_FAILS) {
+        clearInterval(runTimer); runTimer = null
+        ElMessage.warning('执行状态获取失败，已停止刷新——点「刷新」可继续查看')
+      }
+    }
   }, 4000)
 }
 onBeforeUnmount(() => {
