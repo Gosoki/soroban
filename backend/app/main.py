@@ -130,7 +130,6 @@ def docs_enabled(host: str, override: str) -> bool:
     return (override or "").strip().lower() in ("1", "true", "yes") or not lan
 
 
-_LAN = os.environ.get("HOST", "127.0.0.1") not in ("127.0.0.1", "localhost", "::1")
 _DOCS = docs_enabled(os.environ.get("HOST", "127.0.0.1"), os.environ.get("SOROBAN_DOCS", ""))
 
 app = FastAPI(title="soroban", version="0.1.0", lifespan=lifespan,
@@ -139,7 +138,7 @@ app = FastAPI(title="soroban", version="0.1.0", lifespan=lifespan,
               openapi_url="/openapi.json" if _DOCS else None)
 if not _DOCS:
     log.info("HOST=%s（非环回）→ 已关闭 /docs 与 /openapi.json。要开：SOROBAN_DOCS=1",
-             os.environ.get("HOST"))
+             os.environ.get("HOST", "127.0.0.1"))
 
 # 数据库迁移期间只读：拷贝没有读快照，期间写入会产生撕裂的拷贝（详见 app/maintenance.py）。
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})

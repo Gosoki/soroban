@@ -164,3 +164,148 @@ def test_no_unknown_kwargs_in_model_construction(pkg):
                     rel = path.relative_to(_BACKEND)
                     bad.append(f"{rel}:{node.lineno} {node.func.id}(…{kw.arg}=…)")
     assert not bad, "模型构造传了不存在的字段名（会被静默丢弃）：\n  " + "\n  ".join(bad)
+
+
+# --- 演示数据脚本不许碰真账本 -----------------------------------------------------
+
+def _stub_demo(monkeypatch, demo, *, backend, engine=None):
+    """把 demo 的外部副作用换成记录器。**被断言的那几个调用不算「被绕过」**——
+    这条测试要问的正是「它们有没有被调、按什么顺序」。
+    """
+    touched = []
+    monkeypatch.setattr(demo, "current_backend", lambda: backend)
+    monkeypatch.setattr(demo, "create_db_and_tables", lambda: touched.append("迁移"))
+    monkeypatch.setattr(demo.single_process, "acquire", lambda url: touched.append("拿闸"))
+    if engine is not None:
+        monkeypatch.setattr(demo, "get_engine", lambda: engine)
+        # **`app.seed` 那份也要换。** `ensure_admin()` 用的是它自己模块里的 `get_engine`，
+        # 只换 demo 这一份的话，管理员会被建到会话共享库上，而断言查的是临时库
+        # ⇒ 「建号排在闸前」这条破坏两种情况下都不红（判据被另一个原因满足）。
+        from app import seed as _seed
+        monkeypatch.setattr(_seed, "get_engine", lambda: engine)
+    return touched
+
+
+def test_demo_refuses_a_remote_backend_before_touching_it(monkeypatch, capsys):
+    """**闸必须排在任何一次动库之前。**
+
+    第一版把它写在 `create_db_and_tables()` **之后**，而那一句做的是
+    「对当前生效的数据后端跑完整条 alembic upgrade」——MySQL 后端的用户跑一次
+    `python -m app.demo`，生产库先被跑完整链迁移，**然后**才打印「已中止」。
+    而且那一路完全没有单进程闸：soroban 正开着时就是「两个进程同时 ALTER 同一个库」。
+    """
+    from app import demo
+
+    monkeypatch.delenv("SOROBAN_DEMO_YES", raising=False)
+    touched = _stub_demo(monkeypatch, demo, backend="mysql")
+    demo.main()
+
+    out = capsys.readouterr().out
+    assert "已中止" in out and "mysql" in out, out
+    assert touched == [], f"中止之前已经动了库：{touched}"
+
+    # **反面**：显式确认之后必须放行，而且顺序是「先拿闸、再迁移」
+    monkeypatch.setenv("SOROBAN_DEMO_YES", "1")
+    touched2 = _stub_demo(monkeypatch, demo, backend="mysql")
+    try:
+        demo.main()
+    except Exception:
+        pass                      # 之后会真去连库，本条只关心前两步
+    assert touched2[:2] == ["拿闸", "迁移"], touched2
+
+
+def test_demo_leaves_an_existing_ledger_completely_alone(tmp_path, monkeypatch, capsys):
+    """任一张业务表非空就跳过，而且**跳过之前一个字节都不许写**。
+
+    闸只看商品订单是不够的：只记了集运单/杂项的新用户会被放行。
+    而建号原先排在这道闸**之前** ⇒ 一本已经在用的账本会先凭空多出一个
+    用公开默认口令的管理员，紧接着才打印「不覆盖任何现有数据」——那句话当场是假的。
+
+    这条在**自己的临时库**上跑真流程（上一版靠 mock 掉 `create_db_and_tables` 来避开，
+    结果既遮住了上面那条 bug，又真的往会话共享库里灌了一整套演示数据）。
+    """
+    import datetime as dt
+
+    from sqlmodel import Session, select
+
+    from app.database import build_engine, run_migrations
+    from app.models import Order, ShipmentOrder, User
+
+    url = f"sqlite:///{tmp_path / 'demo-target.db'}"
+    run_migrations(url)
+    e = build_engine(url)
+    try:
+        with Session(e) as s:                     # 只有集运单：闸若只看商品订单就会放行
+            s.add(ShipmentOrder(date=dt.date(2027, 1, 1)))
+            s.commit()
+
+        from app import demo
+        monkeypatch.setenv("SOROBAN_DEMO_YES", "1")
+        _stub_demo(monkeypatch, demo, backend="sqlite", engine=e)
+        demo.main()
+
+        out = capsys.readouterr().out
+        assert "集运订单" in out and "跳过" in out, out
+        with Session(e) as s:
+            assert s.exec(select(User)).first() is None, "跳过之前先建了个管理员"
+            assert s.exec(select(Order)).first() is None, "还是灌了演示数据"
+    finally:
+        e.dispose()
+
+
+def test_demo_actually_seeds_an_empty_ledger(tmp_path, monkeypatch, capsys):
+    """**反面**：空库要真的灌进去，否则上面那两条闸写成「永远不灌」也能过。"""
+    from sqlmodel import Session, select
+
+    from app.database import build_engine, run_migrations
+    from app.models import Order, ShipmentOrder
+
+    url = f"sqlite:///{tmp_path / 'demo-empty.db'}"
+    run_migrations(url)
+    e = build_engine(url)
+    try:
+        from app import demo
+        monkeypatch.setenv("SOROBAN_DEMO_YES", "1")
+        _stub_demo(monkeypatch, demo, backend="sqlite", engine=e)
+        demo.main()
+        with Session(e) as s:
+            assert s.exec(select(Order)).first() is not None, "空库也没灌进去"
+            assert s.exec(select(ShipmentOrder)).first() is not None
+    finally:
+        e.dispose()
+
+
+def test_env_can_set_the_first_admin_credentials(tmp_path, monkeypatch):
+    """`.env` 里的 `SOROBAN_ADMIN_USER/PASS` 必须真的生效。
+
+    `seed.ensure_admin()` 读的是 `os.getenv`，而 `.env` 只被 pydantic-settings 读进
+    `Settings`（这两个键还不是 Settings 的字段），**从不写回 `os.environ`**。
+    于是冻结版用户在 `.env` 里写 `SOROBAN_ADMIN_PASS=强口令`，首启建出来的仍是默认口令
+    ——而 `.env` 是双击用户**唯一**能编辑的入口（`run.py` 自己的注释就是这么写的）。
+    删掉「把口令打到控制台」是对的，但替代文案不能指向一个不生效的地方。
+    """
+    import run as run_mod
+
+    for k in ("SOROBAN_ADMIN_USER", "SOROBAN_ADMIN_PASS", "HOST", "BACKEND_PORT"):
+        monkeypatch.delenv(k, raising=False)
+    (tmp_path / ".env").write_text(
+        "SOROBAN_ADMIN_USER=gosoki\nSOROBAN_ADMIN_PASS=一个很长的口令\n", encoding="utf-8")
+
+    # ① 启动器的 .env 解析器读得出这两项（整支 main() 会去起 uvicorn，只能单独调它）
+    assert run_mod._runtime_setting(tmp_path, "SOROBAN_ADMIN_USER", "") == "gosoki"
+    assert run_mod._runtime_setting(tmp_path, "SOROBAN_ADMIN_PASS", "") == "一个很长的口令"
+
+    # ② 而且 main() 里确实把它们**落进了 os.environ**——这一步是承重的：
+    #    seed 读的是 os.getenv，.env 不会自己进环境变量。
+    import ast
+    import inspect
+    import textwrap
+    src = textwrap.dedent(inspect.getsource(run_mod.main))
+    keys = set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                and node.value.startswith("SOROBAN_ADMIN"):
+            keys.add(node.value)
+    assert keys == {"SOROBAN_ADMIN_USER", "SOROBAN_ADMIN_PASS"}, (
+        f"启动器没把 .env 里的这两项落进 os.environ：{keys}。"
+        "`seed.ensure_admin()` 读的是 os.getenv，而 .env 不会自己进环境变量")

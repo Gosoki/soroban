@@ -14,7 +14,8 @@ from decimal import Decimal
 
 from sqlmodel import Session, select
 
-from .database import create_db_and_tables, get_engine
+from . import single_process
+from .database import control_url, create_db_and_tables, current_backend, get_engine
 from .seed import ensure_admin
 from .models import (
     ColumnLayout, FxRate, ShipmentOrder, MiscExpense, OrderItem, StagingItem, TagOption,
@@ -41,9 +42,11 @@ def main() -> None:
     只记了集运单与杂项的新用户会被放行，然后往真库里灌 3 集运 / 9 订单 / 4 杂项 / 4 暂存，
     全程没有确认、也**不说自己在写哪个库**。
     """
-    from .database import current_backend
-
-    create_db_and_tables()
+    # **闸必须排在任何一次动库之前。** 第一版把它放在 `create_db_and_tables()` 之后，
+    # 而那一句做的是「对**当前生效的数据后端**跑完整条 alembic upgrade」——
+    # MySQL 后端的用户跑一次 `python -m app.demo`，生产库先被跑完整链迁移，
+    # **然后**才打印「已中止」。`current_backend()` 只是比较两个模块级引擎
+    # （import 期就解析好了），建库之前调它是安全的。
     backend = current_backend()
     print(f"[demo] 即将写入当前生效的数据库：{backend}")
     if backend != "sqlite" and os.environ.get("SOROBAN_DEMO_YES") != "1":
@@ -52,18 +55,31 @@ def main() -> None:
               "确认要往它灌演示数据，请设 SOROBAN_DEMO_YES=1 再跑。已中止。")
         return
 
-    with Session(get_engine()) as s:
-        # 建号交给 `seed.ensure_admin()`：它认 SOROBAN_ADMIN_USER/PASS。
-        # 原先这里硬写 `admin`/`admin123`，于是改过账号名的用户会在自己的真库里
-        # 悄悄多出一个用公开默认口令的管理员。
-        ensure_admin()
+    # **也要拿单进程闸**：这一路同样会跑完整条迁移，而 soroban 正开着时就是
+    # 「两个进程同时 ALTER 同一个库」——正是把建库从启动器搬进 lifespan 要消灭的那件事。
+    try:
+        single_process.acquire(control_url())
+    except single_process.MultipleInstances:
+        print("[demo] soroban 正在运行 —— 先关掉它再灌演示数据"
+              "（这个脚本会跑迁移，不能和正在用库的进程同时动手）。已中止。")
+        return
 
+    create_db_and_tables()
+    with Session(get_engine()) as s:
         # 闸只看商品订单是不够的：只记了集运单/杂项的新用户会被放行。
+        # **它必须排在建号之前**：第一版把 `ensure_admin()` 写在了前面，
+        # 于是一本已经在用的账本会先凭空多出一个管理员，紧接着才打印
+        # 「跳过演示数据灌入（不覆盖任何现有数据）」——那句话当场就是假的。
         for _model, _label in ((Order, "商品订单"), (ShipmentOrder, "集运订单"),
                                (MiscExpense, "杂项支出"), (OrderStaging, "暂存订单")):
             if s.exec(select(_model)).first():
                 print(f"[demo] 库里已经有{_label}，跳过演示数据灌入（不覆盖任何现有数据）。")
                 return
+
+        # 建号交给 `seed.ensure_admin()`：它认 SOROBAN_ADMIN_USER/PASS。
+        # 原先这里硬写 `admin`/`admin123`，于是改过账号名的用户会在自己的真库里
+        # 悄悄多出一个用公开默认口令的管理员。
+        ensure_admin()
 
         # 汇率（供导入/预填）——已有当日汇率就不重复插入
         if not s.exec(select(FxRate).where(FxRate.date == D(2026, 7, 9))).first():

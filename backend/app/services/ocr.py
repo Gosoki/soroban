@@ -126,15 +126,33 @@ def _longest_digit_run(text: str, min_len: int = 1) -> Optional[str]:
 # 主流快递单号的长度下界：顺丰 12/15、圆通/中通/申通 12、韵达 13、EMS 13、京东 JD+13。
 # 短于它的「号」本身可疑，但只有在**旁边还紧邻着另一段数字**时才判定为被 OCR 断开——
 # 孤立的短号照常取，见 _looks_split。
-_TRACK_TYPICAL_MIN = 10
+#
+# **这个值必须等于上面列出的那个下界（12），原先是 10，没有依据。**
+# 差这两位的后果不是「少挡一点」，而是整条防线在最常见的断法上失效：
+#   `快递单号 7512345678 9012`  → 交出 `7512345678`（10 位）
+#   `国际单号 EB86162438 6CN`   → 交出 `EB86162438`（10 位）
+# 而 `shipment.py` 的闸是 `len(no) < 10` ⇒ 10 位的半截号**两道闸都过**，
+# 随后被 `Order.express_no == no` 精确匹配并**原子挂靠**：匹配不上只是漏一单，
+# 撞上别人的号就是把货挂到无关订单上，而 `version` 已经 +1、不可撤销。
+# 取 12 之后这四种断法全部落进 `unreadable`，用户看得见「另有 N 行未能读出单号」。
+# 代价是「10~11 位的真号 + 紧邻另一段数字」也会被判读不出——那是刻意的安全方向
+# （本函数 docstring 的原话：**宁可不取，也不能取错**），而且现存快递公司没有这个长度。
+_TRACK_TYPICAL_MIN = 12
 
 
 def _looks_split(text: str, best: str) -> bool:
-    """`best` 左右紧邻（只隔一个空格）还有另一段含数字的字母数字串。
+    r"""`best` 左右紧邻（只隔一个空格）还有另一段含数字的字母数字串。
 
-    这是「这一行的号被 OCR 断成了两截」的信号。判据要求**紧邻且只隔一个空格**，
-    所以同行的日期（`2026-08-01` 会被切成三段，但分隔符是连字符）、
-    中文标签（不进 alnum run）都不会误触发。
+    这是「这一行的号被 OCR 断成了两截」的信号。
+
+    ⚠️ **这个判据比它看起来宽。** 原注释说「同行的日期不会误触发」——那是假的：
+    右侧那条正则 `^ [A-Za-z0-9]*\d[A-Za-z0-9]*` **没有右锚定**，
+    所以 `快递单号 12345678 2026-08-01` 里的 `2026` 就够让它返回 True（实测）；
+    `... 1件` 里的 `1` 同样够。真正让「12 位真号 + 同行日期」活下来的是
+    调用方那道**长度闸**（`len(best) < _TRACK_TYPICAL_MIN`），不是这里的什么形态判断。
+    两件事要分开记：本函数只回答「旁边还有没有另一段数字」，
+    「这算不算断号」由长度闸和它一起决定。
+    中文标签确实不会误触发（不进 alnum run）。
     """
     m = re.search(rf"(?<![A-Za-z0-9]){re.escape(best)}(?![A-Za-z0-9])", text)
     if not m:
@@ -166,6 +184,10 @@ def _extract_tracking(text: str, min_len: int = 8) -> Optional[str]:
         return None
     return best.upper()
 
+
+# 「这个框自带中文标签吗」。用于 `_same_row_value` 的向下兜底：
+# 值格里只有号，带中文的框是别人的「标签: 值」，不该被隔壁的锚点抢走。
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
 # OCR 常把 ASCII 连字符识别成各种全角/排版破折号，统一归一后再做正则匹配。
 _DASHES = "–—−‒﹘﹣－"
@@ -270,8 +292,13 @@ _BELOW_ROWS = 2      # 「往下兜底」最多跨几行（× row_tol）；见 _
 
 def _same_row_value(anchor: dict, tokens: list[dict], row_tol: float,
                     min_len: int, key: str = "digits", allow_below: bool = True) -> Optional[str]:
-    """在与 anchor 同一行（y 接近）里找 key 值（digits/tracking）最长的框，优先取右侧的。
-    找不到同行则退回到 anchor 下方最近的框。
+    """在与 anchor 同一行（y 接近）的框里取 key 值（digits/tracking），**优先取右侧的**；
+    右侧有多个时取 y 最接近的那个。找不到同行则退回到 anchor 下方最近的框。
+
+    ⚠️ 原注释写的是「找 key 值**最长**的框」——实现里从来没有比较过长度（见下面那两行）。
+    「取最长」对单号类字段其实更有道理（一行里两段数字时长的那段多半是真号），
+    但没有真实截图能验证这个改动，所以先把注释改成实话，把「要不要改成取最长」
+    记进审计报告等定夺，而不是让一句假描述继续被后来的改动当作前提。
 
     `allow_below=False` 用于**内容词锚点**（如快递公司名）——真标签（「订单编号」「快递单号」）
     只会出现在它的值旁边，往下兜底是安全的；而公司名可能出现在页面任何地方（商品标题里的
@@ -293,11 +320,48 @@ def _same_row_value(anchor: dict, tokens: list[dict], row_tol: float,
         return pick[key]
     if not allow_below:
         return None
+    # **向下兜底只认「光秃秃的值」——自带标签的框属于它自己的标签。**
+    # 那个版式的前提是「列头在上、值在下一行」，而值格里就是一个号、没有中文。
+    # 不加这一条时：页面上只有一个光秃秃的「订单号」列头（列头/筛选栏/灰色分组标题），
+    # 下一行是页脚的 `客服电话 13800138000` ⇒ 兜底把手机号取成订单号。
+    # 而 order_no 是暂存去重键、也是账本活跃唯一键的一半
+    # （`ix_orders_order_no_platform_active`）⇒ 同一批里两张截图兜底到同一个页脚号码，
+    # 第二张会被**并进第一行**，两笔交易塌成一条。
+    # 上面 `_BELOW_ROWS` 那道距离上限挡的是「跨半页抓」，挡不住「紧邻下一行是别人的字段」。
     below = [t for t in cands
-             if 0 < t["cy"] - anchor["cy"] <= row_tol * _BELOW_ROWS]
+             if 0 < t["cy"] - anchor["cy"] <= row_tol * _BELOW_ROWS
+             and not _CJK_RE.search(t["text"])]
     if below:
         return min(below, key=lambda t: t["cy"] - anchor["cy"])[key]
     return None
+
+
+def _column_below(anchor: dict, tokens: list[dict], row_tol: float, key: str) -> list[str]:
+    """锚点是**光秃秃的列头**时，沿着这一列连续往下收值。
+
+    为什么需要：内含快递页存在「一个列头『快递单号』+ 下面 N 行号」的表格版式
+    （`_same_row_value` 的 `_BELOW_ROWS` 兜底就是为它留的）。但取值只取**最近的一个**，
+    而 `parse_shipment_fields` 的循环又只遍历「文本里含『快递单号』的框」
+    ⇒ 三行号只出一个，剩下两个**连看都没看**，且 `unreadable` 仍是 0
+    ⇒ 前端弹出的是纯绿色的「已关联 1 单」，用户没有任何线索知道少了两单。
+
+    判据刻意收得很窄：
+      · 只在**锚点自己不带值**时启用（自带值的行是「标签: 值」，不是列头）；
+      · 逐行**连续**往下，行距超过 `_BELOW_ROWS` 行就停——列到此为止；
+      · 带中文的框直接停（那是下一个字段的标签，见 `_same_row_value` 的同款判据）；
+      · 取不出号的行也停。它可能是被 OCR 断开的号，但继续往下扫就等于回到
+        「一路扫整页」那个老问题；停在这里最坏只是回到本次修复之前的行为。
+    """
+    below = sorted((t for t in tokens if t["cy"] > anchor["cy"]), key=lambda t: t["cy"])
+    out, prev_cy = [], anchor["cy"]
+    for t in below:
+        if t["cy"] - prev_cy > row_tol * _BELOW_ROWS:
+            break
+        if _CJK_RE.search(t["text"]) or not t[key]:
+            break
+        out.append(t[key])
+        prev_cy = t["cy"]
+    return out
 
 
 def _extract_date(text: str) -> Optional[str]:
@@ -335,6 +399,19 @@ def _has_cjk(text: str) -> bool:
     return any("一" <= ch <= "鿿" for ch in (text or ""))
 
 
+# 页面上其它带 ¥ 的行，它们是**价格标签**而不是商品标题。
+# 这是一张黑名单，天生不完备——但比「取最近的那个带 ¥ 行」这个纯几何判据准得多：
+# 标题与成交价之间夹一行运费/邮费时，纯几何判据会把「运费」当成商品名，
+# 而它随后会被写进暂存行的商品列，并成为 `build_items` 的兜底物品名。
+_PRICE_CHROME = ("运费", "邮费", "快递费", "实付款", "优惠", "折扣", "红包", "补贴", "税费", "小计")
+
+
+def _row_cjk_texts(anchor: dict, tokens: list[dict], row_tol: float) -> list[str]:
+    """这一行（含 anchor 自己）上所有带中文的文本。"""
+    return [t["text"] for t in tokens
+            if abs(t["cy"] - anchor["cy"]) <= row_tol and _has_cjk(t["text"])]
+
+
 def _parse_product(tokens: list[dict], row_tol: float, price_anchor: Optional[dict]) -> Optional[str]:
     """商品名称：成交价上方最近的「挂牌价」所在行的中文文本即商品标题。
     （闲鱼订单页：商品图右侧一行 = 标题 + 单件挂牌价，位于「成交价」上方。）"""
@@ -344,7 +421,19 @@ def _parse_product(tokens: list[dict], row_tol: float, price_anchor: Optional[di
     def amount(text: str):
         return re.search(r"[¥￥]\s*[0-9]", text or "")
 
-    above = [t for t in tokens if amount(t["text"]) and t["cy"] < price_anchor["cy"] - row_tol]
+    def is_chrome(t: dict) -> bool:
+        """这一行的中文**就是**一个价格标签（运费/邮费/…），不是商品标题。
+
+        判据必须是「等于」而不是「包含」：写成包含的话，一个叫「运费险专用测试品」
+        的商品会被整行跳过，`product` 变成 None——黑名单过界比它要挡的那个 bug 更糟。
+        比较前只留中文，所以「运费 ¥12.00」这种标签与金额同框的写法照样命中。
+        """
+        texts = ["".join(_CJK_RE.findall(x)) for x in _row_cjk_texts(t, tokens, row_tol)]
+        texts = [x for x in texts if x]
+        return bool(texts) and all(x in _PRICE_CHROME for x in texts)
+
+    above = [t for t in tokens if amount(t["text"]) and t["cy"] < price_anchor["cy"] - row_tol
+             and not is_chrome(t)]
     if not above:
         return None
     listing = max(above, key=lambda t: t["cy"])   # 最靠近成交价的上方价 = 挂牌价行
@@ -835,7 +924,23 @@ def parse_shipment_fields(ocr_result) -> dict:
     for t in tokens:
         if "快递单号" not in t["text"]:
             continue
-        no = _extract_tracking(t["text"], 8) or _same_row_value(t, tokens, row_tol, 8, key="tracking")
+        own = _extract_tracking(t["text"], 8)
+        # **判据要用「同行有没有值」，不能用带兜底的那个**：`_same_row_value` 默认
+        # `allow_below=True`，列头版式下它已经把下面第一个号取回来了 ⇒ 恒不为 None
+        # ⇒ 下面那支列头分支永远走不到（第一版就是这么写的，改完毫无变化）。
+        same_row = _same_row_value(t, tokens, row_tol, 8, key="tracking", allow_below=False)
+        if own is None and same_row is None:
+            # 锚点自己没值、同行也没值 ⇒ 这多半是个**列头**，值在下面成列排着。
+            # 逐行连续往下收（见 _column_below）。原先这里只取最近的一个，
+            # 三行号只出一个、`unreadable` 还是 0 —— 用户看到的是绿色的「已关联 1 单」。
+            column = _column_below(t, tokens, row_tol, "tracking")
+            if column:
+                for no in column:
+                    if no not in seen:
+                        seen.add(no)
+                        out["express_nos"].append(no)
+                continue
+        no = own or _same_row_value(t, tokens, row_tol, 8, key="tracking")
         if no and no not in seen:
             seen.add(no)
             out["express_nos"].append(no)

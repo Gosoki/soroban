@@ -57,6 +57,15 @@ def run_migrations_online() -> None:
             target_metadata=target_metadata,
             render_as_batch=connection.dialect.name == "sqlite",  # SQLite 才需「建新表拷贝」批处理；MySQL 直接 ALTER
             compare_type=True,
+            # **每条迁移各自一个事务，而不是整条链一个。**
+            # MySQL 的 DDL 是隐式提交的，而 `alembic_version` 的 UPDATE 是普通 DML：
+            # 整条链包在一个事务里时，链跑到第 N 条抛错，前 N-1 条的 **DDL 已经落地、
+            # 版本号却被回滚掉了**。用户按报错提示处理完再重跑，会从 N-1 重来，
+            # 撞上一个和原始错误毫无关系的「Duplicate key name」——
+            # 而那正是本项目最怕的「半升级态」。
+            # 每迁移一个事务之后，抛错点之前的每一条都带着自己的版本号落地，重跑从断点继续。
+            # SQLite 侧 DDL 本来可回滚，这个改动对它是等价的。
+            transaction_per_migration=True,
         )
         with context.begin_transaction():
             context.run_migrations()

@@ -1982,8 +1982,12 @@ def _fan_targets(m: dict, cfg, cmd, account: Optional[str] = None) -> list[tuple
         # 装一个京东插件、点一个只在磁盘上存在的号，核心会给它的子进程下发
         # `--platform 淘宝` ⇒ 抓回来的单 platform="淘宝" 进账本 ⇒
         # `platform_provider`（OCR 用它决定说哪句话）会报出**京东插件的名字**在管淘宝截图。
-        # 配置里登记过的账号仍按登记值走（`_account_list` 的默认值是**读旧数据的兼容路径**，
-        # 动它会让库里已有的旧格式账号平台变空，不能碰）。
+        # ⚠️ **这里只堵住了孤儿账号那一支。** 配置里登记过的账号仍按登记值走，
+        # 而那个值本身也可能是核心替它填的「淘宝」：`_account_list` 对**新的结构化格式**
+        # 就写着 `... or "淘宝"`，加账号端点的默认值同样是 `Query("淘宝")`——
+        # 也就是说上面那个「京东插件」的例子对登记过的账号依然成立。
+        # 要真正修干净，得给 `plugin.toml` 加一个 `account_platforms` 声明
+        # （顺带能让前端渲染下拉而不是自由文本），那是一次接口变更，见审计报告 §125。
         # 不下发时插件用它自己的默认值——那才是「核心不认识任何具体插件」的口径。
         if named and named.get("platform"):
             extra += ["--platform", named["platform"]]

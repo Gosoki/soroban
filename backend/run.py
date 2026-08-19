@@ -31,6 +31,11 @@ DATABASE_URL=sqlite:///./soroban.db
 # 登录有效期（天）
 TOKEN_EXPIRE_DAYS=90
 
+# 首个管理员的账号与口令（**只在第一次建号时生效**，之后改这里没用，请在设置页改密码）。
+# 留空则用 README 里写的那对默认值 —— 它是公开的，装好后请尽快改掉。
+#SOROBAN_ADMIN_USER=
+#SOROBAN_ADMIN_PASS=
+
 # 监听地址与端口。改完保存、重新双击即可生效（环境变量优先级更高）。
 # HOST 保持 127.0.0.1 = 只有本机能访问。改成 0.0.0.0 会把账本暴露给整个局域网，
 # **改之前务必先改掉默认密码**。
@@ -257,6 +262,15 @@ def main() -> None:
     # 这两处的默认值都是对的，错在「拿不到真实值」。在这里补上，两处一起好。
     os.environ["HOST"] = host
     os.environ["BACKEND_PORT"] = str(port)
+    # **首个管理员的账号口令也要从 `.env` 认过来。** `app.seed.ensure_admin()` 读的是
+    # `os.getenv`，而 `.env` 只被 pydantic-settings 读进 `Settings`（且这两个键不是
+    # Settings 的字段），**从不写回 `os.environ`**。于是冻结版用户在 `.env` 里写
+    # `SOROBAN_ADMIN_PASS=强口令`，首启建出来的仍然是默认口令 ——
+    # 而 `.env` 是双击用户**唯一**能编辑的入口（见上面那段）。
+    for _k in ("SOROBAN_ADMIN_USER", "SOROBAN_ADMIN_PASS"):
+        _v = _runtime_setting(rt, _k, "")
+        if _v:
+            os.environ[_k] = _v
 
     _check_port_free(host, port)           # 占用 → 现在就说清楚，别等 uvicorn 抛异常
 

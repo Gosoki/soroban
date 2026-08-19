@@ -376,6 +376,34 @@ def test_accountless_command_still_runs_once():
     assert got == [([], "")], "无账号命令必须整体跑一次，且不带 --account"
 
 
+def test_an_orphan_account_is_not_stamped_with_a_hardcoded_platform(tmp_path):
+    """**磁盘上有会话、配置里没登记的孤儿账号，不许被凭空安上「淘宝」。**
+
+    点名某个账号那一支原先写死 `.get("platform", "淘宝")`，而它对**任何**账号型插件生效：
+    装一个京东插件、点一个只在磁盘上存在的号 → 核心给它的子进程下发 `--platform 淘宝`
+    ⇒ 抓回来的单 `platform="淘宝"` 进账本 ⇒ `platform_provider`（OCR 用它决定说哪句话）
+    会报出**京东插件的名字**在管淘宝截图。
+
+    不下发时插件用它自己的默认值——那才是「核心不认识任何具体插件」的口径。
+    （`_account_list` 里那个同名默认值是**读旧数据的兼容路径**，不能动：
+      动它会让库里已有的旧格式账号平台变空。）
+    """
+    from app.routers.plugins import _fan_targets
+
+    class _Cfg:
+        params_json = '{"accounts": [{"name": "已登记", "platform": "闲鱼", "enabled": true}]}'
+
+    m = {"accounts": True, "id": "jd", "_dir": tmp_path, "state_dir": ".state"}
+
+    # 孤儿号：不下发 --platform
+    got = _fan_targets(m, _Cfg(), _Cmd("account"), account="孤儿号")
+    assert got == [(["--account", "孤儿号"], "孤儿号")], got
+
+    # **反面**：登记过的账号仍按登记值下发，否则等于把这个参数整个关掉
+    got2 = _fan_targets(m, _Cfg(), _Cmd("account"), account="已登记")
+    assert got2 == [(["--account", "已登记", "--platform", "闲鱼"], "已登记")], got2
+
+
 def test_fanout_follows_the_command_not_the_plugin():
     """判据是**命令**的 per，不是插件的 accounts。
 
