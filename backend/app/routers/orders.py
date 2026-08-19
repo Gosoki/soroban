@@ -186,7 +186,7 @@ def create_order(payload: OrderCreate, session: Session = Depends(get_session)):
             session, order.date, what=f"建商品订单 {order.order_no or '(无单号)'}")
     # 最小单位是物品：至少 1 条（无物品则按商品名+货款自动生成，灰显可改）。
     # 播种用「货款」= 订单价种子 - 邮费，避免把邮费也摊进物品单价（否则 sync 加邮费会重复计）。
-    seed_goods = goods_seed(payload.price_cny, payload.postage_cny)
+    seed_goods = goods_seed(payload.price_cny, payload.postage_cny, payload.items)
     order.items = [OrderItem(**d) for d in build_items(payload.items, seed_goods, payload.title)]
     order.sync_from_items()                   # price_cny = Σ(单价×数量) + 邮费，并重算日元
     session.add(order)
@@ -233,7 +233,7 @@ def update_order(order_id: int, payload: OrderUpdate, session: Session = Depends
         # （而「只清空部分单价」是记 0 待补价——同一个动作两种结果）；② 同一次请求既改邮费又
         # 送无单价物品时，货款被重算成「旧总价 − 新邮费」，总价看着没变、货款却悄悄改了。
         # 现在没给种子就是「不知道单价」，一律记 0 + auto（灰显待补价），与部分清空口径一致。
-        seed_goods = goods_seed(payload.price_cny, order.postage_cny)
+        seed_goods = goods_seed(payload.price_cny, order.postage_cny, payload.items)
         built = build_items(payload.items, seed_goods, order.title)
         order.items = [OrderItem(**d) for d in built]
     elif not order.items:

@@ -1995,3 +1995,121 @@ def test_no_invalid_escape_sequences_anywhere():
                 if issubclass(w.category, SyntaxWarning):
                     bad.append(f"{f.relative_to(_REPO)}: {w.message}")
     assert not bad, "这些文件有非法转义（加 r 前缀）：\n  " + "\n  ".join(bad)
+
+
+def test_every_after_create_call_passes_the_page_size():
+    """`afterCreate` 的本地插入要把行数截回每页条数，否则第 1 页会变成 31 行，
+    而分页器仍按 30/页 算——翻到第 2 页时第 1 页底部那条会**再出现一次**。
+
+    它刻意不自己 `import { PAGE_SIZE }`：本文件被上面两条测试当作**纯模块**在 node 里
+    原样跑（只桩掉 element-plus 那一句），多一个别名 import 就要多一个桩。
+    代价是「调用方可能漏传」，所以在这里钉住。
+    """
+    import re
+
+    bad = []
+    for f in sorted((_REPO / "frontend" / "src" / "views").rglob("index.vue")):
+        src = f.read_text(encoding="utf-8")
+        for m in re.finditer(r"afterCreate\(created,\s*\{([^}]*)\}", src):
+            if "pageSize" not in m.group(1):
+                line = src[: m.start()].count("\n") + 1
+                bad.append(f"{f.relative_to(_REPO)}:{line}")
+    assert not bad, ("这些 afterCreate 没传 pageSize，本地插入不会截断：\n  "
+                     + "\n  ".join(bad))
+
+
+def test_after_create_keeps_the_first_page_at_page_size():
+    """本地插入之后要把行数截回每页条数——**真跑一遍，不 grep**。
+
+    不截的话第 1 页会显示 31 行，而分页器仍按 30/页 算：翻到第 2 页时，
+    第 1 页底部那条会**再出现一次**（同一个 id 显示两次），刷新才恢复。
+    `afterCreate` 上方那几条注释逐条列了本地插入会与后端对不上的几种表现，
+    独独漏了这一种。
+    """
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        import os
+        if os.environ.get("SOROBAN_NO_NODE"):
+            pytest.skip("显式声明了本机没有 node（SOROBAN_NO_NODE=1）")
+        raise AssertionError("找不到 node，而这是前端行为测试的唯一途径；"
+                             "真没有 node 请设 SOROBAN_NO_NODE=1。")
+
+    src = (_REPO / "frontend" / "src" / "utils" / "listRows.js").read_text(encoding="utf-8")
+    assert "from 'element-plus'" in src, "listRows.js 的依赖变了，这条测试要跟着更新"
+    src = src.replace("import { ElMessage } from 'element-plus'",
+                      "const ElMessage = { info() {}, warning() {} }")
+
+    harness = _REPO / "node-page-size.test.mjs"
+    harness.write_text(src + r"""
+const out = {}
+const mkRows = (n) => Array.from({ length: n }, (_, i) => ({ id: 100 + i, date: '2026-08-01' }))
+
+// 满页（30 行）+ 无筛选 + 第 1 页 ⇒ 插入后仍是 30 行，且新行在最前
+{
+  const rows = { value: mkRows(30) }
+  const total = { value: 42 }
+  await afterCreate({ id: 999, date: '2026-08-09' }, {
+    rows, total, page: { value: 1 }, filters: {}, load: async () => {}, pageSize: 30,
+  })
+  out.stays_at_page_size = rows.value.length === 30
+  out.new_row_is_kept = rows.value[0].id === 999
+  out.total_still_grew = total.value === 43
+}
+
+// 没满页（5 行）⇒ 不该被截
+{
+  const rows = { value: mkRows(5) }
+  await afterCreate({ id: 999, date: '2026-08-09' }, {
+    rows, total: { value: 5 }, page: { value: 1 }, filters: {}, load: async () => {}, pageSize: 30,
+  })
+  out.short_page_is_not_truncated = rows.value.length === 6
+}
+
+console.log(JSON.stringify(out))
+""", encoding="utf-8")
+    try:
+        r = subprocess.run([node, str(harness)], cwd=_REPO, capture_output=True,
+                           text=True, timeout=60)
+    finally:
+        harness.unlink(missing_ok=True)
+    assert r.returncode == 0, f"node 跑挂了：{r.stderr[-800:]}"
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    failed = [k for k, v in got.items() if not v]
+    assert not failed, f"这些行为不成立：{failed}"
+
+
+def test_both_colspans_account_for_the_optional_actions_column():
+    """`NotionTable` 里有两个 colspan：空态那一行用 `emptyColspan`，表体用 `colspan`。
+    它们描述的是同一件事，而**操作列是可选的**（没有 `#actions` 插槽的页面就没有这一列）。
+
+    原先 `emptyColspan` 无条件 `+ 1`，于是 Orders / Shipment / Misc 三页恒多算一列。
+    浏览器会把越界的 colspan 截断，所以看不出来——但它上方的注释专门论证了
+    「少算一列会让文案挤在左边」，也就是说这个值是被当成「要算准」的东西写的。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "components" / "NotionTable.vue").read_text(encoding="utf-8")
+    # **按声明整段取，别按行取**：这两个 computed 都可能被折成多行
+    # （第一版守卫就栽在这里：`const emptyColspan = computed(` 那一行里当然没有 hasActions）。
+    found = {}
+    for name in ("emptyColspan", "colspan"):
+        m = re.search(rf"const {name} = computed\(", src)
+        assert m, f"找不到 {name} 的声明，colspan 的写法变了，这条测试要跟着更新"
+        i, depth = m.end() - 1, 0
+        while i < len(src):                      # 括号配平，取到整个表达式
+            if src[i] == "(":
+                depth += 1
+            elif src[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        found[name] = src[m.start():i + 1]
+    bad = [n for n, expr in found.items() if "hasActions" not in expr]
+    assert not bad, (f"这些 colspan 没把「操作列是可选的」算进去：{bad}\n"
+                     + "\n".join(found[n] for n in bad)
+                     + "\n（两个 computed 描述的是同一件事，应当同口径）")

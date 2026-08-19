@@ -114,7 +114,15 @@ def _runtime_setting(rt: Path, key: str, default: str) -> str:
                 continue
             k, _, val = line.partition("=")
             if k.strip() == key:
-                return val.strip().strip("'\"") or default
+                val = val.strip()
+                # **行尾注释要剥掉。** 用户照着提示改端口时很自然会写
+                # `BACKEND_PORT=8621  # 换个端口`，而带引号的值里 `#` 是内容不是注释，
+                # 所以只在**没被引号包起来**时剥。不剥的话 `int()` 会抛 ValueError，
+                # 落到 __main__ 的兜底里，而那句提示写的是「数据库文件损坏或被占用、
+                # SECRET_KEY 被改坏、磁盘满」——把用户往完全错误的方向指。
+                if val[:1] not in ("'", '"'):
+                    val = val.split("#", 1)[0].strip()
+                return val.strip("'\"") or default
     except OSError:
         pass
     return default
@@ -226,19 +234,39 @@ def main() -> None:
     # 这两项刻意不进 app.config 的 Settings：那是**应用**的配置，
     # 而监听地址是**启动器**的事，冻结版与源码版的启动器不是同一个。
     host = _runtime_setting(rt, "HOST", "127.0.0.1")
-    port = int(_runtime_setting(rt, "BACKEND_PORT", "8620"))
+    raw_port = _runtime_setting(rt, "BACKEND_PORT", "8620")
+    try:
+        port = int(raw_port)
+    except ValueError:
+        # 说清楚是**哪一项**配错了。原先这里直接抛，被 __main__ 的兜底接住，
+        # 而那句提示指向「数据库损坏」——用户会去查一个完全无关的方向。
+        _fatal(f"`.env` 里的 BACKEND_PORT 不是一个数字：{raw_port!r}。",
+               hint="用记事本打开 exe 旁边的 .env，把这一行改成形如 `BACKEND_PORT=8621`。")
+    if not (1 <= port <= 65535):
+        _fatal(f"`.env` 里的 BACKEND_PORT 超出范围：{port}。", hint="端口要在 1..65535 之间。")
+    # **必须落回 os.environ，而且要在 `import app.main` 之前。**
+    # `.env` 这一档只有启动器读得到（pydantic-settings 读 .env 也不写回 os.environ），
+    # 而应用侧有两个模块在**导入期**只认环境变量：
+    #   · `main._LAN` —— 决定要不要关掉 /docs、/openapi.json。冻结态下它恒读不到
+    #     用户在 .env 里设的 HOST ⇒ 恒判「环回」⇒ 用户按模板把 HOST 改成 0.0.0.0
+    #     想用手机记账，局域网里任何设备都能免登录打开完整 API 地图，
+    #     而那句「已关闭 /docs」的日志也不会出现，连痕迹都没有。
+    #   · `plugins._SELF_URL` —— 插件回灌地址。用户照本程序自己的提示把 BACKEND_PORT
+    #     改成 8621 之后，浏览器一切正常，插件却把数据（连同 Bearer 令牌）POST 到 8620
+    #     ——那上面往往正是**占用了端口的那个别的程序**。
+    # 这两处的默认值都是对的，错在「拿不到真实值」。在这里补上，两处一起好。
+    os.environ["HOST"] = host
+    os.environ["BACKEND_PORT"] = str(port)
 
     _check_port_free(host, port)           # 占用 → 现在就说清楚，别等 uvicorn 抛异常
 
     import uvicorn
     from app.main import app  # 触发建表/迁移在 lifespan 内进行
 
-    # 幂等建库/迁移 + 确保有 admin（首次分发即可登录；已存在则跳过）。
-    from app.seed import main as seed_admin
-    try:
-        seed_admin()
-    except Exception as e:  # 建号失败不阻断启动（日志提示即可）
-        print(f"[warn] 初始化 admin 失败：{e}")
+    # 建库/迁移 + 建管理员**都在 lifespan 里做**（`app.main.lifespan`），
+    # 因为那里才拿得到单进程闸。这里原先先调一次 `seed.main()`，而它自己会
+    # `create_db_and_tables()` ⇒ 完整 alembic upgrade 跑在闸之前，
+    # 改端口开第二个实例时会对正在被老进程使用的库跑完迁移。
 
     if created_env:
         print(f"已生成 {rt / '.env'}（含随机 SECRET_KEY）。请勿外传或提交。")
@@ -256,7 +284,20 @@ def main() -> None:
         uvicorn.run(app, host=host, port=port, log_level="info")
     except KeyboardInterrupt:              # 正常退出路径，不该报「启动失败」
         pass
-    except OSError as e:
+    except SystemExit as e:
+        # **uvicorn 不把启动失败抛给调用方。** 它自己 `except OSError → logger.error →
+        # sys.exit(STARTUP_FAILURE)`；lifespan 里抛异常同样被转成 `sys.exit(3)`。
+        # 于是下面那支 `except OSError` 是**死代码**（从来没执行过），
+        # 而 `__main__` 里的 `except SystemExit: raise` 会让打包版**闪退**：
+        # 数据库连不上时 database.py 那段精心写的中文指引、单实例闸的解释、
+        # SECRET_KEY 校验不过的说明——全都打印出来了，然后窗口在一秒内消失。
+        # 用户看到的是「点了没反应」，而 __main__ 的注释还写着「这些原先都只会让窗口闪一下」。
+        if e.code:
+            _fatal(f"服务启动失败（uvicorn 退出码 {e.code}）。",
+                   hint="真正的原因在上面几行：端口被占用或绑定被拒（改 .env 的 BACKEND_PORT）、"
+                        "数据库连不上、已经有一个实例在跑、.env 里的 SECRET_KEY 被改坏。")
+        raise                              # 正常退出（code=0/None）原样放行
+    except OSError as e:                   # 兜底：将来 uvicorn 若改成向上抛
         _fatal(f"无法监听 {host}:{port}（{e}）。",
                hint="用记事本打开旁边的 .env，把 BACKEND_PORT 改成别的（如 8621）再双击。")
 

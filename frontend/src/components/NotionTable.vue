@@ -171,7 +171,13 @@ const slots = useSlots()
 
 // 空态那一行要横跨整表。列数 = ID 列 + 可选展开列 + 数据列 + 操作列，
 // 少算一列的话空态文案会挤在左边、右边留一段空表格，比没有还难看。
-const emptyColspan = computed(() => 1 + (props.expandable ? 1 : 0) + props.columns.length + 1)
+// **操作列是可选的**（没有 `#actions` 插槽的页面就没有这一列）——原先这里无条件 +1，
+// 于是 Orders / Shipment / Misc 三页恒多算一列。浏览器会把越界的 colspan 截断，
+// 所以看不出来，但这个值是被当成「要算准」的东西写的。
+// 数的是 `props.columns` 而不是 `cols.value`：后者要等列布局拉回来才有值，
+// 而空态在那之前就可能渲染。下面的 `colspan` 用于布局已就绪之后，故用 cols.value。
+const emptyColspan = computed(
+  () => 1 + (props.expandable ? 1 : 0) + props.columns.length + (hasActions.value ? 1 : 0))
 
 const DEFAULT_COL_W = 160   // 无显式 width 的列默认宽
 const ID_COL_W = 56         // 最左 ID/删除/新建 列
@@ -246,10 +252,24 @@ function newCol(col) {
   const c = cellCol(col)
   return col.newEditable ? { ...c, readonly: false } : c
 }
+// 标签列的派生配置**必须缓存**：`cellCol` 写在模板里（`:col="cellCol(col)"`），
+// 而它对标签列每次调用都返回一个**新对象** ⇒ 这些 `GotionCell` 的 props 在父组件
+// 每次重渲时都判定为「变了」（Vue 的 props diff 是浅比较）。
+// 商品订单页 2 个标签列 × 30 行 = 60 个格子：点一下展开箭头、改一个格子、翻一页
+// 都会让它们全部重渲并重算颜色；拖列宽时更是**每帧一次**。
+// 用 computed 建一张按列 key 的表：只要 tagOptions/tagMeta 没变，对象身份就稳定。
+const tagColCache = computed(() => {
+  const out = {}
+  for (const c of props.columns) {
+    if (c.type === 'tag') {
+      out[c.key] = { ...c, type: 'select', options: tagOptions[c.field] || [],
+                     tagMeta: tagMeta[c.field] || {}, tagColored: true }
+    }
+  }
+  return out
+})
 function cellCol(col) {
-  return col.type === 'tag'
-    ? { ...col, type: 'select', options: tagOptions[col.field] || [], tagMeta: tagMeta[col.field] || {}, tagColored: true }
-    : col
+  return col.type === 'tag' ? (tagColCache.value[col.key] || col) : col
 }
 function applyTags(field, list) {   // list: [{value, color, in_use}]
   tagOptions[field] = list.map((t) => t.value)
@@ -266,8 +286,18 @@ function applyTags(field, list) {   // list: [{value, color, in_use}]
   // 只发 `reload` 不够——它只让父页重拉**行**，既不刷新候选集、也不管仍停在旧名的筛选值。
   emit('tags-changed', { field, values: tagOptions[field] })
 }
-async function loadTag(field) {   // 单字段拉取；失败保留旧值/置空，供列头弹窗 @show 重试
-  try { applyTags(field, await tagsApi.list(field)) } catch (_) { if (!tagOptions[field]) { tagOptions[field] = []; tagMeta[field] = {} } }
+async function loadTag(field) {   // 单字段拉取；失败**保持未拉到**（见下），供列头弹窗 @show 重试
+  // 原先失败时会把候选集**固化成空数组**，而 `loadTags()` 只在 onMounted 跑一次、
+  // 此后没有任何自动重试：后端刚起（或迁移期返 503）时进页面，用户看到的是
+  // 「我的账号标签全没了，但旧数据还照常带色显示」——实际只是那一次 GET 挂了。
+  // 留 `undefined` 表示「还没拿到」：渲染侧对 undefined 与 [] 处理相同
+  // （`tagOptions[col.field] || []`），所以不置空没有副作用，而 `loadTags` 能据此重试。
+  try {
+    applyTags(field, await tagsApi.list(field))
+    return true
+  } catch (_) {
+    return false
+  }
 }
 function onTagShow(field) { paletteFor[field] = null; loadTag(field) }   // 每次开弹窗：收起调色盘 + 拉最新标签
 function togglePalette(field, value) { paletteFor[field] = paletteFor[field] === value ? null : value }
@@ -276,7 +306,13 @@ async function setColor(field, value, color) {   // 改某标签的颜色（调�
 }
 async function loadTags() {
   const fields = [...new Set(props.columns.filter((c) => c.type === 'tag').map((c) => c.field))]
-  await Promise.all(fields.map((f) => loadTag(f)))
+  const ok = await Promise.all(fields.map((f) => loadTag(f)))
+  // **失败重试一次。** 这一路只在 onMounted 跑，而它最常见的失败恰恰是「后端刚起来」
+  // 或迁移期的 503 ——两者都是几秒内自愈的。不重试的话，用户要么点列头的 ⚙、
+  // 要么切页再回来，两条自愈路径都不显眼。只重试一次：真的连不上时，
+  // 拦截器那条全屏离线提示才是该出场的东西，不该由这里反复刷。
+  const failed = fields.filter((_, i) => !ok[i])
+  if (failed.length) setTimeout(() => failed.forEach(loadTag), 3000)
 }
 async function addTag(field) {
   const v = (newTag[field] || '').trim()
@@ -343,14 +379,25 @@ function commitNew() {
   committing.value = true
   let settled = false
   // done 在契约上是**可选**的（父页写的是 done?.(true)）。哪个父页将来早退没调它，
-  // 只在 done 里解锁就会让幽灵行永久点不动——那比偶发多建一条更糟。故加超时兜底
-  // （20s > api 层 15s 默认超时），最坏情况只是「短暂锁一会儿」。
-  const timer = setTimeout(() => finish(false), 20000)
-  function finish(ok) {
+  // 只在 done 里解锁就会让幽灵行永久点不动——那比偶发多建一条更糟。故加超时兜底。
+  //
+  // **20s 是错的。** 原注释算的是「20s > api 层 15s 默认超时」，但父页的 `addRow` 在
+  // `done` 之前还 `await afterCreate(...)`，而它在「有筛选 / 不在第 1 页」那一支里会
+  // 再 `await load()` —— **两次**请求，上界 15+15=30s。
+  // 早于上界触发的后果不是注释里说的「短暂锁一会儿」：`finish(false)` 会解锁并
+  // **留下草稿**（`ok !== false` 才清），用户看着字还在、以为没存上，再按一次回车 ——
+  // 而杂项支出**没有任何唯一约束**，同一笔钱就这么记两遍。
+  // 所以时长抬到两次请求之上，并且超时那一支要**说一句话**：此刻结果是未知的，
+  // 默默解锁等于邀请用户重复提交。
+  const timer = setTimeout(() => finish(false, true), 35000)
+  function finish(ok, timedOut = false) {
     if (settled) return
     settled = true
     clearTimeout(timer)
     committing.value = false
+    if (timedOut) {
+      ElMessage.warning('等了很久还没收到结果。先别重复提交——刷新看看是不是已经存上了')
+    }
     // 成功才清空草稿：失败（如订单号撞唯一约束）时把用户刚敲的内容留在格子里让他改，
     // 而不是连人带字一起吞掉。
     if (ok !== false) Object.keys(newRow).forEach((k) => delete newRow[k])

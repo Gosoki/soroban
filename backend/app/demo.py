@@ -1,20 +1,24 @@
 """灌入演示数据。运行：python -m app.demo
 
-会建 admin（若无）+ 一批真实感的代购/集运数据：集运订单、淘宝订单（含一单多物、
-退款、日元直付、已取消示例）、杂项、以及暂存页的待导入订单。已有淘宝数据则跳过。
+会建 admin（若无，走 seed.ensure_admin，认 SOROBAN_ADMIN_*）+ 一批真实感的代购/集运数据：
+集运订单、淘宝订单（含一单多物、退款、日元直付、已取消示例）、杂项、暂存页的待导入订单。
+
+**只在库里四张业务表都空时才灌**，且当前后端不是本地 SQLite 时必须显式
+`SOROBAN_DEMO_YES=1` —— 它写的是**当前生效的数据库**，那可能就是你的真实账本。
 """
 
 import datetime as dt
 import json
+import os
 from decimal import Decimal
 
 from sqlmodel import Session, select
 
-from .auth import hash_password
 from .database import create_db_and_tables, get_engine
+from .seed import ensure_admin
 from .models import (
     ColumnLayout, FxRate, ShipmentOrder, MiscExpense, OrderItem, StagingItem, TagOption,
-    Order, OrderStaging, User,
+    Order, OrderStaging,
 )
 
 # 列布局默认：顺序 + 统一列宽（≈ 刚好显示日期，取整多留一点 = 110）。demo 注入库，reset 后即此默认序。
@@ -30,25 +34,50 @@ D = lambda y, m, d: dt.date(y, m, d)  # noqa: E731
 
 
 def main() -> None:
-    create_db_and_tables()
-    with Session(get_engine()) as s:
-        if not s.exec(select(User).where(User.username == "admin")).first():
-            s.add(User(username="admin", password_hash=hash_password("admin123"), display_name="管理员"))
-            s.commit()
+    """灌入演示数据。**写的是当前生效的后端**——可能就是用户的 MySQL 账本。
 
-        if s.exec(select(Order)).first():
-            print("已有淘宝数据，跳过演示数据灌入。")
-            return
+    这个脚本没有 HTTP 入口、也不在 PyInstaller 的导入图里（打包版根本没有它），
+    所以只在源码模式下可达。但它原先的唯一一道闸是「已有 Order 行就跳过」——
+    只记了集运单与杂项的新用户会被放行，然后往真库里灌 3 集运 / 9 订单 / 4 杂项 / 4 暂存，
+    全程没有确认、也**不说自己在写哪个库**。
+    """
+    from .database import current_backend
+
+    create_db_and_tables()
+    backend = current_backend()
+    print(f"[demo] 即将写入当前生效的数据库：{backend}")
+    if backend != "sqlite" and os.environ.get("SOROBAN_DEMO_YES") != "1":
+        # 远程库多半是真账本。要往它写，必须显式说一声。
+        print("[demo] 当前后端不是本地 SQLite —— 这多半是你的真实账本。"
+              "确认要往它灌演示数据，请设 SOROBAN_DEMO_YES=1 再跑。已中止。")
+        return
+
+    with Session(get_engine()) as s:
+        # 建号交给 `seed.ensure_admin()`：它认 SOROBAN_ADMIN_USER/PASS。
+        # 原先这里硬写 `admin`/`admin123`，于是改过账号名的用户会在自己的真库里
+        # 悄悄多出一个用公开默认口令的管理员。
+        ensure_admin()
+
+        # 闸只看商品订单是不够的：只记了集运单/杂项的新用户会被放行。
+        for _model, _label in ((Order, "商品订单"), (ShipmentOrder, "集运订单"),
+                               (MiscExpense, "杂项支出"), (OrderStaging, "暂存订单")):
+            if s.exec(select(_model)).first():
+                print(f"[demo] 库里已经有{_label}，跳过演示数据灌入（不覆盖任何现有数据）。")
+                return
 
         # 汇率（供导入/预填）——已有当日汇率就不重复插入
         if not s.exec(select(FxRate).where(FxRate.date == D(2026, 7, 9))).first():
             s.add(FxRate(date=D(2026, 7, 9), rate=Decimal("23.8642")))
 
         # 标签选项（列头可管理的下拉集：淘宝账号 / 集运收货人）
+        # 已存在的标签跳过：`TagOption` 有 `(field, value)` 唯一索引，
+        # 无条件 add 会让下面第一个 commit 直接 IntegrityError 崩掉。
         for _field, _vals in (("platform_account", ["acctA", "acctB"]),
                               ("recipient", ["本人", "家人", "朋友"])):
             for _v in _vals:
-                s.add(TagOption(field=_field, value=_v))
+                if not s.exec(select(TagOption).where(
+                        TagOption.field == _field, TagOption.value == _v)).first():
+                    s.add(TagOption(field=_field, value=_v))
 
         # —— 集运订单 ——
         jf1 = ShipmentOrder(date=D(2026, 6, 5), shipment_no="JF-2606A", weight=Decimal("4.5"),

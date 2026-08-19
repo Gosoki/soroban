@@ -30,7 +30,7 @@ def _ocr_limiter():
     return _OCR_LIMITER
 
 
-def goods_seed(price_cny, postage_cny):
+def goods_seed(price_cny, postage_cny, items=None):
     """「订单价种子」→「货款种子」：扣掉邮费。没给价就没有种子（None）。
 
     订单价 = Σ(单价×数量) + 邮费，而 sync_from_items 事后会自己再加一次邮费；所以喂给
@@ -57,7 +57,15 @@ def goods_seed(price_cny, postage_cny):
     if price_cny is None:
         return None
     postage = postage_cny or 0
-    if postage > price_cny:
+    # **判据必须与 `schemas._check_postage_within_total` 同口径**：只有走「种子价路径」
+    # （物品都不带单价）时 price_cny 才参与计算，才谈得上「邮费超过总价」。
+    # 原先这里是**无条件**比较，而 schema 那边明确跳过带价物品 ⇒ 同一份 body 两处判据打架：
+    #     {price_cny: "5.00", postage_cny: "10.00", items: [A×1 @100.00]}
+    # 真实订单价 = 100 + 10 = 110，邮费 10 远小于它，却被一个**即将被忽略的字段**否决成 422。
+    # `items=None` 表示调用方不知道（例如从库里的行反推），保持检查。
+    seeded = items is None or not any(
+        getattr(it, "unit_price_cny", None) is not None for it in items)
+    if seeded and postage > price_cny:
         raise ValueError(
             f"邮费（{postage}）不能大于订单总价（{price_cny}）——"
             f"订单价 = 商品单价×数量 + 邮费。请先改总价，或把邮费调小。")
@@ -99,17 +107,29 @@ def build_items(items_in, seed_goods, fallback_name):
     返回的 dict 同时适用 OrderItem 与 StagingItem 构造。"""
     if seed_goods is not None and seed_goods < 0:     # 邮费>总价等异常输入 → 货款夹到 0，绝不落负单价
         seed_goods = Decimal("0.00")
-    # **先剔掉上一轮自己生成的尾差行**：它是派生产物，不该作为输入参与下一次折算
-    # （前端会把服务端返回的 items 原样回传，见 _is_residual）。
-    # 放在所有分支之前：带单价的那条分支同样不该把它原样留下来——
-    # 那会在列表里留一行 0.00 的占位，越攒越多。
-    items_in = [it for it in (items_in or []) if not _is_residual(it)]
+    items_in = list(items_in or [])
     if not items_in:
         return [{"name": (fallback_name or "未命名物品")[:255], "quantity": 1,
                  "unit_price_cny": seed_goods if seed_goods is not None else Decimal("0.00"),
                  "auto": True}]
     any_priced = any(it.unit_price_cny is not None for it in items_in)
     if not any_priced and seed_goods is not None:
+        # **剔掉上一轮自己生成的尾差行——只在这一支。**
+        # 这一支要按 seed_goods 重新折算，留着它就会被当成「一条没有单价的物品」
+        # 再折一遍，于是每保存一次多一条（实测 1 条能涨到 5 条）。
+        #
+        # ⚠️ 这行过滤**原先放在所有分支之前**，理由写的是「带价那一支也不该把它原样留下」。
+        # 那句话是错的，而且代价是真金白银：带价那一支只是原样采用 items，
+        # 尾差行被删掉之后**没有任何地方把那笔钱加回去**。而前端的 `toPayload`
+        # 恰恰是带着单价整体回传的（物品编辑器改任一格都会触发），于是
+        #   建单 ¥100.00 / A×3 → [A@33.33, A（金额尾差）@0.01]
+        #   随便改一下物品名再保存 → 尾差行被剔、总价变成 99.99
+        # 一次静默缩水，200 OK、无日志，误差上限是 数量×0.01（数量 1000 时 9.99 元）。
+        # 而账本金额与爬虫抓到的实付金额从此对不上——正是上面那段 ROUND_DOWN
+        # 长注释拼命要守住的那个不变量。
+        # 带价那一支把尾差行**当普通物品留着**才是对的：它带着真实的单价，
+        # 总价因此守恒；它也不会在那一支里累积（那一支根本不生成新的尾差行）。
+        items_in = [it for it in items_in if not _is_residual(it)] or items_in
         out, residual = [], Decimal("0.00")
         for i, it in enumerate(items_in):
             if i == 0:
@@ -218,6 +238,28 @@ def mirror_to_staging(session: Session, order, built_items) -> None:
     ).first()
     if st is None:
         return
+    # **改单号时，撞的可能是暂存表的索引，而不是账本的。**
+    # 两张表的唯一性契约不一样：账本的活跃唯一键是 `(order_no, COALESCE(platform,''))`
+    # ——注释明写「不同来源下允许同号」；而暂存表是 `order_no` **单列**的部分唯一索引
+    # （不分平台、不分是否已导入）。镜像会把新单号推进暂存行，于是**账本这边合法的改名，
+    # 会被暂存表的索引否决**：用户在订单页把号改成 BBB（纠正 OCR 认错的号），
+    # 而 BBB 正被另一条他可能根本没在看的**未导入暂存行**占着 ⇒ IntegrityError
+    # ⇒ 全局 handler 转成 409「数据完整性冲突」⇒ 前端把 409 当乐观锁冲突整表重拉，
+    # 编辑消失，提示里一个字都没提暂存表。
+    # 先查一次说清楚。`staging.py` 里那段注释正好把这种失败模式写成了「不能这么干」的理由，
+    # 同一条推理没被应用到这里。
+    if order.order_no and st.order_no != order.order_no:
+        clash = session.exec(
+            select(OrderStaging).where(OrderStaging.order_no == order.order_no,
+                                       OrderStaging.id != st.id)
+        ).first()
+        if clash:
+            where = "已导入账本" if clash.imported_order_id else "还没导入"
+            raise HTTPException(status_code=409, detail=(
+                f"订单号「{order.order_no}」在暂存里已经被另一条记录占着"
+                f"（来源 {clash.platform or '未标'}，{where}）。"
+                "账本允许不同来源同号，但暂存表的订单号是全表唯一的——"
+                "请先去暂存页处理掉那一条，或换一个号。"))
     for staging_field, order_field in _SHARED_TO_ORDER.items():
         setattr(st, staging_field, getattr(order, order_field))
     if built_items is not None:

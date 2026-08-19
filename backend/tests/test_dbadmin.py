@@ -84,6 +84,125 @@ def test_copy_data_is_idempotent_overwrite(client, dst_engine):
         assert len(d.exec(select(Order)).all()) == second["orders"]
 
 
+def test_migrating_onto_a_non_empty_target_needs_an_explicit_confirmation(
+        client, dst_engine, monkeypatch):
+    """目标库里已有的数据会被 `replace_data` 逐表 delete 掉，所以**必须先说清楚要删什么**。
+
+    在此之前全仓没有任何一处比较源库与目标库谁更新：`_is_same_as_active` 只回答
+    「目标是不是当前正在用的那个」，`switch` 里那道指纹闸只回答「源库比上次迁移时新不新」
+    ——**看不见反方向**。于是有一条全程走本应用自己指引的路会毁掉整个账本：
+
+        MySQL 连不上 → 按 database.py 的提示 `--use-local-db` 退回本地（停在切走那天）
+        → 停机期间在本地补记几单（rescue.py 正是这么建议的）
+        → MySQL 恢复后点「切换」→ 源库有改动 ⇒ 409
+        → 弹窗的**默认按钮**「重新迁移再切换」⇒ 直接调 migrate（那条路原先一句确认都没有）
+        → 用几个月前的本地快照覆盖掉 MySQL 上几个月的账本，单事务提交、无备份可退。
+
+    `_resolve_target` 是这里唯一被替换的东西（把目标指到临时库），
+    migrate 的判定逻辑本身跑的是真代码。
+    """
+    from app.database import get_engine
+    from app.routers import dbadmin as mod
+
+    # **自己造一行商品订单**，别指望别的测试文件先建过。
+    # 第一版没有这一句：整套跑是绿的（`test_edge_cases` 等先建了订单），
+    # 单跑就红——detail 里只有「用户 1 条」。而「有没有把对面的东西列出来」
+    # 恰恰是这条测试真正想钉的那一半。
+    client.post("/api/orders", json={"date": "2027-04-01", "title": "覆盖闸的证据"})
+    db_migrate.replace_data(get_engine(), dst_engine)       # 让目标库变成非空
+    monkeypatch.setattr(mod, "_resolve_target",
+                        lambda t: ("sqlite", "sqlite:///dst", dst_engine, False))
+    monkeypatch.setattr(mod, "_is_same_as_active", lambda backend, url: False)
+    monkeypatch.setattr(mod, "run_migrations", lambda url: None)
+
+    r = client.post("/api/db/migrate", json={"backend": "sqlite"})
+    assert r.status_code == 409, f"目标非空却直接开拷了：{r.status_code} {r.text[:200]}"
+    detail = r.json()["detail"]
+    assert "无法撤销" in detail
+    assert "商品订单" in detail, f"没把「对面现在有什么」列出来，用户没法判断值不值得覆盖：{detail}"
+
+    # **反面一**：用户明确确认之后必须放行，否则这道闸就成了死路。
+    r2 = client.post("/api/db/migrate", json={"backend": "sqlite", "confirm_overwrite": True})
+    assert r2.status_code == 200, r2.text
+
+
+def test_the_overwrite_409_is_recognisable(client, dst_engine, monkeypatch):
+    """前端要靠 detail 里这句话把「目标库里已经有数据」与另一种 409
+    （「已有另一项维护操作在进行」）分开——不分的话，用户会在一条讲维护中的消息上
+    点下「仍然覆盖」，而重试带上 `confirm_overwrite: true` 正好**跳过了这道闸本身**。
+    所以这句话是一份跨前后端的契约，钉在这里。
+    """
+    from app.database import get_engine
+    from app.routers import dbadmin as mod
+
+    client.post("/api/orders", json={"date": "2027-04-02", "title": "证据"})
+    db_migrate.replace_data(get_engine(), dst_engine)
+    monkeypatch.setattr(mod, "_resolve_target",
+                        lambda t: ("sqlite", "sqlite:///dst", dst_engine, False))
+    monkeypatch.setattr(mod, "_is_same_as_active", lambda backend, url: False)
+    monkeypatch.setattr(mod, "run_migrations", lambda url: None)
+
+    r = client.post("/api/db/migrate", json={"backend": "sqlite"})
+    assert r.status_code == 409
+    assert "目标库里已经有数据" in r.json()["detail"], (
+        "前端认的就是这句话（Database/index.vue 的 migrateWithOverwriteGuard），"
+        "改了要一起改")
+
+
+def test_migrating_onto_an_empty_target_is_not_interrupted(client, dst_engine, monkeypatch):
+    """**反面二**：目标是空库时没有任何东西可丢，不该拿一次确认去打断用户。
+
+    少了这一条，把闸写成「一律要 confirm_overwrite」也能过上面那条。
+    """
+    from app.routers import dbadmin as mod
+
+    monkeypatch.setattr(mod, "_resolve_target",
+                        lambda t: ("sqlite", "sqlite:///dst", dst_engine, False))
+    monkeypatch.setattr(mod, "_is_same_as_active", lambda backend, url: False)
+    monkeypatch.setattr(mod, "run_migrations", lambda url: None)
+    assert db_migrate.is_target_empty(dst_engine) is True, "夹具不该是非空的"
+
+    r = client.post("/api/db/migrate", json={"backend": "sqlite"})
+    assert r.status_code == 200, r.text
+
+
+def test_preflight_catches_integers_mysql_cannot_store(client, dst_engine, monkeypatch):
+    """`preflight` 原先只体检 VARCHAR 长度与 DECIMAL 范围，**漏了整数列**。
+
+    SQLite 是弱类型，`jpy_override` 之类能静默存下超过 2^31 的值；MySQL 的 INT 是
+    4 字节，插入时抛 `1264 Out of range`。而 `replace_data` 是**单事务**——一行踩雷
+    整批回滚，用户只看到一句「拷贝「集运订单」表时失败：(1264, ...)」，
+    既不知道是哪一行也不知道该改什么。那正是 preflight 存在的理由。
+
+    入口层的卡口（`schemas._bounded_jpy`）只保证**今后**写不进越界值，
+    对那道卡口存在**之前**就躺在库里的历史行无能为力。
+    """
+    from app.database import get_engine
+
+    with Session(get_engine()) as s:
+        # table=True 的 SQLModel 不跑校验——这正是历史脏行的来路
+        row = ShipmentOrder(date=dt.date(2027, 3, 3), jpy_override=3_000_000_000)
+        s.add(row)
+        s.commit()
+        dirty_id = row.id
+
+    # preflight 只在目标是 MySQL 时才干活；这里把目标的方言名改掉，
+    # 判定逻辑本身跑的是真代码（查询照常打在 SQLite 源库上）。
+    monkeypatch.setattr(dst_engine.dialect, "name", "mysql")
+    problems = db_migrate.preflight(get_engine(), dst_engine)
+    assert any("jpy_override" in p and f"#{dirty_id}" in p for p in problems), \
+        f"越界的整数没被体检出来，迁移会在拷到一半时炸：{problems}"
+
+    # **反面**：把那行改回正常值之后不许再报——判据不能写成「有整数列就报」。
+    with Session(get_engine()) as s:
+        r = s.get(ShipmentOrder, dirty_id)
+        r.jpy_override = 12345
+        s.add(r)
+        s.commit()
+    assert not [p for p in db_migrate.preflight(get_engine(), dst_engine)
+                if "jpy_override" in p], "正常的整数也被报成越界"
+
+
 def test_is_target_empty(tmp_path):
     url = f"sqlite:///{tmp_path / 'empty.db'}"
     run_migrations(url)
@@ -118,6 +237,8 @@ def test_switch_upgrades_stale_target_schema(client, tmp_path, monkeypatch):
     那会用源库快照覆盖目标——把「schema 落后」升级成「数据被旧快照盖掉」。"""
     from sqlalchemy import inspect as sa_inspect
 
+    from app.routers import dbadmin as mod
+
     url = f"sqlite:///{tmp_path / 'stale.db'}"
     _stamp_at(url, "b8c9d0e1f2a3")                   # 改名之前的老 schema
     e = build_engine(url)
@@ -130,16 +251,92 @@ def test_switch_upgrades_stale_target_schema(client, tmp_path, monkeypatch):
     finally:
         e.dispose()
 
-    r = client.post("/api/db/switch", json={"backend": "sqlite", "sqlite_path": str(url)})
-    # 本项目的 sqlite 目标恒指向控制库，故这里只断言 schema 被升级这一件事
-    run_migrations(url)                              # 幂等：若 switch 已升，这里什么都不做
+    # ⚠️ 这条测试原先**完全是空转的**，三处叠加：
+    #   ① body 里那个 `sqlite_path` 根本不是 `Target` 的字段（pydantic 默认 extra=ignore）
+    #      ⇒ 目标恒指向控制库 ⇒ `_is_same_as_active` 直接 400，switch 一个字都没执行到；
+    #   ② 断言之前**测试自己**跑了一次 `run_migrations(url)` ⇒ 后面「已升到 head」必然成立；
+    #   ③ 收尾是 `assert r.status_code in (200, 400)` ⇒ 等于没有断言。
+    # 于是把 switch 里那句 run_migrations 整个删掉，这条照样绿。
+    # 现在改成：把目标指到那个落后的库（只换解析目标，switch 的判定逻辑跑真代码），
+    # 而且**绝不自己升级**——升没升全看 switch。
+    tgt = build_engine(url)
+    monkeypatch.setattr(mod, "_resolve_target", lambda t: ("sqlite", url, tgt, False))
+    monkeypatch.setattr(mod, "_is_same_as_active", lambda backend, u: False)
+    try:
+        # `confirm_changed` 是**必须显式给**的：本文件里前面那条迁移用例成功之后会写下
+        # 一条 `migrate_state` 指纹，而此后别的用例又往源库里写了行 ⇒ 这里会被
+        # 「迁移之后源库又有改动」那道闸 409 掉。那道闸不是这条用例要测的东西，
+        # 不给它就会变成「单跑绿、整套红」的用例间污染。
+        r = client.post("/api/db/switch", json={"backend": "sqlite", "confirm_changed": True})
+        assert r.status_code == 200, r.text
+    finally:
+        tgt.dispose()
+
     e = build_engine(url)
     try:
         cols = {c["name"] for c in sa_inspect(e).get_columns("orders")}
-        assert "title" in cols and "shop" not in cols
+        assert "title" in cols and "shop" not in cols, \
+            "switch 没有把落后的目标库升到 head —— 切过去之后全站 500，"\
+            "而用户最自然的自救动作会把数据一起盖掉"
     finally:
         e.dispose()
-    assert r.status_code in (200, 400)               # 不关心切没切成，关心不会静默切到坏库上
+
+
+def test_switching_to_an_unsupported_server_is_refused_before_any_ddl(
+        client, dst_engine, monkeypatch):
+    """版本闸原先只挂在 test 与 migrate 两处，`switch` 漏了——而它第一件事就是对目标库
+    `run_migrations`。界面上三个按钮平级、没有任何东西强制「先测试」，于是跳过测试
+    直接点「切换到此库」= 对一台 MariaDB / 5.7 跑完整 alembic 链。
+
+    MySQL 的 DDL 是**隐式提交**的：跑到 `utf8mb4_0900_bin` 那条炸掉时，前面十几条
+    已经落地，库停在半升级态，只能手工 DROP DATABASE 才能重来。
+    所以断言的重点不是「返回 400」，而是**一条 DDL 都还没跑**。
+    """
+    from app.routers import dbadmin as mod
+
+    ddl = []
+    monkeypatch.setattr(mod, "_resolve_target",
+                        lambda t: ("mysql", "mysql://x", dst_engine, False))
+    monkeypatch.setattr(mod, "_is_same_as_active", lambda backend, url: False)
+    monkeypatch.setattr(mod, "_mysql_conn_fields", lambda t: ("h", 3306, "u", "p", "d"))
+    monkeypatch.setattr(mod.db_migrate, "test_connection", lambda *a, **k: (True, "5.7.44"))
+    monkeypatch.setattr(mod, "run_migrations", lambda url: ddl.append(url))
+
+    r = client.post("/api/db/switch",
+                    json={"backend": "mysql", "host": "h", "user": "u", "database": "d"})
+    assert r.status_code == 400, r.text
+    assert not ddl, "服务端版本不够却已经对目标库跑了 DDL —— 库会停在半升级态"
+
+    # **反面**：版本够的时候不许被这道新闸拦住（否则等于把切换整个焊死）。
+    monkeypatch.setattr(mod.db_migrate, "test_connection", lambda *a, **k: (True, "8.0.36"))
+    r2 = client.post("/api/db/switch",
+                     json={"backend": "mysql", "host": "h", "user": "u", "database": "d"})
+    assert r2.status_code != 400 or "版本" not in r2.json().get("detail", "")
+    assert ddl, "版本够却没往下走到建表那一步"
+
+
+def test_connections_that_cannot_be_decrypted_are_flagged_not_hidden(monkeypatch):
+    """SECRET_KEY 变过之后，已保存连接的 DSN 就解不开了。
+
+    列表**照列**（跳过等于「记录凭空消失」，用户连删都删不掉），但迁移/切换会拿到
+    404「连接不存在或无法解密」——「明明列在这里」却说「不存在」，是一条读不懂的死路。
+    所以每条带上 `decryptable`，界面据此标出来并禁掉那两个按钮。
+    （`list_connections` 的 docstring 原先写着「解不开的跳过」，而它根本不解密。）
+    """
+    from app.config import settings
+    from app.database import control_engine
+
+    e = control_engine()
+    cid = control.upsert_connection(e, backend="mysql",
+                                    url="mysql+pymysql://u:p@h:3306/flagdb",
+                                    host="h", port=3306, user="u", database="flagdb")
+    got = {r["id"]: r for r in control.list_connections(e)}
+    assert got[cid]["decryptable"] is True, "刚存进去就说解不开"
+
+    monkeypatch.setattr(settings, "SECRET_KEY", "a-completely-different-secret-key-value")
+    after = {r["id"]: r for r in control.list_connections(e)}
+    assert cid in after, "解不开就把记录藏起来了——用户连删都删不掉"
+    assert after[cid]["decryptable"] is False
 
 
 def test_switch_runs_migrations_before_emptiness_probe():

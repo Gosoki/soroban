@@ -277,3 +277,40 @@ def test_ledger_only_columns_are_all_accounted_for():
         f"共享清单里有暂存表没有的列：{sorted(set(_SHARED_TO_ORDER) - staging)}"
     assert set(_SHARED_TO_ORDER.values()) <= ledger | {"date"}, \
         f"共享清单里有账本没有的列：{sorted(set(_SHARED_TO_ORDER.values()) - ledger)}"
+
+
+def test_renaming_an_order_onto_a_staging_only_number_says_where_the_clash_is(client):
+    """两张表的唯一性契约不一样，而镜像会把新单号推进暂存行：
+
+      · 账本：`(order_no, COALESCE(platform,''))` —— 注释明写「不同来源下允许同号」；
+      · 暂存：`order_no` **单列**部分唯一索引，不分平台、不分是否已导入。
+
+    于是**账本这边合法的改名，会被暂存表的索引否决**。原先撞上去得到的是
+    全局 handler 的一句「数据完整性冲突（唯一约束/外键/必填）」，
+    而前端把 409 当乐观锁冲突整表重拉 —— 编辑消失，提示里一个字都没提暂存表。
+    """
+    import uuid
+
+    a = "MIRA" + uuid.uuid4().hex[:8].upper()
+    b = "MIRB" + uuid.uuid4().hex[:8].upper()
+
+    s1 = client.post("/api/staging", json={"order_no": a, "platform": "淘宝"}).json()
+    client.post(f"/api/staging/{s1['id']}/import")
+    oid = client.get(f"/api/staging?q={a}").json()["items"][0]["imported_order_id"]
+    # 另一条**未导入**的暂存行占着目标号（用户很可能根本没在看它）
+    client.post("/api/staging", json={"order_no": b, "platform": "闲鱼"})
+
+    o = client.get(f"/api/orders/{oid}").json()
+    r = client.patch(f"/api/orders/{oid}", json={"version": o["version"], "order_no": b})
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert "暂存" in detail and b in detail, f"没说清撞在哪：{detail}"
+    # 账本没被改动
+    assert client.get(f"/api/orders/{oid}").json()["order_no"] == a
+
+    # **反面**：目标号没人占时，改名必须照常成功（别把闸写成「不许改单号」）
+    free = "MIRC" + uuid.uuid4().hex[:8].upper()
+    o = client.get(f"/api/orders/{oid}").json()
+    ok = client.patch(f"/api/orders/{oid}", json={"version": o["version"], "order_no": free})
+    assert ok.status_code == 200, ok.text
+    assert client.get(f"/api/orders/{oid}").json()["order_no"] == free

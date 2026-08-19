@@ -416,6 +416,79 @@ def test_plugin_token_ttl_is_derived_from_the_reap_timeout():
         scopes.revoke(jti)
 
 
+def test_a_manifest_cannot_buy_itself_a_long_lived_token():
+    """TTL 的**上界**不能让清单说了算。
+
+    `timeout` 是 plugin.toml 里的一个数字，插件作者随手写 `timeout = 604800`
+    就换来一枚**一周有效**的令牌——而这枚令牌此刻已经落在插件的日志、
+    环境变量和子进程命令行里了。上界必须由核心的 `_HARD_TTL` 说了算。
+
+    与上面那条是**同一个量的两端**：下界防「令牌比子进程先死」（回灌 401、
+    整批订单静默丢失），上界防「子进程早没了，令牌还能用一周」。
+    补这一条之前只有下界：把 `min(..., _HARD_TTL)` 整个删掉，全套一条都不红。
+    """
+    import time
+
+    from jose import jwt
+
+    from app.config import settings
+    from app.plugins import scopes
+
+    class _U:
+        id, username = 1, "u"
+
+    tok, jti = scopes.issue(_U(), "demo", set(), timeout_s=604800)   # 清单写了一周
+    try:
+        cap = scopes._HARD_TTL.total_seconds()
+        left = scopes._ALIVE[jti] - time.monotonic()
+        assert left <= cap + 1, f"清单要多久就给多久：这枚令牌还能活 {left / 3600:.1f} 小时"
+        # 进程内的撤销表会随重启清空，而**令牌本身**是带着 exp 出门的那一份，
+        # 两处都要封顶（只钉一处，另一处改坏了照样不红）。
+        claims = jwt.decode(tok, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        assert claims["exp"] - claims["iat"] <= cap + 1
+    finally:
+        scopes.revoke(jti)
+
+    # 反面：没顶到上界时仍按 timeout+120 走。少了这一句，把上界写成
+    # 「恒定 40 分钟」也能过——那会让每枚令牌都活满 40 分钟。
+    _, short = scopes.issue(_U(), "demo", set(), timeout_s=600)
+    try:
+        assert scopes._ALIVE[short] - time.monotonic() <= 600 + 120 + 1
+    finally:
+        scopes.revoke(short)
+
+
+def test_a_token_nobody_revoked_still_dies_on_its_own(monkeypatch):
+    """`alive()` 里那句过期检查是**唯一**一道不依赖别人来收拾的闸——零覆盖（实测：
+    把 `if exp < time.monotonic()` 换成 `if False`，全套一条都不红）。
+
+    正常路径上令牌由 `_reap` 的 finally `revoke()` 掉，所以过期检查平时轮不到。
+    但确实有几条路没人来收：
+      · `_launch` 起收割线程失败（OS 拒绝建线程）——那条路明确写了「不调 on_done」，
+        也就没有任何人会 revoke；
+      · `run_command` 里 `_launch` 抛 HTTPException（缺 venv / Popen 失败）时，
+        只有 `except PluginBusy` 那一支会 revoke，别的异常不会。
+    这些情况下 `_ALIVE` 里那一条如果永不过期，它就**一直有效到进程重启**。
+    """
+    import time as _time
+
+    from app.plugins import scopes
+
+    class _U:
+        id, username = 1, "u"
+
+    _, jti = scopes.issue(_U(), "demo", set(), timeout_s=60)
+    try:
+        assert scopes.alive(jti) is True, "刚签发就说它死了"
+        # 拨到 TTL 之后：60+120 秒，多给一点余量
+        base = _time.monotonic()
+        monkeypatch.setattr(scopes.time, "monotonic", lambda: base + 60 + 120 + 5)
+        assert scopes.alive(jti) is False, "过了 exp 还认这枚令牌"
+        assert jti not in scopes._ALIVE, "过期项没被顺手清掉，表会一直长"
+    finally:
+        scopes.revoke(jti)
+
+
 def test_kind_to_scope_map_is_pinned():
     """每种 kind 对应哪一枚权限，**钉死在这里**。
 
@@ -455,6 +528,68 @@ def test_by_kind_sentinel_is_used_by_exactly_one_route():
         f"`*by-kind*` 哨兵出现在 {len(marked)} 条路由上：{marked}。"
         f"每一条都必须自带 kind 级判权，否则它对所有持令牌的插件是敞开的。"
     )
+
+
+def test_a_route_without_an_x_scope_is_closed_to_plugin_tokens(client, session):
+    """**默认拒绝**是这套权限的地基：没显式挂 `x-scope` 的路由，插件令牌一律进不去。
+    有了它，将来谁 include 一个新 router 都不会悄悄扩大插件的权限面。
+
+    挑 `DELETE /api/orders/{id}` 来测，是因为它正是 scopes 模块 docstring 里点名的
+    那个场景——「抓取插件里一个写错的 URL 把 DELETE 发到了 `/api/orders/1`」。
+
+    ⚠️ **必须先断言这条路由真的没挂 x-scope。** 挑到有声明的那种，`need` 非 None，
+    于是把闸门从「默认拒绝」翻成「默认放行」也照样测不出来。实测：把 main.py 里
+    `ok = matched and need is not None and (…)` 换成 `matched and (need is None or …)`，
+    全套 1065 条**一条都不红**——这条地基在此之前是零覆盖的。
+    """
+    from app.main import app
+    from app.plugins import scopes
+
+    hit = [r for r in scopes._iter_routes(app)
+           if r.path == "/api/orders/{order_id}" and "DELETE" in (r.methods or set())]
+    assert len(hit) == 1, "路由变了：换一条**没挂** x-scope 的写操作来测"
+    assert not (hit[0].openapi_extra or {}).get("x-scope"), \
+        "这条路由现在挂了 x-scope，默认分支就测不到了——换一条没挂的"
+
+    class _U:
+        id, username = 1, "admin"
+
+    # 把核心已知的权限**全都**给它：仍然要被挡住，因为这条路由一项都没声明。
+    tok, _ = scopes.issue(_U(), "anyplugin", set(scopes.SCOPES))
+    h = {"Authorization": f"Bearer {tok}"}
+    r = client.delete("/api/orders/1", headers=h)
+    assert r.status_code == 403, \
+        f"没挂 x-scope 的删除接口对插件敞开了：{r.status_code} {r.text[:200]}"
+
+    # **反面**：不能靠「插件令牌什么都进不去」来满足上面那条断言。
+    # 声明了 orders:read 的那条路由，同一枚令牌必须进得去。
+    assert client.get("/api/orders", headers=h).status_code == 200
+
+
+def test_only_scopes_the_manifest_declared_can_take_effect(client, session):
+    """三重交集里的**∩清单声明**与**∩核心已知**：两项都零覆盖（实测各自删掉，全套全绿）。
+
+      ∩清单声明 —— 用户在界面上多勾了（或库里存着一份手改过的 granted_scopes），
+                    插件自己都没说要的权限不该生效。
+      ∩核心已知 —— 核心删掉某个 scope 之后，库里存着的旧授权自动失效。
+
+    这两项都只在「授权集比清单声明的大」时才起作用，而已有测试全都是
+    「授权集 ⊆ 清单声明」，于是交集去掉哪一项结果都一样。
+    """
+    import json as _json
+
+    from app.plugins import scopes
+
+    class _Cfg:
+        granted_scopes = _json.dumps(["fx:write", "orders:read", "core:已删除的旧权限"])
+
+    # 那个「核心已不认识的旧权限」**必须同时写进 declared**，否则它先被
+    # 「∩清单声明」挡掉，`∩核心已知` 那一项一次都没参与判定——把它删掉照样不红。
+    # （第一版就是这么写的，变异测试当场把这条守卫本身判成零覆盖。）
+    eff = scopes.token_scopes({"scopes": ["fx:write", "core:已删除的旧权限"]}, _Cfg())
+    assert "fx:write" in eff, "既声明又授权的那项必须在（否则下面两条是恒真的）"
+    assert "orders:read" not in eff, "插件从没声明过的权限被授权生效了"
+    assert "core:已删除的旧权限" not in eff, "核心已经不认识的旧授权还在生效"
 
 
 # --- 基础设施权限（baseline）---------------------------------------------------

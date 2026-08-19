@@ -414,3 +414,24 @@ def test_zero_amount_rows_are_not_reported_as_swallowed(client, session):
     finally:
         session.delete(row)
         session.commit()
+
+
+def test_recoloring_cannot_create_a_blank_ghost_tag(client):
+    """改色端点用的是 upsert：没登记过的值会被**顺带创建**。它原先既不 strip 也不判空，
+    于是 `?value=%20%20` / `?value=` 都 200 并在库里留下一个 `'  '` / `''` 的标签。
+    这种值永远不可能 `in_use`（所有写入口都 strip），于是常驻下拉框。
+    对照：`POST /api/tags/{field} {"value":"  "}` 是 422 —— 同一件事两处口径不一样。
+    """
+    before = {t["value"] for t in client.get("/api/tags/platform").json()}
+    for bad in ("   ", ""):
+        r = client.put("/api/tags/platform/color", params={"value": bad, "color": 1})
+        assert r.status_code == 422, f"{bad!r} 建出了幽灵标签：{r.status_code}"
+    after = {t["value"] for t in client.get("/api/tags/platform").json()}
+    assert after == before, f"库里多出了空标签：{after - before}"
+
+    # **反面**：带空格的正常值要被 strip 之后照常改色，而不是一并拒掉。
+    client.post("/api/tags/platform", json={"value": "改色测试"})
+    ok = client.put("/api/tags/platform/color", params={"value": "  改色测试  ", "color": 3})
+    assert ok.status_code == 200, ok.text
+    got = {t["value"]: t["color"] for t in ok.json()}
+    assert got.get("改色测试") == 3, got

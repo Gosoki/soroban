@@ -301,8 +301,15 @@ def _same_row_value(anchor: dict, tokens: list[dict], row_tol: float,
 
 
 def _extract_date(text: str) -> Optional[str]:
-    """从文本里抽出 YYYY-MM-DD（兼容 - / . 及全角连字符 – —），无则 None。"""
-    m = re.search(r"(\d{4})\s*[-/.–—]\s*(\d{1,2})\s*[-/.–—]\s*(\d{1,2})", text or "")
+    """从文本里抽出 YYYY-MM-DD（兼容 - / . 以及 `_DASHES` 里的各种破折号），无则 None。
+
+    **先过 `_norm_dashes` 再匹配**，不要在字符类里自己再抄一份破折号表。
+    原先字符类写的是 `[-/.–—]`，只覆盖了 `_DASHES` 七个里的两个 ——
+    而漏掉的 `－`（U+FF0D 全角连字符）恰恰是中文界面 OCR 最常吐出来的那个，
+    于是 `2026－07－19` 返回 None、下单时间/订单时间**静默为空**，用户不知道为什么这张没认出来。
+    `_extract_package_no` 一直是先归一再匹配的，两处口径现在一致。
+    """
+    m = re.search(r"(\d{4})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})", _norm_dashes(text))
     if not m:
         return None
     y, mo, d = (int(g) for g in m.groups())
@@ -437,7 +444,6 @@ def _load_truck_ref():
     global _truck_ref, _truck_ref_loaded
     if _truck_ref_loaded:
         return _truck_ref
-    _truck_ref_loaded = True
     try:
         import cv2
         import numpy as np
@@ -445,8 +451,20 @@ def _load_truck_ref():
         # 用 imdecode 而非 imread：避开 Windows 下 imread 对非 ASCII 路径的读取问题
         data = _TRUCK_REF_PATH.read_bytes()
         _truck_ref = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
-    except Exception:
+        if _truck_ref is None:
+            log.warning("闲鱼卡车模板解码失败（%s）：本次运行内不再使用这一路平台信号，"
+                        "无文案线索的闲鱼截图会判成「认不出是哪个平台」", _TRUCK_REF_PATH)
+    except Exception as e:                      # noqa: BLE001  cv2 缺失 / 文件被杀软隔离
         _truck_ref = None
+        log.warning("闲鱼卡车模板加载失败（%s）：%s —— 本次运行内不再使用这一路平台信号",
+                    _TRUCK_REF_PATH, e)
+    finally:
+        # **置位必须在加载之后。** 原先第一句就置 True：并发的另一路请求会看到
+        # 「已加载 + _truck_ref is None」⇒ 那一张的卡车信号凭空消失，而它恰恰是
+        # 文案兜不住时唯一的闲鱼证据。窗口只有一次文件读 + imdecode，但确实存在。
+        # 另一半是失败**永久静默**：原先连一行日志都没有，与 `_get_engine`
+        # （明确写了「失败后下次可重试」）的取向正相反。现在至少说一次。
+        _truck_ref_loaded = True
     return _truck_ref
 
 
@@ -593,6 +611,8 @@ def _decode_image(image_bytes: bytes):
     try:
         img = Image.open(io.BytesIO(image_bytes))
         w, h = img.size
+    except MemoryError:
+        raise                     # 见下面 np.array 那处的说明
     except Exception as e:
         raise ValueError(f"图片无法解析：{e}") from e
     if w * h > MAX_OCR_PIXELS:
@@ -602,6 +622,14 @@ def _decode_image(image_bytes: bytes):
         )
     try:
         return np.array(img.convert("RGB"))
+    except MemoryError:
+        # **MemoryError 必须原样抛上去。** 它是 Exception 的子类，会先被下面那支接住
+        # 转成 ValueError → 路由映射成 400「图片无法解析：」——而 `str(MemoryError())`
+        # 是**空串**，用户拿到的是一句以冒号结尾、后面什么都没有的话，
+        # 含义还是「你这张图坏了」，真实原因是机器内存不够。
+        # 路由里那个带 Retry-After 的 503「服务器内存不足，请稍后重试」因此**不可达**，
+        # 日志里也不会留下任何痕迹。解码与推理恰恰是仅有的两个会 OOM 的位置。
+        raise
     except Exception as e:
         raise ValueError(f"图片无法解析：{e}") from e
 
@@ -611,6 +639,8 @@ def _run_engine(engine, arr):
     with _infer_lock:
         try:
             result, _ = engine(arr)
+        except MemoryError:
+            raise                     # 同 _decode_image：别把「内存不够」说成「图片坏了」
         except Exception as e:        # noqa: BLE001  极端尺寸/畸形图让引擎前处理内部报错
             raise ValueError(f"图片无法识别（OCR 引擎处理失败）：{e}") from e
     return result
@@ -665,12 +695,24 @@ def _stamp_platform(fields: dict, full_text: str, arr, hint: Optional[str] = Non
         # ⚠️ 这里**故意不调 `_truck_present`**：它是全图 8 尺度 matchTemplate，
         #    批量拖十几张时省下的就是十几秒。跳过只能写在这一支里——做成无条件短路
         #    会让「闲鱼卡车必须被看一眼」那条守卫变红，而那条守卫是有道理的。
-        seen = None if (_is_xianyu(full_text) or other == hint) else other
+        xianyu = _is_xianyu(full_text)
+        seen = None if (xianyu or other == hint) else other
         fields["platform"] = hint
         if hint == "闲鱼":
             # 解析规则本来就是照闲鱼版式写的，不冲突就一个字都不说。
             fields["platform_warning"] = (
                 f"你标了闲鱼，但截图上看到的是{seen}的特征，请复核这张图有没有传错" if seen else None)
+        elif xianyu:
+            # **图上有明确的闲鱼特征 ⇒ 解析规则是对的，这一张多半解析得准。**
+            # 原先这一支不存在，下面那句「成交价与商品名多半认不出来」是**无条件**发的：
+            # 批量拖 12 张、来源选「淘宝」，里面混进 2 张闲鱼截图，
+            # 汇总弹窗就写「其中 12 张不是闲鱼版式……多半认不出来」——
+            # 而那 2 张恰恰是准的。这正是本函数上面写的「冲突信息本身有用」那条理由
+            # （「那张的解析其实是准的」）被自己的文案否掉了。
+            # 仍然保持 truthy：路由要靠它去查 platform_plugin，前端要靠它计数。
+            fields["platform_warning"] = (
+                f"你标了{hint}，但这张看着是闲鱼的版式——解析结果应该是准的，"
+                f"只是来源会按你选的记成{hint}，请确认没传错图")
         else:
             fields["platform_warning"] = (
                 f"你标了{hint}；OCR 的解析规则是照闲鱼的版式写的，"

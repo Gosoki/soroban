@@ -81,7 +81,7 @@
 import PageHeader from '@/components/PageHeader.vue'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { itemsApi, ordersApi, shipmentApi, tagsApi } from '@/api'
-import { ORDER_SOURCES, PURCHASE_STATUS, SHIPMENT_STATUS, platformSemanticStyle, statusStyle, tagStyleAt } from '@/constants'
+import { ORDER_SOURCES, PAGE_SIZE, PURCHASE_STATUS, SHIPMENT_STATUS, platformSemanticStyle, statusStyle, tagStyleAt } from '@/constants'
 import NotionTable from '@/components/NotionTable.vue'
 import OrderEditPanel from '@/components/OrderEditPanel.vue'
 
@@ -114,7 +114,7 @@ const rows = ref([])
 const total = ref(0)
 const loading = ref(false)
 const page = ref(1)
-const pageSize = 30
+const pageSize = PAGE_SIZE
 const filters = reactive({ q: '', platform: '', fulfillmentStatus: '', platform_account: '', range: null })
 
 // 账号标签的持久化配色（与其它页同一套色序，保证同一账号处处同色）+ 账号候选（编辑弹窗下拉用）

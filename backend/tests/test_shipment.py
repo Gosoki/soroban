@@ -1,4 +1,5 @@
 """集运订单：挂靠/解除的原子性、软删联动、特殊费、金额。"""
+import uuid
 from decimal import Decimal
 
 
@@ -316,3 +317,41 @@ def test_full_length_tracking_number_still_attaches(client, session, monkeypatch
     got = client.post(f"/api/shipment/{ship['id']}/ocr-express",
                       files={"file": ("x.png", b"\x89PNG", "image/png")}).json()
     assert [o["id"] for o in got["attached"]] == [od["id"]], "正常单号也挂不上了"
+
+
+def test_ocr_attach_reports_orders_already_on_another_shipment(client, session, monkeypatch):
+    """「已经挂在别张集运单上的订单，不许被抢走、且必须回报给用户」——`skipped` 桶。
+
+    这条规则**全仓零断言**：`skipped` 这个键在 tests 里只出现在插件那两处
+    （按账号清空暂存的计数、插件卡片计数），与集运挂靠无关。
+    改坏了不会红——把这些订单塞进 `attached` 而不是 `skipped`，
+    前端只会照数量弹一句绿色的「已关联 N 单」，而那 N 单里有几单一个字节都没写。
+    对照：同一条语义在 `attach_order` 那个入口有 `test_attach_already_attached_elsewhere_rejected`
+    钉着——两个入口，只有一半有守卫。
+    """
+    from app.routers import shipment as mod
+
+    # **单号要自足。** 用 `SF1234567890` 这种「大家都在用」的号会让整套跑时
+    # 匹配到别的用例建的订单（那条没挂集运单 ⇒ 会被正常挂上 ⇒ attached 非空），
+    # 于是这条测试单跑绿、整套红。随机后缀让它只匹配自己造的那一行。
+    no = "SFSKIP" + uuid.uuid4().hex[:10].upper()
+    a = client.post("/api/shipment", json={"date": "2026-03-02", "shipment_no": "SKIP-A"}).json()
+    b = client.post("/api/shipment", json={"date": "2026-03-02", "shipment_no": "SKIP-B"}).json()
+    od = client.post("/api/orders", json={
+        "date": "2026-03-02", "title": "已挂在 A 上", "express_no": no,
+        "shipment_order_id": a["id"]}).json()
+    assert client.get(f"/api/orders/{od['id']}").json()["shipment_order_id"] == a["id"]
+
+    async def fake_ocr(file, recognizer):
+        return {"express_nos": [no], "unreadable": 0}
+
+    monkeypatch.setattr(mod, "run_ocr", fake_ocr)
+    r = client.post(f"/api/shipment/{b['id']}/ocr-express",
+                    files={"file": ("x.png", b"\x89PNG", "image/png")})
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert [o["id"] for o in got["attached"]] == [], "把别张集运单的货抢过来了"
+    assert od["id"] in [o["id"] for o in got["skipped"]], (
+        f"没回报给用户：skipped={got['skipped']}，用户只会看到一句绿色的「已关联 0 单」")
+    # 库里没被动
+    assert client.get(f"/api/orders/{od['id']}").json()["shipment_order_id"] == a["id"]

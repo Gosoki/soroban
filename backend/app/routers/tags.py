@@ -169,6 +169,13 @@ def set_tag_color(
     """手动给某标签改颜色（调色盘 10 色之一）。颜色本是建标签时自动分配、之后不变，这里开手动改的口子。
     用 upsert：标签已在库则改色；只在数据里出现、还没登记的值则顺带登记为该色。"""
     _check_field(field)
+    # **和 add_tag / rename_tag 同一道口径。** 这里用的是 upsert：没登记过的值会被
+    # **顺带创建**，而这个端点原先既不 strip 也不判空 ⇒ `?value=%20%20` / `?value=`
+    # 都会 200 并在库里留下一个 `'  '` / `''` 的标签。它们永远不可能 in_use
+    # （所有写入口都 strip），于是常驻下拉框。对照：`POST /api/tags/{field} {"value":"  "}` 是 422。
+    value = value.strip()
+    if not value:
+        raise HTTPException(status_code=422, detail="标签值不能为空")
     check_value_fits(field, value)      # 它会顺带登记该值，同样得先确认装得进数据列
     session.execute(upsert(
         session.get_bind(), TagOption,

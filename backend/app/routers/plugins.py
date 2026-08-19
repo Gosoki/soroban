@@ -233,10 +233,41 @@ def _save_accounts(session: Session, cfg: PluginConfig, accounts: list[dict]) ->
     session.add(cfg)
 
 
+# 会话文件「能不能解析」的缓存：(路径, mtime_ns, 大小) → bool。
+# 卡片每次刷新都会问一遍每个账号，而会话文件能到 MB 级——不缓存就是每次刷新
+# 都把它们全解析一遍。文件一变（mtime/size 变）键就变，天然失效。
+_SESSION_OK: dict[tuple, bool] = {}
+
+
 def _authorized(manifest: dict, account: str) -> bool:
-    """该账号是否已授权：插件的 state 目录下有 <account>.json（登录会话）即算。"""
-    state_dir = manifest.get("state_dir", ".state")
-    return (manifest["_dir"] / state_dir / f"{account}.json").is_file()
+    """该账号是否已授权：state 目录下有 `<account>.json`，**且它能解析成 JSON**。
+
+    只判 `is_file()` 是不够的，而且这个「不够」是插件作者已经踩过并修掉的：
+    淘宝插件的 `session.has_session()` 注释写着「会话文件存在**且**能解析成 JSON——
+    坏文件不算已授权，避免『显示已授权却永远抓不了』」。
+    但**用户看到的绿标来自核心这一份**。断电/磁盘满把 `.state/<账号>.json` 截断之后：
+      · 核心 `is_file()` → True → 卡片绿标「已授权」、「抓这个号」可点；
+      · 插件 `has_session()` → False → 每次 fetch 立刻退出。
+    插件那条修复对用户唯一会看的那个界面完全无效。两份实现、核心那份更弱、
+    且核心那份才是可见的——所以这里跟插件对齐，而不是反过来。
+    """
+    f = manifest["_dir"] / manifest.get("state_dir", ".state") / f"{account}.json"
+    try:
+        st = f.stat()
+    except OSError:
+        return False
+    key = (str(f), st.st_mtime_ns, st.st_size)
+    hit = _SESSION_OK.get(key)
+    if hit is None:
+        try:
+            json.loads(f.read_text(encoding="utf-8"))
+            hit = True
+        except (OSError, ValueError):
+            hit = False
+        if len(_SESSION_OK) > 256:          # 账号改名/换插件会留下旧键，别让它无限长
+            _SESSION_OK.clear()
+        _SESSION_OK[key] = hit
+    return hit
 
 
 def _state_accounts(manifest: dict) -> list[str]:
@@ -566,6 +597,31 @@ def _browser_ready(py: Path) -> bool:
         return False
 
 
+# 卡片上认识的计数键 → 中文标签。顺序即显示顺序。
+_COUNTERS = (("created", "新建"), ("updated", "更新"), ("unchanged", "无变化"),
+             ("skipped", "跳过"), ("blocked", "挡下"), ("failed", "失败"),
+             ("rejected", "拒收"))
+# 核心认识、但本身不构成「有话要说」的键。
+# `account` 必须在里面：淘宝插件**每一行**都吐 `{"ok":…, "account": args.account, **res}`，
+# 而账号名已经由 `_batch_text` 拼在整句最前面了——不排除它的话，
+# 卡片会变成「甲 ✓ 新建 3、更新 1｜account=甲」，同一个名字出现两遍。
+_KNOWN_KEYS = frozenset({"ok", "error", "logged_in", "rate", "source", "account"}) | {
+    k for k, _ in _COUNTERS}
+
+
+def _extra_notes(d: dict) -> str:
+    """插件说了、而核心不认识的那些话。
+
+    **只取值是非空字符串的键**：那是插件写给人看的一句话（如汇率插件 `probe` 的
+    `note: "没有 SOROBAN_TOKEN，只取不交"`）。布尔与列表一律跳过——
+    原先无差别地 `f"{k}={d[k]}"`，于是中文卡片上会出现 `pushed=True`、`tried=['boc']`
+    这种 Python 字面量，而它们对用户没有任何意义。
+    """
+    out = [str(v).strip() for k, v in d.items()
+           if k not in _KNOWN_KEYS and isinstance(v, str) and v.strip()]
+    return "；".join(out)[:120]
+
+
 def _summarize(line: str, returncode: int, errtail: str = "") -> str:
     """把插件吐的那行 JSON 变成一句人话，放插件卡片上。
 
@@ -579,9 +635,11 @@ def _summarize(line: str, returncode: int, errtail: str = "") -> str:
     全在 stderr 里，而用户看不到日志文件。这正是打包版汇率插件的失败形态。
     """
     try:
-        d = json.loads(line or "{}")
+        d, parsed = json.loads(line or "{}"), True
     except (TypeError, ValueError):
-        d = {}
+        # **这一支要和「line 是空的」分开记。** 两者都得到 d={}，而它们该走不同的结局：
+        # 解析不了的原样显示（那是插件唯一能说的话），空的才叫「已完成」。
+        d, parsed = {}, False
     if not isinstance(d, dict):
         return (line or "")[:200]
     if d.get("error"):
@@ -589,21 +647,39 @@ def _summarize(line: str, returncode: int, errtail: str = "") -> str:
     bits = []
     # skipped/logged_in 是淘宝插件最常见的两种结果（本轮无变化 / 登录成功），
     # 原先不在表里 → 落到最后一支，卡片上显示的是原始 JSON。
-    for k, label in (("created", "新建"), ("updated", "更新"), ("unchanged", "无变化"),
-                     ("skipped", "跳过"), ("blocked", "挡下"), ("failed", "失败"),
-                     ("rejected", "拒收")):
+    for k, label in _COUNTERS:
         if d.get(k):
             bits.append(f"{label} {d[k]}")
     if d.get("logged_in"):
         bits.append("登录成功")
     if d.get("rate"):
         bits.append(f"1元 = {str(d['rate'])[:8]}円" + (f"（{d['source']}）" if d.get("source") else ""))
+    notes = _extra_notes(d)
     if bits:
-        return "、".join(bits)
+        # **认识的键说完之后，别把不认识的悄悄吞掉。**
+        # 汇率插件的 `probe`（「只测试、不写入」）回的是
+        #   {"ok":true,"source":"boc","rate":"21.03","pushed":false,"note":"没有 SOROBAN_TOKEN，只取不交"}
+        # `rate` 命中就提前返回 ⇒ `note` 消失 ⇒ 卡片上「只测不写」和一次真正成功的写入
+        # **显示同一句话**，而 probe 存在的全部理由就是排查「取不到汇率」。
+        return "、".join(bits) + (f"｜{notes}" if notes else "")
     if returncode != 0:
         # stderr 的**最后一行非空内容**通常就是异常那一行，比整段栈更适合放卡片。
         last = next((ln.strip() for ln in reversed((errtail or "").splitlines()) if ln.strip()), "")
         return f"退出码 {returncode}" + (f"：{last[:160]}" if last else "")
+    # 到这里说明：退出码 0，而认识的计数键**一个非零的都没有**。
+    # 上面那个循环用的是真值判断，所以 `{"created": 0, "updated": 0, "skipped": 0}`
+    # ——定时抓取最常见的结局，跑完了确实没新东西——一条 bits 都不产生，
+    # 原先直接落到最后一行，把整坨 JSON 显示在卡片上（正是本函数要避免的那件事）。
+    #
+    # ⚠️ 判据**不能**是「这行 JSON 里没有核心不认识的键」。第一版就是那么写的，
+    # 而淘宝插件每一行都带着 `account` ⇒ 差集恒非空 ⇒ 这一支对**真正的生产者**
+    # 是死代码，而配套用例手工去掉了 `account`（那个形状没有任何插件会产生）——
+    # 一条把自己测绿了的假绿。判据改成「计数键出现过」，那才是「这一轮跑完了」的信号；
+    # 不认识的话由 `_extra_notes` 单独接住，不会丢。
+    if parsed and any(k in d for k, _ in _COUNTERS):
+        return "本轮无变化" + (f"｜{notes}" if notes else "")
+    if parsed and not set(d) - _KNOWN_KEYS:
+        return "已完成"
     return (line or "已完成")[:200]
 
 
@@ -1900,8 +1976,18 @@ def _fan_targets(m: dict, cfg, cmd, account: Optional[str] = None) -> list[tuple
         # 磁盘上有会话、但配置里没登记的孤儿账号也允许点（换机/重置库之后就剩它了）。
         named = next((a for a in known if a["name"] == account), None)
         _check_account_name(m, account)
-        return [(["--account", account,
-                  "--platform", (named or {}).get("platform", "淘宝")], account)]
+        extra = ["--account", account]
+        # **孤儿账号（磁盘上有会话、配置里没登记）不许被凭空安上「淘宝」。**
+        # 这一支原先写死 `.get("platform", "淘宝")`，而它对**任何**账号型插件生效：
+        # 装一个京东插件、点一个只在磁盘上存在的号，核心会给它的子进程下发
+        # `--platform 淘宝` ⇒ 抓回来的单 platform="淘宝" 进账本 ⇒
+        # `platform_provider`（OCR 用它决定说哪句话）会报出**京东插件的名字**在管淘宝截图。
+        # 配置里登记过的账号仍按登记值走（`_account_list` 的默认值是**读旧数据的兼容路径**，
+        # 动它会让库里已有的旧格式账号平台变空，不能碰）。
+        # 不下发时插件用它自己的默认值——那才是「核心不认识任何具体插件」的口径。
+        if named and named.get("platform"):
+            extra += ["--platform", named["platform"]]
+        return [(extra, account)]
     return [(["--account", a["name"], "--platform", a["platform"]], a["name"])
             for a in known if a["enabled"]]
 

@@ -141,10 +141,33 @@ def test_layout_roundtrip(client):
     assert got == cols
 
 
-def test_layout_negative_width_stored_verbatim(client):
-    """当前无宽度下限校验——记录现状，改了要同步这条。"""
-    r = client.put("/api/layout/misc", json={"columns": [{"key": "date", "width": -50}]})
-    assert r.status_code == 200
+def test_layout_write_has_bounds(client):
+    """`/api/layout` 曾是全仓唯一一条**无上限**写入 Text 列的路径。
+
+    实测 3000 个列定义 → 200 OK、落库 94890 字节；而 MySQL 的 TEXT 上限是 65535 **字节**
+    → 1406 → `DataError`，`main.py` 没有这个 handler ⇒ **裸 500**。
+    SQLite 那边静默收下 —— 同一份数据库导出，两个后端两种结局。
+    负宽度原先也照单全收（这条测试的旧版本就是「记录现状」）。
+    """
+    # 负宽度
+    assert client.put("/api/layout/misc",
+                      json={"columns": [{"key": "date", "width": -50}]}).status_code == 422
+    # 荒谬的大宽度
+    assert client.put("/api/layout/misc",
+                      json={"columns": [{"key": "date", "width": 999999}]}).status_code == 422
+    # 超长列名
+    assert client.put("/api/layout/misc",
+                      json={"columns": [{"key": "x" * 200, "width": 100}]}).status_code == 422
+    # 条数
+    many = [{"key": f"c{i}", "width": 100} for i in range(3000)]
+    assert client.put("/api/layout/misc", json={"columns": many}).status_code == 422
+    # 多余的键
+    assert client.put("/api/layout/misc",
+                      json={"columns": [{"key": "date", "width": 100, "zzz": 1}]}).status_code == 422
+
+    # **反面**：正常的一份布局必须照常存进去（别把闸写成「什么都不收」）
+    ok = client.put("/api/layout/misc", json={"columns": [{"key": "date", "width": 120}]})
+    assert ok.status_code == 200, ok.text
 
 
 def test_wrong_types_never_500(client):

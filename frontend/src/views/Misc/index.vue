@@ -26,6 +26,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { miscApi } from '@/api'
 import { handled } from '@/api/http'
 import { today } from '@/utils/datetime'
+import { PAGE_SIZE } from '@/constants'
 import { afterCreate, afterDelete } from '@/utils/listRows'
 import NotionTable from '@/components/NotionTable.vue'
 
@@ -44,7 +45,7 @@ const rows = ref([])
 const total = ref(0)
 const loading = ref(false)
 const page = ref(1)
-const pageSize = 30
+const pageSize = PAGE_SIZE
 const filters = reactive({ range: null, q: '' })
 
 // 请求序号：筛选/翻页可以在上一次响应回来前再发一次，慢的那次后到会把新数据整个覆盖掉
@@ -88,7 +89,7 @@ async function saveCell(row, key, value) {
 async function addRow(data = {}, done) {
   try {
     const created = await miscApi.create({ date: today(), name: '', ...data })
-    await afterCreate(created, { rows, total, page, filters, load })
+    await afterCreate(created, { rows, total, page, filters, load, pageSize })
     done?.(true)
   } catch (_) {
     done?.(false)   // 失败时保留幽灵行里的草稿，让用户就地改，别把刚敲的内容一起吞掉
@@ -97,7 +98,8 @@ async function addRow(data = {}, done) {
 
 async function delRow(row) {
   try {
-    await ElMessageBox.confirm(`删除杂项「${row.name || row.id}」？`, '确认', { type: 'warning' })
+    await ElMessageBox.confirm(`删除杂项「${row.name || row.id}」？`, '删除杂项支出',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' })
   } catch (_) { return }
   try {
     await miscApi.remove(row.id)

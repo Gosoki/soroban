@@ -145,7 +145,7 @@ async function saveItems() {
   // 真正的删除只走 removeItem（有二次确认）。
   const blank = all.filter((it) => !it.name || !it.name.trim())
   if (blank.length) {
-    ElMessage.warning(`有 ${blank.length} 条物品还没填名字——先填上，或点右侧 🗑 删掉`)
+    ElMessage.warning(`有 ${blank.length} 条物品还没填名字——先填上，或点右侧的删除按钮删掉`)
     return false
   }
   const items = toPayload(all)
@@ -207,7 +207,8 @@ async function savePostage() {
 async function removeItem(i) {
   const it = props.order.items?.[i]
   try {
-    await ElMessageBox.confirm(`删除物品「${it?.name || '未命名'}」？`, '确认', { type: 'warning' })
+    await ElMessageBox.confirm(`删除物品「${it?.name || '未命名'}」？`, '删除物品',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' })
   } catch (_) { return }
   // **先删本地、失败要放回去**。不放回去的话本地数组已经少了这条，
   // 下一次任何成功的保存都会把「不含它的 items」整体覆盖上去——

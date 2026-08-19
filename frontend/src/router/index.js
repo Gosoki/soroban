@@ -20,7 +20,7 @@ const routes = [
       { path: 'misc', name: 'Misc', component: () => import('@/views/Misc/index.vue'), meta: { title: '杂项支出', icon: 'Money' } },
       { path: 'fx', name: 'Fx', component: () => import('@/views/Fx/index.vue'), meta: { title: '日元汇率', icon: 'Coin' } },
       { path: 'plugins', name: 'Plugins', component: () => import('@/views/Plugins/index.vue'), meta: { title: '插件管理', icon: 'Connection' } },
-      { path: 'database', name: 'Database', component: () => import('@/views/Database/index.vue'), meta: { title: '数据库', icon: 'Coin' } },
+      { path: 'database', name: 'Database', component: () => import('@/views/Database/index.vue'), meta: { title: '数据库', icon: 'Files' } },
       { path: 'settings', name: 'Settings', component: () => import('@/views/Settings/index.vue'), meta: { title: '设置', icon: 'Setting' } },
     ],
   },

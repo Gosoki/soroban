@@ -149,7 +149,15 @@ def write_config(engine: Engine, backend: str, mysql_url: Optional[str] = None) 
 # --- 记录连接过的数据库（saved connections）-------------------------------------
 
 def list_connections(engine: Engine) -> list[dict]:
-    """返回已保存的 MySQL 连接（不含密码，最近使用在前）。解不开的（SECRET_KEY 变更）跳过。"""
+    """返回已保存的 MySQL 连接（不含密码，最近使用在前）。
+
+    **不跳过解不开的那些**——原先 docstring 说「跳过」，而当时这里根本不解密，那句话是假的。
+    现在会逐条试解一次（只为算出下面那个 `decryptable`，明文不出这个函数）。
+    列出来是对的：跳过等于「记录凭空消失」，而用户至少要能看见并删掉它。
+    但列出来之后点「切换」会拿到 404「连接不存在或无法解密」——「明明列在这里」
+    却说「不存在」，是一条读不懂的死路。所以每条带上 `decryptable`：
+    解不开的那些在界面上标出来并禁掉切换/迁移，用户一眼知道该重填密码。
+    """
     with engine.connect() as conn:
         rows = conn.execute(
             select(db_connection).order_by(db_connection.c.last_used_at.desc())
@@ -160,6 +168,8 @@ def list_connections(engine: Engine) -> list[dict]:
             "id": r.id, "label": r.label, "backend": r.backend,
             "host": r.host, "port": r.port, "user": r.username, "database": r.dbname,
             "last_used_at": r.last_used_at.isoformat() if r.last_used_at else None,
+            # SECRET_KEY 变过之后这条就再也解不开了（Fernet 密钥由它派生）。
+            "decryptable": decrypt(r.url_enc) is not None,
         })
     return out
 

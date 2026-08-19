@@ -15,6 +15,7 @@ from decimal import Decimal
 from urllib.parse import quote_plus
 
 import pymysql
+from sqlalchemy import BigInteger, Integer, SmallInteger, or_
 from sqlalchemy import func as sa_func
 from sqlmodel import Session, delete, select
 
@@ -186,6 +187,25 @@ def is_target_empty(engine) -> bool:
     return True
 
 
+# MySQL 的 INT 是 4 字节有符号；SQLite 没有这个限制，历史脏行能静默躺在里面。
+_INT32_MIN, _INT32_MAX = -2147483648, 2147483647
+
+
+def target_rows(engine) -> dict[str, int]:
+    """目标库各业务表**现有**行数（只回非空的，键是中文表名）。
+
+    给「迁移会删掉什么」这句话提供事实。`is_target_empty` 只回是/否，
+    而用户要决定的是「值不值得覆盖」——那需要知道对面有多少东西。
+    """
+    out: dict[str, int] = {}
+    with Session(engine) as s:
+        for model in MIGRATION_ORDER:
+            n = int(s.exec(select(sa_func.count()).select_from(model)).one() or 0)
+            if n:
+                out[_TABLE_LABELS.get(model.__tablename__, model.__tablename__)] = n
+    return out
+
+
 def preflight(src_engine, dst_engine) -> list[str]:
     """拷贝前体检：找出**源库里合法、目标库会拒收**的行，说人话报给用户。
 
@@ -226,6 +246,20 @@ def preflight(src_engine, dst_engine) -> list[str]:
                         problems.append(
                             f"{label} #{key} 的「{col.name}」有 {n} 个字符，"
                             f"超过上限 {limit}：{str(val)[:40]}…"
+                        )
+                    continue
+                # **整数列**：SQLite 是弱类型，`jpy_override` 之类能静默存下超过 2^31 的值；
+                # MySQL 的 INT 是 4 字节，插入时抛 1264 Out of range。
+                # 入口层的 `_bounded_jpy`（schemas.py）只保证**今后**写不进越界值，
+                # 对那道卡口存在**之前**就躺在库里的历史行无能为力——那正是 preflight 的职责。
+                # （`config.py` 里那条「SQLite 与 MySQL 的整数范围发散」的说明就是指这个。）
+                if isinstance(col.type, Integer) and not isinstance(col.type, (BigInteger, SmallInteger)):
+                    for key, val in s.exec(
+                        select(pk, col).where(or_(col > _INT32_MAX, col < _INT32_MIN)).limit(3)
+                    ).all():
+                        problems.append(
+                            f"{label} #{key} 的「{col.name}」= {val}，"
+                            f"超出目标库 INT 能存的范围（{_INT32_MIN} ~ {_INT32_MAX}）"
                         )
                     continue
                 precision = getattr(col.type, "precision", None)

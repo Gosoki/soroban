@@ -31,7 +31,7 @@
       <template #title>有 {{ data.uncounted_count }} 笔没算进下面的合计</template>
       这些行填了货款（合计 ¥{{ data.uncounted_cny }}）但当时<b>没有汇率</b>，折不出日元。
       下面的总支出因此偏小，而单数是全的。
-      <router-link to="/fx">去汇率页补一条</router-link>，然后在对应行重填一次货款即可重算。
+      <el-link type="primary" :underline="false" @click="$router.push('/fx')">去汇率页补一条</el-link>，然后在对应行重填一次货款即可重算。
     </el-alert>
     <el-row :gutter="16" v-loading="loading">
       <el-col :xs="12" :sm="12" :md="6" v-for="c in cards" :key="c.label">

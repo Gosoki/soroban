@@ -105,6 +105,39 @@ def test_run_py_does_not_print_default_password():
     assert "admin123" not in src
 
 
+def test_no_backend_code_prints_a_password():
+    """**守卫要钉行为，不是钉位置。**
+
+    上面那条只 grep `run.py`，而真正把 `已创建 admin：admin / admin123` 打出来的是
+    `app/seed.py`（`run.py` 首启会调它）。于是那一行删掉不会有任何测试变红、
+    加回来也不会——防线钉在了实现位置上。打包版首启是双击运行的，
+    这句话会白纸黑字留在控制台，用户截图求助时口令一起进去。
+
+    这里改成扫全仓的 `print(...)`：任何一个参数里提到口令的，都算。
+    （`admin123` 这个**字面量本身**允许存在——它是 `seed.py` 的默认值、
+    `demo.py` 的建号口令；不许的是把它打出来。）
+    """
+    import ast
+
+    bad = []
+    for py in (_REPO / "backend").rglob("*.py"):
+        if any(p in py.parts for p in (".venv", "tests", "alembic", "__pycache__")):
+            continue
+        src = py.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:                     # 不是本条守卫的职责
+            continue
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "print"):
+                continue
+            for arg in node.args:
+                seg = ast.get_source_segment(src, arg) or ""
+                if "password" in seg or "admin123" in seg:
+                    bad.append(f"{py.relative_to(_REPO)}:{node.lineno}: {seg[:90]}")
+    assert not bad, "这些 print 会把口令打到控制台：\n  " + "\n  ".join(bad)
+
+
 def test_pyinstaller_bat_claim_matches_reality():
     """打包脚本的说明文字曾声称 exe 首启会生成 .env——当时是假的。现在真了，说明也得对得上。"""
     bat = (_REPO / "pyinstaller.bat").read_text(encoding="utf-8", errors="replace")
@@ -398,3 +431,47 @@ def test_unknown_username_costs_the_same_as_a_known_one(session):
     # 只要求同一量级：绝对值随机器差别很大，差 5 倍以上才算可判别的信道
     assert 0.2 < unknown / max(known, 1e-6) < 5, \
         f"不存在的用户名 {unknown*1000:.0f}ms vs 存在的 {known*1000:.0f}ms —— 时序可判别"
+
+
+# --- 交互式文档只在环回时默认开 --------------------------------------------------
+
+@pytest.mark.parametrize("host,override,want", [
+    ("127.0.0.1", "", True),          # 环回：默认开，它平时很有用
+    ("localhost", "", True),
+    ("::1", "", True),
+    ("", "", True),                   # 没设 HOST = 默认环回
+    ("0.0.0.0", "", False),           # **对外监听：默认关**
+    ("192.168.1.50", "", False),
+    ("0.0.0.0", "1", True),           # 显式要开，就开
+    ("0.0.0.0", "true", True),
+    ("0.0.0.0", "YES", True),
+    ("0.0.0.0", "0", False),          # 只有明确的真值才算
+    ("0.0.0.0", "no", False),
+])
+def test_docs_are_closed_on_a_lan_unless_explicitly_opened(host, override, want):
+    """`/docs`、`/redoc`、`/openapi.json` 都**不需要登录**，摆出来的是完整 API 面
+    （含每条路由的插件 scope 标注、`/api/db/*`、`/api/plugins/*`）。绑到 0.0.0.0 时
+    那就是给整个局域网看的一张地图。
+
+    这道闸原先零覆盖：整段删掉、`docs_url` 写死成 `/docs`，全套一条都不红。
+    """
+    from app.main import docs_enabled
+
+    assert docs_enabled(host, override) is want
+
+
+def test_the_plugin_gate_runs_outside_the_readonly_barrier():
+    """两个中间件的**注册顺序**决定运行时的嵌套顺序，而 `main.py` 明写了理由：
+    越权请求要在 403 时就被挡掉，不该先去占一个「在飞写」计数。
+
+    这条同样零覆盖：把两个装饰器对调，全套一条都不红。
+    Starlette 的 `add_middleware` 每次 `insert(0)`，所以**后注册的在外层**：
+    最终顺序是 [CORS, _plugin_gate, _readonly_barrier]，越靠前越外层。
+    """
+    from app.main import app
+
+    names = [m.kwargs.get("dispatch").__name__ if m.kwargs.get("dispatch") else m.cls.__name__
+             for m in app.user_middleware]
+    assert "_plugin_gate" in names and "_readonly_barrier" in names, names
+    assert names.index("_plugin_gate") < names.index("_readonly_barrier"), (
+        f"插件闸跑到了只读屏障的内层：{names}。越权请求会先占一个「在飞写」计数才被 403 挡掉")

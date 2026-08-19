@@ -215,6 +215,22 @@ def test_settings_rejects_bad_values(client, patch):
     assert client.put("/api/settings", json={"values": patch}).status_code == 422
 
 
+@pytest.mark.parametrize("bad", ["NaN", "nan", "sNaN", "-NaN"])
+def test_manual_rate_rejects_not_a_number_values(client, bad):
+    """**NaN 能被 `Decimal()` 正常解析**，坑在下一步：decimal 对 NaN 做**有序比较**
+    会抛 `InvalidOperation`——那是 `ArithmeticError` 而不是 `ValueError`，
+    于是路由的 `except ValueError` 接不住、`main.py` 也没有对应 handler ⇒ 裸 500。
+
+    `PUT /api/settings` 的 `values` 是个裸 dict（`SettingsUpdate`），pydantic 不做任何
+    拦截，所以 `"NaN"` 能一路走到 `_check_manual_rate`。上面那条参数化测试有
+    「超出区间」和「解析不出来」两档，唯独没有这一档——**解析得出、但比较会抛**。
+
+    `schemas._q_decimal` 早就踩过同一个坑并写了注释（顺序是「先 is_finite 再比较」），
+    而 prefs 这份校验是后来单独写的、漏了那一句。
+    """
+    assert client.put("/api/settings", json={"values": {"fx.manual_rate": bad}}).status_code == 422
+
+
 def test_settings_partial_update_keeps_others(client):
     """只提交变了的键。整包提交会把别人刚在另一个标签页改过的项一起盖回去。"""
     client.put("/api/settings", json={"values": {"fx.manual_rate": "20.0", "fx.stale_hours": 36}})

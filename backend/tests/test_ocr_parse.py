@@ -692,6 +692,30 @@ def test_non_xianyu_hint_warns_that_the_rules_are_still_xianyu_shaped(monkeypatc
     assert w and "闲鱼" in w, w
 
 
+def test_a_xianyu_screenshot_tagged_otherwise_is_not_told_it_cannot_be_parsed(monkeypatch):
+    """人选了淘宝，但图上有**明确的闲鱼特征** ⇒ 解析规则恰恰是对的，别说反话。
+
+    这一支原先不存在：非闲鱼 hint 一律发「成交价与商品名多半认不出来，请在暂存表里补」。
+    而 `_stamp_platform` 自己的 docstring 写着保留检测的理由正是
+    「批量选了淘宝、里面混进一张闲鱼截图，**那张的解析其实是准的**」——
+    文案把这条理由否掉了。批量拖 12 张选淘宝、混 2 张闲鱼，
+    汇总弹窗就写「其中 12 张不是闲鱼版式、多半认不出来」，而那 2 张是准的。
+
+    仍然要保持 truthy（上一条守卫的理由：路由靠它查 platform_plugin、前端靠它计数）。
+    """
+    # 「成交价」是 _XIANYU_CUES 里的一条，同时也是解析锚点——有它就是闲鱼版式
+    _stub_recognize(monkeypatch, ["订单编号 1234567890123456", "成交价 ¥100.00"])
+    w = ocr.recognize_order(b"fake", platform_hint="淘宝")["platform_warning"]
+    assert w, "警告不能置空，否则 platform_plugin 与 offPlatform 整条链一起失效"
+    assert "认不出" not in w, f"明明是闲鱼版式却说认不出来：{w}"
+    assert "闲鱼" in w and "淘宝" in w, w
+
+    # **反面**：真的没有闲鱼特征时，那句「多半认不出来」必须还在
+    _stub_recognize(monkeypatch, ["订单编号 1234567890123456"])
+    w2 = ocr.recognize_order(b"fake", platform_hint="淘宝")["platform_warning"]
+    assert "认不出" in w2, w2
+
+
 def test_warning_stays_truthy_for_every_hint_that_is_not_xianyu(monkeypatch):
     """带 hint 时 `platform_warning` 必须保持 truthy（闲鱼无冲突那一支除外）。
 
@@ -867,3 +891,87 @@ def test_the_smallest_declared_scale_stays_above_the_sanity_bound():
     w, h = int(rw * s), int(rh * s)
     assert w >= 24 and h >= 18, \
         f"最小尺度 {s} 缩出 {w}×{h}，会被 _truck_score 里那道 24×18 的下界直接跳过——加了等于没加"
+
+
+# --- 内存不足不许被说成「图片坏了」 ---------------------------------------------
+#
+# `MemoryError` 是 `Exception` 的子类，会先被解码/推理那两处的 `except Exception` 接住、
+# 转成 `ValueError` → 路由映射成 400「图片无法解析：」——而 `str(MemoryError())` 是**空串**，
+# 用户拿到的是一句以冒号结尾、后面什么都没有的话，含义还是「你这张图坏了」。
+# 路由里那个带 `Retry-After` 的 503「服务器内存不足，请稍后重试」因此**不可达**，
+# 日志里也不会留下任何痕迹——而解码与推理恰恰是仅有的两个会 OOM 的位置。
+#
+# 拆成两条：推理那一半不依赖任何可选包，任何环境下都要跑；
+# 解码那一半要真有 pillow 才测得了（OCR 依赖是可选的，本仓 venv 里常常没装）。
+# 合成一条的话，没装 pillow 的环境会把不需要它的那一半一起跳过。
+
+def test_engine_out_of_memory_is_not_disguised_as_a_broken_image():
+    class _Oom:
+        def __call__(self, arr):
+            raise MemoryError()
+
+    with pytest.raises(MemoryError):
+        ocr._run_engine(_Oom(), None)
+
+    # **反面**：别的异常仍要转成 ValueError（路由映射成 400「这张图有问题」）。
+    class _Bad:
+        def __call__(self, arr):
+            raise RuntimeError("畸形图")
+
+    with pytest.raises(ValueError):
+        ocr._run_engine(_Bad(), None)
+
+
+def test_decode_out_of_memory_is_not_disguised_as_a_broken_image(monkeypatch):
+    Image = pytest.importorskip("PIL.Image", reason="解码分支需要 pillow")
+
+    def _oom(*a, **k):
+        raise MemoryError()
+
+    monkeypatch.setattr(Image, "open", _oom)
+    with pytest.raises(MemoryError):
+        ocr._decode_image(b"whatever")
+
+
+# --- 日期：模块声明了哪些破折号，就得认哪些 -------------------------------------
+
+def test_dates_survive_every_dash_the_module_declares():
+    """`_extract_date` 原先在字符类里**自己又抄了一份**破折号表（`[-/.–—]`），
+    只覆盖 `_DASHES` 七个里的两个。漏掉的 `－`（U+FF0D 全角连字符）恰恰是中文界面
+    OCR 最常吐出来的那个 ⇒ `2026－07－19` 返回 None ⇒ 下单时间/订单时间**静默为空**，
+    用户不知道为什么这张图的日期没认出来。
+
+    这条测试**从 `_DASHES` 自己生成用例**，不再抄第三份——加一个破折号就自动被覆盖。
+    """
+    for d in ocr._DASHES:
+        got = ocr._extract_date(f"下单时间 2026{d}07{d}19")
+        assert got == "2026-07-19", f"不认 {d!r}（U+{ord(d):04X}）：{got}"
+    for sep in "-/.":
+        assert ocr._extract_date(f"下单时间 2026{sep}07{sep}19") == "2026-07-19", sep
+    # **反面**：日历上不存在的日期仍要挡掉（别把判据改成「凑够三段数字就行」）
+    assert ocr._extract_date("2026-02-31") is None
+    assert ocr._extract_date("没有日期") is None
+
+
+def test_truck_template_is_not_marked_loaded_until_it_actually_is(monkeypatch):
+    """`_truck_ref_loaded` 原先是**加载之前**就置 True 的：并发的另一路请求会看到
+    「已加载 + _truck_ref is None」⇒ 那一张的卡车信号凭空消失，而它恰恰是文案兜不住时
+    唯一的闲鱼证据（结果是无线索的闲鱼截图被判成「认不出是哪个平台」）。
+    """
+    cv2 = pytest.importorskip("cv2", reason="卡车模板要 opencv")
+
+    seen = {}
+    real = cv2.imdecode
+
+    def spy(*a, **k):
+        seen["flag_during_load"] = ocr._truck_ref_loaded
+        return real(*a, **k)
+
+    monkeypatch.setattr(cv2, "imdecode", spy)
+    monkeypatch.setattr(ocr, "_truck_ref_loaded", False)
+    monkeypatch.setattr(ocr, "_truck_ref", None)
+
+    ocr._load_truck_ref()
+    assert seen.get("flag_during_load") is False, \
+        "加载还没做完就置了「已加载」——并发的另一路会拿到 None"
+    assert ocr._truck_ref_loaded is True, "加载完了却没置位，每次都要重读一遍文件"

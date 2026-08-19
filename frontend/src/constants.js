@@ -132,6 +132,11 @@ export function fxSourceName(r) {
 // 第 5 处很自然地写成了 10000——同一类提示两种时长，就是割裂感的来源。
 export const TOAST_LONG = 8000
 
+// 列表页每页条数。**五个列表页原先各写一份 `const pageSize = 30`**——与上面 TOAST_LONG
+// 同一类问题：分散的同一个数字迟早会有一处漂掉。而 `listRows.afterCreate` 的本地插入
+// 也要用到它（不知道每页几条就没法在插入后截断，见那里的说明）。
+export const PAGE_SIZE = 30
+
 /** 需要看清内容的长提示。type 同 ElMessage：success | warning | info | error。 */
 export function longToast(ElMessage, type, message) {
   ElMessage({ type, message, duration: TOAST_LONG })

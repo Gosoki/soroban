@@ -44,6 +44,7 @@ export function sortByDateDesc(rows, dateKey = 'date') {
   })
 }
 
+
 /**
  * 新建成功后同步列表。返回这条记录当前是否显示在列表里。
  * `dateKey` 是该页的排序日期列——**必须与那一页后端的 order_by 同一列**。
@@ -51,11 +52,22 @@ export function sortByDateDesc(rows, dateKey = 'date') {
  * 后者可以为 NULL（OCR 认不出「下单时间」就不下发这个键、幽灵行也不预填），
  * 拿它排序会让本地插入的顺序与刷新后的顺序对不上。
  */
-export async function afterCreate(created, { rows, total, page, filters, load, dateKey = 'date' }) {
+export async function afterCreate(created, {
+  rows, total, page, filters, load, dateKey = 'date', pageSize,
+}) {
   if (!anyFilterActive(filters) && page.value === 1) {
     rows.value.unshift(created)
     sortByDateDesc(rows.value, dateKey)
     total.value++
+    // **插完要截回每页条数。** 不截的话第 1 页会显示 31 行，而分页器仍按 30/页 算 ——
+    // 翻到第 2 页时，第 1 页底部那条会**再出现一次**（同一个 id 显示两次），刷新才恢复。
+    // 上面那几条注释逐条列了本地插入会与后端对不上的几种表现，独独漏了这一种。
+    //
+    // `pageSize` **由调用方传**（各页取自 constants.PAGE_SIZE），这里刻意不 import 它：
+    // 本文件被 `test_consistency` 当作**纯模块**在 node 里原样跑（只桩掉 element-plus 那一句），
+    // 多一个别名 import 就要多一个桩，而这个文件的价值恰恰在于「能被原样跑起来」。
+    // 漏传由 `test_every_after_create_call_passes_the_page_size` 守着。
+    if (pageSize && rows.value.length > pageSize) rows.value.length = pageSize
     return true
   }
   page.value = 1

@@ -699,6 +699,30 @@ class StagingCreate(StagingBase):
     import_status: str = ImportStatus.pending.value
     items: list[StagingItemIn] = []
 
+    @field_validator("import_status")
+    @classmethod
+    def _import_status(cls, v: str) -> str:
+        """新建的暂存行**只能是「待导入」**。
+
+        这个字段原先在 create 侧一点校验都没有（update 侧有白名单），三个后果：
+          · 任意长字符串落进 VARCHAR(32) 列 —— SQLite 静默收下，MySQL 抛 1406 DataError，
+            而 `main.py` 只挂了 IntegrityError/ValueError/OperationalError ⇒ **裸 500**；
+          · 非枚举值原样入库并回读，还会被标签同步当成「在用」登记；
+          · **最要紧的一条**：`{"import_status": "已导入"}` 能建出一条
+            `import_status=已导入` 而 `imported_order_id=NULL` 的行 —— 按状态筛选时它算已导入
+            （用户以为账已经记了），而 `POST /{id}/import` 照样能再导一次，同一笔货进账本两遍。
+        而这正是 `staging.update_staging` 用十行注释堵死的那个洞 —— 只堵在了 PATCH 上。
+        同一个前缀、同一份 `staging:write` 权限、同一个字段，POST 放行、PATCH 拒绝。
+
+        口径与 PATCH 一致：导入状态只由「导入账本」/「忽略」/删除来推进。
+        """
+        v = _check(v, _IMPORT_STATUS, "导入状态")
+        if v != ImportStatus.pending.value:
+            raise ValueError(
+                f"新建的暂存行只能是「{ImportStatus.pending.value}」："
+                "导入状态请用「导入账本」或「忽略」来推进")
+        return v
+
     @model_validator(mode="after")
     def _postage_le_total(self):
         _check_postage_within_total(self.price_cny, self.postage_cny, self.items)
@@ -728,9 +752,22 @@ class StagingRead(StagingBase):
 
 # --- 列布局 -----------------------------------------------------------------
 
+# 列布局落库时是 `json.dumps` 进 `ColumnLayout.columns_json`（**Text 列**）。
+# `/api/layout` 曾是全仓唯一一条**无上限**写入 Text 列的路径：实测 3000 个列定义
+# → 200 OK、落库 94890 字节。SQLite 静默收下，MySQL 的 TEXT 上限是 65535 **字节**
+# → 1406 Data too long → `DataError`，而 `main.py` 只挂了 IntegrityError / ValueError /
+# OperationalError ⇒ **裸 500**。同一份数据库导出，两个后端两种结局。
+# 同样往 Text 列写 JSON 的 `ingest/kinds/plugin_record.py` 早就把上限钉成 65535 并
+# 写了整段说明，这条推理没有被应用到这里。
+#
+# 三档边界都按「真实列数的量级」定，而不是按 Text 容量倒推——留足余量比卡死更好用：
+#   · key   —— 列名，最长的现有列名不到 20 字符；
+#   · width —— 像素宽，负数与荒谬的大数都不该落库（原先负数照单全收，见下方测试）；
+#   · 条数  —— 最宽的表也就十几列，200 足够，且 200×(64+数字) 远小于 65535。
 class LayoutColumn(SQLModel):
-    key: str
-    width: int
+    model_config = _FORBID
+    key: str = Field(max_length=64)
+    width: int = Field(ge=0, le=4000)
 
 
 class LayoutRead(SQLModel):
@@ -739,7 +776,8 @@ class LayoutRead(SQLModel):
 
 
 class LayoutUpdate(SQLModel):
-    columns: list[LayoutColumn]
+    model_config = _FORBID
+    columns: list[LayoutColumn] = Field(max_length=200)
 
 
 # --- 标签选项（列头可管理的下拉集）------------------------------------------
@@ -751,8 +789,15 @@ class TagIn(SQLModel):
 # --- 爬虫插件配置 -----------------------------------------------------------
 
 class PluginConfigIn(SQLModel):
+    # **`extra="forbid"`，且刻意不再有 `params`。**
+    # 原先这里声明了 `params: dict = {}`（注释还写着该放什么），而 `save_config`
+    # 从头到尾没读过它——全仓 `payload.params` 零次出现。真正的参数入口是另一个端点
+    # `PUT /{plugin_id}/params`。于是任何带 `params` 的调用都是
+    # 「200 OK + 什么都没改 + 零日志」，正是本仓头号敌人。
+    # 删掉字段还不够（没有 forbid 时多余键照样被静默忽略），所以一起把 forbid 补上：
+    # 拼错的键、发错端点的参数，现在都会当场 422 说清楚。
+    model_config = _FORBID
     enabled: bool = False
-    params: dict = {}                 # 用户填的参数（如 {"accounts": "acctA,acctB"}）
     schedule_minutes: int = 0         # 定时抓取间隔（分钟），0=不定时
 
 

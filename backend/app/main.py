@@ -27,6 +27,7 @@ from .routers import (
     ingest, items, layout, meta, misc, orders, plugins,
     settings as settings_router, shipment, staging, tags,
 )
+from .seed import ensure_admin
 from .routers.plugins import (
     reclaim_stale_runs,
     scheduler_loop,
@@ -79,6 +80,16 @@ async def lifespan(app: FastAPI):
     # 而不是先各自跑一遍迁移（幂等归幂等，但那是几个进程同时 ALTER 同一个库）。
     single_process.acquire(_control_url())
     create_db_and_tables()          # Alembic upgrade head（幂等；旧库自动接管，见 database.py）
+    # 确保有管理员（首次分发即可登录；已存在则跳过）。
+    # **必须在这里、不能在启动器里**：`run.py` 原先在 `uvicorn.run()` 之前调 `seed.main()`，
+    # 而那个函数自己会先 `create_db_and_tables()` ⇒ 完整 alembic upgrade 跑在
+    # 上面那道单进程闸**之前**。改端口开第二个实例时，新进程会对
+    # 正在被老进程使用的库跑完迁移，然后才在这里被闸拒绝。
+    # 建号失败不阻断启动——那时用户至少还能看到界面与日志。
+    try:
+        ensure_admin()
+    except Exception as e:          # noqa: BLE001
+        log.warning("初始化管理员失败：%s", e)
     # 打包版：把 exe 里自带的插件释放到运行目录（源码运行是空操作）。
     # 必须排在定时循环之前——那个循环起来就会去发现插件并按 schedule 触发。
     seed_bundled_plugins()
@@ -107,8 +118,20 @@ async def lifespan(app: FastAPI):
 # 摆出来；绑到 0.0.0.0 时那就是给整个局域网看的一张地图。
 # 环回下没有这个问题，而它平时很有用，所以不是一刀切关掉。
 # 想在局域网上也开，显式设 SOROBAN_DOCS=1。
+def docs_enabled(host: str, override: str) -> bool:
+    """交互式文档要不要开。**做成纯函数是为了它能被测**：
+
+    原先这里是两行模块级表达式，而全仓测试一次都没提到 `SOROBAN_DOCS` / `docs_url` ——
+    把这段整个删掉、`docs_url` 写死成 `/docs`，1084 条测试一条都不红。
+    而它守的是「绑到 0.0.0.0 时不要把完整 API 地图（含每条路由的插件 scope 标注）
+    摆给整个局域网看」，是一道真防线。
+    """
+    lan = (host or "127.0.0.1") not in ("127.0.0.1", "localhost", "::1")
+    return (override or "").strip().lower() in ("1", "true", "yes") or not lan
+
+
 _LAN = os.environ.get("HOST", "127.0.0.1") not in ("127.0.0.1", "localhost", "::1")
-_DOCS = os.environ.get("SOROBAN_DOCS", "").strip().lower() in ("1", "true", "yes") or not _LAN
+_DOCS = docs_enabled(os.environ.get("HOST", "127.0.0.1"), os.environ.get("SOROBAN_DOCS", ""))
 
 app = FastAPI(title="soroban", version="0.1.0", lifespan=lifespan,
               docs_url="/docs" if _DOCS else None,

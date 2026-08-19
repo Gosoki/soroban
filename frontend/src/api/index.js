@@ -72,9 +72,11 @@ export const fxApi = {
   // 按天汇总 + 某天的各次抓取。一天可以有多条，页面据此回看「那天几点是多少」
   history: (days = 30) => http.get('/fx/history', { params: { days } }),
   historyDay: (on) => http.get(`/fx/history/${on}`),
+  // （原先这里挂着一段「超时必须放宽」的注释，说的是**已经不存在的** `fx.refresh`——
+  //   那时 soroban 自己会串行走完整条汇率源链。现在 `GET /api/fx` 是纯读，
+  //   抓取由汇率插件的子进程完成，默认 15s 足够。留着那段注释会让人给一个纯读接口
+  //   加上几分钟的超时。）
   get: () => http.get('/fx'),
-  // 超时**必须**放宽：默认 15s（http.js），而后端一轮可能串行走完整条源链——
-  // 每源 httpx 20~25s × 重试次数 × 退避，最坏几分钟。15s 一定先炸在前端。
 }
 
 export const layoutApi = {

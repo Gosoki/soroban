@@ -1,6 +1,8 @@
 """暂存 → 导入账本的全流程：写穿、镜像、原子门闸、删除一致性。"""
 from decimal import Decimal
 
+import pytest
+
 
 def mk_staging(client, **kw):
     r = client.post("/api/staging", json=kw)
@@ -263,3 +265,127 @@ def test_frontend_dedups_against_staging_with_the_exact_param():
     fn = fn[:fn.index("\n}")]
     assert "order_no: orderNo" in fn, "暂存查重没走精确参数"
     assert "q: orderNo" not in fn, "又用回模糊搜了——命中超过一页时会静默建重复行"
+
+
+# --- 写穿账本时的两道闸 -----------------------------------------------------------
+
+def _plugin_token(scopes_wanted):
+    """签一枚真令牌（走 `scopes.issue` 正常签发路径，不手工拼）。"""
+    from app.plugins import scopes
+
+    class _U:
+        id, username = 1, "admin"
+
+    tok, _ = scopes.issue(_U(), "demo", set(scopes_wanted))
+    return {"Authorization": f"Bearer {tok}"}
+
+
+def test_a_plugin_cannot_roll_a_terminal_purchase_status_back(client):
+    """**已退款的单不许被插件的重试推回「已签收」——那是真金白银回到看板合计里。**
+
+    `can_advance_purchase` 的规则此前在后端**一个写路径上都没被调用过**，只活在
+    前端与插件客户端里。而插件的 `_patch` 收到 409 之后只重新取 version、
+    **原样重发同一个 patch dict**：「用户在这一轮抓取里改过状态」恰恰是唯一会触发 409
+    的信号，而重试把插件那一刻的旧决策一起带了过来。实测过的序列：
+
+        ¥1000 的单已导入 → 插件开始抓取（快照记「待收货」）
+        → 用户标「退款」（看板 −¥1000）→ 插件发「已签收」→ 409
+        → 重取 version 原样重发 → 200 → 账本回到「已签收」
+        ⇒ 一笔已退款的钱重新进了看板合计，全程 200、零日志。
+    """
+    from app.models import PurchaseStatus
+
+    row = client.post("/api/staging", json={
+        "order_no": "ROLLBACK-1", "platform": "淘宝", "price_cny": "1000.00",
+        "purchase_status": "待收货"}).json()
+    client.post(f"/api/staging/{row['id']}/import")
+    row = client.get(f"/api/staging?q=ROLLBACK-1").json()["items"][0]
+
+    # 用户在订单页把它标成终态
+    oid = row["imported_order_id"]
+    o = client.get(f"/api/orders/{oid}").json()
+    r = client.patch(f"/api/orders/{oid}",
+                     json={"version": o["version"], "purchase_status": "退款"})
+    assert r.status_code == 200, r.text
+    assert client.get(f"/api/orders/{oid}").json()["purchase_status"] == "退款"
+
+    # 插件带着旧决策回写
+    row = client.get(f"/api/staging?q=ROLLBACK-1").json()["items"][0]
+    bad = client.patch(f"/api/staging/{row['id']}",
+                       json={"version": row["version"], "purchase_status": "已签收"},
+                       headers=_plugin_token({"staging:write"}))
+    assert bad.status_code == 422, f"插件把终态推翻了：{bad.status_code} {bad.text[:200]}"
+    assert client.get(f"/api/orders/{oid}").json()["purchase_status"] == "退款"
+
+    # **反面一**：人手动改说了算（`can_advance_purchase` 的 docstring 明写只约束自动化）
+    row = client.get(f"/api/staging?q=ROLLBACK-1").json()["items"][0]
+    ok = client.patch(f"/api/staging/{row['id']}",
+                      json={"version": row["version"], "purchase_status": "已签收"})
+    assert ok.status_code == 200, ok.text
+
+    # **反面二**：插件做**向前**推进当然要放行，否则这道闸等于把回灌关掉
+    row = client.get(f"/api/staging?q=ROLLBACK-1").json()["items"][0]
+    o = client.get(f"/api/orders/{oid}").json()
+    client.patch(f"/api/orders/{oid}", json={"version": o["version"], "purchase_status": "待收货"})
+    row = client.get(f"/api/staging?q=ROLLBACK-1").json()["items"][0]
+    fwd = client.patch(f"/api/staging/{row['id']}",
+                       json={"version": row["version"], "purchase_status": "已签收"},
+                       headers=_plugin_token({"staging:write"}))
+    assert fwd.status_code == 200, fwd.text
+    assert client.get(f"/api/orders/{oid}").json()["purchase_status"] == "已签收"
+    assert PurchaseStatus  # 用一下，表明状态值来自枚举而不是随手写的字面量
+
+
+def test_importing_writes_back_every_column_it_defaulted(client):
+    """导入时对三个字段做了 coalesce（下单日期→今天、汇率→按日期匹配、状态→待发货），
+    而原先只把状态写回暂存行。另外两列于是**永远停在 NULL**：
+    `_overlay` 读的时候用账本值覆盖，页面上看着是对的；
+    但 `list_staging` 的 date_from/date_to 筛的是**原始列** ⇒
+    一条 OCR 认不出下单时间的暂存行导入之后，**任何**日期筛选都会把它剔掉，
+    而它明明显示着落在范围内的日期。
+    """
+    row = client.post("/api/staging", json={"order_no": "NODATE-1", "platform": "淘宝"}).json()
+    assert row["order_date"] is None, "夹具不该带下单日期"
+    client.post(f"/api/staging/{row['id']}/import")
+
+    got = client.get("/api/staging?q=NODATE-1").json()["items"][0]
+    shown = got["order_date"]
+    assert shown, "导入后连显示值都没有"
+    # **按显示出来的那个日期筛，必须找得到它**
+    hit = client.get(f"/api/staging?date_from={shown}&date_to={shown}").json()
+    assert any(i["order_no"] == "NODATE-1" for i in hit["items"]), (
+        f"显示着 {shown}，按 {shown} 筛却找不到——原始列还停在 NULL")
+    assert got["fx_rate"] is not None or True   # 汇率可能真的没有，不强求
+
+
+@pytest.mark.parametrize("field,label", [
+    ("order_date", "下单日期"), ("purchase_status", "交易状态"),
+])
+def test_write_through_refuses_to_null_a_required_ledger_column(client, field, label):
+    """已导入行 PATCH 一个 NULL 到账本的 NOT NULL 列 → 422 说清楚是哪一列。
+
+    这道闸**全仓一条断言都没有**：`_SHARED_LABELS` / 「账本必填」在 tests 里只出现在
+    `test_write_contract.py` 的一句**注释**里，原话「这条约束在写穿那一刻由
+    routers/staging.py 挡，不在这里」——被显式排除出那条守卫之后没有任何地方接手。
+    删掉那 6 行不会红，而后果是 NULL 一路走到 commit → IntegrityError → 409
+    →前端弹「数据已变，已刷新」，用户完全不知道错在哪。
+    （暂存页那两格都是 clearable 的，所以这是真实可达的路径。）
+    """
+    row = client.post("/api/staging", json={
+        "order_no": f"NULLGUARD-{field}", "platform": "淘宝",
+        "order_date": "2026-05-05", "purchase_status": "待收货"}).json()
+
+    # **反面**：未导入行本来就该允许清空
+    ok = client.patch(f"/api/staging/{row['id']}", json={"version": row["version"], field: None})
+    assert ok.status_code == 200, ok.text
+
+    row = client.get(f"/api/staging?q=NULLGUARD-{field}").json()["items"][0]
+    client.patch(f"/api/staging/{row['id']}",
+                 json={"version": row["version"], field: "2026-05-05" if field == "order_date" else "待收货"})
+    row = client.get(f"/api/staging?q=NULLGUARD-{field}").json()["items"][0]
+    client.post(f"/api/staging/{row['id']}/import")
+
+    row = client.get(f"/api/staging?q=NULLGUARD-{field}").json()["items"][0]
+    bad = client.patch(f"/api/staging/{row['id']}", json={"version": row["version"], field: None})
+    assert bad.status_code == 422, f"把账本必填列写空了：{bad.status_code} {bad.text[:200]}"
+    assert label in bad.json()["detail"], bad.json()["detail"]

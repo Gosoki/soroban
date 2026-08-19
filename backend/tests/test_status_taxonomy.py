@@ -265,6 +265,7 @@ _ILLEGAL_STATUS_CASES = [
     ("/api/orders", {"date": "2026-03-01"}, "purchase_status"),
     ("/api/staging", {"order_no": "S-BADST"}, "purchase_status"),
     ("/api/shipment", {"date": "2026-06-01"}, "shipment_status"),
+    ("/api/staging", {"order_no": "S-BADIMP"}, "import_status"),
 ]
 
 
@@ -280,9 +281,49 @@ def test_illegal_status_hits_the_whitelist_validator(client, endpoint, base, fie
 def test_every_writable_leg_status_has_a_whitelist_case():
     """段一旦新增，上面的参数表必须跟着登记——否则新段的写入口没有闸门也没人发现。
 
-    `import_status` 例外：它是 soroban 自己的导入工作流，没有独立的 POST 写入口
-    （只能经 /ignore、/import 这两个动作端点推进），故显式排除而不是遗漏。
+    ⚠️ 这里原先把 `import_status` 显式排除，理由写的是「它没有独立的 POST 写入口
+    （只能经 /ignore、/import 推进）」——**那句话是假的**：`StagingCreate` 就是那个写入口，
+    而它当时对这个字段一点校验都没有。豁免理由不成立的豁免，比遗漏更难发现：
+    元断言 `test_server_owned_names_are_real_columns` 只检查名字还是不是真列，
+    检查不到「豁免的理由还成不成立」。现已补上校验，例外随之取消。
     """
     covered = {field for _, _, field in _ILLEGAL_STATUS_CASES}
-    assert covered == set(_LEG_REGISTRY) - {"import_status"}, (
+    assert covered == set(_LEG_REGISTRY), (
         f"业务段与白名单用例对不上：段={sorted(_LEG_REGISTRY)}，已覆盖={sorted(covered)}")
+
+
+def test_a_new_staging_row_cannot_claim_it_is_already_imported(client):
+    """`POST /api/staging {"import_status": "已导入"}` 必须被拒。
+
+    「已导入」是合法枚举值，所以光有白名单还不够——它建出来的是一条
+    `import_status=已导入` 而 `imported_order_id=NULL` 的行：
+      · 按状态筛选时它算已导入 ⇒ 用户以为这笔账已经记了；
+      · `POST /{id}/import` 判的是 `imported_order_id`，照样能再导一次
+        ⇒ **同一笔货进账本两遍**。
+    `update_staging` 用十行注释堵死的正是这个洞，但只堵在 PATCH 上。
+    """
+    r = client.post("/api/staging", json={"order_no": "S-IMPCLAIM", "import_status": "已导入"})
+    assert r.status_code == 422, f"新建就能自称已导入：{r.status_code} {r.text[:200]}"
+
+    # 初始值取自枚举本身，不在测试里再抄一份字面量（抄了就会漂）。
+    from app.models import ImportStatus
+    initial = ImportStatus.pending.value
+
+    # **反面一**：默认值（不传）当然要放行。
+    ok = client.post("/api/staging", json={"order_no": "S-IMPOK"})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["import_status"] == initial
+
+    # **反面二**：显式传初始值也要放行——闸是「只能是初始值」，不是「不许出现这个键」。
+    ok2 = client.post("/api/staging",
+                      json={"order_no": "S-IMPOK2", "import_status": initial})
+    assert ok2.status_code == 200, ok2.text
+
+
+def test_a_new_staging_row_cannot_smuggle_an_oversized_status(client):
+    """超长值同样要在门口挡掉：这一列是 VARCHAR(32)，SQLite 静默收下 100 个字符，
+    MySQL 抛 1406 DataError —— 而 main.py 没有 DataError 的 handler ⇒ 裸 500。
+    同一份数据库导出，两个后端两种结局。
+    """
+    r = client.post("/api/staging", json={"order_no": "S-IMPLONG", "import_status": "x" * 100})
+    assert r.status_code == 422, r.text

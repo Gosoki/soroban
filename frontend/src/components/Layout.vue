@@ -35,7 +35,17 @@
         <SidebarCalc v-if="!isMobile" />
 
         <div class="foot">
-          <div class="fx" v-if="fx.rate" @click="loadFx" title="点一下刷新汇率">
+          <!-- **「一条汇率都没有」比「值过期了」更该看得见，而它原先是唯一看不见的那种。**
+               `FxRead.rate` 是 Optional，库里一条汇率都没有时就是 null，
+               原先 `v-if="fx.rate"` 把整块（含「已过期」标签）藏掉；
+               而 `@click="loadFx"` 就挂在这块上 ⇒ 用户按提示去设置页手填一条之后，
+               侧栏仍然什么都不显示，直到整页刷新。 -->
+          <div class="fx" v-if="fxLoaded && !fx.rate" @click="loadFx"
+               title="点一下重新取。去「设置」页手填一个，或检查汇率插件">
+            <el-tag :style="typeStyle('danger')">没有汇率</el-tag>
+            <span class="sub">新建的单折不出日元</span>
+          </div>
+          <div class="fx" v-else-if="fx.rate" @click="loadFx" title="点一下刷新汇率">
             1元 = {{ fx.rate }}円
             <!-- 「旧」= 不是今天的（日粒度）；「已过期」= 超过设置里的上限、这个值已经不该信了。
                  分两级是因为前者很常见（凌晨还没刷新），后者意味着取汇率的链路真的断了：
@@ -127,6 +137,11 @@ try {
 } catch (_) { /* ignore */ }
 
 const fx = reactive({ rate: null, notToday: false, source: '', expired: false, ageText: '' })
+// **必须区分「还没拉到」与「拉到了，但库里一条汇率都没有」**：
+// 两者的 `fx.rate` 都是 null，而前者不该显示任何东西（页面刚打开的一瞬），
+// 后者恰恰是最该说出来的状态。没有这个标志就只能用 `v-if="fx.rate"`，
+// 于是「一条都没有」被整块藏掉——连同挂在那块上的唯一重取入口。
+const fxLoaded = ref(false)
 
 // 侧栏汇率原先只在 onMounted 取一次。Layout 是父级路由组件、切页不卸载，
 // 于是那一行是**登录那一刻的快照**：红色的「已过期」标签正劝用户去设置页手填一个，
@@ -141,7 +156,8 @@ async function loadFx() {
     fx.expired = !!r.expired
     const h = r.age_hours || 0
     fx.ageText = h >= 48 ? `${Math.floor(h / 24)} 天` : `${Math.round(h)} 小时`
-  } catch (_) { /* 拦截器已提示 */ }
+    fxLoaded.value = true
+  } catch (_) { /* 拦截器已提示；拉失败不置 loaded——那是「不知道」，不是「没有」 */ }
 }
 
 onMounted(async () => {

@@ -88,6 +88,18 @@ def _lock(fh) -> None:
     if os.name == "nt":
         import msvcrt
 
+        # **必须先 seek(0)。** `msvcrt.locking` 锁的是「从**当前位置**开始的 N 个字节」，
+        # 而上面是 `open(path, "a+")`——指针落在 EOF，也就是**上一个实例写进去的
+        # pid 字符串有多长，这次就锁在第几个字节上**（acquire 拿到锁后会
+        # truncate + 写自己的 pid，所以文件大小就是上一个实例 pid 的位数）。
+        # 于是：第一次启动锁 byte[0] 并写下 5 位 pid → 第二次启动以 size=5 打开、
+        # 锁 byte[5]，两把锁**不冲突**，闸门直接漏放。Windows 的 pid 4↔5 位很常见，
+        # 用户双击两次就能开出两个实例。
+        # 后果不是「开了两个窗口」：`scopes._ALIVE` 是**进程内**的 dict，
+        # 插件回灌被分到另一个进程就是全线 401——抓了一批单一条都回不来，
+        # 而日志里只有 401，正是本模块开头写的那个事故。
+        # POSIX 那支用的是整文件 flock，不受指针影响（但归零对它也无害）。
+        fh.seek(0)
         try:
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError as e:

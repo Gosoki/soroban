@@ -229,6 +229,37 @@ def test_running_a_command_without_scope_is_409_not_403(client, fake_plugin):
     ('{"error": "全部汇率源都取不到"}', 1, "全部汇率源都取不到"),
     ("", 1, "退出码 1"),
     ("不是 JSON", 0, "不是 JSON"),
+    # 计数键**出现了但全是 0**：定时抓取最常见的结局（跑完了，确实没新东西）。
+    # 上面那个循环用真值判断，所以一条 bits 都不产生 —— 原先直接把整坨 JSON
+    # 显示在卡片上，正是本函数存在的理由被自己违反。
+    # ⚠️ **用例必须是插件真实会吐的形状。** 第一版手工去掉了 `account`，
+    # 而淘宝插件每一行都是 `{"ok":…, "account": args.account, **res}` ——
+    # 那个形状没有任何插件会产生，于是这条用例把一支对真实生产者是**死代码**的分支
+    # 测成了绿的（判据当时写的是「没有核心不认识的键」，`account` 让差集恒非空）。
+    ('{"ok": true, "account": "甲", "created": 0, "updated": 0, "skipped": 0, '
+     '"blocked": 0, "failed": 0}', 0, "本轮无变化"),
+    # 账号名已经由 _batch_text 拼在整句最前面，不许在尾巴上再出现一遍
+    ('{"ok": true, "account": "甲", "created": 3, "updated": 1}', 0, "新建 3、更新 1"),
+    # 全零 + **还带着一个核心不认识的键**：判据必须是「计数键出现过」，
+    # 不能是「这行 JSON 里没有核心不认识的键」——后者会让这一支对任何多说一句话的插件
+    # 重新变成死代码，卡片又回到显示整坨 JSON。
+    ('{"ok": true, "account": "甲", "created": 0, "updated": 0, "note": "风控冷却中"}', 0,
+     "本轮无变化｜风控冷却中"),
+    ('{"created": 0, "failed": 2}', 0, "失败 2"),          # 有非零的就照常报非零
+    ('{"created": 0}', 1, "退出码 1"),                     # 非零退出码优先
+    ('{"ok": true}', 0, "已完成"),                         # 一个计数键都没有 ≠ 无变化
+    # **反面**：核心不认识的键必须原样显示，不能跟着一起被吞成「无变化」——
+    # 那句话是插件唯一能告诉用户的事。
+    ('{"note": "风控冷却中"}', 0, '{"note": "风控冷却中"}'),
+    # 认识的键命中之后**也不许**把不认识的悄悄丢掉。汇率插件的 `probe`（「只测不写」）
+    # 回的正是这个形状：`rate` 命中就提前返回 ⇒ pushed/note 消失 ⇒ 卡片上
+    # 「只测不写」与一次真正成功的写入显示同一句话，而 probe 存在的全部理由
+    # 就是排查「取不到汇率」。
+    # 不认识的键里**只取人话**：布尔与列表跳过，否则中文卡片上会出现
+    # `pushed=True`、`tried=['boc']` 这种 Python 字面量。
+    ('{"ok": true, "source": "boc", "rate": "21.03", "pushed": false, '
+     '"tried": ["boc"], "note": "只取不交"}', 0,
+     "1元 = 21.03円（boc）｜只取不交"),
 ])
 def test_summary_is_human_readable(line, code, want):
     """插件之间字段不统一（爬虫回 created/updated，汇率回 rate/source）。
@@ -2280,3 +2311,49 @@ def test_the_batch_finishes_even_though_seal_runs_before_any_callback(client, fa
         assert batch not in mod._BATCHES, "批次凑齐了没回收，每执行一次泄漏一条"
     finally:
         mod._BATCHES.pop(batch, None)
+
+
+# --- 「已授权」的判据必须与插件自己那份一致 --------------------------------------
+
+def test_a_corrupt_session_file_is_not_reported_as_authorized(tmp_path):
+    """核心只判 `is_file()` 是不够的，而这个「不够」插件作者已经踩过并修掉了：
+    淘宝插件的 `session.has_session()` 注释写着「存在**且**能解析成 JSON——坏文件不算已授权，
+    避免『显示已授权却永远抓不了』」。
+
+    但**用户看到的绿标来自核心这一份**。断电/磁盘满把会话文件截断之后：
+      · 核心 `is_file()` → True → 卡片绿标「已授权」、「抓这个号」可点；
+      · 插件 `has_session()` → False → 每次 fetch 立刻退出。
+    插件那条修复对用户唯一会看的界面完全无效。
+    """
+    from app.routers import plugins as mod
+
+    m = {"_dir": tmp_path, "state_dir": ".state"}
+    (tmp_path / ".state").mkdir()
+    f = tmp_path / ".state" / "甲.json"
+
+    f.write_text('{"cookies": [], "ua": "x"}', encoding="utf-8")
+    assert mod._authorized(m, "甲") is True, "完好的会话文件被判成没授权"
+
+    f.write_text('{"cookies": [', encoding="utf-8")          # 截断
+    assert mod._authorized(m, "甲") is False, \
+        "截断的会话文件仍被判成「已授权」——卡片绿标，而每次抓取都会立刻退出"
+
+    # **反面**：文件根本不存在时当然也是 False（别把判据写成恒假）
+    assert mod._authorized(m, "乙") is False
+
+
+def test_config_endpoint_refuses_params_instead_of_dropping_them(client):
+    """`PluginConfigIn` 原先声明了 `params: dict = {}`（注释还写着该放什么），
+    而 `save_config` 从头到尾没读过它——全仓 `payload.params` 零次出现。
+    真正的入口是 `PUT /{id}/params`。于是任何带 `params` 的调用都是
+    「200 OK + 什么都没改 + 零日志」，正是本仓头号敌人。
+    """
+    r = client.put("/api/plugins/demo/config",
+                   json={"enabled": True, "schedule_minutes": 0, "params": {"accounts": "a,b"}})
+    assert r.status_code == 422, f"参数被静默丢弃了：{r.status_code} {r.text[:200]}"
+
+    # **反面**：不带 params 的 body 必须照常通过校验（否则把 forbid 写成「什么都不收」
+    # 也能过上面那条）。这条不依赖 demo 插件是否已装——插件在不在是下一道闸的事，
+    # 这里只看 body 校验有没有放行。
+    ok = client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
+    assert ok.status_code != 422, ok.text

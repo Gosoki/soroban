@@ -556,7 +556,8 @@ async function doInstall(p) {
 async function saveConfig(p) {
   p._busy = true
   try {
-    await pluginsApi.saveConfig(p.id, { enabled: p._form.enabled, params: {}, schedule_minutes: p._form.schedule_minutes })
+    // `params` 不在这个接口保存（走 PUT /{id}/params），后端已改成 extra=forbid，带上会 422
+    await pluginsApi.saveConfig(p.id, { enabled: p._form.enabled, schedule_minutes: p._form.schedule_minutes })
     ElMessage.success('已保存')
     await load()
   } catch (_) {
@@ -581,7 +582,7 @@ async function doAddAccount(p) {
     await load()
   } catch (e) {
     // 409（账号已存在）被 http 拦截器刻意跳过（留给页面处理），这里显式弹出后端 detail，否则静默无反馈
-    if (e.response?.status === 409) { handled(e); ElMessage.error(e.response?.data?.detail || '账号已存在') }
+    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || '账号已存在') }
   } finally {
     p._busy = false
   }
@@ -641,7 +642,7 @@ async function doRenameAccount(p, account) {
     await load()
   } catch (e) {
     // 409（新名字已被占用）被 http 拦截器刻意跳过，这里显式弹出后端 detail，否则静默无反馈
-    if (e.response?.status === 409) { handled(e); ElMessage.error(e.response?.data?.detail || '新名字已被占用') }
+    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || '新名字已被占用') }
   } finally {
     p._busy = false
   }

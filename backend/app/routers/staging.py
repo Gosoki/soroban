@@ -18,6 +18,7 @@ from ..db.dialect import ci_contains
 from ..models import (
     OrderItem,
     CreatedVia,
+    can_advance_purchase,
     StagingItem,
     ImportStatus,
     Order,
@@ -178,7 +179,7 @@ def create_staging(payload: StagingCreate, session: Session = Depends(get_sessio
         row.fx_rate = rate_for_date(
             session, row.order_date, what=f"暂存行 {row.order_no or '(无单号)'}")
     # 最小单位是物品：至少 1 条。播种用「货款」= 种子价 - 邮费，避免邮费摊进单价再被 sync 重复计
-    seed_goods = goods_seed(payload.price_cny, payload.postage_cny)
+    seed_goods = goods_seed(payload.price_cny, payload.postage_cny, payload.items)
     row.items = [StagingItem(**d) for d in build_items(payload.items, seed_goods, payload.title)]
     row.sync_from_items()                    # price_cny = Σ(单价×数量) + 邮费
     session.add(row)
@@ -188,7 +189,8 @@ def create_staging(payload: StagingCreate, session: Session = Depends(get_sessio
 
 
 @router.patch("/{row_id}", response_model=StagingRead, openapi_extra={"x-scope": "staging:write"})
-def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depends(get_session)):
+def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depends(get_session),
+                   current=Depends(get_current_user)):
     row = session.get(OrderStaging, row_id)
     if not row:
         raise_not_found("暂存记录")
@@ -219,6 +221,28 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
                 # 而前端把 409 当乐观锁冲突，弹「数据已变，已刷新」——用户完全不知道错在哪。
                 # 也**不要**在这里 coalesce 成默认值（import_staging 那样）：导入是「批量入账时
                 # 兜底未知值」，编辑是「用户明确按了清除」，把清除静默换成今天的日期比 409 更糟。
+                # **交易状态：自动化写入只许向前推进。**
+                # `can_advance_purchase` 的规则此前在后端**一个写路径上都没被调用过**——
+                # 它只活在前端与插件客户端里。而插件的 `_patch` 收到 409 之后
+                # **只重新取 version、原样重发同一个 patch dict**：
+                # 「用户在这一轮抓取里改过状态」恰恰是唯一会触发 409 的信号，
+                # 而重试把插件那一刻的旧决策一起带了过来。实测过的序列：
+                #   ¥1000 的单已导入 → 插件开始一轮抓取（快照记下「待收货」）
+                #   → 用户把它标「退款」（看板 −¥1000，暂存 version 被镜像顶高）
+                #   → 插件发 PATCH「已签收」→ 409 → 重取 version 原样重发 → 200
+                #   → 账本回到「已签收」⇒ **一笔已退款的钱重新进了看板合计**，全程 200、零日志。
+                # 这正是 `can_advance_purchase` 第 2 条（终态不许被自动改写）存在的理由。
+                #
+                # 判据是「调用者是不是插件」，不是一刀切：那个函数的 docstring 明写
+                # 「只约束自动化写入，人在界面上手动改不走这里——用户说了算」。
+                # 用 422 而不是 409：409 会让插件再重试一次，正好又掉进同一个洞。
+                if (key == "purchase_status" and getattr(current, "_plugin_claims", None)
+                        and value and value != order.purchase_status
+                        and not can_advance_purchase(order.purchase_status, value)):
+                    raise HTTPException(status_code=422, detail=(
+                        f"不接受把已导入订单的交易状态从「{order.purchase_status}」改成「{value}」："
+                        "自动写入只能向前推进，且终态（退款/交易关闭）不允许被自动改写。"
+                        "确要回退请在「商品订单」页手动改。"))
                 col = Order.__table__.columns.get(_SHARED_TO_ORDER[key])
                 if value is None and col is not None and not col.nullable:
                     raise HTTPException(
@@ -241,7 +265,7 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
                     )
         if payload.items is not None:                   # 物品写穿账本（单一真源）+ 暂存镜像，两页一致
             # 种子只认本次显式传来的 price_cny，不回退到当前价——理由同 orders.update_order
-            seed_goods = goods_seed(payload.price_cny, order.postage_cny)
+            seed_goods = goods_seed(payload.price_cny, order.postage_cny, payload.items)
             built = build_items(payload.items, seed_goods, order.title)
             order.items = [OrderItem(**d) for d in built]
             row.items = [StagingItem(**d) for d in built]
@@ -276,7 +300,7 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
         setattr(row, key, value)
     if payload.items is not None:                       # 给了 items 就整体替换（[] → 自动补 1 条占位）
         # 种子只认本次显式传来的 price_cny，不回退到当前价——理由同 orders.update_order
-        seed_goods = goods_seed(payload.price_cny, row.postage_cny)
+        seed_goods = goods_seed(payload.price_cny, row.postage_cny, payload.items)
         row.items = [StagingItem(**d) for d in build_items(payload.items, seed_goods, row.title)]
     row.sync_from_items()
     session.add(row)
@@ -374,6 +398,15 @@ def import_staging(row_id: int, session: Session = Depends(get_session)):
         .where(OrderStaging.id == row_id, OrderStaging.imported_order_id.is_(None))
         .values(
             import_status=ImportStatus.imported.value,
+            # **导入时兜底过的列都要回写，不能只回写一个。**
+            # 这里对三个字段做了 coalesce（order_date→今天、fx_rate→按日期匹配、
+            # purchase_status→待发货），而原先只把第三个写回暂存行。
+            # 另外两列于是**永远停在 NULL**：`_overlay` 读的时候用账本值覆盖，
+            # 所以页面上看着是对的；但 `list_staging` 的 date_from/date_to 筛的是**原始列**
+            # ⇒ 一条 OCR 认不出下单时间的暂存行导入之后，任何日期筛选（包括「本月」）
+            # 都会把它剔掉，而它明明显示着落在范围内的日期。
+            order_date=order.date,
+            fx_rate=order.fx_rate,
             purchase_status=order.purchase_status,          # 快照对齐账本（此后以账本为准，读时覆盖）
             imported_order_id=order.id,
             version=OrderStaging.version + 1,

@@ -467,3 +467,140 @@ def test_pyinstaller_bat_gates_the_python_version_on_both_ends():
     assert "(3,11) <= sys.version_info < (3,13)" in bat, "没有上下界都管的版本闸"
     assert ":bad_python_version" in bat, "闸挡下之后没有可诊断的出口"
     assert "3.13" in bat and "rapidocr" in bat, "没说清为什么 3.13 不行"
+
+
+# --- 启动器把解析出来的 HOST/PORT 交给应用 ----------------------------------------
+
+def test_runtime_host_and_port_reach_the_app_before_it_is_imported():
+    """`.env` 这一档**只有启动器读得到**（pydantic-settings 读 .env 也不写回 os.environ），
+    而应用侧有两个模块在**导入期**只认环境变量：
+
+      · `main._LAN` —— 决定要不要关掉 /docs、/openapi.json。读不到用户在 .env 里设的
+        HOST ⇒ 恒判「环回」⇒ 用户按模板把 HOST 改成 0.0.0.0 想用手机记账，
+        局域网里任何设备都能免登录打开完整 API 地图，而「已关闭 /docs」那条日志也不会出现。
+      · `plugins._SELF_URL` —— 插件回灌地址。用户照本程序自己的提示把 BACKEND_PORT
+        改成 8621 之后，插件仍把数据连同 Bearer 令牌 POST 到 8620。
+
+    所以两条赋值必须排在 `from app.main import app` **之前**。这是顺序守卫：
+    位置错了（或被删掉）就红。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    import run as run_mod
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(run_mod.main)))
+    set_at, import_at = {}, None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store):
+            seg = ast.dump(node)
+            for name in ("HOST", "BACKEND_PORT"):
+                if f"'{name}'" in seg or f'"{name}"' in seg:
+                    set_at.setdefault(name, node.lineno)
+        if isinstance(node, ast.ImportFrom) and node.module == "app.main":
+            import_at = node.lineno
+    assert set(set_at) == {"HOST", "BACKEND_PORT"}, f"启动器没把 {set_at} 落进 os.environ"
+    assert import_at, "找不到 `from app.main import app`"
+    for name, line in set_at.items():
+        assert line < import_at, f"os.environ[{name!r}] 排在 app.main 导入之后，来不及生效"
+
+
+def test_uvicorn_startup_failure_is_not_a_silent_flash():
+    """**uvicorn 不把启动失败抛给调用方**：它自己 `except OSError → sys.exit(3)`，
+    lifespan 里抛异常同样被转成 `sys.exit(3)`。于是 `except OSError` 那一支是死代码，
+    而 `__main__` 里的 `except SystemExit: raise` 会让打包版闪退——
+    数据库连不上的那段中文指引、单实例闸的解释全都打印出来了，然后窗口一秒内消失。
+
+    这里钉的是「`uvicorn.run` 外面必须有一支 `except SystemExit` 且它会调 `_fatal`」。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    import run as run_mod
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(run_mod.main)))
+    ok = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        calls = {getattr(n.func, "attr", getattr(n.func, "id", ""))
+                 for n in ast.walk(node) if isinstance(n, ast.Call)}
+        if "run" not in calls:                      # 不是包着 uvicorn.run 的那个 try
+            continue
+        for h in node.handlers:
+            names = ast.dump(h.type or ast.Pass())
+            if "SystemExit" in names and "_fatal" in ast.dump(ast.Module(h.body, [])):
+                ok = True
+    assert ok, "uvicorn.run 外面没有会调 _fatal 的 `except SystemExit` —— 打包版会闪退"
+
+
+def test_env_values_tolerate_a_trailing_comment(tmp_path, monkeypatch):
+    """用户照着提示改端口时很自然会写 `BACKEND_PORT=8621  # 换个端口`。
+
+    不剥行尾注释的话 `int()` 抛 ValueError，落到 `__main__` 的兜底里 ——
+    而那句提示写的是「数据库文件损坏或被占用、SECRET_KEY 被改坏、磁盘满」，
+    把用户往完全错误的方向指。（这条路径**会** pause，所以不是闪退，是指错方向。）
+    """
+    import run as run_mod
+
+    monkeypatch.delenv("BACKEND_PORT", raising=False)
+    monkeypatch.delenv("HOST", raising=False)
+    (tmp_path / ".env").write_text(
+        "BACKEND_PORT=8621  # 换个端口\n"
+        "HOST=0.0.0.0   # 局域网\n"
+        # **带引号时 `#` 是内容不是注释**：这一条防止把剥注释写成无脑 split
+        "SOROBAN_NOTE='a#b'\n",
+        encoding="utf-8")
+
+    assert run_mod._runtime_setting(tmp_path, "BACKEND_PORT", "8620") == "8621"
+    assert int(run_mod._runtime_setting(tmp_path, "BACKEND_PORT", "8620")) == 8621
+    assert run_mod._runtime_setting(tmp_path, "HOST", "127.0.0.1") == "0.0.0.0"
+    assert run_mod._runtime_setting(tmp_path, "SOROBAN_NOTE", "") == "a#b"
+
+    # **反面**：没有注释的普通值不能被这段处理弄坏
+    (tmp_path / ".env").write_text("BACKEND_PORT=8622\n", encoding="utf-8")
+    assert run_mod._runtime_setting(tmp_path, "BACKEND_PORT", "8620") == "8622"
+
+
+def test_database_init_happens_after_the_single_process_gate():
+    """建表/迁移与建管理员都必须排在**单进程闸之后**。
+
+    `main.lifespan` 特意把 `single_process.acquire()` 放在 `create_db_and_tables()`
+    之前，理由原话是「多 worker 时后来的那些会在这里当场退出，而不是先各自跑一遍迁移
+    ——幂等归幂等，但那是几个进程同时 ALTER 同一个库」。
+
+    而启动器原先在 `uvicorn.run()` **之前**调 `seed.main()`，那个函数自己会先
+    `create_db_and_tables()` ⇒ 完整 alembic upgrade 跑在闸之前。
+    改端口开第二个实例时，新进程会对**正在被老进程使用的库**跑完迁移，
+    然后才在 lifespan 里被闸拒绝。
+
+    两头都钉：lifespan 里的顺序，以及启动器不许自己碰库。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    import run as run_mod
+    from app import main as main_mod
+
+    # ① lifespan 里：acquire → create_db_and_tables → ensure_admin
+    tree = ast.parse(textwrap.dedent(inspect.getsource(main_mod.lifespan)))
+    order = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "attr", getattr(node.func, "id", ""))
+            if name in ("acquire", "create_db_and_tables", "ensure_admin"):
+                order.setdefault(name, node.lineno)
+    assert set(order) == {"acquire", "create_db_and_tables", "ensure_admin"}, order
+    assert order["acquire"] < order["create_db_and_tables"] < order["ensure_admin"], (
+        f"lifespan 里的顺序不对：{order}（闸 → 建表 → 建号）")
+
+    # ② 启动器不许在 uvicorn 之前碰库
+    launcher = ast.parse(textwrap.dedent(inspect.getsource(run_mod.main)))
+    touched = {getattr(n.func, "attr", getattr(n.func, "id", ""))
+               for n in ast.walk(launcher) if isinstance(n, ast.Call)}
+    bad = touched & {"create_db_and_tables", "seed_admin", "ensure_admin"}
+    assert not bad, (f"启动器在拿到单进程闸之前就碰库了：{sorted(bad)}。"
+                     "这些事都该在 app.main.lifespan 里做")

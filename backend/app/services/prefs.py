@@ -57,6 +57,15 @@ def _check_manual_rate(v: Any) -> None:
         d = Decimal(v.strip())
     except InvalidOperation:
         raise ValueError(f"手填汇率 {v!r} 不是一个数")
+    if not d.is_finite():
+        # **NaN / Infinity 能被 Decimal 正常解析**，坑在下一行：decimal 对 NaN 做**有序比较**
+        # 会抛 InvalidOperation，那是 ArithmeticError 而不是 ValueError ⇒ 路由的
+        # `except ValueError` 接不住、main.py 也没有对应 handler ⇒ 用户拿到裸 500。
+        # `PUT /api/settings` 的 values 是个裸 dict（schemas.SettingsUpdate），pydantic
+        # 不做任何拦截，所以 "NaN" 能一路走到这里。
+        # schemas._q_decimal 早就踩过同一个坑并写了注释，顺序是「先 is_finite 再比较」；
+        # 这份校验是后来单独写的，漏了这一句。
+        raise ValueError(f"手填汇率 {v!r} 不是一个数")
     if not (FX_MIN <= d <= FX_MAX):
         raise ValueError(f"手填汇率 {d} 不在合理区间 [{FX_MIN}, {FX_MAX}]（1元≈20円）")
 

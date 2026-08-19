@@ -30,7 +30,22 @@ def upgrade() -> None:
     """Upgrade schema."""
     # 重跑安全：MySQL 上一次失败的迁移可能已经把表建出来了（DDL 隐式提交，不回滚）。
     # 不加这个判断的话，修好问题再跑会撞「Table already exists」，看起来像另一个错误。
-    if "pluginrecord" in sa.inspect(op.get_bind()).get_table_names():
+    #
+    # ⚠️ **但只丢空壳，绝不丢数据。** 这是全链 25 个 `upgrade()` 里唯一一条
+    # `drop_table`（其余 12 处全在 `downgrade()` 里）。它要收拾的那条路径上，
+    # 表必然是空的——建完就炸、没有任何写入者跑过。而代码原先不区分
+    # 「空壳残留」和「有数据」：只要库里有一张同名表而 `alembic_version` 还没走到这里，
+    # 它就会连同全部插件私有数据一起删掉，没有日志、没有备份、没有计数。
+    # `database.py` 的 pre-Alembic 收养逻辑（丢了 `alembic_version` 就 stamp 回 baseline
+    # 重跑全链）理论上能走到这里。非空就抬起来报错，让人来决定。
+    bind = op.get_bind()
+    if "pluginrecord" in sa.inspect(bind).get_table_names():
+        n = bind.execute(sa.text("SELECT COUNT(*) FROM pluginrecord")).scalar() or 0
+        if n:
+            raise RuntimeError(
+                f"迁移 b0c1d2e3f4a5 想重建 pluginrecord，但它里面有 {n} 行数据。"
+                "这条重建只为收拾「建完就炸的空壳」，不该丢任何东西。"
+                "请先把这张表备份/导出，确认无用后手动 DROP，再重跑迁移。")
         op.drop_table("pluginrecord")
     op.create_table(
         "pluginrecord",

@@ -291,6 +291,48 @@ def test_residual_row_does_not_pile_up_on_every_edit(client):
     assert len(o["items"]) == 2
 
 
+def test_resaving_the_items_verbatim_does_not_shrink_the_order(client):
+    """**原样存一次，订单价不许少一分钱。**
+
+    上面那三条尾差测试全都把 `unit_price_cny` 置成 None 再回传，走的是「重新折算」
+    那一支——而前端**从不这么发**：`OrderItemsEditor.toPayload` 是带着单价整体回传的，
+    并且 `saveItems` 只发 `{version, items}`、不发 `price_cny`。于是走的是「带价原样采用」
+    那一支，而剔尾差行原先放在所有分支之前 ⇒ 尾差被删掉、那笔钱没有任何地方加回去：
+
+        建单 ¥100.00 / A×3 → [A@33.33, A（金额尾差）@0.01]
+        在物品编辑器里随便改一格（改名、改数量、加一条）→ 触发整体保存 → 99.99
+
+    200 OK、无日志、不可逆。误差上限是 数量×0.01（数量 1000 时是 9.99 元），
+    而账本金额与爬虫抓到的实付金额从此对不上。
+    """
+    o = mk_order(client, price_cny="100.00", items=[{"name": "a", "quantity": 3}])
+    assert Decimal(o["price_cny"]) == Decimal("100.00")
+    assert any(i["name"].endswith("（金额尾差）") for i in o["items"]), "夹具没造出尾差行"
+
+    # 逐字模拟 toPayload：带单价、带 auto，且**不发 price_cny**
+    body = {"version": o["version"],
+            "items": [{"name": i["name"], "quantity": i["quantity"],
+                       "unit_price_cny": i["unit_price_cny"], "auto": i["auto"]}
+                      for i in o["items"]]}
+    r = client.patch(f"/api/orders/{o['id']}", json=body)
+    assert r.status_code == 200, r.text
+    o2 = r.json()
+    assert Decimal(o2["price_cny"]) == Decimal("100.00"), \
+        f"原样存一次就少了钱：{o['price_cny']} → {o2['price_cny']}"
+
+    # **反面**：这一支不许把尾差行当成「要重算的输入」——它带着真实单价，
+    # 留着才守恒；同时也不许因此就在这一支里再生成一条新的。
+    assert [i["name"] for i in o2["items"]].count("a（金额尾差）") == 1
+
+    # 再存一次仍然守恒（一次性丢钱与持续丢钱都要挡住）
+    body2 = {"version": o2["version"],
+             "items": [{"name": i["name"], "quantity": i["quantity"],
+                        "unit_price_cny": i["unit_price_cny"], "auto": i["auto"]}
+                       for i in o2["items"]]}
+    o3 = client.patch(f"/api/orders/{o2['id']}", json=body2).json()
+    assert Decimal(o3["price_cny"]) == Decimal("100.00")
+
+
 def test_residual_row_is_recognised_even_with_a_very_long_item_name(client):
     """长物品名下，后缀必须仍在——否则下一次认不出它，又开始叠加。
 

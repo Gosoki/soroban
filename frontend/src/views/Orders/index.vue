@@ -78,7 +78,7 @@
     </NotionTable>
 
     <div v-if="focusId && !loading && !total" class="focus-empty">
-      未找到该订单（可能已删除）。<el-link type="primary" @click="clearFocus">显示全部</el-link>
+      未找到该订单（可能已删除）。<el-link type="primary" :underline="false" @click="clearFocus">显示全部</el-link>
     </div>
 
     <el-pagination class="pager" layout="prev, pager, next, total" :total="total"
@@ -95,7 +95,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check } from '@element-plus/icons-vue'
 import { shipmentApi, ordersApi, tagsApi } from '@/api'
 import { handled } from '@/api/http'
-import { ORDER_SOURCES, PRICE_HELP, PURCHASE_STATUS, SHIPMENT_STATUS, statusStyle, typeStyle } from '@/constants'
+import { ORDER_SOURCES, PAGE_SIZE, PRICE_HELP, PURCHASE_STATUS, SHIPMENT_STATUS, statusStyle, typeStyle } from '@/constants'
 import { fmtJPY } from '@/utils/money'
 import { applyRowUpdate, queueOrderWrite } from '@/utils/orderWrites'
 import { today } from '@/utils/datetime'
@@ -141,7 +141,7 @@ const rows = ref([])
 const total = ref(0)
 const loading = ref(false)
 const page = ref(1)
-const pageSize = 30
+const pageSize = PAGE_SIZE
 const focusId = ref(null)   // 跳转定位的订单 id（?focus=）
 const filters = reactive({ q: '', platform: '', fulfillmentStatus: '', platform_account: '', range: null })
 const shipmentOptions = ref([])
@@ -302,7 +302,7 @@ async function addRow(data = {}, done) {
       done?.(true)
       return created
     }
-    await afterCreate(created, { rows, total, page, filters, load })
+    await afterCreate(created, { rows, total, page, filters, load, pageSize })
     done?.(true)
     return created
   } catch (e) {
@@ -321,7 +321,8 @@ async function addRow(data = {}, done) {
 
 async function delRow(row) {
   try {
-    await ElMessageBox.confirm(`删除订单「${row.order_no || row.id}」？`, '确认', { type: 'warning' })
+    await ElMessageBox.confirm(`删除订单「${row.order_no || row.id}」？`, '删除订单',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' })
   } catch (_) { return }
   try {
     await ordersApi.remove(row.id)

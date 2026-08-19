@@ -11,7 +11,7 @@
         <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
           <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
         </el-select>
-        <el-select v-model="filters.importStatus" placeholder="全部状态" clearable style="width: 120px" @change="reload">
+        <el-select v-model="filters.importStatus" placeholder="状态" clearable style="width: 120px" @change="reload">
           <el-option v-for="s in IMPORT_STATUS" :key="s" :label="s" :value="s" />
         </el-select>
         <el-select v-model="filters.platform_account" placeholder="账号昵称" clearable filterable style="width: 120px" @change="reload">
@@ -71,7 +71,7 @@
           <el-tag :style="importStatusStyle('已导入')">已导入 #{{ row.imported_order_id }}</el-tag>
         </template>
         <template v-else>
-          <el-button type="primary" @click="doImport(row)">导入</el-button>
+          <el-button link type="primary" @click="doImport(row)">导入</el-button>
           <el-button v-if="row.import_status !== '已忽略'" link @click="doIgnore(row)">忽略</el-button>
         </template>
       </template>
@@ -117,10 +117,10 @@ import PageHeader from '@/components/PageHeader.vue'
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Camera, Delete, Plus } from '@element-plus/icons-vue'
-import { applyRowUpdate } from '@/utils/orderWrites'
+import { applyRowUpdate, queueOrderWrite } from '@/utils/orderWrites'
 import { ordersApi, stagingApi, tagsApi } from '@/api'
 import { handled } from '@/api/http'
-import { ORDER_SOURCES, PRICE_HELP, IMPORT_STATUS, PURCHASE_STATUS, canAdvancePurchase, importStatusStyle } from '@/constants'
+import { ORDER_SOURCES, PAGE_SIZE, PRICE_HELP, IMPORT_STATUS, PURCHASE_STATUS, canAdvancePurchase, importStatusStyle } from '@/constants'
 import { fmtDate } from '@/utils/datetime'
 import { afterCreate, afterDelete } from '@/utils/listRows'
 import NotionTable from '@/components/NotionTable.vue'
@@ -154,7 +154,7 @@ const rows = ref([])
 const total = ref(0)
 const loading = ref(false)
 const page = ref(1)
-const pageSize = 30
+const pageSize = PAGE_SIZE
 // 默认只看「待处理」（抓进来待逐单导入的）；清空筛选或切状态即可看全部/已导入/已忽略
 const filters = reactive({ q: '', platform: '', importStatus: '待处理', platform_account: '', range: null })
 const accountOptions = ref([])   // 账号昵称下拉候选（标签接口）
@@ -229,9 +229,13 @@ function onPage(p) { page.value = p; load() }
 
 async function saveCell(row, key, value) {
   try {
-    const patch = { version: row.version, [key]: value }
-    const updated = await stagingApi.update(row.id, patch)
-    applyRowUpdate(row, patch, updated)      // 没送 items → 不覆盖展开面板里未保存的物品编辑
+    // 入队串行：同一行的格子、邮费、物品三条写路径各自读一次 version，
+    // 重叠时后到的那个必 409。链的 key 加 `staging:` 前缀，与订单页的 id 空间分开。
+    await queueOrderWrite(`staging:${row.id}`, async () => {
+      const patch = { version: row.version, [key]: value }
+      const updated = await stagingApi.update(row.id, patch)
+      applyRowUpdate(row, patch, updated)    // 没送 items → 不覆盖展开面板里未保存的物品编辑
+    })
   } catch (e) {
     if (e.response?.status === 409) {
       handled(e)
@@ -242,15 +246,42 @@ async function saveCell(row, key, value) {
   }
 }
 
+// 送给后端的物品形状。**送出去和回来后比对必须走同一个函数**（理由同 OrderItemsEditor）。
+function itemsPayload(rows) {
+  return (rows || []).map((it) => ({
+    name: (it.name || '').trim(), quantity: Number(it.quantity) || 1,
+    unit_price_cny: (it.unit_price_cny === '' || it.unit_price_cny == null)
+      ? null : Number(it.unit_price_cny),
+    auto: !!it.auto }))
+}
+
 async function saveItems(row) {
-  const items = (row.items || []).filter((it) => it.name && it.name.trim())
-    .map((it) => ({ name: it.name.trim(), quantity: Number(it.quantity) || 1,
-                    unit_price_cny: (it.unit_price_cny === '' || it.unit_price_cny == null)
-                      ? null : Number(it.unit_price_cny),
-                    auto: !!it.auto }))
+  const all = row.items || []
+  // **绝不静默丢弃没名字的行。** 原先这里是 `.filter(有名字)` —— 与订单页那份逐字节相同的
+  // 老写法，而订单页早就改掉了（`OrderItemsEditor.saveItems` 的 blank 拦截）。
+  // 「Ctrl+A 清空名字准备重打」是最常见的改名姿势，期间任何一次保存（改数量、改单价、
+  // 改另一条物品）都会把那条连同它的钱一起删掉，暂存价随之缩水——无确认、无撤销、无提示。
+  // 那次修复的结论原话是「守卫必须放在**所有入口**的必经之路上」，这个入口没跟上。
+  const blank = all.filter((it) => !it.name || !it.name.trim())
+  if (blank.length) {
+    ElMessage.warning(`有 ${blank.length} 条物品还没填名字——先填上，或点右侧的删除按钮删掉`)
+    return
+  }
+  const items = itemsPayload(all)
+  const sent = JSON.stringify(items)
   try {
-    const updated = await stagingApi.update(row.id, { version: row.version, items })
-    Object.assign(row, updated)
+    // 入队串行：与同一行的 saveCell / savePostage 抢 version 会互相 409。
+    // 最短的触发路径不需要任何并发意识：在邮费框里填个数，直接点「保存物品」——
+    // 按钮的 mousedown 先让邮费框失焦触发 savePostage，click 再触发 saveItems，
+    // 后者读到的还是同一个旧 version ⇒ 必 409 ⇒ 整表重拉，刚填的物品全没了。
+    await queueOrderWrite(`staging:${row.id}`, async () => {
+      const patch = { version: row.version, items }
+      const updated = await stagingApi.update(row.id, patch)
+      // 送出去之后、响应回来之前本地又被改过 ⇒ 那份响应算的是旧数组，整体覆盖
+      // 等于当着用户的面把他这几百毫秒里敲的字回滚掉（见 applyRowUpdate 的说明）。
+      const stale = JSON.stringify(itemsPayload(row.items || [])) !== sent
+      applyRowUpdate(row, patch, updated, { itemsStale: stale })
+    })
     ElMessage.success('物品已保存')
   } catch (e) {
     // 仅 409（数据已变）才整表刷新；其它错误交拦截器提示，保留本地未保存编辑
@@ -262,9 +293,11 @@ async function saveItems(row) {
 async function savePostage(row) {
   const postage = (row.postage_cny === '' || row.postage_cny == null) ? null : Number(row.postage_cny)
   try {
-    const patch = { version: row.version, postage_cny: postage }
-    const updated = await stagingApi.update(row.id, patch)
-    applyRowUpdate(row, patch, updated)
+    await queueOrderWrite(`staging:${row.id}`, async () => {
+      const patch = { version: row.version, postage_cny: postage }
+      const updated = await stagingApi.update(row.id, patch)
+      applyRowUpdate(row, patch, updated)
+    })
   } catch (e) {
     if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
   }
@@ -276,7 +309,7 @@ async function addRow(data = {}, done) {
     // `dateKey` 用 scraped_at：与后端 staging.py 的 order_by 同一列。
     // 不能用 order_date——它可以为 NULL（OCR 认不出「下单时间」就不下发这个键），
     // 而空值会让比较器失去传递性，本地插入的顺序与刷新后的对不上（见 sortByDateDesc）。
-    await afterCreate(created, { rows, total, page, filters, load, dateKey: 'scraped_at' })
+    await afterCreate(created, { rows, total, page, filters, load, pageSize, dateKey: 'scraped_at' })
     done?.(true)
     // **必须把新建的行回传**：OCR 那条路径靠返回值判成败（`if (!created) 记失败`）。
     // 不回传的话建成功了也拿到 undefined，整批统计会把每一张都记成「失败」，
@@ -315,7 +348,8 @@ async function doIgnore(row) {
 }
 async function doDelete(row) {
   try {
-    await ElMessageBox.confirm('删除这条暂存记录？', '确认', { type: 'warning' })
+    await ElMessageBox.confirm('删除这条暂存记录？', '删除暂存记录',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' })
   } catch (_) { return }
   try {
     await stagingApi.remove(row.id)
@@ -455,9 +489,17 @@ async function reportOcr(t) {
     t.inLedger ? `${t.inLedger} 单的订单号已经在账本里了，没有重复放进暂存` : '',
     t.unread ? `未识别出订单信息 ${t.unread} 张` : '',
     t.failed ? `失败 ${t.failed} 张` : '',
+    // 后端**已经逐张**给出了准确的 platform_warning（这一张是不是闲鱼版式、准不准）。
+    // 这里原先又补一句「这类截图上成交价和商品名多半认不出来」——那是对**全部 N 张**
+    // 的断言，而 N 张里可能混着解析得很准的闲鱼截图（选了淘宝、里面混进两张闲鱼）。
+    // 重复后端的话正是它变成假话的原因，所以只报数 + 举一个实例，不再自己下结论。
+    // 这个计数把**三种语义不同**的 warning 合在一起：来源冲突、「解析规则照闲鱼写的」、
+    // 「这张其实是闲鱼版式」。所以汇总这一行**不能替后端断言原因**——
+    // 上一版写「来源与图上看到的不一致」，而批量拖 12 张纯淘宝截图时一张都不冲突，
+    // 那句话是假的；再上一版写「不是闲鱼版式、成交价多半认不出来」，
+    // 混进闲鱼截图时同样是假的。只报数 + 原样引后端那句话。
     t.offPlatform
-      ? `<br><b>其中 ${t.offPlatform} 张不是闲鱼版式</b>：${t.offHint}。`
-        + '<br>这类截图上<b>成交价和商品名多半认不出来</b>（它们靠「成交价」这个闲鱼独有的标签定位），请在表里补。'
+      ? `<br><b>其中 ${t.offPlatform} 张后端给了提示</b>，例如：${t.offHint}`
       : '',
     // 本批按什么来源记的，必须可复核：选了淘宝、十几张全打上淘宝，
     // 事后要能一眼看出这不是 OCR 自己判的。

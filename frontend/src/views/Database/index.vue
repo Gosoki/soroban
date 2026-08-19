@@ -41,14 +41,17 @@
         <el-table-column label="状态" width="76" align="center">
           <template #default="{ row }">
             <el-tag v-if="isActive(row)" :style="typeStyle('success')">当前</el-tag>
-            <span v-else class="dash">—</span>
+            <el-tag v-else-if="row.locked" :style="typeStyle('warning')">密钥已变</el-tag>
+            <span v-else class="ph">—</span>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="230" align="right">
           <template #default="{ row }">
-            <el-button link type="primary" :disabled="!!busy || isActive(row)"
+            <el-button link type="primary" :disabled="!!busy || isActive(row) || row.locked"
+                       :title="row.locked ? LOCKED_WHY : ''"
                        @click="doMigrate(targetOf(row), row.label)">迁移到此库</el-button>
-            <el-button link type="warning" :disabled="!!busy || isActive(row)"
+            <el-button link type="warning" :disabled="!!busy || isActive(row) || row.locked"
+                       :title="row.locked ? LOCKED_WHY : ''"
                        @click="doSwitch(targetOf(row), row.label)">切换</el-button>
             <el-button v-if="row.kind === 'mysql'" link type="danger"
                        :disabled="!!busy || isActive(row)" @click="doDelete(row)">删除</el-button>
@@ -132,8 +135,13 @@ const rows = computed(() => [
     id: c.id, kind: 'mysql', label: c.label,
     desc: `${c.user}@${c.host}:${c.port}/${c.database}`,
     host: c.host, port: c.port, user: c.user, database: c.database,
+    // SECRET_KEY 变过之后这条的 DSN 就再也解不开了。列表照列（跳过等于「记录凭空消失」），
+    // 但迁移/切换都会拿到 404「连接不存在或无法解密」——「明明列在这里」却说「不存在」，
+    // 是一条读不懂的死路。所以在这里就标出来并禁掉那两个按钮，删除保持可用（那是出口）。
+    locked: c.decryptable === false,
   })),
 ])
+const LOCKED_WHY = 'SECRET_KEY 变过，这条连接的密码解不开了。请在下面「连接新的 MySQL」重填一次，或直接删掉这条。'
 const resultRows = computed(() =>
   result.value ? Object.entries(result.value.counts).map(([table, rows]) => ({ table, rows })) : [])
 
@@ -169,21 +177,51 @@ async function onTest() {
   } catch (_) { /* 拦截器已提示 */ } finally { busy.value = null }
 }
 
+// 迁移会**先删光目标库的业务表**再整表覆盖。后端在目标非空时返回 409，
+// 并把「对面现在有什么」逐表列出来——用户要判断的是「值不值得覆盖」，
+// 只说一句「会覆盖目标同名表」他没法判断。目标是空库时没有任何东西可丢，不打断。
+//
+// **两个入口都必须走这里**：按钮（doMigrate）与「当前库有未迁移的改动」弹窗里的
+// 「重新迁移再切换」（onSourceChanged）。后者原先直接调 dbApi.migrate，一句确认都没有——
+// 而它恰恰是那个弹窗的**默认按钮**，且那条路上目标库往往比当前库新得多
+// （MySQL 断线 → --use-local-db 退回本地 → 本地补记几单 → 回来点切换 → 409 → 默认按钮）。
+async function migrateWithOverwriteGuard(target) {
+  try {
+    return await dbApi.migrate(target)
+  } catch (e) {
+    // **只认「目标库里已经有数据」那一种 409。** `migrate` 还会因为
+    // 「已有另一项维护操作在进行」返回 409（备份/另一次迁移在跑）——
+    // 不区分的话，用户会在一条讲维护中的消息上点下「仍然覆盖」，
+    // 而重试带上 `confirm_overwrite: true` 正好**跳过了这道闸本身**。
+    // 那句话由后端的 `test_the_overwrite_409_is_recognisable` 钉住，不会漂。
+    const detail = e.response?.data?.detail
+    if (e.response?.status !== 409 || typeof detail !== 'string'
+        || !detail.includes('目标库里已经有数据')) throw e
+    handled(e)
+    await ElMessageBox.confirm(
+      e.response?.data?.detail || '目标库里已经有数据，迁移会把它们全部覆盖。',
+      '目标库里已有数据',
+      { type: 'warning', confirmButtonText: '仍然覆盖', cancelButtonText: '取消' },
+    )
+    return await dbApi.migrate({ ...target, confirm_overwrite: true })
+  }
+}
+
 async function doMigrate(target, name) {
   try {
     await ElMessageBox.confirm(
-      `将建库/建表，并把【当前数据库】的数据整表覆盖到【${name}】（会覆盖目标同名表）。此步不切换、不改动当前库。确认继续？`,
+      `将建库/建表，并把【当前数据库】的数据整表覆盖到【${name}】。此步不切换、不改动当前库。确认继续？`,
       '迁移数据库', { type: 'warning', confirmButtonText: '开始迁移', cancelButtonText: '取消' },
     )
   } catch (_) { return }
   busy.value = 'migrate'
   result.value = null
   try {
-    const r = await dbApi.migrate(target)
+    const r = await migrateWithOverwriteGuard(target)
     result.value = r
     ElMessage.success(`迁移完成，共 ${r.total} 行。确认无误后可「切换」到该库`)
     await loadStatus()
-  } catch (_) { /* 拦截器已提示 */ } finally { busy.value = null }
+  } catch (_) { /* 取消覆盖，或拦截器已提示 */ } finally { busy.value = null }
 }
 
 async function doSwitch(target, name) {
@@ -234,7 +272,8 @@ async function onSourceChanged(target, name, detail) {
       await dbApi.switch({ ...target, confirm_changed: true })
       ElMessage.warning(`已切换到 ${name}（放弃了未迁移的改动）`)
     } else {
-      await dbApi.migrate(target)            // 先补一次迁移，把新改动带过去
+      // 先补一次迁移，把新改动带过去。走 guard：目标库非空时先说清楚要删掉什么。
+      await migrateWithOverwriteGuard(target)
       await dbApi.switch(target)
       ElMessage.success(`已重新迁移并切换到 ${name}`)
     }
@@ -285,7 +324,6 @@ onMounted(loadStatus)
    同一种组件不该有两种排版。 */
 .degraded { margin-bottom: 12px; }
 .hint { color: var(--txt-3); font-size: 12px; }
-.dash { color: var(--txt-2); }
 .row-ic { margin-right: 4px; vertical-align: -2px; }
 .form { margin-top: 6px; }
 

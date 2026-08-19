@@ -49,6 +49,8 @@ class Target(BaseModel):
     database: Optional[str] = None
     # 切换时若发现「迁移之后源库又被改过」会 409 拦下；用户明确表示放弃那些改动时置 True 再来一次。
     confirm_changed: bool = False
+    # 迁移时若发现目标库**已经有数据**（会被整表删掉）会 409 拦下；用户看清了要覆盖什么再置 True。
+    confirm_overwrite: bool = False
 
 
 # --- 解析目标 ------------------------------------------------------------------
@@ -201,6 +203,27 @@ def migrate(t: Target):
         # 拷贝前体检：SQLite 不检查 VARCHAR 长度与 DECIMAL 范围，历史脏行会让 MySQL 侧
         # 抛 1406/1264；而拷贝是单事务，一行踩雷整批回滚。与其让用户对着一句原始异常发呆，
         # 不如先把具体是哪张表哪一行、哪个字段超了列出来。
+        # **目标库里已有的数据会被 replace_data 逐表 delete 掉。**
+        # 在此之前全仓没有任何一处比较源库与目标库谁更新：`_is_same_as_active` 只回答
+        # 「目标是不是当前正在用的那个」，而 switch 里那道指纹闸只回答「源库比上次迁移时新不新」
+        # ——**它看不见反方向**。于是有一条全程走本应用自己指引的路会毁掉整个账本：
+        #   MySQL 连不上 → 按提示 `--use-local-db` 退回本地（内容停在切走那天）
+        #   → 停机期间在本地补记几单（rescue.py 正是这么建议的）
+        #   → MySQL 恢复后点「切换」→ 源库有改动 ⇒ 409
+        #   → 弹窗的**默认按钮**是「重新迁移再切换」⇒ 直接调到这里
+        #   → 用几个月前的本地快照覆盖掉 MySQL 上几个月的账本，单事务提交。
+        # 而 MySQL 侧没有任何自动备份（backup.sh 在 MySQL 模式下是直接拒绝的），退不回去。
+        # 所以这道闸按「目标非空」拦，并且**把对面有什么如实列出来**：用户要判断的是
+        # 「值不值得覆盖」，只说一句「会覆盖同名表」他没法判断。
+        existing = db_migrate.target_rows(tgt)
+        if existing and not t.confirm_overwrite:
+            # 单行不带 \n：前端用 ElMessageBox 显示，它默认不保留换行。
+            raise HTTPException(status_code=409, detail=(
+                "目标库里已经有数据（"
+                + "、".join(f"{k} {v} 条" for k, v in existing.items())
+                + "），迁移会先把它们全部删除，再用当前库整表覆盖。"
+                "请先确认目标库里没有当前库所没有的东西——这一步没有备份，无法撤销。"))
+
         problems = db_migrate.preflight(get_engine(), tgt)
         if problems:
             raise HTTPException(
@@ -238,6 +261,27 @@ def switch(t: Target):
     backend, url, tgt, owns = _resolve_target(t)
     if _is_same_as_active(backend, url):
         raise HTTPException(status_code=400, detail="当前已在使用该数据库")
+
+    # **服务端版本闸也要挂在这里。** 原先只挂在 test 与 migrate 两处（见 _reject_unsupported
+    # 的 docstring），而界面上「测试连接 / 迁移到此库 / 切换」是三个平级按钮，
+    # 没有任何东西强制「先测试」。跳过测试直接点「切换到此库」时，下面那句 run_migrations
+    # 会对一台 MariaDB / MySQL 5.7 跑完整 alembic 链，跑到用 utf8mb4_0900_bin 那条时炸——
+    # 而 MySQL 的 DDL 是**隐式提交**的：前面十几条已经落地，库停在既不是旧版也不是新版的
+    # 半升级态，用户只拿到一句「表结构升级失败」。此后连「迁移到此库」都会被版本闸拒掉
+    # （那道闸是好的），只能手工 DROP DATABASE 才能重来。
+    if backend == "mysql":
+        h, p, u, pw, dbn = _mysql_conn_fields(t)
+        ok, msg = db_migrate.test_connection(h, p, u, pw, None)
+        if not ok:
+            if owns:
+                tgt.dispose()
+            raise HTTPException(status_code=400, detail=f"MySQL 连接失败：{msg}")
+        try:
+            _reject_unsupported(msg)
+        except HTTPException:
+            if owns:
+                tgt.dispose()
+            raise
 
     # 目标库的 schema 必须先升到 head，否则切过去全站 500（缺列 1054 / 缺表 1146，
     # 两者都不是 IntegrityError/ValueError，main.py 无对应 handler → 裸 500）。

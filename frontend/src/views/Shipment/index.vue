@@ -133,7 +133,7 @@ import { shipmentApi, ordersApi } from '@/api'
 import { checkImageSize } from '@/utils/imageGate'
 import { useWindowFileDrop } from '@/utils/windowFileDrop'
 import { handled } from '@/api/http'
-import { SHIPMENT_STATUS, longToast } from '@/constants'
+import { PAGE_SIZE, SHIPMENT_STATUS, longToast } from '@/constants'
 import { fmtJPY } from '@/utils/money'
 import { today } from '@/utils/datetime'
 import { afterCreate, afterDelete } from '@/utils/listRows'
@@ -166,7 +166,7 @@ const rows = ref([])
 const total = ref(0)
 const loading = ref(false)
 const page = ref(1)
-const pageSize = 30
+const pageSize = PAGE_SIZE
 const filters = reactive({ range: null, shipmentStatus: '', q: '' })
 const unassignedOptions = ref([])
 const unassignedTotal = ref(0)   // 后端说共有多少条未挂靠；用来判断本地这 200 条是不是被截断了
@@ -213,7 +213,7 @@ async function saveCell(row, key, value) {
 async function addRow(data = {}, done) {
   try {
     const created = await shipmentApi.create({ date: today(), shipment_status: '打包中', ...data })
-    await afterCreate(created, { rows, total, page, filters, load })
+    await afterCreate(created, { rows, total, page, filters, load, pageSize })
     done?.(true)
     return created                    // OCR 建单据此判断是否真的建成（失败时拦截器已提示）
   } catch (e) {
@@ -231,7 +231,8 @@ async function addRow(data = {}, done) {
 
 async function delRow(row) {
   try {
-    await ElMessageBox.confirm(`删除集运订单「${row.shipment_no || row.id}」？`, '确认', { type: 'warning' })
+    await ElMessageBox.confirm(`删除集运订单「${row.shipment_no || row.id}」？`, '删除集运订单',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' })
   } catch (_) { return }
   try {
     await shipmentApi.remove(row.id)

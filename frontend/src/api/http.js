@@ -91,7 +91,14 @@ http.interceptors.response.use(
       }, 0)
       return Promise.reject(err)
     }
-    const text = hasDetail ? detail : (err.message || '请求失败')
+    // 超时是全站唯一一句会漏出**英文**的提示（axios 给的是 `timeout of 15000ms exceeded`）。
+    // 它与「连接被拒」是两种不同的故障：后端还活着但卡住了（迁移期的长事务、
+    // 连接池排队、握手阻塞）。这里只把话说成中文；要不要顺带弹全屏离线提示
+    // 是另一个取舍（那会在后端其实健康时闪一下），见审计报告的待定项。
+    const timedOut = err.code === 'ECONNABORTED' || /timeout/i.test(err.message || '')
+    const text = hasDetail ? detail
+      : (timedOut ? '后端一直没有响应（已等待超时）。它可能正忙或卡住了，稍后重试。'
+                  : (err.message || '请求失败'))
     // 503 = 数据库迁移期间的只读屏障：是暂时状态、稍后重试即可，用 warning 而非 error，
     // 别让用户以为账本坏了。
     if (status === 503) ElMessage.warning(text)

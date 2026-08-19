@@ -286,3 +286,48 @@ def test_mysql_users_are_not_told_to_delete_the_control_db(monkeypatch, caplog):
     assert not offenders, \
         f"给 MySQL 用户出了删控制库的主意（业务数据不在里面，删了只会连不回去）：\n" + "\n".join(offenders)
     assert "use-local-db" in text, "没给出「暂时改用本地账本」这条真正能照做的出路"
+
+
+def test_the_only_drop_table_in_the_chain_refuses_to_eat_data(fresh_url):
+    """`b0c1d2e3f4a5` 里那条 `drop_table` 是全链 25 个 `upgrade()` 中**唯一**的一条
+    （其余 12 处全在 `downgrade()` 里）。它要收拾的是「MySQL 上一次失败的迁移留下的空壳」
+    ——那条路径上表必然是空的，因为建完就炸、没有任何写入者跑过。
+
+    但代码原先不区分「空壳残留」和「有数据」：只要库里有一张同名表而 `alembic_version`
+    还没走到这里，它就会连同全部插件私有数据一起删掉，**没有日志、没有备份、没有计数**。
+    （`database.py` 的 pre-Alembic 收养逻辑——丢了 `alembic_version` 就 stamp 回 baseline
+    重跑全链——理论上能走到这里。）
+    """
+    e = build_engine(fresh_url)
+    try:
+        command.upgrade(_cfg(fresh_url), "a9b0c1d2e3f4")     # 停在这条迁移的前一版
+        with e.begin() as c:
+            # 手工造一张「有数据的同名表」——就是那种绝不该被静默删掉的情形
+            c.execute(text("CREATE TABLE pluginrecord (id INTEGER PRIMARY KEY, k TEXT)"))
+            c.execute(text("INSERT INTO pluginrecord (id, k) VALUES (1, '轨迹去重状态')"))
+
+        with pytest.raises(Exception) as ei:                  # alembic 会把它包一层
+            command.upgrade(_cfg(fresh_url), "b0c1d2e3f4a5")
+        assert "pluginrecord" in str(ei.value), str(ei.value)
+
+        # 数据必须原封不动
+        with e.begin() as c:
+            assert c.execute(text("SELECT COUNT(*) FROM pluginrecord")).scalar() == 1
+    finally:
+        e.dispose()
+
+
+def test_the_rebuild_still_clears_an_empty_leftover(fresh_url):
+    """**反面**：空壳照常清掉，否则这条重建就等于被关掉了——
+    而它存在的理由正是「修好问题再跑不该撞 Table already exists」。
+    """
+    e = build_engine(fresh_url)
+    try:
+        command.upgrade(_cfg(fresh_url), "a9b0c1d2e3f4")
+        with e.begin() as c:
+            c.execute(text("CREATE TABLE pluginrecord (id INTEGER PRIMARY KEY, k TEXT)"))
+        command.upgrade(_cfg(fresh_url), "b0c1d2e3f4a5")      # 不该抛
+        cols = {c["name"] for c in inspect(e).get_columns("pluginrecord")}
+        assert {"plugin_id", "kind", "key", "data"} <= cols, f"空壳没被换成真表：{cols}"
+    finally:
+        e.dispose()
