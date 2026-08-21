@@ -1,4 +1,4 @@
-// 同一订单的 PATCH 串行化。
+// 同一行的 PATCH 串行化（商品订单 / 暂存 / 集运 / 杂项四张表共用）。
 // 订单页格子、展开面板、整单编辑面板各自独立发 ordersApi.update，都在调用时读一次
 // order.version、拿到响应后才自增。两次编辑若在第一个响应回来前重叠，会带着同一个旧
 // version 发出，第二个必 409 → 前端提示「已刷新」并整表重载，用户刚敲的那笔被悄悄丢掉。
@@ -8,13 +8,16 @@
 // 才能保证下一个任务读到的是回写后的新版本。
 const chains = new Map()
 
-export function queueOrderWrite(orderId, task) {
-  const prev = chains.get(orderId) || Promise.resolve()
+// `key` 必须带表名前缀（`order:12` / `shipment:12`）：四张表的 id 空间是**各自独立**的，
+// 只用数字的话，订单 12 与集运 12 会共用一条链——不会出错，但会毫无理由地互相等，
+// 而且哪天有人调试「为什么这两个写操作串起来了」会完全摸不着头脑。
+export function queueRowWrite(key, task) {
+  const prev = chains.get(key) || Promise.resolve()
   const run = prev.then(task, task)   // 前一个无论成败都接着跑本任务，避免一次失败卡死整条链
   const tail = run.catch(() => {}).finally(() => {
-    if (chains.get(orderId) === tail) chains.delete(orderId)   // 链尾跑完即回收，防 Map 泄漏
+    if (chains.get(key) === tail) chains.delete(key)   // 链尾跑完即回收，防 Map 泄漏
   })
-  chains.set(orderId, tail)
+  chains.set(key, tail)
   return run                          // 调用方拿到本任务的真实结果/异常
 }
 

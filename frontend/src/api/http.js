@@ -1,5 +1,6 @@
 import axios from 'axios'
 import { ElLoading, ElMessage } from 'element-plus'
+import { markRetried, retryDelayFor } from './retry'
 
 // baseURL '/api'：各模块用 '/orders' 等拼接；Vite 代理 /api → 后端。
 const http = axios.create({ baseURL: '/api', timeout: 15000 })
@@ -55,10 +56,20 @@ http.interceptors.request.use((config) => {
   return config
 })
 
+// 只读屏障（503）的自动重试。策略与「能不能重试」的判断在 ./retry.js——
+// 那个文件刻意零依赖，node 能直接跑，由后端的一致性测试做真行为测试。
+function _sleep(ms) { return new Promise((r) => setTimeout(r, ms)) }
+
 http.interceptors.response.use(
   (res) => { hideOfflineOverlay(); return res.data },
-  (err) => {
+  async (err) => {
     if (err.code === 'ERR_CANCELED') return Promise.reject(err)
+    // 屏障 503：短暂重试几次再放弃（判据与间隔见 ./retry.js）
+    const wait = retryDelayFor(err)
+    if (wait !== null) {
+      await _sleep(wait)
+      return http.request(markRetried(err.config))
+    }
     if (isNetworkError(err)) { showOfflineOverlay(); return Promise.reject(err) }
     if (err.response?.status === 401) {
       localStorage.removeItem('auth_token')

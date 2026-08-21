@@ -1079,3 +1079,31 @@ def test_a_shipping_fee_row_is_not_mistaken_for_the_product_name():
     res3 = [tok("运费险专用测试品", x=100, y=100), tok("¥520.00", x=400, y=100),
             tok("成交价", x=100, y=180), tok("¥500.00", x=400, y=180)]
     assert ocr.parse_order_fields(res3)["product"] == "运费险专用测试品"
+
+
+def test_same_row_prefers_the_longer_candidate():
+    """同一行里有多个候选时**取最长的**，不是取 y 最接近的。
+
+    这两条规则此前一直不一致：docstring 写「找 key 值最长的框」，
+    而实现按 `abs(cy - anchor.cy)` 取最近——**没有任何用例能区分它们**，
+    所以那句假描述一直被后来的改动当作前提。
+
+    哪个对：同一行的候选本来就都在 `row_tol` 之内，谁的 cy 更近几乎是随机的；
+    而订单号 15~20 位、快递号 12~15 位，这类字段「越长越像真的」。
+    """
+    # 两个候选都在同一行、都够 min_len：短的那个 cy 完全对齐（老规则会选它），
+    # 长的那个偏 5px（新规则选它）。
+    res = [tok("订单号", x=100, y=40),
+           tok("1234567890", x=300, y=40),
+           tok("98765432109876543210", x=520, y=45)]
+    assert ocr.parse_order_fields(res)["order_no"] == "98765432109876543210"
+
+    # **反面一**：右侧优先仍然生效——左边那个再长也不该被选走
+    res2 = [tok("订单号", x=300, y=40),
+            tok("11111111111111111111", x=60, y=40),
+            tok("2222222222", x=520, y=40)]
+    assert ocr.parse_order_fields(res2)["order_no"] == "2222222222"
+
+    # **反面二**：只有一个候选时行为不变
+    res3 = [tok("订单号", x=100, y=40), tok("1234567890123456", x=300, y=40)]
+    assert ocr.parse_order_fields(res3)["order_no"] == "1234567890123456"

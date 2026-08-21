@@ -2357,3 +2357,144 @@ def test_config_endpoint_refuses_params_instead_of_dropping_them(client):
     # 这里只看 body 校验有没有放行。
     ok = client.put("/api/plugins/demo/config", json={"enabled": True, "schedule_minutes": 0})
     assert ok.status_code != 422, ok.text
+
+
+# --- 清单能表达的三件事：动词、平台、能不能定时 ---------------------------------
+
+def test_frontend_does_not_hardcode_any_plugin_verb():
+    """插件页不许把 `login` / `fetch` 这种**动词名**写死。
+
+    既有的 `test_core_does_not_hardcode_any_plugin_id` 只查**插件 id**
+    （注释还写明「不查『淘宝』，那是 Order.platform 的合法取值」），
+    所以「账号行写死两个动词」一直没人发现。它的三个后果：
+      · 那两个按钮不判「插件已停用」也不判「缺权限」⇒ 点了拿 409，
+        而 `Command.needs` 的定义原话是「缺了就不给点（而不是点了 403）」；
+      · 清单里的 label / hint / confirm 在这条路径上全被忽略；
+      · 第二个账号型插件（动词叫 sync / auth）在账号行上没有任何执行入口。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "views" / "Plugins" / "index.vue").read_text(encoding="utf-8")
+    code = "\n".join(ln for ln in src.splitlines()
+                     if not ln.strip().startswith(("//", "*", "<!--", "#")))
+    bad = []
+    for verb in ("login", "fetch"):
+        # 只找**被当成值用**的字面量（'login' / "fetch" / `fetch`），不找注释与英文单词
+        for m in re.finditer(rf"""['"`]{verb}['"`]""", code):
+            bad.append(f"{verb} @ …{code[max(0, m.start() - 45):m.end() + 15]}…")
+    assert not bad, ("插件页写死了动词名——动词由 plugin.toml 声明，界面按声明渲染：\n  "
+                     + "\n  ".join(bad))
+
+
+def test_the_manifest_can_say_which_command_is_schedulable():
+    """定时该跑哪条命令，**由清单说**，不由核心按字面量猜。
+
+    老口径是「先按字面量找叫 fetch 的，没有再取 primary」，两种误判都真实存在：
+      · 把 `sync` 标成 primary、同时留一条诊断用 `fetch` 的插件 ⇒ 定时跑错动词；
+      · 单纯翻转成「先 primary」 ⇒ 把 `login` 标成 primary 的清单会在无人值守时
+        反复弹出有头浏览器。
+    """
+    from app.plugins.manifest import parse
+    from app.routers.plugins import _scheduled_command
+
+    def mk(raw):
+        return {"_m": parse(raw, Path("/tmp/x")), "id": raw.get("id", "p")}
+
+    # 声明了就听声明的——哪怕它既不叫 fetch、也不是 primary
+    m = mk({"id": "p", "commands": [
+        {"name": "fetch", "label": "诊断抓一次"},
+        {"name": "sync", "label": "同步", "primary": True, "schedulable": True}]})
+    assert _scheduled_command(m).name == "sync"
+
+    # **反面一**：一条都没声明 ⇒ 回落老口径（老清单行为不变）
+    m2 = mk({"id": "p", "commands": [
+        {"name": "fetch", "label": "抓取"}, {"name": "other", "label": "别的", "primary": True}]})
+    assert _scheduled_command(m2).name == "fetch"
+
+    # **反面二**：没有 fetch 也没有声明 ⇒ 取 primary
+    m3 = mk({"id": "p", "commands": [
+        {"name": "a", "label": "A"}, {"name": "b", "label": "B", "primary": True}]})
+    assert _scheduled_command(m3).name == "b"
+
+
+def test_account_platform_is_validated_against_the_manifest(client, tmp_path, monkeypatch):
+    """加账号时的平台**不再由核心替所有插件默认成「淘宝」**。
+
+    那个默认值对每个插件生效：装一个京东插件、加账号时不改平台，
+    抓回来的单就带着 `platform="淘宝"` 进账本，而 `platform_provider`
+    （OCR 用它决定说哪句话）会据此报出**京东插件的名字**在管淘宝截图。
+    """
+    from app.plugins.manifest import parse
+
+    m = parse({"id": "jd", "name": "京东", "accounts": True,
+               "account_platforms": ["京东"]}, tmp_path)
+    assert m.account_platforms == ("京东",)
+
+    # **反面**：没声明的清单沿用旧行为（自由文本），老插件不受影响
+    m2 = parse({"id": "old", "name": "老插件", "accounts": True}, tmp_path)
+    assert m2.account_platforms == ()
+
+
+def test_commands_declare_whether_they_need_a_session():
+    """「这条命令要不要先有登录会话」由清单声明，核心不按动词名猜。
+
+    原先账号行写死「login 之外的都要会话」——第二个插件的 status / probe
+    明明不需要会话，却会被无端灰掉。
+    """
+    from app.plugins.manifest import parse
+
+    m = parse({"id": "p", "commands": [
+        {"name": "login", "label": "登录"},
+        {"name": "fetch", "label": "抓取", "needs_session": True}]}, Path("/tmp/x"))
+    by = {c.name: c for c in m.commands}
+    assert by["login"].needs_session is False
+    assert by["fetch"].needs_session is True
+
+
+def test_every_launched_subprocess_is_told_it_was_launched(monkeypatch, tmp_path):
+    """核心起的每一个子进程都要带 `SOROBAN_LAUNCHED=1`，**与要不要下发令牌无关**。
+
+    插件为了「手动跑」方便，通常会在没拿到 `SOROBAN_TOKEN` 时回落成账密登录
+    （仓库里那个淘宝插件就是，默认账密还写在它自己的 config 里）。那条回落拿到的是
+    一枚**完整用户令牌**，`_plugin_gate` 对非插件令牌直接放行 ⇒ 整套 scope 判定不适用。
+    今天核心总是下发令牌，所以正常路径踩不到——但这意味着**任何让令牌下发失效的回归，
+    表现不是响亮的 401，而是静默的全权限运行**，日志和卡片上完全看不出区别。
+
+    这不是权限模型（用户明确说过插件都是自己写的、防君子即可），
+    是**让一类回归有声音**。
+    """
+    from app.routers import plugins as mod
+
+    seen = {}
+
+    class _P:
+        pid = 4242
+        stdout = stderr = None
+
+        def poll(self):
+            return 0
+
+    def fake_popen(cmd, **kw):
+        seen["env"] = kw.get("env") or {}
+        return _P()
+
+    monkeypatch.setattr(mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(mod.threading, "Thread", lambda **kw: type(
+        "T", (), {"start": lambda self: None})())
+    monkeypatch.setattr(mod, "_python", lambda m: tmp_path / "py")
+    (tmp_path / "py").write_text("", encoding="utf-8")
+    m = {"id": "demo", "_dir": tmp_path, "_m": type("M", (), {"entry": "-m x", "commands": ()})()}
+    monkeypatch.setattr(mod, "_plugin_argv", lambda *a: ["py", "-m", "x"])
+
+    # 不带令牌也要有哨兵——这正是要覆盖的那种情形
+    mod._launch(m, "run", [])
+    assert seen["env"].get("SOROBAN_LAUNCHED") == "1", "没令牌时哨兵也必须在"
+    mod._INFLIGHT.clear()
+    mod._ALIVE_PROCS.clear()
+
+    # 带令牌时两个都在
+    mod._launch(m, "run", [], token="t0k")
+    assert seen["env"].get("SOROBAN_LAUNCHED") == "1"
+    assert seen["env"].get("SOROBAN_TOKEN") == "t0k"
+    mod._INFLIGHT.clear()
+    mod._ALIVE_PROCS.clear()

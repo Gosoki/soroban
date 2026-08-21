@@ -5,6 +5,11 @@
 - POST   /api/db/migrate             把当前数据整表覆盖到目标（建库/建表/拷数据，不切换）
 - POST   /api/db/switch              热切换到目标（无需重启；不清源库，故可逆）
 - DELETE /api/db/connections/{id}    删除一条已保存连接（不能删当前正在用的）
+- GET    /api/db/backups             已有的备份快照列表
+- POST   /api/db/backups             立刻备份一次当前生效的库
+
+**恢复刻意不给 HTTP 入口**：那是唯一一条能一键清空账本的操作，留在需要手敲 `yes`
+的命令行里（`python -m tools.backup_db --restore <文件>`）。备份可以点，恢复要走人。
 
 目标(Target)三选一：{connection_id} 一键复用已存连接 / {backend:'mysql', host...} 新连接 /
 {backend:'sqlite'} 本地库。安全：DSN 全程 Fernet 加密存储，密码永不回传前端；库名白名单防注入；
@@ -12,6 +17,8 @@
 """
 from __future__ import annotations
 
+import datetime as dt
+import io
 import logging
 from typing import Optional
 
@@ -122,6 +129,48 @@ def _remember(host, port, user, pw, db) -> int:
 
 
 # --- 端点 ----------------------------------------------------------------------
+
+@router.get("/backups")
+def list_backups():
+    """已有的备份快照（新的在前）。只列本模块自己造的那种文件名。"""
+    from ..backup import _MINE, _default_dir
+
+    d = _default_dir()
+    if not d.is_dir():
+        return {"dir": str(d), "items": []}
+    items = []
+    for f in sorted((x for x in d.iterdir() if _MINE.match(x.name)), reverse=True):
+        st = f.stat()
+        items.append({"name": f.name, "bytes": st.st_size,
+                      "mtime": dt.datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")})
+    return {"dir": str(d), "items": items}
+
+
+@router.post("/backups")
+def create_backup():
+    """立刻备份一次**当前生效的库**（SQLite 或 MySQL 都一样）。
+
+    拷贝期间会挂只读屏障，几秒内其他人的写入会收到 503 并自动重试——
+    这是必须的：没有屏障就会拷出「订单拷过去了、它的物品还没拷」的撕裂快照。
+    """
+    from ..backup import make_backup
+
+    buf = io.StringIO()
+    try:
+        path, counts = make_backup(stream=buf)
+    except RuntimeError as e:
+        # 「已有另一项维护操作在进行」——两个人同时点备份，或备份撞上迁移。
+        # 这是 409 不是 500：没出错，只是现在轮不到，等几秒再点就行。
+        # 与 migrate 的映射保持一致（前端只认 409 里那句「目标库里已经有数据」，
+        # 不会把这条误当成覆盖确认）。
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        log.exception("备份失败")
+        raise HTTPException(500, f"备份失败：{e}") from e
+    return {"file": path.name, "dir": str(path.parent),
+            "counts": {k: v for k, v in counts.items() if v}, "total": sum(counts.values()),
+            "log": buf.getvalue().strip()}
+
 
 @router.get("/status")
 def status():

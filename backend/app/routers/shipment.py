@@ -17,8 +17,8 @@ from ..schemas import (
     ShipmentCreate, ShipmentOcrAttachResult, ShipmentRead, ShipmentUpdate, OrderItemRead, OrderBrief,
 )
 from .common import (
-    guarded_bump, mirror_to_staging, raise_conflict, raise_not_found, run_ocr, soft_delete,
-    stamp_fx,
+    guarded_bump, list_totals, mirror_to_staging, raise_conflict, raise_not_found, run_ocr,
+    soft_delete, stamp_fx
 )
 
 router = APIRouter(
@@ -34,14 +34,47 @@ def _brief(order: Order) -> OrderBrief:
     )
 
 
-def _shipment_read(s: ShipmentOrder, children: list[Order]) -> ShipmentRead:
+# `ShipmentRead` 里**不是本表列**的字段。下面那个 getattr 推导式会挨个去模型上取，
+# 漏登记一个就是运行时 AttributeError（而且只在这条路径上炸）。
+# `test_shipment_read_derived_fields_are_registered` 钉住这张表，把它变成测试期失败。
+_DERIVED_FIELDS = {"orders", "orders_jpy", "landed_jpy", "unconverted"}
+
+
+def _landed(s: ShipmentOrder, children: list[Order]) -> dict:
+    """这张集运单的到岸成本。子订单已经在内存里，不再查库。
+
+    **排除规则从模型上取**（`Order.ledger_exclusions()`），与看板同一套：退款/关闭/
+    待付款的单没花钱，不该算进这张集运单的成本。另抄一份状态清单是这类合计出错的常见方式。
+
+    `unconverted` 数的是「有货款、却没折算成日元」的行：`SUM` 对 NULL 视而不见，
+    不数出来的话，缺汇率的单会让合计**静默变小**而笔数照旧——看板那边为同一件事
+    专门有个 `_uncounted`，这里不能重蹈。本单自己缺汇率也算一条。
+    """
+    excluded = {v for _col, vals in Order.ledger_exclusions() for v in vals}
+    counted = [c for c in children if c.purchase_status not in excluded]
+    orders_jpy = sum(c.jpy_settled or 0 for c in counted)
+    missing = sum(1 for c in counted if c.price_cny is not None and c.jpy_settled is None)
+    if s.price_cny is not None and s.jpy_settled is None:
+        missing += 1
+    return {"orders_jpy": orders_jpy,
+            "landed_jpy": orders_jpy + (s.jpy_settled or 0),
+            "unconverted": missing}
+
+
+def _shipment_read(s: ShipmentOrder, children: list[Order],
+                   *, landed: bool = True) -> ShipmentRead:
     """只用本表的列构造响应，再挂上调用方过滤好的子订单。
 
     刻意不用 ShipmentRead.model_validate(s)：那样会为了填 orders 字段去懒加载 s.orders
     关系——每行一条 SQL、且**连已软删的子订单一起拉**，随后又被这份过滤过的列表整个覆盖，
-    纯属白跑（正是本函数批量化想省掉的那部分）。"""
-    scalars = {k: getattr(s, k) for k in ShipmentRead.model_fields if k != "orders"}
-    return ShipmentRead(**scalars, orders=[_brief(c) for c in children])
+    纯属白跑（正是本函数批量化想省掉的那部分）。
+
+    `landed=False`（`brief=True` 那条路）时三个到岸字段留 **None** 而不是 0：
+    那条路根本没查子订单，报 0 等于说「这单没花钱」，而实际可能挂着十几万日元。"""
+    scalars = {k: getattr(s, k) for k in ShipmentRead.model_fields
+               if k not in _DERIVED_FIELDS}
+    extra = _landed(s, children) if landed else {}
+    return ShipmentRead(**scalars, orders=[_brief(c) for c in children], **extra)
 
 
 def _read_many(session: Session, shipments: list[ShipmentOrder],
@@ -56,7 +89,7 @@ def _read_many(session: Session, shipments: list[ShipmentOrder],
     响应 1.1MB / 1073ms，而消费方只用 4 个标量字段——纯浪费。
     查询条数测试（tests/test_queries.py）钉的是条数、钉不住体积，1.1MB 它照样绿。"""
     if brief:
-        return [_shipment_read(s, []) for s in shipments]
+        return [_shipment_read(s, [], landed=False) for s in shipments]
     ids = [s.id for s in shipments]
     by_parent: dict[int, list[Order]] = {}
     if ids:
@@ -81,7 +114,8 @@ def list_orders(
     date_from: Optional[dt.date] = None,
     date_to: Optional[dt.date] = None,
     shipment_status: Optional[str] = None,
-    q: Optional[str] = Query(None, description="按集运单号搜索"),
+    q: Optional[str] = Query(None, description="模糊搜：集运单号 / 国际运单号 / 收货人"),
+    recipient: Optional[str] = Query(None, description="按收货人精确筛选"),
     brief: bool = Query(False, description="只要集运单本身，不展开子订单与物品（供下拉选项用）"),
     legacy_status: Optional[str] = Query(
         None, alias="status", include_in_schema=False,
@@ -101,10 +135,21 @@ def list_orders(
         conds.append(ShipmentOrder.date <= date_to)
     if shipment_status:
         conds.append(ShipmentOrder.shipment_status == shipment_status)
+    if recipient:
+        conds.append(ShipmentOrder.recipient == recipient)
     if q:
-        conds.append(ci_contains(ShipmentOrder.shipment_no, q, session))
+        # 三个都搜：**手上只有一张国际运单号或者一个收件人名字**时，
+        # 只搜集运单号等于搜不到——而那正是回头找一张单最常见的起点。
+        # 三列都走 ci_contains：收货人也是 BinStr 列（键列一律二进制排序规则，与 SQLite 对齐），
+        # 裸 contains 在 MySQL 上会变成大小写敏感——`test_binstr_columns_use_ci_contains_for_search`
+        # 当场把这个写法拦了下来。
+        conds.append(
+            ci_contains(ShipmentOrder.shipment_no, q, session)
+            | ci_contains(ShipmentOrder.intl_tracking_no, q, session)
+            | ci_contains(ShipmentOrder.recipient, q, session)
+        )
 
-    total = session.exec(select(func.count()).select_from(ShipmentOrder).where(*conds)).one()
+    totals = list_totals(session, ShipmentOrder, conds)
     rows = session.exec(
         select(ShipmentOrder)
         .where(*conds)
@@ -112,7 +157,7 @@ def list_orders(
         .offset(offset)
         .limit(limit)
     ).all()
-    return {"items": _read_many(session, rows, brief=brief), "total": total}
+    return {"items": _read_many(session, rows, brief=brief), **totals}
 
 
 @router.post("/ocr")

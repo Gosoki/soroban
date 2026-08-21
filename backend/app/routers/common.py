@@ -312,3 +312,33 @@ async def run_ocr(file: UploadFile, recognizer: Callable[[bytes], dict]) -> dict
         log.warning("OCR 内存不足：%s bytes", len(data))
         raise HTTPException(status_code=503, detail="服务器内存不足，请稍后重试或换一张更小的截图",
                             headers={"Retry-After": "10"})
+
+
+def list_totals(session: Session, model, conds: list) -> dict:
+    """列表页脚要的三个数：条数 / 日元合计 / 有钱但没折算的行数。
+
+    **一条 SQL 全算完**，替换掉原先那条只数条数的查询——页脚不该让列表接口多打一次库。
+
+    `sum_jpy` 求的是**当前筛选出的全部行**，不是屏幕上那 50 行：翻页时页脚跟着变的话
+    这个数没有任何用处。
+
+    `unconverted` 必须一起给：`SUM` 对 NULL 视而不见，缺汇率的行会让合计静默变小
+    而条数照旧——看板那边为同一件事专门有个 `_uncounted`，页脚不能重蹈。
+
+    **刻意不套 `ledger_exclusions()`**：这是「你正在看的这些行加起来多少」，
+    不是看板的「你花了多少」。用户筛出退款单时，页脚报 0 才是撒谎。
+    两者口径不同是有意的，所以页脚的措辞是「筛选合计」而不是「支出」。
+    """
+    from sqlalchemy import case, func
+    from sqlmodel import select
+
+    n, total_jpy, missing = session.exec(
+        select(
+            func.count(),
+            func.coalesce(func.sum(model.jpy_settled), 0),
+            func.coalesce(func.sum(
+                case((model.price_cny.isnot(None) & model.jpy_settled.is_(None), 1), else_=0)
+            ), 0),
+        ).select_from(model).where(*conds)
+    ).one()
+    return {"total": int(n), "sum_jpy": int(total_jpy), "unconverted": int(missing)}

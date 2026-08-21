@@ -19,6 +19,7 @@ from ..database import get_session
 from ..db.dialect import insert_or_ignore, upsert
 from ..maintenance import barrier
 from ..models import (
+    MiscExpense,
     ShipmentOrder,
     StagingItem,
     ImportStatus,
@@ -35,7 +36,7 @@ router = APIRouter(
 
 log = logging.getLogger("soroban")
 
-_ALLOWED_FIELDS = {"platform_account", "recipient", "platform"}
+_ALLOWED_FIELDS = {"platform_account", "recipient", "platform", "category"}
 _N_COLORS = 10   # 与前端 TAG_PALETTE 长度一致
 
 # 每个标签字段 → 数据里承载该值的 (模型, 列)。用于把「数据里出现过的值」并入可选集。
@@ -46,6 +47,9 @@ _FIELD_SOURCES = {
         (OrderStaging, OrderStaging.platform_account),
     ),
     "recipient": ((ShipmentOrder, ShipmentOrder.recipient),),
+    # 杂项分类。原先它是三张表里唯一的**纯文本**分类列：别处点标签就能选，
+    # 这里要手打，还打得出「手续费」和「手续费 」两个值来。
+    "category": ((MiscExpense, MiscExpense.category),),
     "platform": (
         (Order, Order.platform),
         (OrderStaging, OrderStaging.platform),

@@ -31,9 +31,18 @@ def _keys(page: str) -> set[str]:
 _PAGES = [
     ("Orders", schemas.OrderCreate, schemas.OrderUpdate, {
         "jpy_settled",   # 派生：结算日元，后端算
+        # `jpy_auto` = 按汇率算出来的日元（`jpy_settled` 是「覆盖值优先」的最终额）。
+        # 两者并列显示才看得出「这一行被手工覆盖过」，但它同样是**派生**的，不可写。
+        "jpy_auto",
     }),
     ("Shipment", schemas.ShipmentCreate, schemas.ShipmentUpdate, {
         "jpy_settled",
+        # `jpy_auto` = 按汇率算出来的日元（`jpy_settled` 是「覆盖值优先」的最终额）。
+        # 两者并列显示才看得出「这一行被手工覆盖过」，但它同样是**派生**的，不可写。
+        "jpy_auto",
+        # 到岸成本 = 子订单货款 + 本单国际运费。**派生且跨表**——它甚至不是集运表上的列，
+        # 由 `_landed()` 从已加载的子订单算出来。可写的话就等于让人手改一个合计。
+        "landed_jpy",
         "orders",        # 关系列：挂靠子订单走 /api/shipment/{id}/order，不在 body 里
         "bind_express",  # 操作列（「内含快递」按钮），不是字段
     }),
@@ -42,6 +51,9 @@ _PAGES = [
     }),
     ("Misc", schemas.MiscCreate, schemas.MiscUpdate, {
         "jpy_settled",   # 派生：结算日元，后端算
+        # `jpy_auto` = 按汇率算出来的日元（`jpy_settled` 是「覆盖值优先」的最终额）。
+        # 两者并列显示才看得出「这一行被手工覆盖过」，但它同样是**派生**的，不可写。
+        "jpy_auto",
     }),
 ]
 

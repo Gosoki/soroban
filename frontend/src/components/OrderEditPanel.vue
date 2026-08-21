@@ -55,7 +55,14 @@
       <label class="f"><span>商品标题</span>
         <el-input v-model="order.title" placeholder="商品标题" @change="saveField('title', order.title)" /></label>
       <label class="f f-wide"><span>商品链接</span>
-        <el-input v-model="order.url" placeholder="商品链接" @change="saveField('url', order.url)" /></label>
+        <el-input v-model="order.url" placeholder="商品链接" @change="saveField('url', order.url)">
+          <!-- 爬虫一直在灌这个字段，而它此前只是个**点不开**的输入框。
+               只认 http(s)：这一格的值来自爬虫与手输，不是可信输入。 -->
+          <template v-if="openableUrl(order.url)" #append>
+            <el-link type="primary" :underline="false" :href="order.url"
+                     target="_blank" rel="noopener noreferrer" title="在新标签页打开">打开</el-link>
+          </template>
+        </el-input></label>
       <label class="f f-wide"><span>备注</span>
         <el-input v-model="order.note" type="textarea" :rows="2" placeholder="备注" @change="saveField('note', order.note)" /></label>
     </div>
@@ -72,7 +79,7 @@ import { ordersApi, shipmentApi } from '@/api'
 import { handled } from '@/api/http'
 import { ORDER_SOURCES, PURCHASE_STATUS } from '@/constants'
 import { fmtCNY, fmtJPY } from '@/utils/money'
-import { applyRowUpdate, queueOrderWrite } from '@/utils/orderWrites'
+import { applyRowUpdate, queueRowWrite } from '@/utils/rowWrites'
 import OrderItemsEditor from '@/components/OrderItemsEditor.vue'
 
 const props = defineProps({
@@ -121,11 +128,16 @@ function onShipDropdown(visible) {
 }
 
 // 字段级即存：与订单页格子同一 PATCH。空串归一为 null（清空）。不回传 items，免踩面板里的物品数组。
+// 只有 http(s) 链接才给「打开」。`javascript:` / `data:` 一律不给——
+// 这一格的值来自爬虫与手输，而 target=_blank 打开的新页面能拿到 window.opener，
+// 所以 rel="noopener noreferrer" 一并带上。
+function openableUrl(u) { return /^https?:\/\//i.test(String(u || '').trim()) }
+
 async function saveField(key, value) {
   const v = value === '' ? null : value
   try {
     // 入队串行：面板里连改多个字段（或与内嵌物品编辑器并发）不会各读旧 version 互相 409
-    await queueOrderWrite(props.order.id, async () => {
+    await queueRowWrite(`order:${props.order.id}`, async () => {
       const patch = { version: props.order.version, [key]: v }
       const updated = await ordersApi.update(props.order.id, patch)
       applyRowUpdate(props.order, patch, updated)

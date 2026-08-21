@@ -527,3 +527,43 @@ def test_config_is_passed_by_env_not_argv():
             names = {n.id for n in ast.walk(node.value) if isinstance(n, ast.Name)}
             assert "config" not in names, "配置被拼进了命令行——API key 会出现在 ps 里"
     assert "SOROBAN_CONFIG" in src, "配置没有通过环境变量下发"
+
+
+def test_last_ok_at_only_advances_on_success(client, session):
+    """`last_ok_at` **只在成功那次**推进——失败也推的话它就退化成 `last_finished_at` 的副本。
+
+    这一列存在的全部意义是把两者分开：爬虫的登录会话过期之后，每次定时都照跑、照失败，
+    「上次跑完」一直很新，「上次抓到东西」才会停在两周前。后者才是那条会变红的线。
+    """
+    from app.models import PluginConfig
+    from app.routers.plugins import _write_outcome
+
+    pid = "soroban-plugin-taobao"
+    if session.get(PluginConfig, pid) is None:
+        session.add(PluginConfig(plugin_id=pid))
+        session.commit()
+
+    _write_outcome(pid, "ok", "抓到 3 单")
+    session.expire_all()
+    first_ok = session.get(PluginConfig, pid).last_ok_at
+    assert first_ok is not None, "成功之后没记下 last_ok_at"
+
+    _write_outcome(pid, "failed", "登录已过期")
+    session.expire_all()
+    cfg = session.get(PluginConfig, pid)
+    assert cfg.last_ok_at == first_ok, "失败也推进了 last_ok_at"
+    assert cfg.last_finished_at != first_ok, "失败没推进 last_finished_at（那一列是成败都推的）"
+
+
+def test_the_card_reports_when_it_last_succeeded(client, session):
+    """列表接口要把「上次成功」单独给出来，前端才说得出「跑过了，但 14 天没抓到东西」。"""
+    from app.models import PluginConfig
+
+    pid = "soroban-plugin-taobao"
+    if session.get(PluginConfig, pid) is None:
+        session.add(PluginConfig(plugin_id=pid))
+        session.commit()
+
+    body = client.get("/api/plugins").json()
+    for p in body:
+        assert "ok_at" in p["last_run"], f"{p.get('id')} 的 last_run 里没有 ok_at：{p['last_run']}"

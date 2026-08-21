@@ -519,6 +519,14 @@ class ShipmentRead(MoneyOut):
     updated_at: dt.datetime
     orders: list[OrderBrief] = []
 
+    # --- 到岸成本（派生，**不是本表的列**）------------------------------------
+    # 一张集运单真正花了多少钱 = 里面那些商品单的货款 + 这张单自己的国际运费。
+    # 三个都可能是 None，含义是「这次没算」（`brief=True` 不展开子订单），
+    # 与「算出来是 0」是两回事——0 会被读成「这单不要钱」。
+    orders_jpy: Optional[int] = None      # 子订单货款合计（已排除退款/关闭等不计入的单）
+    landed_jpy: Optional[int] = None      # 到岸合计 = orders_jpy + 本单 jpy_settled
+    unconverted: Optional[int] = None     # 有钱、却缺汇率没折算成日元的行数（含本单自己）
+
 
 class ShipmentOcrAttachResult(SQLModel):
     """「内含快递」截图识别 + 联动挂靠的结果。分三类回报，前端据此拼提示。"""

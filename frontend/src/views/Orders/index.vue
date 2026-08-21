@@ -9,13 +9,13 @@
     <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable hide-id :open-id="focusId"
                  table-name="orders" :empty-text="loadFailed ? '加载失败——请检查网络或后端，然后重试' : '没有符合条件的记录'" @save="saveCell" @add="addRow" @delete="delRow" @reload="load" @tags-changed="onTagsChanged">
       <template #toolbar>
-        <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="reload" />
-        <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
+        <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="applyFilters" />
+        <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="applyFilters">
           <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
         </el-select>
         <!-- 选项 = 国内段 + 集运段：列表显示的是继承后的状态，只列国内段的话，
              界面上一堆「已发出」却在筛选框里选不到它 -->
-        <el-select v-model="filters.fulfillmentStatus" placeholder="状态" clearable style="width: 120px" @change="reload">
+        <el-select v-model="filters.fulfillmentStatus" placeholder="状态" clearable style="width: 120px" @change="applyFilters">
           <el-option-group label="国内段（商品订单）">
             <el-option v-for="s in PURCHASE_STATUS" :key="s" :label="s" :value="s" />
           </el-option-group>
@@ -23,14 +23,26 @@
             <el-option v-for="s in SHIPMENT_STATUS" :key="s" :label="s" :value="s" />
           </el-option-group>
         </el-select>
-        <el-select v-model="filters.platform_account" placeholder="账号昵称" clearable filterable style="width: 120px" @change="reload">
+        <el-select v-model="filters.platform_account" placeholder="账号昵称" clearable filterable style="width: 120px" @change="applyFilters">
           <el-option v-for="a in accountOptions" :key="a" :label="a" :value="a" />
         </el-select>
+        <el-select v-model="filters.recipient" placeholder="收货人" clearable filterable style="width: 120px" @change="applyFilters">
+          <el-option v-for="r in recipientOptions" :key="r" :label="r" :value="r" />
+        </el-select>
         <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
-                        start-placeholder="起" end-placeholder="止" @change="reload" />
+                        start-placeholder="起" end-placeholder="止" @change="applyFilters" />
+        <!-- 「还没装箱的有哪些」是发货前最常问的一句。后端早就支持 unassigned，
+             只是界面上没有入口——用 checkbox 而不是再加一个下拉：它是二选一的开关，
+             塞进「状态」那种多选下拉里会和真正的状态值混在一起。 -->
+        <el-checkbox v-model="filters.unassigned" @change="applyFilters">仅未挂靠</el-checkbox>
         <el-tag v-if="focusId" :style="typeStyle('warning')" closable disable-transitions class="focus-chip" @close="clearFocus">
           定位订单 #{{ focusId }} · 点 × 看全部
         </el-tag>
+      </template>
+      <template #toolbar-right>
+        <!-- 导出当前筛选的全部行（不是这一页）。放 toolbar-right 与集运页的 OCR 按钮同侧：
+             它们都是「对整张表做一件事」，而左边那排是筛选。 -->
+        <el-button :loading="exporting" @click="doExport">导出 CSV</el-button>
       </template>
 
 
@@ -75,6 +87,9 @@
         <OrderItemsEditor :order="row" @conflict="load" />
       </template>
 
+      <template #footer>
+        <TableFooterSum :total="total" :sum-jpy="sumJpy" :unconverted="unconverted" />
+      </template>
     </NotionTable>
 
     <div v-if="focusId && !loading && !total" class="focus-empty">
@@ -89,15 +104,17 @@
 
 <script setup>
 import PageHeader from '@/components/PageHeader.vue'
+import TableFooterSum from '@/components/TableFooterSum.vue'
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { exportCsv } from '@/utils/exportCsv'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check } from '@element-plus/icons-vue'
 import { shipmentApi, ordersApi, tagsApi } from '@/api'
 import { handled } from '@/api/http'
 import { ORDER_SOURCES, PAGE_SIZE, PRICE_HELP, PURCHASE_STATUS, SHIPMENT_STATUS, statusStyle, typeStyle } from '@/constants'
 import { fmtJPY } from '@/utils/money'
-import { applyRowUpdate, queueOrderWrite } from '@/utils/orderWrites'
+import { applyRowUpdate, queueRowWrite } from '@/utils/rowWrites'
 import { today } from '@/utils/datetime'
 import { afterCreate, afterDelete } from '@/utils/listRows'
 import NotionTable from '@/components/NotionTable.vue'
@@ -135,35 +152,62 @@ const columns = [
   { key: 'express_company', label: '快递公司', type: 'text', width: COL_W, placeholder: '快递公司' },
   { key: 'express_no', label: '快递号', type: 'text', width: COL_W, placeholder: '快递号' },
   { key: 'order_no', label: '订单号', type: 'text', width: COL_W, placeholder: '订单号' },
+  // 下面四列的数据**一直都在**（每次响应都在回），只是列数组里没有它们：
+  //   · `url`          —— 爬虫一直在灌商品链接，想看却要绕到物品页开编辑面板；
+  //   · `jpy_auto`     —— 按汇率算出来的日元。它与 `jpy_settled` 并列才看得出
+  //                       「这一行的钱被手工覆盖过」；只显示结算额时，覆盖过的行
+  //                       和正常折算的行长得一模一样；
+  //   · `override_note` —— 填了覆盖值却不说为什么，过三个月自己也想不起来；
+  //   · `note`         —— `LedgerBase` 上的备注列。
+  { key: 'url', label: '商品链接', type: 'text', long: true, width: COL_W, placeholder: '商品链接' },
+  { key: 'jpy_auto', label: '折算（円）', format: 'jpy', readonly: true, width: COL_W },
+  { key: 'override_note', label: '覆盖原因', type: 'text', long: true, width: COL_W },
+  { key: 'note', label: '备注', type: 'text', long: true, minWidth: 160 },
 ]
 
 const rows = ref([])
 const total = ref(0)
+// 页脚合计。**服务端算的、覆盖当前筛选的全部行**，不是屏幕上这一页——
+// 前端自己把当页加一遍的话，翻页时这个数会跟着变，等于没有。
+const sumJpy = ref(null)
+const unconverted = ref(0)
 const loading = ref(false)
 const page = ref(1)
 const pageSize = PAGE_SIZE
 const focusId = ref(null)   // 跳转定位的订单 id（?focus=）
-const filters = reactive({ q: '', platform: '', fulfillmentStatus: '', platform_account: '', range: null })
+const filters = reactive({ q: '', platform: '', fulfillmentStatus: '', platform_account: '',
+                           recipient: '', unassigned: false, range: null })
 const shipmentOptions = ref([])
 const accountOptions = ref([])   // 账号昵称下拉候选（标签接口）
+// 收货人在**集运表**上，不在订单上；后端按子查询筛。候选走同一套标签接口。
+const recipientOptions = ref([])
 // 表格里改了标签（改名/新增/删除/改色）之后，工具栏那份候选集要跟着变。
 // **还要管仍停在旧名的筛选值**：改名时旧名在库里已经不存在了，
 // 拿它精确匹配会查回 0 行，空态显示「没有符合条件的记录」——
 // 用户刚改完名就看到「单子没了」。清掉筛选比留着一个查不到东西的值好，
 // 而且要说一句，否则他会以为筛选自己乱了。
 function onTagsChanged({ field, values }) {
+  if (field === 'recipient') {
+    recipientOptions.value = values
+    if (filters.recipient && !values.includes(filters.recipient)) {
+      filters.recipient = ''
+      ElMessage.info('筛选里那个收货人已改名或删除，已为你清掉筛选')
+      applyFilters()
+    }
+  }
   if (field === 'platform_account') {
     accountOptions.value = values
     if (filters.platform_account && !values.includes(filters.platform_account)) {
       filters.platform_account = ''
       ElMessage.info('筛选里那个账号已改名或删除，已为你清掉筛选')
-      reload()
+      applyFilters()
     }
   }
 }
 
 async function loadAccounts() {
   try { accountOptions.value = (await tagsApi.list('platform_account')).map((t) => t.value) } catch (_) { /* 已提示 */ }
+  try { recipientOptions.value = (await tagsApi.list('recipient')).map((t) => t.value) } catch (_) { /* 已提示 */ }
 }
 
 // null = 当前不在搜索态；数组 = 本次搜索的命中（**可能是空数组 = 零命中**）。
@@ -234,21 +278,50 @@ let loadSeq = 0
 // 「请求挂了」与「真的没有记录」渲染成同一句「没有符合条件的记录」，是这个项目反复栽的那类
 // ——拦截器那句 toast 三秒就没了，此后这一屏与「真的还没记过账」完全无法区分。
 const loadFailed = ref(false)
+const exporting = ref(false)
+
+// 导出当前筛选的**全部行**（不是这一页），列以页面正在显示的那份列配置为准。
+// 两条口径都在 utils/exportCsv.js 里说明了理由——反过来做会产出
+// 「看起来对、其实少了东西」的文件，而这种文件往往会被当成完整账目发给别人。
+async function doExport() {
+  exporting.value = true
+  try {
+    const n = await exportCsv({
+      fetchPage: (limit, offset) => ordersApi.list({ ...filterParams(), limit, offset }),
+      columns,
+      name: 'orders',
+    })
+    if (!n) ElMessage.info('当前筛选下没有记录，没有导出文件')
+    else ElMessage.success(`已导出 ${n} 条商品订单`)
+  } catch (_) { /* 拦截器已提示 */ } finally { exporting.value = false }
+}
+
+// 当前筛选 → 查询参数。**列表与导出共用这一份**：各写一份的话，
+// 导出的 CSV 会和屏幕上看到的不是同一批行，而这种文件往往是要发给别人的。
+function filterParams() {
+  const params = {}
+  if (filters.q) params.q = filters.q
+  if (filters.platform) params.platform = filters.platform
+  if (filters.fulfillmentStatus) params.fulfillment_status = filters.fulfillmentStatus
+  if (filters.platform_account) params.platform_account = filters.platform_account
+  if (filters.recipient) params.recipient = filters.recipient
+  if (filters.unassigned) params.unassigned = true
+  if (filters.range) { params.date_from = filters.range[0]; params.date_to = filters.range[1] }
+  if (focusId.value) params.id = focusId.value          // 跳转定位：隔离显示该单
+  return params
+}
+
 async function load() {
   const my = ++loadSeq
   loading.value = true
   try {
-    const params = { limit: pageSize, offset: (page.value - 1) * pageSize }
-    if (filters.q) params.q = filters.q
-    if (filters.platform) params.platform = filters.platform
-    if (filters.fulfillmentStatus) params.fulfillment_status = filters.fulfillmentStatus
-    if (filters.platform_account) params.platform_account = filters.platform_account
-    if (filters.range) { params.date_from = filters.range[0]; params.date_to = filters.range[1] }
-    if (focusId.value) params.id = focusId.value          // 跳转定位：隔离显示该单
-    const res = await ordersApi.list(params)
+    const res = await ordersApi.list({ ...filterParams(), limit: pageSize,
+                                      offset: (page.value - 1) * pageSize })
     if (my !== loadSeq) return          // 已有更新的请求发出，丢弃这次的结果
     rows.value = res.items
     total.value = res.total
+    sumJpy.value = res.sum_jpy
+    unconverted.value = res.unconverted
     loadFailed.value = false
   } catch (_) {
     // 拦截器已提示原因；这里负责让**页面本身**留下痕迹，否则空态在说假话。
@@ -257,7 +330,12 @@ async function load() {
     if (my === loadSeq) loading.value = false
   }
 }
-function reload() { page.value = 1; load() }
+// 名字要说清它做了两件事：**回到第一页** + 重新拉数据。
+// 叫 reload 时它比行为窄，读的人会以为只是「重拉当前页」，
+// 而筛选条件变了却不回第一页的话，用户会停在一个空的第 3 页上。
+// ⚠️ 与 NotionTable 的组件事件 `@reload="load"` 是两回事：那个是「表格请父页重拉行」，
+// 不重置分页，名字没问题。
+function applyFilters() { page.value = 1; load() }
 function onPage(p) { page.value = p; load() }
 
 async function loadShipment() {
@@ -268,7 +346,7 @@ async function loadShipment() {
 async function saveCell(row, key, value) {
   try {
     // 入队串行：格子保存与展开面板/物品编辑器对同一订单的写不再并发撞 version
-    await queueOrderWrite(row.id, async () => {
+    await queueRowWrite(`order:${row.id}`, async () => {
       const patch = { version: row.version, [key]: value }
       const updated = await ordersApi.update(row.id, patch)
       // 本次没送 items → 不覆盖：展开面板里可能有尚未点「保存物品」的编辑（见 applyRowUpdate）

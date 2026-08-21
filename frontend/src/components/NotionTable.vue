@@ -139,6 +139,14 @@
             </tr>
           </template>
         </tbody>
+        <!-- 页脚：合计那一行。**没有 #footer 插槽的页面完全不渲染 tfoot**——
+             多一条空白横线会让每张表看起来都被截断了。
+             跨整表用 colspan（与展开行同一个值），合计文字靠右，与数字列的右对齐一致。 -->
+        <tfoot v-if="$slots.footer">
+          <tr class="gtn-foot-row">
+            <td :colspan="footColspan"><slot name="footer" /></td>
+          </tr>
+        </tfoot>
       </table>
     </div>
   </div>
@@ -195,6 +203,11 @@ const paletteFor = reactive({})   // { field: 正在改色的标签值 | null }�
 
 const hasActions = computed(() => !!slots.actions)
 const colspan = computed(() => 1 + (props.expandable ? 1 : 0) + cols.value.length + (hasActions.value ? 1 : 0))
+// 页脚要横跨整表，而它**在列布局拉回来之前就渲染了**（`cols` 初值是空数组）。
+// 只用 `colspan` 的话，每次进页面都会先画出一条只跨两三列的短横条再跳到全宽。
+// 取两者较大值：`emptyColspan` 数的是 `props.columns`（权威全集，不等布局）。
+// 多跨了会被浏览器截断（无害），少跨了是看得见的错位。
+const footColspan = computed(() => Math.max(colspan.value, emptyColspan.value))
 const totalWidth = computed(() =>
   ID_COL_W + (props.expandable ? EXPAND_COL_W : 0)
   + cols.value.reduce((s, c) => s + (c.width || c.minWidth || DEFAULT_COL_W), 0)
@@ -454,6 +467,10 @@ function stopResize() {
 </script>
 
 <style scoped>
+/* 合计行：底色与表头同源（.gtn-th），上边框 2px 与表头的下边框对称——
+   一张表的头和尾用同一套分隔语言，中间的数据行才立得住。 */
+.gtn-foot-row > td { background: var(--bg-hover); border-top: 2px solid var(--border);
+                     padding: 8px 10px; font-size: 12px; color: var(--txt-2); }
 .gtn { display: flex; flex-direction: column; }
 /* align-items: center 是**必需的**，不是审美：flex 默认 stretch，会把每个控件拉到
    与本行最高者等高。工具栏里混着输入框(24px)和日期范围选择器(32px)，于是搜索框被

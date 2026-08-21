@@ -14,6 +14,18 @@
         <el-radio-button v-for="d in [7, 30, 90, 365]" :key="d" :value="d">近 {{ d }} 天</el-radio-button>
       </el-radio-group>
       <span v-if="!loadFailed" class="sub">共 {{ rows.length }} 天有记录</span>
+      <span class="grow"></span>
+      <!-- 手填某一天的汇率。放在这一页而不是设置页：设置页那个是「没有任何汇率时的起点值」，
+           记的永远是今天；这里填的是**具体某一天**，用来补历史。两者写的是同一张表，
+           但解决的是两个问题，混在一处只会让人填错地方。 -->
+      <el-date-picker v-model="mf.date" type="date" value-format="YYYY-MM-DD"
+                      placeholder="补填哪一天" :disabled-date="isFuture" class="mf-date" />
+      <el-input v-model="mf.rate" placeholder="汇率" class="mf-rate">
+        <template #prepend>1 元 =</template>
+        <template #append>円</template>
+      </el-input>
+      <el-button type="primary" :disabled="!mf.date || !mf.rate" :loading="saving"
+                 @click="saveManual">手填这一天</el-button>
     </div>
 
     <!-- **三分支，顺序要紧**：失败 → 真空 → 表格。
@@ -92,13 +104,18 @@
 
 <script setup>
 import PageHeader from '@/components/PageHeader.vue'
-import { onMounted, ref } from 'vue'
+import { onMounted, reactive, ref } from 'vue'
 import { ArrowRight } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 import { fxApi } from '@/api'
 import { FX_SOURCE_NAMES, typeStyle } from '@/constants'
 
 const loading = ref(false)
+const saving = ref(false)
 const days = ref(30)
+// 手填表单。**只追加一条，不覆盖**任何已有行；也不会改动已经折算过的旧单
+// （那些行盖的是成交当时的汇率，事后改汇率去动它们是篡改账目而不是修复）。
+const mf = reactive({ date: '', rate: '' })
 const rows = ref([])
 const openDay = ref('')
 const detail = ref([])
@@ -142,13 +159,37 @@ async function toggle(r) {
   }
 }
 
+// 未来的汇率不存在。前端先挡一道，后端仍会 422——两边都拦是有意的：
+// 日期选择器挡的是「点不到」，后端挡的是「绕过界面直接调接口」。
+function isFuture(d) {
+  const today = new Date()
+  today.setHours(23, 59, 59, 999)
+  return d > today
+}
+
+async function saveManual() {
+  saving.value = true
+  try {
+    const r = await fxApi.setManual(mf.date, mf.rate)
+    ElMessage.success(`已记下 ${r.date} 的手填汇率 1 元 = ${r.rate} 円`)
+    mf.rate = ''
+    await load()
+  } catch (_) { /* 拦截器已提示 */ } finally { saving.value = false }
+}
+
 onMounted(load)
 </script>
 
 <style scoped>
 /* 页宽不再自己设上限：这一页主体就是一张**表**，900px 下右边白掉 450px。
    全站统一「内容装在卡片里、卡片占满宽度」。 */
-.bar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.bar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+.grow { flex: 1; }
+/* 两个输入框都给固定宽度：不给的话 el-input 会把 .bar 撑到整行，
+   把左边的「近 N 天」挤成两行。与 Database 页 .field-grid 同样的意图——
+   一组相关的输入横着排，但不许某一个独吞剩余宽度。 */
+.mf-date { width: 160px; }
+.mf-rate { width: 220px; }
 /* ↓ 以下逐条对齐 components/NotionTable.vue 的取值。
    这张表是手写的（只读 + 按天展开，用不上 NotionTable 的列宽持久化/单元格编辑/
    幽灵新建行），但**看上去必须是同一个应用里的表**。差异原先有九处，

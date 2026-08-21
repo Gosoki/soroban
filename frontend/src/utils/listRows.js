@@ -18,10 +18,17 @@
  */
 import { ElMessage } from 'element-plus'
 
-/** 筛选是否生效。空串/null/undefined/空数组都算「没筛」。 */
+/** 筛选是否生效。空串/null/undefined/空数组/**false** 都算「没筛」。
+ *
+ * `false` 那一条是必须的：开关型筛选（订单页的「仅未挂靠」）在 filters 里恒有一个
+ * 布尔值。不把 false 算作「没筛」的话，这一页的 `anyFilterActive` **永远返回 true**，
+ * 于是「没筛选时本地插入、零请求」那条快路径整个失效——没有任何报错，
+ * 只是每次新建都多打一次库、列表闪一下。
+ */
 export function anyFilterActive(filters) {
   return Object.values(filters || {}).some(
-    (v) => v !== '' && v !== null && v !== undefined && !(Array.isArray(v) && v.length === 0),
+    (v) => v !== '' && v !== null && v !== undefined && v !== false
+      && !(Array.isArray(v) && v.length === 0),
   )
 }
 

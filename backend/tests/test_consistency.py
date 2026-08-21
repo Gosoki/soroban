@@ -1184,7 +1184,7 @@ def test_staging_table_shows_every_field_ocr_writes():
 # --- applyRowUpdate 的**行为**测试：直接拿 node 跑那个纯函数 ---------------------
 
 _APPLY_ROW_HARNESS = r"""
-import { applyRowUpdate } from './frontend/src/utils/orderWrites.js'
+import { applyRowUpdate } from './frontend/src/utils/rowWrites.js'
 
 const results = {}
 
@@ -1227,7 +1227,7 @@ console.log(JSON.stringify(results))
 def test_apply_row_update_behaviour_under_node():
     """`applyRowUpdate` 的**行为**测试——不是源码 grep，是真跑一遍。
 
-    它是纯函数（`orderWrites.js` 一个 import 都没有），所以 node 能直接跑。
+    它是纯函数（`rowWrites.js` 一个 import 都没有），所以 node 能直接跑。
     这一轮已经有 6 处守卫栽在「按字符串判」上，凡是能真跑的就别去 grep 源码。
 
     四条断言里，②是这次新加的：送出去之后本地 items 又被改过时，响应不许整体覆盖——
@@ -2113,3 +2113,214 @@ def test_both_colspans_account_for_the_optional_actions_column():
     assert not bad, (f"这些 colspan 没把「操作列是可选的」算进去：{bad}\n"
                      + "\n".join(found[n] for n in bad)
                      + "\n（两个 computed 描述的是同一件事，应当同口径）")
+
+
+# --- contract 的 rest 段：跨仓字段契约的唯一真源 --------------------------------
+
+def test_contract_rest_section_matches_the_real_schemas():
+    """`GET /api/plugins/contract` 的 `rest` 段必须与写入 schema **同源**。
+
+    它存在的理由：爬虫走的是 `POST/PATCH /api/staging`，而 `staging` 不是一个 kind，
+    所以它取不到 `kinds` 段——「自我投影」这个设计原先只覆盖了**不需要它**的那一侧
+    （fx 插件通过 ingest 只发两个字段，几乎不可能漂），而真正会漂的那一侧
+    仍然硬编码着字段名。写入 schema 是 `extra="forbid"`，字段名对不上是**整条订单 422**，
+    不是丢一格。
+    """
+    from app.schemas import StagingCreate, StagingItemIn, StagingUpdate
+    from app.services import ingest
+
+    ingest.load_kinds()
+    rest = ingest.contract()["rest"]
+    assert set(rest) == {"staging.create", "staging.update"}, rest
+    assert rest["staging.create"]["fields"] == sorted(StagingCreate.model_fields)
+    assert rest["staging.update"]["fields"] == sorted(StagingUpdate.model_fields)
+    for k in rest:
+        assert rest[k]["item_fields"] == sorted(StagingItemIn.model_fields)
+
+    # **反面**：不能把它做成一张手抄的常量表（那正是要消灭的东西）
+    assert "order_no" in rest["staging.create"]["fields"]
+    assert "version" in rest["staging.update"]["fields"], "update 侧的乐观锁字段漏了"
+
+
+def test_the_plugins_hardcoded_field_whitelist_is_a_subset_of_the_contract():
+    """插件里那份 `_PUSH_FIELDS` 硬编码白名单，必须是核心暴露出去的字段的**子集**。
+
+    这条是跨仓守卫：插件按字段名 POST，名字对不上 = 整批 422 静默丢同步，
+    是这个项目历史上排第一的 bug 类。今天插件还没改成从 contract 取，
+    所以先用一条断言把两边钉在一起——插件改成动态取之后这条依然成立（子集关系不变）。
+    """
+    import re
+
+    from app.services import ingest
+
+    ingest.load_kinds()
+    rest = ingest.contract()["rest"]
+    src = plugin_source("taobao_scraper", "soroban_client.py").read_text(encoding="utf-8")
+
+    def arr(name):
+        m = re.search(rf"{name}\s*=\s*\((.*?)\)", src, re.S)
+        assert m, f"插件里找不到 {name}"
+        return {x.strip().strip('\'"') for x in m.group(1).split(",") if x.strip()}
+
+    push = arr("_PUSH_FIELDS")
+    item = arr("_PUSH_ITEM_FIELDS")
+    # 插件推的是「建行 + 改行」两条路，取并集比对
+    known = set(rest["staging.create"]["fields"]) | set(rest["staging.update"]["fields"])
+    assert push <= known, (
+        f"插件会推核心不认识的字段 {sorted(push - known)} —— 写入 schema 是 extra=forbid，"
+        "这会让**整条订单 422**，而不是丢一格")
+    assert item <= set(rest["staging.create"]["item_fields"]), sorted(item - set(rest["staging.create"]["item_fields"]))
+
+
+def test_every_filter_initial_value_counts_as_not_filtering():
+    """列表页 `filters` 里**意思是「没筛」的那些初值**，`anyFilterActive` 必须都认得。
+
+    这条不变量的失效方式没有任何报错：`anyFilterActive` 判的是「用户现在有没有在筛」，
+    为 false 时新建走「本地插入 + 零请求」的快路径。往 filters 里加一个初值为
+    `false` / `0` 的开关型筛选，这个函数就**永远返回 true**，快路径整个失效——
+    界面上只是每次新建都多打一次库、列表闪一下，谁也不会去查。
+    （2026-08-19 加「仅未挂靠」时就当场踩了这一脚。）
+
+    判据是**假值**：`''` / `null` / `false` / `[]` / `0` 这些初值的意思都是「这一栏没填」，
+    所以必须被排掉。真值初值不在此列——暂存页默认就筛「待处理」，它**确实**处于筛选态，
+    `anyFilterActive` 对它返回 true 是对的。
+    """
+    import re
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    helper = (root / "utils" / "listRows.js").read_text(encoding="utf-8")
+    body = helper[helper.index("export function anyFilterActive"):]
+    body = body[:body.index("\n}")]
+
+    # 「意思是没筛」的初值 → anyFilterActive 里应该出现的排除写法
+    _FALSY = {
+        "''": "v !== ''",
+        '""': "v !== ''",
+        "null": "v !== null",
+        "undefined": "v !== undefined",
+        "false": "v !== false",
+        "0": "v !== 0",
+        "[]": "Array.isArray(v) && v.length === 0",
+    }
+
+    seen: set[str] = set()
+    pages = []
+    for f in sorted(root.glob("views/*/index.vue")):
+        m = re.search(r"const filters = reactive\(\{(.*?)\}\)", f.read_text(encoding="utf-8"), re.S)
+        if not m:
+            continue
+        pages.append(f.parent.name)
+        for _key, val in re.findall(r"(\w+)\s*:\s*([^,\n}]+)", m.group(1)):
+            if val.strip() in _FALSY:
+                seen.add(val.strip())
+
+    assert len(pages) >= 4, f"只扫到 {pages}，探测方式可能已过期"
+    assert seen, "一个「空」初值都没扫到——正则多半已经不匹配了"
+    missing = sorted(v for v in seen if _FALSY[v] not in body)
+    assert not missing, (
+        f"有页面用这些初值表示「没筛」，但 anyFilterActive 里没排掉它们：{missing}\n"
+        f"当前的判断体：\n{body}")
+
+
+def test_every_ledger_page_serialises_writes_to_the_same_row():
+    """四个账本页的 `saveCell` 都必须走 `queueRowWrite`，并且链的 key 带表名前缀。
+
+    **不串行的后果是静默丢数据**：连改同一行的两个格子时，两次 PATCH 都读到同一个旧
+    `version`，后一次必 409 →「数据已变，已刷新」→ 用户刚敲的那一格没了，
+    而提示词说的是「已刷新」，看上去像是好事。这套系统会有 2–3 个人同时用，
+    但**这个坑一个人也踩得到**——它是同一个标签页里两次连续编辑。
+
+    key 必须带前缀：四张表的 id 空间各自独立，只用数字会让订单 12 与集运 12
+    共用一条链——不出错，但毫无理由地互相等。
+    """
+    import re
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    bad = []
+    for page in ["Orders", "Shipment", "Misc", "Staging"]:
+        src = (root / "views" / page / "index.vue").read_text(encoding="utf-8")
+        m = re.search(r"async function saveCell\(.*?\n\}", src, re.S)
+        assert m, f"{page} 页没找到 saveCell —— 探测方式可能已过期"
+        body = m.group(0)
+        if "queueRowWrite" not in body:
+            bad.append(f"{page}: saveCell 没入队串行")
+        for key in re.findall(r"queueRowWrite\(([^,]+),", body):
+            if ":" not in key:
+                bad.append(f"{page}: 链 key 没带表名前缀（{key.strip()}）")
+    assert not bad, "\n  ".join(["同一行的写没有串行化："] + bad)
+
+
+# --- 503 重试策略的**行为**测试：拿 node 真跑（retry.js 刻意零依赖）--------------
+
+_RETRY_HARNESS = r"""
+import { retryDelayFor, markRetried, RETRY_503_DELAYS } from './frontend/src/api/retry.js'
+
+const results = {}
+const err = (status, cfg) => ({ response: { status }, config: cfg })
+
+// ① 503 → 第一次要重试，且间隔是策略里的第一个值
+{
+  const cfg = {}
+  results.retries_503 = retryDelayFor(err(503, cfg)) === RETRY_503_DELAYS[0]
+}
+
+// ② 重试次数用完就放弃 —— 否则长迁移（屏障硬上限 900 秒）会把界面卡在这儿干等
+{
+  const cfg = {}
+  let n = 0
+  while (retryDelayFor(err(503, cfg)) !== null) { markRetried(cfg); if (++n > 10) break }
+  results.gives_up = n === RETRY_503_DELAYS.length
+}
+
+// ③ 别的状态码一律不重试。**409 尤其不能重试**：它的意思是「数据已经被别人改了」，
+//    重发只会拿着同一个旧 version 再撞一次墙；而 422 重发同样不会有不同结果。
+{
+  results.no_retry_409 = retryDelayFor(err(409, {})) === null
+  results.no_retry_422 = retryDelayFor(err(422, {})) === null
+  results.no_retry_500 = retryDelayFor(err(500, {})) === null
+}
+
+// ④ 调用方能显式关掉
+{
+  results.respects_opt_out = retryDelayFor(err(503, { __noRetry: true })) === null
+}
+
+// ⑤ 没有 config 时不重试（重发无从谈起）
+{
+  results.no_config_no_retry = retryDelayFor(err(503, undefined)) === null
+}
+
+console.log(JSON.stringify(results))
+"""
+
+
+def test_the_503_retry_policy_under_node():
+    """503 重试策略的**行为**测试——真跑，不是 grep。
+
+    这段代码的价值和风险都在同一处：备份/迁移的屏障期撞上写请求时，
+    不重试就是「用户刚敲的那一格没了」；而重试范围放宽一点点
+    （比如把 409 也带上）就会变成「拿着旧 version 一次次撞墙」。
+    所以边界要钉死：只有 503、只有前两次、可以被调用方关掉。
+    """
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        import os
+        if os.environ.get("SOROBAN_NO_NODE"):
+            pytest.skip("显式声明了本机没有 node（SOROBAN_NO_NODE=1）")
+        raise AssertionError("找不到 node；真没有请设 SOROBAN_NO_NODE=1")
+
+    harness = _REPO / "node-retry-policy.test.mjs"
+    harness.write_text(_RETRY_HARNESS, encoding="utf-8")
+    try:
+        r = subprocess.run([node, str(harness)], cwd=_REPO, capture_output=True,
+                           text=True, timeout=60)
+    finally:
+        harness.unlink(missing_ok=True)
+    assert r.returncode == 0, f"node 跑挂了：{r.stderr[-800:]}"
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    failed = [k for k, v in got.items() if not v]
+    assert not failed, f"这些行为不成立：{failed}"

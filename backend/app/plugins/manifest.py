@@ -38,6 +38,17 @@ class Command(NamedTuple):
     needs: tuple[str, ...] = ()          # 需要哪些 scope，缺了就不给点（而不是点了 403）
     confirm: str = ""                    # 非空 → 前端先弹确认，文案就是它
     primary: bool = False                # 卡片上的主按钮（高亮那个）
+    # 这条命令要不要先有登录会话（`state_dir/<账号>.json`）。
+    # **为什么必须声明而不是核心猜**：账号行原先写死「login 之外的都要会话」，
+    # 那是把一个具体插件的动词名焊进核心——第二个插件的 `status`/`probe` 明明不需要会话，
+    # 却会被灰掉。声明了才禁用，没声明就让它点（失败时插件自己会说）。
+    needs_session: bool = False
+    # 这条命令适不适合**无人值守**地定时跑。
+    # 原先定时是「先按字面量找叫 fetch 的，没有再取 primary」——
+    # 一个把 `sync` 标成 primary、同时留一条诊断用 `fetch` 的插件会被定时跑错动词；
+    # 而单纯翻转优先级又会让「把 login 标成 primary」的清单在无人值守时反复弹浏览器。
+    # 让清单直说，两种误判一起消失。都没声明时回落到老口径（见 _scheduled_command）。
+    schedulable: bool = False
 
 
 class Manifest(NamedTuple):
@@ -57,6 +68,12 @@ class Manifest(NamedTuple):
     # 那些操作要把账号名迁到账本行上，核心得知道迁到哪一列。
     # 原先核心里写死的是 `if manifest["platform"] != "taobao"`，把一个插件的名字焊进了核心。
     ledger_field: str = ""
+    # 这个插件的账号可以属于哪几个平台。声明了：加账号时前端渲染下拉、后端按它校验；
+    # 没声明：沿用旧行为（自由文本 + 默认「淘宝」）。
+    # **为什么要有**：`add_account` 的 `platform` 默认值是写死的「淘宝」，而它对**每个**
+    # 插件生效——装一个京东插件、加账号时不改平台，抓回来的单就带着 platform="淘宝"
+    # 进账本，而 `platform_provider`（OCR 用它决定说哪句话）会报出京东插件的名字在管淘宝截图。
+    account_platforms: tuple[str, ...] = ()
     # 插件**建议**的定时间隔（分钟）。只在这个插件还没有配置行时当默认值用；
     # 用户存过一次之后，以库里的为准（哪怕存的是 0 = 不定时）。
     # 没有它的话，装上汇率插件、开了开关、然后什么也不会发生——
@@ -126,6 +143,8 @@ def _command(raw: dict, plugin_id: str, has_accounts: bool) -> Optional[Command]
         needs=tuple(raw.get("needs") or ()),
         confirm=str(raw.get("confirm") or ""),
         primary=bool(raw.get("primary")),
+        needs_session=bool(raw.get("needs_session")),
+        schedulable=bool(raw.get("schedulable")),
     )
 
 
@@ -178,6 +197,8 @@ def parse(raw: dict, directory) -> Manifest:
         commands=cmds,
         state_dir=str(raw.get("state_dir") or ".state"),
         ledger_field=str(raw.get("accounts_ledger_field") or ""),
+        account_platforms=tuple(
+            str(x).strip() for x in (raw.get("account_platforms") or ()) if str(x).strip()),
         default_schedule_minutes=_positive_int(raw.get("default_schedule_minutes")),
         error=err,
     )

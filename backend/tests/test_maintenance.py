@@ -382,3 +382,33 @@ def test_a_finishing_hold_does_not_revoke_someone_elses_barrier():
         assert b.blocked_reason() == "B 的迁移", \
             "A 收工时把 B 的屏障撤掉了——B 的迁移会在零保护下跑完"
     assert b.blocked_reason() is None, "B 自己收工后屏障没撤干净"
+
+
+def test_a_barrier_503_never_reaches_the_handler(client, session, monkeypatch):
+    """屏障拒掉的写请求**一次都没有执行过**。
+
+    这是前端敢自动重试 503 的**全部依据**（frontend/src/api/retry.js）：
+    重发不会重复落库，因为第一次根本没跑到处理函数。
+    哪天有人把这道闸挪到「写了一半之后」，这条会红——而如果没有它，
+    表现会是「屏障期间一次编辑被重复写了两三遍」，而且只在有人正好点了备份时才出现。
+    """
+    from sqlmodel import select
+
+    from app.maintenance import barrier
+    from app.models import MiscExpense
+
+    before = len(session.exec(select(MiscExpense)).all())
+
+    with barrier.hold("测试占住"):
+        r = client.post("/api/misc", json={"date": "2026-08-04", "name": "屏障期间"})
+    assert r.status_code == 503, r.text
+    assert r.headers.get("Retry-After"), "503 没带 Retry-After，前端没法知道这是暂时状态"
+
+    session.expire_all()
+    after = session.exec(select(MiscExpense)).all()
+    assert len(after) == before, "屏障期间的写请求居然落库了"
+    assert not [x for x in after if x.name == "屏障期间"], "屏障没拦住这一笔"
+
+    # 屏障放开之后同一笔照样能写进去（说明拦的是时机，不是内容）
+    ok = client.post("/api/misc", json={"date": "2026-08-04", "name": "屏障期间"})
+    assert ok.status_code in (200, 201), ok.text

@@ -72,6 +72,8 @@ export const fxApi = {
   // 按天汇总 + 某天的各次抓取。一天可以有多条，页面据此回看「那天几点是多少」
   history: (days = 30) => http.get('/fx/history', { params: { days } }),
   historyDay: (on) => http.get(`/fx/history/${on}`),
+  // 手填某一天的汇率（补历史）。只追加一条，不覆盖已有行、不改已折算的旧单。
+  setManual: (date, rate) => http.post('/fx', { date, rate }),
   // （原先这里挂着一段「超时必须放宽」的注释，说的是**已经不存在的** `fx.refresh`——
   //   那时 soroban 自己会串行走完整条汇率源链。现在 `GET /api/fx` 是纯读，
   //   抓取由汇率插件的子进程完成，默认 15s 足够。留着那段注释会让人给一个纯读接口
@@ -100,11 +102,10 @@ export const pluginsApi = {
   // 通用命令端点：动词由清单声明，加插件/加动词都不用再往这里加方法
   run: (id, command, account) =>
     http.post(`/plugins/${id}/run/${command}`, null, { params: account ? { account } : {} }),
-  // login / fetch 不再是独立端点：它们就是清单里的两条命令，统一走 run。
-  // 各开一个端点的下场是校验各写一套——遗留的 /fetch 绕过了「停用」总开关、
-  // 不校验命令 needs、不下发插件参数、扇出还共用同一枚令牌。
-  login: (id, account) => http.post(`/plugins/${id}/run/login`, null, { params: { account } }),
-  fetch: (id, account) => http.post(`/plugins/${id}/run/fetch`, null, { params: account ? { account } : {} }),
+  // （原先这里还有 login / fetch 两个薄封装，把动词名写死在了前端。
+  //   后端早就统一成 `run/{command}` 了，账号行现在也按清单渲染，两者已无人调用，删掉。
+  //   各开一个端点的下场是校验各写一套——遗留的 /fetch 曾绕过「停用」总开关、
+  //   不校验命令 needs、不下发插件参数、扇出还共用同一枚令牌。）
   addAccount: (id, name, platform) => http.post(`/plugins/${id}/account`, null, { params: { name, platform } }),
   setAccountEnabled: (id, account, enabled) => http.patch(`/plugins/${id}/account`, null, { params: { account, enabled } }),
   deleteAccount: (id, account) => http.delete(`/plugins/${id}/account`, { params: { account } }),
@@ -127,6 +128,11 @@ export const dbApi = {
   // 热切换（无需重启）
   switch: (target) => http.post('/db/switch', target, { timeout: 60000 }),
   removeConnection: (id) => http.delete(`/db/connections/${id}`),
+  // 备份要把整本账读一遍并写成快照，与迁移同量级，放宽超时
+  backups: () => http.get('/db/backups'),
+  createBackup: () => http.post('/db/backups', null, { timeout: 120000 }),
+  // 恢复刻意**没有**前端入口：那是唯一一条能一键清空账本的操作，
+  // 只留在需要手敲 yes 的命令行里（backend: python -m tools.backup_db --restore <文件>）。
 }
 
 export const tagsApi = {

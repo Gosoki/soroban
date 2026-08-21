@@ -8,13 +8,13 @@
                  :empty-text="loadFailed ? '加载失败——请检查网络或后端，然后重试' : '没有符合条件的记录'"
                  table-name="items" hide-id :addable="false" :deletable="false" @reload="load" @tags-changed="onTagsChanged">
       <template #toolbar>
-        <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="reload" />
-        <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
+        <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="applyFilters" />
+        <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="applyFilters">
           <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
         </el-select>
         <!-- 选项 = 国内段 + 集运段：列表显示的是继承后的状态，只列国内段的话，
              界面上一堆「已发出」却在筛选框里选不到（与订单页同款） -->
-        <el-select v-model="filters.fulfillmentStatus" placeholder="状态" clearable style="width: 120px" @change="reload">
+        <el-select v-model="filters.fulfillmentStatus" placeholder="状态" clearable style="width: 120px" @change="applyFilters">
           <el-option-group label="国内段（商品订单）">
             <el-option v-for="s in PURCHASE_STATUS" :key="s" :label="s" :value="s" />
           </el-option-group>
@@ -22,11 +22,11 @@
             <el-option v-for="s in SHIPMENT_STATUS" :key="s" :label="s" :value="s" />
           </el-option-group>
         </el-select>
-        <el-select v-model="filters.platform_account" placeholder="账号昵称" clearable filterable style="width: 120px" @change="reload">
+        <el-select v-model="filters.platform_account" placeholder="账号昵称" clearable filterable style="width: 120px" @change="applyFilters">
           <el-option v-for="a in accountOptions" :key="a" :label="a" :value="a" />
         </el-select>
         <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
-                        start-placeholder="起" end-placeholder="止" @change="reload" />
+                        start-placeholder="起" end-placeholder="止" @change="applyFilters" />
       </template>
 
       <!-- 彩色标签（只读），配色与订单列表一致：账号用持久化色序、来源/状态用语义色 -->
@@ -161,7 +161,12 @@ async function load() {
     if (my === loadSeq) loading.value = false
   }
 }
-function reload() { page.value = 1; load() }
+// 名字要说清它做了两件事：**回到第一页** + 重新拉数据。
+// 叫 reload 时它比行为窄，读的人会以为只是「重拉当前页」，
+// 而筛选条件变了却不回第一页的话，用户会停在一个空的第 3 页上。
+// ⚠️ 与 NotionTable 的组件事件 `@reload="load"` 是两回事：那个是「表格请父页重拉行」，
+// 不重置分页，名字没问题。
+function applyFilters() { page.value = 1; load() }
 function onPage(p) { page.value = p; load() }
 
 // 灰显 = 物品名与商品标题相同（无独立物品详情）

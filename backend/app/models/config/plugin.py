@@ -36,4 +36,8 @@ class PluginConfig(SQLModel, table=True):
     last_outcome: str = Field(default="", max_length=16)     # ok | failed | running | ""
     last_summary: str = Field(default="", max_length=512)   # 给人看的一句话（插件回的 JSON 摘要）
     last_finished_at: Optional[dt.datetime] = Field(default=None, sa_type=UtcDateTime())
+    # 上一次**成功**跑完的时间。与 `last_finished_at` 分开是必须的：那一列成功失败都推进，
+    # 于是一个登录会话已经过期两周、每次定时都照跑照失败的插件，卡片上依然显示一个
+    # 很新的时间戳。「最近跑过」和「最近抓到过东西」是两件事，而用户只会看前者。
+    last_ok_at: Optional[dt.datetime] = Field(default=None, sa_type=UtcDateTime())
     updated_at: dt.datetime = Field(default_factory=utcnow, sa_type=UtcDateTime())

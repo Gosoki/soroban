@@ -15,8 +15,8 @@ from ..db.dialect import ci_contains
 from ..models import ShipmentOrder, OrderItem, ImportStatus, Order, OrderStaging, utcnow
 from ..schemas import OrderCreate, OrderRead, OrderUpdate, norm_code, norm_id
 from .common import (
-    build_items, goods_seed, guarded_bump, mirror_to_staging, raise_conflict, raise_not_found,
-    run_ocr, soft_delete, stamp_fx,
+    build_items, goods_seed, guarded_bump, list_totals, mirror_to_staging, raise_conflict,
+    raise_not_found, run_ocr, soft_delete, stamp_fx
 )
 
 router = APIRouter(
@@ -69,6 +69,7 @@ def list_orders(
     express_no: Optional[str] = None,
     shipment_order_id: Optional[int] = None,
     unassigned: Optional[bool] = Query(None, description="仅未挂靠集运的订单（供集运页点选添加）"),
+    recipient: Optional[str] = Query(None, description="按所属集运单的收货人筛选"),
     order_no: Optional[str] = Query(None, description="按订单号精确匹配（OCR 去重用，区别于模糊 q）"),
     q: Optional[str] = Query(None, description="按订单号搜索（子串模糊）"),
     legacy_status: Optional[str] = Query(
@@ -87,6 +88,14 @@ def list_orders(
         conds.append(Order.id == only_id)
     if unassigned:
         conds.append(Order.shipment_order_id.is_(None))
+    if recipient:
+        # 收货人在**集运表**上，不在订单上。用子查询而不是给订单加一列冗余字段：
+        # 加列就要在挂靠/解挂/改集运单收货人三处同步，漏一处就是两张表说法不一，
+        # 而这种不一致没有任何报错、只会让筛选悄悄少几单。
+        conds.append(Order.shipment_order_id.in_(
+            select(ShipmentOrder.id).where(ShipmentOrder.recipient == recipient,
+                                           ShipmentOrder.is_delete.is_(False))
+        ))
     if date_from:
         conds.append(Order.date >= date_from)
     if date_to:
@@ -125,7 +134,7 @@ def list_orders(
             | Order.items.any(OrderItem.name.contains(q, autoescape=True))
         )
 
-    total = session.exec(select(func.count()).select_from(Order).where(*conds)).one()
+    totals = list_totals(session, Order, conds)
     rows = session.exec(
         select(Order)
         .where(*conds)
@@ -136,7 +145,7 @@ def list_orders(
         .offset(offset)
         .limit(limit)
     ).all()
-    return {"items": [OrderRead.model_validate(r) for r in rows], "total": total}
+    return {"items": [OrderRead.model_validate(r) for r in rows], **totals}
 
 
 @router.post("/ocr")

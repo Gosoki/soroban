@@ -1,9 +1,17 @@
-"""汇率查询：当前 CNY→JPY（含历史兜底）。**自动获取由汇率插件负责**，本模块只读。"""
+"""汇率查询：当前 CNY→JPY（含历史兜底）。**自动获取由汇率插件负责**。
+
+只有一处写：`POST /api/fx` 手填某一天的汇率。它对插件**关闭**，理由不是权限而是语义——
+「手填」那个源名（`fx.SOURCE_MANUAL`）是核心保留给人的，`ingest/kinds/fx_rate.py` 里
+明文拒绝插件用它。给这条路开个插件入口，等于给那道检查开一扇后门。
+插件要报汇率走通用写入通道的 `fx_rate`，会记成它自己的源名。
+"""
 
 import datetime as dt
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from decimal import Decimal, InvalidOperation
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlmodel import Session, col, select
 
 from ..auth import get_current_user
@@ -13,8 +21,8 @@ from ..models import FxRate
 from ..plugins import scopes
 from ..schemas import FxRead
 from ..services.fx import (
-    JST, SOURCE_LABELS, current_row, is_expired, pick_from, pick_on, rate_age_hours,
-    rows_on,
+    JST, SOURCE_LABELS, SOURCE_MANUAL, _sane, current_row, is_expired, pick_from, pick_on,
+    rate_age_hours, rows_on, store,
 )
 
 router = APIRouter(
@@ -157,3 +165,33 @@ def history_day(on: dt.date, session: Session = Depends(get_session)):
             "used": bool(used and r.id == used.id),
         } for r in rows],
     }
+
+
+@router.post("")
+def set_manual(on: dt.date = Body(..., embed=True, alias="date"),
+               rate: Decimal = Body(..., embed=True),
+               session: Session = Depends(get_session)):
+    """手填某一天的汇率（补历史）。**追加一条，不覆盖**任何已有行。
+
+    为什么允许填过去、不允许填未来：补录上个月的支出要按**那一天**的牌价折算，
+    这是记账的正常需求；而「明天的汇率」不存在，填了只会让 `pick_on` 在明天
+    选中一个凭空捏造的值——那是一条没人会再回头核对的脏数据。
+
+    **已经折算过的旧单不会被改。** 那些行盖的是成交当时的汇率，事后改汇率去动它们
+    是篡改账目而不是修复。真正没折算成日元的行（货款有值、汇率为空），会在下次
+    编辑它时由 `stamp_fx` 自动补上——所以这里刻意不做「一键回填」。
+    """
+    today = dt.datetime.now(JST).date()
+    if on > today:
+        raise HTTPException(422, f"不能给未来的日期（{on}）填汇率，今天是 {today}（JST）。")
+    try:
+        r = _sane(Decimal(rate))
+    except (InvalidOperation, ValueError, ArithmeticError) as e:
+        raise HTTPException(422, str(e)) from e
+
+    row, _ = store(session, r, SOURCE_MANUAL, on=on)
+    session.commit()
+    session.refresh(row)
+    return {"id": row.id, "date": row.date, "rate": row.rate,
+            "source": row.source, "source_label": SOURCE_LABELS.get(row.source, row.source),
+            "same_day_rows": len(rows_on(session, on))}

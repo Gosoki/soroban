@@ -188,6 +188,20 @@ def create_staging(payload: StagingCreate, session: Session = Depends(get_sessio
     return _read(session, row)
 
 
+def _cleared_prices(items):
+    """把现有物品的单价清成 None，好让 `build_items` 按种子价重新折算。
+
+    与前端 `Staging/index.vue` 补价时做的事逐字节相同
+    （`row.items.map(it => ({...it, unit_price_cny: null, auto: true}))`）——
+    两处口径必须一致，否则「插件补的价」和「人补的价」会摊出不同的明细。
+    `build_items` 只读 name / quantity / unit_price_cny / auto 四项，所以用轻量替身即可。
+    """
+    from types import SimpleNamespace
+
+    return [SimpleNamespace(name=it.name, quantity=it.quantity,
+                            unit_price_cny=None, auto=True) for it in (items or [])]
+
+
 @router.patch("/{row_id}", response_model=StagingRead, openapi_extra={"x-scope": "staging:write"})
 def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depends(get_session),
                    current=Depends(get_current_user)):
@@ -269,6 +283,25 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
             built = build_items(payload.items, seed_goods, order.title)
             order.items = [OrderItem(**d) for d in built]
             row.items = [StagingItem(**d) for d in built]
+        elif payload.price_cny is not None and not order.price_cny:
+            # `price_cny` 单独送来（**不带 items**）时的口径：**只在这一行现在一分钱都没有时才补**。
+            #
+            # 为什么要有：淘宝插件对「整单一条物品都没解析出来」写了一条兜底——把订单实付当**种子价**
+            # 推上来，它自己的注释是「宁可明细摊得不准，也要保住『订单总额 = 实付』这个底线」。
+            # 但那条路径上 `row["items"]` 是 `[]`，而插件侧 `if row.get("items") and …` 把空列表判假
+            # ⇒ items 不进 body ⇒ 发出来的是 `PATCH {price_cny}` 不带 items
+            # ⇒ 这里 `payload.items is None` ⇒ 价被 `model_dump(exclude=...)` 丢掉
+            # ⇒ `sync_from_items()` 按**原有物品**重算 ⇒ **金额一分没变**。
+            # 全程 200 OK，插件记一笔 updated，`runlog` 也不会记（那不是拒收，是成功）。
+            #
+            # 三种做法里选了这一种：422 会把插件这条**救场**路径打进 failed 桶；
+            # 「当种子重建物品」会覆盖用户已经手工拆好的明细。
+            # 「只补空格」与插件自己的「空格可以补，非空格绝不覆盖」、以及前端 `noPrice` 那道判据同源，
+            # 只会增加信息、不会覆盖任何东西。
+            built = build_items(_cleared_prices(order.items),
+                                goods_seed(payload.price_cny, order.postage_cny), order.title)
+            order.items = [OrderItem(**d) for d in built]
+            row.items = [StagingItem(**d) for d in built]
         # 缺汇率就补一条——与 orders.update_order:220、misc、shipment 三处同一刀。
         # 漏掉这里的后果不是报错：jpy_auto/jpy_settled 一起是 NULL，看板 SUM 跳过它、
         # 笔数照数，「笔数 +1、金额 +0」。而汇率格在暂存页是可编辑且可清空的，
@@ -302,6 +335,10 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
         # 种子只认本次显式传来的 price_cny，不回退到当前价——理由同 orders.update_order
         seed_goods = goods_seed(payload.price_cny, row.postage_cny, payload.items)
         row.items = [StagingItem(**d) for d in build_items(payload.items, seed_goods, row.title)]
+    elif payload.price_cny is not None and not row.price_cny:
+        # 口径同上面已导入那一支（见那里的长注释）：只补空格，绝不覆盖。
+        row.items = [StagingItem(**d) for d in build_items(
+            _cleared_prices(row.items), goods_seed(payload.price_cny, row.postage_cny), row.title)]
     row.sync_from_items()
     session.add(row)
     session.commit()

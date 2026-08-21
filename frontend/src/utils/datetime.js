@@ -33,3 +33,25 @@ export function today() {
   const d = new Date()
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
+
+/** 后端时间戳 → 「N 天前」这类相对说法（无效/空返回 null，由调用方决定显示什么）。
+ *
+ * 相对时间比绝对时间戳更容易看出「不对劲」：`2026-08-05 10:00` 要减一下才知道多久了，
+ * 「14 天前」一眼就是异常。所以「上次成功抓取」用它，而精确时间放 title 里备查。
+ */
+export function fmtAgo(s) {
+  const d = parseUtc(s)
+  if (!d) return null
+  const mins = Math.floor((Date.now() - d.getTime()) / 60000)
+  if (mins < 1) return '刚刚'
+  if (mins < 60) return `${mins} 分钟前`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours} 小时前`
+  return `${Math.floor(hours / 24)} 天前`
+}
+
+/** 后端时间戳距今多少天（无效/空返回 null）。用来判断「太久没成功了」。 */
+export function daysSince(s) {
+  const d = parseUtc(s)
+  return d ? (Date.now() - d.getTime()) / 86400000 : null
+}

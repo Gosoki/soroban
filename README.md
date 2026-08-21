@@ -66,7 +66,7 @@ soroban/
 ├── start.sh                一键启动（开发）
 ├── pyinstaller.bat         打包 soroban.exe
 ├── soroban.spec            PyInstaller 清单（手写，**必须提交**——标准 .gitignore 的 *.spec 会误伤）
-└── backup.sh               数据库备份（WAL 安全；MySQL 模式下会拒绝执行）
+└── backup.sh               数据库备份（薄壳 → backend/tools/backup_db.py；两种后端通用）
 ```
 
 ## 本地运行
@@ -230,22 +230,48 @@ git pull               # 2) 拉最新（在 master 分支）
 
 > 已在 MySQL 9.7 上实测：迁移、生成列、四种「软删唯一」语义、整库 ETL、应用启动路径全部通过。
 
-## 备份
+## 备份与恢复
+
+**应用内**：「数据库」页 → 备份 → 「立刻备份」。备的是**当前正在用的那个库**，
+SQLite 和 MySQL 都一样，不需要装 `sqlite3` 或 `mysqldump`。
+
+**命令行**（在 `backend/` 下）：
+```bash
+python -m tools.backup_db                 # 备份到 backend/backups/，保留最近 30 份
+python -m tools.backup_db --dir /mnt/nas  # 备到别处（异地才叫备份）
+python -m tools.backup_db --keep 60       # 改保留份数
+```
+`./backup.sh` 是上面这条命令的薄壳，参数原样透传，用来挂定时：
+```
+0 3 * * * /path/to/soroban/backup.sh >> /path/to/soroban/backend/backups/backup.log 2>&1
+```
+
+每次备份会产出两个文件：
+- `soroban-<时间戳>.db` —— 全部业务数据（一个独立的 SQLite 库，可以直接用 DB 工具打开看）
+- `env-<时间戳>.txt` —— 当时的 `backend/.env` 副本
+
+> **`.env` 为什么要一起备**：里面的 `SECRET_KEY` 是解开已保存 MySQL 连接串的唯一钥匙。
+> 它丢了，应用会静默退回本地 SQLite，界面上的现象是「账本全空了」。
+
+### 恢复
+
+**恢复只有命令行入口**，而且要手敲一次确认——它是唯一一条能一键清空账本的操作，
+刻意不做成界面上的按钮。
 
 ```bash
-./backup.sh            # 用 sqlite3 .backup，WAL 安全；自动保留最近 30 份到 backups/
+cd backend
+python -m tools.backup_db --restore backups/soroban-20260819-120000.db
 ```
-> `backup.sh` 仅针对 SQLite。它会**先读控制库确认当前后端**：若已切到 MySQL 就直接报错退出
-> （不再静默备出一份「体积正常、表齐全、却停在迁移当天」的旧快照——那种备份挂 cron 天天成功、
-> 真出事去恢复才发现丢了几个月）。用 MySQL 时请改用：
-> ```bash
-> mysqldump --single-transaction --default-character-set=utf8mb4 soroban > soroban_$(date +%F).sql
-> ```
+它会：① 打印**真正要写的那个库**让你确认（不是配置里记的，是进程里连着的）；
+② 先把当前账本另存一份（恢复错了能退回来）；③ 挂只读屏障，整表覆盖。
 
-建议挂定时（macOS 用 `launchd`，或 `crontab -e`）：
-```
-0 3 * * * /path/to/soroban/backup.sh >> /path/to/soroban/backups/backup.log 2>&1
-```
+快照里**不含**控制表（`app_db_config` / `db_connection`），所以恢复一份旧快照
+不会顺带把「你正连着哪个库」也还原回去，加密的连接串也不会被复制到备份目录。
+
+> 恢复路径已实测：把一份 SQLite 快照恢复进 MySQL，136 行、9 张表、
+> MySQL 专属的生成列（活跃唯一索引用的那根）全部完好，再用安全备份原样退回。
+> **备份没演练过就等于没有备份**——挂着 cron 天天返回退出码 0、真出事才发现备错东西，
+> 比明摆着没有备份更危险。
 
 ## 默认账号 / 改密码
 

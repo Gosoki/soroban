@@ -169,6 +169,30 @@ async def _readonly_barrier(request: Request, call_next):
         barrier.end_write()
 
 
+# **核心侧事实**：哪些状态码算「核心拒收了插件这一次写入」。
+#
+# 为什么要有：卡片上显示的是插件自己 print 的那句话。一个不看回执的插件——
+# 推 30 条、核心逐条拒收 30 条、照常 print「已导入 30 单」并 exit 0——会让卡片显示
+# 绿色的成功而库里零写入。`plugins/runlog.py` 就是为这件事建的，但它此前**只覆盖
+# `/api/ingest`**，而唯一批量写数据的淘宝插件走的是 REST（`/api/staging`）——
+# 保证装在了不需要它的那一侧。
+#
+# **刻意排除 409**：`POST /api/staging` 撞唯一键回 409，而那在淘宝插件那里是
+# 「这单已经在暂存里了」这个**正常结局**（它靠 409 做幂等 upsert）。
+# 把 409 记成拒收，每一次正常抓取的卡片都会变黄——那比不记更糟，
+# 因为黄色一旦成为常态，真正的黄就没人看了。
+# 503（只读屏障）同理排除：那是暂时状态，不是拒收。
+_CORE_REFUSED = frozenset({400, 403, 422})
+
+
+def _note_core_refusal(jti, plugin_id: str, request: Request, status: int) -> None:
+    if status in _CORE_REFUSED and jti:
+        from .plugins import runlog
+
+        runlog.note_rejected(jti, plugin_id,
+                             f"{request.method} {request.url.path}", 1, f"HTTP {status}")
+
+
 @app.middleware("http")
 async def _plugin_gate(request: Request, call_next):
     """插件令牌只能进它声明过、且被用户授权的那扇门。**默认拒绝。**
@@ -187,6 +211,7 @@ async def _plugin_gate(request: Request, call_next):
         return await call_next(request)
     if not _scopes.alive(claims.get("jti")):
         return JSONResponse(status_code=401, content={"detail": "插件令牌已失效（任务已结束）"})
+    jti, plg = claims.get("jti"), claims.get("plg") or "?"
     matched, need = _scopes.route_scope(request.app, request)
     granted = set(claims.get("scp") or [])
     # 通用写入通道一条路由服务多种数据，权限由 kind 决定 → 这里只验「有权限总量」，
@@ -196,9 +221,12 @@ async def _plugin_gate(request: Request, call_next):
         log.warning("插件 %s(run=%s) 越权：%s %s 需要 %s，持有 %s",
                     claims.get("plg"), claims.get("jti"),
                     request.method, request.url.path, need, sorted(granted))
+        _note_core_refusal(jti, plg, request, 403)
         return JSONResponse(status_code=403, content={"detail": "插件无权访问该接口"})
     request.state.plugin_scope_ok = True
-    return await call_next(request)
+    resp = await call_next(request)
+    _note_core_refusal(jti, plg, request, resp.status_code)
+    return resp
 
 
 # 令牌走 Authorization 头、不使用 cookie，故 allow_credentials=False（更安全）

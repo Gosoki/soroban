@@ -389,3 +389,67 @@ def test_write_through_refuses_to_null_a_required_ledger_column(client, field, l
     bad = client.patch(f"/api/staging/{row['id']}", json={"version": row["version"], field: None})
     assert bad.status_code == 422, f"把账本必填列写空了：{bad.status_code} {bad.text[:200]}"
     assert label in bad.json()["detail"], bad.json()["detail"]
+
+
+# --- D8：插件最后一道金额兜底不许被静默丢弃 --------------------------------------
+
+def test_a_lone_price_fills_an_empty_row_but_never_overwrites(client):
+    """淘宝插件对「整单一条物品都没解析出来」写了一条兜底：把订单实付当**种子价**推上来，
+    它自己的注释是「宁可明细摊得不准，也要保住『订单总额 = 实付』这个底线」。
+
+    但那条路径上 `row["items"]` 是 `[]`，插件侧 `if row.get("items") and …` 判假
+    ⇒ items 不进 body ⇒ 发出来的是 `PATCH {price_cny}` **不带 items**
+    ⇒ 价被 `model_dump(exclude=...)` 丢掉 ⇒ `sync_from_items()` 按原有物品重算
+    ⇒ **金额一分没变**。全程 200 OK，插件记一笔 updated，runlog 也不会记（那不是拒收）。
+
+    口径是「只补空格，绝不覆盖」——与插件自己的规则、以及前端 `noPrice` 那道判据同源。
+    """
+    import uuid
+
+    no = "D8-" + uuid.uuid4().hex[:6]
+    row = mk_staging(client, order_no=no, platform="淘宝",
+                     items=[{"name": "未解析出的商品", "quantity": 1}])
+    assert Decimal(row["price_cny"]) == Decimal("0.00"), row["price_cny"]
+
+    # 只送价、不送 items —— 空行应该被补上
+    r = client.patch(f"/api/staging/{row['id']}",
+                     json={"version": row["version"], "price_cny": "112.00"})
+    assert r.status_code == 200, r.text
+    got = client.get(f"/api/staging?q={no}").json()["items"][0]
+    assert Decimal(got["price_cny"]) == Decimal("112.00"), \
+        f"插件的最后一道金额兜底被静默丢弃了：{got['price_cny']}"
+
+    # **反面一**：已经有价了就绝不覆盖
+    r2 = client.patch(f"/api/staging/{got['id']}",
+                      json={"version": got["version"], "price_cny": "999.00"})
+    assert r2.status_code == 200, r2.text
+    got2 = client.get(f"/api/staging?q={no}").json()["items"][0]
+    assert Decimal(got2["price_cny"]) == Decimal("112.00"), \
+        f"把已有的价覆盖掉了：{got2['price_cny']}"
+
+    # **反面二**：物品名保住了（补价走的是「清单价重折」，不是「重建成占位物品」）
+    assert [i["name"] for i in got2["items"]] == ["未解析出的商品"], got2["items"]
+
+
+def test_filling_an_empty_imported_row_writes_through_to_the_ledger(client):
+    """已导入的行同一口径：空的补、非空的不动，而且要写穿到账本。"""
+    import uuid
+
+    no = "D8IMP-" + uuid.uuid4().hex[:6]
+    row = mk_staging(client, order_no=no, platform="淘宝",
+                     items=[{"name": "未解析出的商品", "quantity": 1}])
+    client.post(f"/api/staging/{row['id']}/import")
+    row = client.get(f"/api/staging?q={no}").json()["items"][0]
+    oid = row["imported_order_id"]
+    assert Decimal(client.get(f"/api/orders/{oid}").json()["price_cny"]) == Decimal("0.00")
+
+    r = client.patch(f"/api/staging/{row['id']}",
+                     json={"version": row["version"], "price_cny": "88.00"})
+    assert r.status_code == 200, r.text
+    assert Decimal(client.get(f"/api/orders/{oid}").json()["price_cny"]) == Decimal("88.00")
+
+    # **反面**：再送一次不许覆盖
+    row2 = client.get(f"/api/staging?q={no}").json()["items"][0]
+    client.patch(f"/api/staging/{row2['id']}",
+                 json={"version": row2["version"], "price_cny": "777.00"})
+    assert Decimal(client.get(f"/api/orders/{oid}").json()["price_cny"]) == Decimal("88.00")

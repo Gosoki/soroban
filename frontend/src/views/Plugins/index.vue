@@ -35,6 +35,18 @@
           </el-tag>
           <el-tag v-if="pendingGrants(p).length" :style="typeStyle('warning')"
                   :title="`还没授权：${pendingGrants(p).join('、')}——展开卡片勾选`">需要授权</el-tag>
+          <!-- 「上次**成功**抓取」是与「上次跑过」不同的一件事，也是这套系统里最安静的
+               那类故障唯一会露头的地方：爬虫的登录会话过期之后，每次定时都照跑、照失败、
+               `last_run.at` 一直很新，没有任何一处会变红——而暂存里已经两周没进新单了。
+               超过阈值就把这个标签变黄，它是唯一会主动说「不对劲」的东西。 -->
+          <el-tag v-if="p.last_run.ok_at" :style="typeStyle(staleOk(p) ? 'warning' : 'info')"
+                  :title="`上次成功抓取：${fmtTime(p.last_run.ok_at)}`">
+            成功 {{ fmtAgo(p.last_run.ok_at) }}
+          </el-tag>
+          <el-tag v-else-if="p.installed && p.last_run.outcome" :style="typeStyle('warning')"
+                  title="这个插件跑过，但一次都没成功过。展开卡片看看它最后说了什么。">
+            从未成功
+          </el-tag>
           <span v-if="p.last_run.summary" class="lastsum">{{ p.last_run.summary }}</span>
 
           <div class="grow" />
@@ -142,10 +154,22 @@
           <el-tag v-else-if="!a.enabled" :style="typeStyle('info')">未启用</el-tag>
         </span>
 
-        <el-button link type="primary" :disabled="!p.installed" @click="doLogin(p, a.account)">
-          {{ a.authorized ? '重新授权' : '授权登录' }}
+        <!-- 账号级命令**按清单渲染**，判据与卡片头那排同源。
+             原先这里写死了 login / fetch 两个动词，三个后果：
+               · 不判「插件已停用」也不判「缺权限」⇒ 点了拿 409，
+                 而 `manifest.Command.needs` 的定义原话是「缺了就不给点（而不是点了 403）」；
+               · 清单里的 label / hint / confirm 在这条路径上全被忽略
+                 （插件把 fetch 的 label 写成「同步订单」，用户看到的仍是「抓这个号」）；
+               · 第二个账号型插件（动词叫 sync / auth）在账号行上没有任何执行入口。
+             按钮文案直接用清单的 label——「已授权 / 未授权」左边那个标签已经在说状态了，
+             不必再让按钮名去兼这个职（那正是原先要靠动词名特判的原因）。 -->
+        <el-button v-for="c in accountCommands(p)" :key="c.name"
+                   link :type="c.primary ? 'primary' : 'default'"
+                   :disabled="!p.installed || !p._form.enabled || !!c.blocked.length
+                              || (c.needs_session && !a.authorized)"
+                   :title="accountCmdTitle(p, c, a)" @click="doRun(p, c, a.account)">
+          {{ c.label }}
         </el-button>
-        <el-button link :disabled="!p.installed || !a.authorized" @click="doFetch(p, a.account)">抓这个号</el-button>
         <el-button link @click="doRenameAccount(p, a.account)">改名</el-button>
         <el-button link type="danger" @click="doDeleteAccountStaging(p, a.account)">删暂存单</el-button>
         <el-button link type="danger" @click="doDeleteAccountOrders(p, a.account)">删账本单</el-button>
@@ -159,9 +183,15 @@
       <div v-if="p.accounts_enabled" class="field">
         <el-input v-model="p._add.name" placeholder="账号昵称" style="width: 160px"
                   @keyup.enter="doAddAccount(p)" />
-        <el-select v-model="p._add.platform" filterable allow-create default-first-option
+        <!-- 清单声明了 `account_platforms` ⇒ 只能从它里面选（后端也按它校验，
+             打错一个字就是一个新平台，而平台是账本活跃唯一键的一半）。
+             没声明 ⇒ 沿用旧行为：全站标签候选 + 可自由新建。 -->
+        <el-select v-model="p._add.platform"
+                   :filterable="!p.account_platforms?.length"
+                   :allow-create="!p.account_platforms?.length" default-first-option
                    placeholder="导入平台" style="width: 140px">
-          <el-option v-for="o in platformOpts" :key="o" :label="o" :value="o" />
+          <el-option v-for="o in (p.account_platforms?.length ? p.account_platforms : platformOpts)"
+                     :key="o" :label="o" :value="o" />
         </el-select>
         <el-button type="primary" :disabled="!p.installed" @click="doAddAccount(p)">添加</el-button>
         <span class="sub">平台加时确定、之后不可改（改名只改昵称）</span>
@@ -230,7 +260,7 @@ import { ArrowDown, ArrowRight, ArrowUp, Refresh, QuestionFilled } from '@elemen
 import { pluginsApi, tagsApi } from '@/api'
 import { handled } from '@/api/http'
 import { longToast, tagStyleAt, typeStyle } from '@/constants'
-import { fmtDateTime } from '@/utils/datetime'
+import { daysSince, fmtAgo, fmtDateTime } from '@/utils/datetime'
 
 const plugins = ref([])
 let loadSeq = 0
@@ -251,6 +281,16 @@ const platformColor = computed(() => Object.fromEntries(platformTags.value.map((
 function platformTagStyle(v) { return tagStyleAt(platformColor.value[v] ?? -1, v) }
 
 const fmtTime = fmtDateTime   // 后端存 naive UTC，必须补 Z 再解析，见 utils/datetime.js
+
+// 多久没成功算「太久」：取这个插件自己的定时间隔的 3 倍，没设定时的按 3 天。
+// **刻意不写死一个天数**：一个每 10 分钟跑一次的插件，停 1 天就已经很不对劲；
+// 而一个每周手动点一次的插件，3 天前成功过完全正常。用它自己的节奏当基准。
+function staleOk(p) {
+  const days = daysSince(p.last_run?.ok_at)
+  if (days === null) return false
+  const every = Number(p._form?.schedule_minutes) || 0
+  return days > (every > 0 ? (every * 3) / 1440 : 3)
+}
 // 权限元信息由后端随列表下发（catalog），前端不写第二份说明文案——
 // 那份必然与后端漂移，而漂移的方向通常是「界面上写的比实际权限小」。
 // warn = 插件正常退出、但自己在结果里报了 error（部分成功 / 软跳过）。
@@ -299,7 +339,7 @@ async function doForget(p) {
     await load()
   } catch (_) { /* 拦截器已提示 */ } finally { p._busy = false }
 }
-async function doRun(p, c) {
+async function doRun(p, c, account = null) {
   // 这句文案来自插件自己的 plugin.toml，是**第三方自由文本**——只能当纯文本渲染。
   if (c.confirm) {
     try {
@@ -310,12 +350,17 @@ async function doRun(p, c) {
   }
   p._busy = true
   try {
-    const r = await pluginsApi.run(p.id, c.name)
-    ElMessage.success(`已触发「${c.label}」${r.targets?.length ? '：' + r.targets.join('、') : ''}`)
+    const r = await pluginsApi.run(p.id, c.name, account)
+    // 被互斥挡掉的目标要说出来。只报「已触发」而其中几个根本没起来，是半句假话。
+    const skipped = r?.skipped_running || []
+    ElMessage.success(
+      `已触发「${c.label}」${r.targets?.length ? '：' + r.targets.join('、') : ''}`
+      + (skipped.length ? `；${skipped.join('、')} 上一次还在跑，本次跳过` : ''))
     // 卡片立刻进入「执行中」，然后**一直盯到它收尾**。
     // 原先只是 3 秒后刷一次：抓取动辄几分钟，那一刷必然还在跑，之后再没有人来问，
     // 于是「执行中」就一直挂着——看起来和真的卡死一模一样，而它其实早就跑完了。
-    p.last_run = { outcome: 'running', summary: `${c.label} 执行中…`, at: null }
+    p.last_run = { outcome: 'running',
+                   summary: `${c.label}${account ? ' ' + account : ''} 执行中…`, at: null }
     scheduleRunPoll()
   } catch (e) {
     // 不能空 catch：这里要把「哪个命令没起来」也说出来（后端的 detail 只说原因，
@@ -392,6 +437,16 @@ async function toggleGrant(p, key, on) {
 }
 
 function enabledCount(p) { return p.accounts.filter((a) => a.configured && a.enabled).length }
+// 账号行上该出现哪些按钮：清单里 per = "account" 的那些。核心不认识任何具体动词。
+function accountCommands(p) { return (p.commands || []).filter((c) => c.per === 'account') }
+function accountCmdTitle(p, c, a) {
+  if (!p.installed) return '插件未安装'
+  if (!p._form.enabled) return '插件已停用——打开左上角的开关'
+  if (c.blocked.length) return `缺权限：${c.blocked.join('、')}——先在下面勾选授权`
+  // 「要不要先有登录会话」由清单声明（needs_session），不由核心按动词名猜。
+  if (c.needs_session && !a.authorized) return '这个账号还没授权——先点左边的登录命令'
+  return c.hint || ''
+}
 
 async function load() {
   // **序号门**：这一页的 load 会被 onMounted、安装轮询、执行轮询三处并发调用，
@@ -426,7 +481,10 @@ async function load() {
                // 那样一保存就会把密钥真的改成 '__set__' 这个字符串。
                params: Object.fromEntries((p.params || []).map(
                  (x) => [x.key, x.value === '__set__' ? '' : x.value])) },
-      _add: prev[p.id]?._add ?? { name: '', platform: '淘宝' },
+      // 平台初值：清单声明了就取它的第一项，别再写死「淘宝」——
+      // 那个默认值对**每个**插件生效，装一个京东插件不改它，抓回来的单就带着
+      // platform="淘宝" 进账本（后端同一处默认值已一并去掉）。
+      _add: prev[p.id]?._add ?? { name: '', platform: p.account_platforms?.[0] ?? '淘宝' },
     }))
     // 有安装在跑就继续盯着，装完自动刷新（按钮解禁、缺依赖提示消失）
     if (list.some((p) => p.install && p.install.running)) scheduleInstallPoll()
@@ -597,28 +655,9 @@ async function doToggle(p, a, enabled) {
   }
 }
 
-async function doLogin(p, account) {
-  // `_busy` 不是装饰：它是连点的第一道闸。这两个按钮原先都没设它（只有卡片头的命令按钮有），
-  // 于是连点三下就是三个有头浏览器同时登同一个账号——项目自己把这写成风控红线。
-  // 后端现在也有互斥（重复请求 409），但让按钮当场变灰比让用户吃一个 409 好。
-  p._busy = true
-  try {
-    await pluginsApi.login(p.id, account)
-    ElMessage.success(`已启动 ${account} 的登录，请在弹出的浏览器完成登录后点「刷新」`)
-  } catch (_) { /* 拦截器已提示 */ } finally { p._busy = false }
-}
-
-async function doFetch(p, account) {
-  p._busy = true
-  try {
-    const r = await pluginsApi.fetch(p.id, account)
-    // 被互斥挡掉的账号要说出来。只报「已触发抓取」而其中几个根本没起来，是半句假话。
-    const skipped = r?.skipped_running || []
-    ElMessage.success(
-      (account ? `已触发抓取：${account}` : '已触发抓取（全部启用账号）')
-      + (skipped.length ? `；${skipped.join('、')} 上一次还在跑，本次跳过` : ''))
-  } catch (_) { /* 拦截器已提示 */ } finally { p._busy = false }
-}
+// （doLogin / doFetch 已删：它们是「把 login / fetch 两个动词写死在界面里」的最后两处。
+//   账号行现在按清单渲染，统一走 doRun —— 连点保护、confirm、缺权限判据也随之统一。
+//   `_busy` 那道连点闸没有丢：doRun 自己就设它。）
 
 async function doRenameAccount(p, account) {
   let value

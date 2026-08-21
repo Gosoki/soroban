@@ -11,7 +11,8 @@ from ..auth import get_current_user
 from ..database import get_session
 from ..models import MiscExpense
 from ..schemas import MiscCreate, MiscRead, MiscUpdate
-from .common import guarded_bump, raise_conflict, raise_not_found, soft_delete, stamp_fx
+from .common import (guarded_bump, list_totals, raise_conflict, raise_not_found,
+                     soft_delete, stamp_fx)
 
 router = APIRouter(
     prefix="/api/misc", tags=["misc"], dependencies=[Depends(get_current_user)]
@@ -38,7 +39,7 @@ def list_expenses(
     if q:
         conds.append(MiscExpense.name.contains(q, autoescape=True))
 
-    total = session.exec(select(func.count()).select_from(MiscExpense).where(*conds)).one()
+    totals = list_totals(session, MiscExpense, conds)
     rows = session.exec(
         select(MiscExpense)
         .where(*conds)
@@ -46,7 +47,7 @@ def list_expenses(
         .offset(offset)
         .limit(limit)
     ).all()
-    return {"items": [MiscRead.model_validate(r) for r in rows], "total": total}
+    return {"items": [MiscRead.model_validate(r) for r in rows], **totals}
 
 
 @router.post("", response_model=MiscRead)

@@ -293,12 +293,12 @@ _BELOW_ROWS = 2      # 「往下兜底」最多跨几行（× row_tol）；见 _
 def _same_row_value(anchor: dict, tokens: list[dict], row_tol: float,
                     min_len: int, key: str = "digits", allow_below: bool = True) -> Optional[str]:
     """在与 anchor 同一行（y 接近）的框里取 key 值（digits/tracking），**优先取右侧的**；
-    右侧有多个时取 y 最接近的那个。找不到同行则退回到 anchor 下方最近的框。
+    右侧有多个时**取最长的**（长度相同才比 y 距离）。找不到同行则退回到 anchor 下方最近的框。
 
-    ⚠️ 原注释写的是「找 key 值**最长**的框」——实现里从来没有比较过长度（见下面那两行）。
-    「取最长」对单号类字段其实更有道理（一行里两段数字时长的那段多半是真号），
-    但没有真实截图能验证这个改动，所以先把注释改成实话，把「要不要改成取最长」
-    记进审计报告等定夺，而不是让一句假描述继续被后来的改动当作前提。
+    「取最长」这条一度只存在于注释里：实现从来没有比较过长度，而是按 y 距离取最近——
+    可同一行的候选本来就都在 row_tol 之内，谁更近几乎是随机的。
+    这些字段（订单号 15~20 位、快递号 12~15 位）本身就是「越长越像真的」，
+    所以现在按注释说的做。见 `test_same_row_prefers_the_longer_candidate`。
 
     `allow_below=False` 用于**内容词锚点**（如快递公司名）——真标签（「订单编号」「快递单号」）
     只会出现在它的值旁边，往下兜底是安全的；而公司名可能出现在页面任何地方（商品标题里的
@@ -316,7 +316,13 @@ def _same_row_value(anchor: dict, tokens: list[dict], row_tol: float,
     same_row = [t for t in cands if abs(t["cy"] - anchor["cy"]) <= row_tol]
     if same_row:
         right = [t for t in same_row if t["x0"] >= anchor["x0"]]
-        pick = min(right or same_row, key=lambda t: abs(t["cy"] - anchor["cy"]))
+        # **同一行里有多个候选时取最长的**，y 距离只作确定性 tiebreak。
+        # 这些候选本来就都在 row_tol 之内，所以「谁的 cy 更近」几乎是随机的；
+        # 而这些字段（订单号 15~20 位、快递号 12~15 位）本身就是「越长越像真的」。
+        # 注：这条 docstring 原先就写着「找 key 值最长的框」，只是实现从没比较过长度——
+        # 现在两者对齐了。
+        pick = max(right or same_row,
+                   key=lambda t: (len(t[key]), -abs(t["cy"] - anchor["cy"])))
         return pick[key]
     if not allow_below:
         return None

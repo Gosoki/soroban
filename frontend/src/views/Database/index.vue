@@ -91,6 +91,31 @@
       </el-form>
     </el-card>
 
+    <!-- 备份 -->
+    <el-card shadow="never" class="card">
+      <div class="card-hd">
+        <span>备份</span>
+        <el-tag v-if="backups.length" :style="typeStyle('info')">{{ backups.length }} 份</el-tag>
+      </div>
+      <div class="hint">
+        把<b>当前正在用的那个库</b>整本拷成一个独立的 SQLite 文件（换成 MySQL 之后也一样）。
+        拷贝那几秒会短暂只读，别人的保存会自动重试。
+        恢复不在这里——那是唯一一条能一键清空账本的操作，要到服务器上执行
+        <code>python -m tools.backup_db --restore &lt;文件&gt;</code> 并手敲一次确认。
+      </div>
+      <div class="bk-actions">
+        <el-button type="primary" :disabled="!!busy" :loading="busy === 'backup'"
+                   @click="doBackup">立刻备份</el-button>
+        <span v-if="backupDir" class="ph">存放在 {{ backupDir }}</span>
+      </div>
+      <el-table v-if="backups.length" :data="backups" style="width: 100%">
+        <el-table-column prop="name" label="文件" min-width="200" />
+        <el-table-column prop="when" label="时间" width="180" />
+        <el-table-column prop="size" label="大小" width="110" align="right" />
+      </el-table>
+      <div v-else class="hint">还没有备份。</div>
+    </el-card>
+
     <!-- 迁移结果 -->
     <el-card v-if="result" shadow="never" class="card">
       <div class="card-hd"><span>迁移完成</span><el-tag :style="typeStyle('success')">共 {{ result.total }} 行</el-tag></div>
@@ -119,7 +144,7 @@ const loadingStatus = ref(false)
 const form = reactive({ host: '', port: 3306, user: '', password: '', database: 'soroban' })
 // 初始 readonly，聚焦解除 → 阻止浏览器自动填充登录账号
 const ro = reactive({ user: true, pass: true })
-const busy = ref(null)          // null | 'test' | 'migrate' | 'switch'（单操作串行，期间禁用按钮）
+const busy = ref(null)          // null | 'test' | 'migrate' | 'switch' | 'backup'（单操作串行，期间禁用按钮）
 const result = ref(null)
 
 const activeLabel = computed(() => {
@@ -157,6 +182,31 @@ function targetOf(row) {
 function formTarget() {
   return { backend: 'mysql', host: form.host, port: form.port, user: form.user,
     password: form.password, database: form.database }
+}
+
+const backupList = ref([])
+const backupDir = ref('')
+const backups = computed(() => backupList.value.map((b) => ({
+  name: b.name,
+  when: String(b.mtime).replace('T', ' '),
+  size: b.bytes >= 1048576 ? `${(b.bytes / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(b.bytes / 1024))} KB`,
+})))
+
+async function loadBackups() {
+  try {
+    const r = await dbApi.backups()
+    backupList.value = r.items || []
+    backupDir.value = r.dir || ''
+  } catch (_) { /* 拦截器已提示 */ }
+}
+
+async function doBackup() {
+  busy.value = 'backup'
+  try {
+    const r = await dbApi.createBackup()
+    ElMessage.success(`已备份 ${r.total} 行 → ${r.file}`)
+    await loadBackups()
+  } catch (_) { /* 拦截器已提示；409「已有另一项维护操作在进行」也走这里 */ } finally { busy.value = null }
 }
 
 async function loadStatus() {
@@ -309,7 +359,7 @@ async function doDelete(row) {
   } catch (_) { /* 拦截器已提示 */ }
 }
 
-onMounted(loadStatus)
+onMounted(() => { loadStatus(); loadBackups() })
 </script>
 
 <style scoped>
@@ -325,6 +375,8 @@ onMounted(loadStatus)
 .degraded { margin-bottom: 12px; }
 .hint { color: var(--txt-3); font-size: 12px; }
 .row-ic { margin-right: 4px; vertical-align: -2px; }
+/* 按钮与它右边那句说明是一组，走 gap 而不是给按钮挂 margin——与本页其它成组元素同一套。 */
+.bk-actions { display: flex; align-items: center; gap: 12px; margin: 10px 0; }
 .form { margin-top: 6px; }
 
 /* 去掉浏览器自动填充（用户名/密码）留下的黄/蓝底色，保持与其它输入框一致 */

@@ -93,6 +93,37 @@ def contract() -> dict:
                 "fields": sorted(h.schema.model_fields)}
             for k, h in sorted(KINDS.items())
         },
+        "rest": _rest_contract(),
+    }
+
+
+def _rest_contract() -> dict:
+    """**REST 写侧**的字段名，给插件自我投影用。
+
+    为什么必须有：上面那段注释写着「爬虫的 `_PUSH_FIELDS` 白名单就是这个思路，
+    改成从这里取，跨仓字段漂移就变成插件自己能发现的事」——但爬虫走的是
+    `POST/PATCH /api/staging`，而 `staging` 不是一个 kind，它**取不到**。
+    于是保护装在了不需要它的那一侧（fx 插件通过 ingest 只发两个字段，几乎不可能漂），
+    而真正会漂的那一侧仍然硬编码着字段名。
+
+    这不是假想：`url` 这个键在后端补列之前推上去会让**整条订单 422**（不是丢一格），
+    因为写入 schema 是 `extra="forbid"` —— 插件仓的 normalize.py 里记着这次事故。
+
+    插件的用法：启动时取一次，把自己的字段白名单与这里取交集再发；
+    取不到就回落到内置常量（`meta:read` 是 baseline，老插件不读它照旧跑）。
+    局部导入避免与 schemas 形成导入环。
+    """
+    from ...schemas import StagingCreate, StagingItemIn, StagingUpdate
+
+    return {
+        "staging.create": {
+            "fields": sorted(StagingCreate.model_fields),
+            "item_fields": sorted(StagingItemIn.model_fields),
+        },
+        "staging.update": {
+            "fields": sorted(StagingUpdate.model_fields),
+            "item_fields": sorted(StagingItemIn.model_fields),
+        },
     }
 
 

@@ -414,3 +414,40 @@ def test_postage_equal_to_total_is_still_allowed(client):
         "price_cny": "100", "postage_cny": "100", "items": [{"name": "运费", "quantity": 1}]})
     assert r.status_code == 200, r.text
     assert r.json()["price_cny"] == "100.00", r.json()
+
+
+def test_postage_already_in_the_db_still_blocks_an_impossible_price(client):
+    """**D2**：改单时只送 `price_cny` + 无价物品，而邮费**已经在库里**（不在这次 payload 里）。
+
+    这一档原先没人钉：`goods_seed` 的邮费参数从哪来决定了它挡不挡得住——
+    传 `payload.postage_cny` 就会读到 None ⇒ 判据恒不成立 ⇒
+    货款被夹到 0、订单价被悄悄抬成「就等于邮费」，与用户填的总价不符。
+    现在传的是 `order.postage_cny`（库里的值），所以挡得住。
+    """
+    o = mk_order(client, price_cny="100.00", postage_cny="10.00",
+                 items=[{"name": "a", "quantity": 1}])
+    assert Decimal(o["postage_cny"]) == Decimal("10.00")
+
+    r = client.patch(f"/api/orders/{o['id']}", json={
+        "version": o["version"], "price_cny": "5.00",
+        "items": [{"name": "a", "quantity": 1, "unit_price_cny": None, "auto": True}]})
+    assert r.status_code == 422, f"邮费 10 > 总价 5，却放行了：{r.status_code}"
+    assert "邮费" in r.json()["detail"]
+
+    # 库里没被改动
+    got = client.get(f"/api/orders/{o['id']}").json()
+    assert Decimal(got["price_cny"]) == Decimal("100.00")
+
+    # **反面一**：总价高于邮费时照常放行
+    ok = client.patch(f"/api/orders/{o['id']}", json={
+        "version": got["version"], "price_cny": "50.00",
+        "items": [{"name": "a", "quantity": 1, "unit_price_cny": None, "auto": True}]})
+    assert ok.status_code == 200, ok.text
+
+    # **反面二**：物品自带单价时 price_cny 根本不参与计算，不该被这条闸误伤
+    got2 = client.get(f"/api/orders/{o['id']}").json()
+    ok2 = client.patch(f"/api/orders/{o['id']}", json={
+        "version": got2["version"], "price_cny": "5.00",
+        "items": [{"name": "a", "quantity": 1, "unit_price_cny": "100.00", "auto": False}]})
+    assert ok2.status_code == 200, ok2.text
+    assert Decimal(client.get(f"/api/orders/{o['id']}").json()["price_cny"]) == Decimal("110.00")

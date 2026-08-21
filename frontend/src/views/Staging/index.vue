@@ -7,18 +7,18 @@
     <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable
                  table-name="staging" :empty-text="loadFailed ? '加载失败——请检查网络或后端，然后重试' : '没有符合条件的记录'" :actions-width="128" @save="saveCell" @add="addRow" @delete="doDelete" @reload="load" @tags-changed="onTagsChanged">
       <template #toolbar>
-        <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="reload" />
-        <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="reload">
+        <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="applyFilters" />
+        <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="applyFilters">
           <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
         </el-select>
-        <el-select v-model="filters.importStatus" placeholder="状态" clearable style="width: 120px" @change="reload">
+        <el-select v-model="filters.importStatus" placeholder="状态" clearable style="width: 120px" @change="applyFilters">
           <el-option v-for="s in IMPORT_STATUS" :key="s" :label="s" :value="s" />
         </el-select>
-        <el-select v-model="filters.platform_account" placeholder="账号昵称" clearable filterable style="width: 120px" @change="reload">
+        <el-select v-model="filters.platform_account" placeholder="账号昵称" clearable filterable style="width: 120px" @change="applyFilters">
           <el-option v-for="a in accountOptions" :key="a" :label="a" :value="a" />
         </el-select>
         <el-date-picker v-model="filters.range" type="daterange" value-format="YYYY-MM-DD" class="flt-date"
-                        start-placeholder="起" end-placeholder="止" @change="reload" />
+                        start-placeholder="起" end-placeholder="止" @change="applyFilters" />
       </template>
 
       <template #toolbar-right>
@@ -117,7 +117,7 @@ import PageHeader from '@/components/PageHeader.vue'
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Camera, Delete, Plus } from '@element-plus/icons-vue'
-import { applyRowUpdate, queueOrderWrite } from '@/utils/orderWrites'
+import { applyRowUpdate, queueRowWrite } from '@/utils/rowWrites'
 import { ordersApi, stagingApi, tagsApi } from '@/api'
 import { handled } from '@/api/http'
 import { ORDER_SOURCES, PAGE_SIZE, PRICE_HELP, IMPORT_STATUS, PURCHASE_STATUS, canAdvancePurchase, importStatusStyle } from '@/constants'
@@ -169,7 +169,7 @@ function onTagsChanged({ field, values }) {
     if (filters.platform_account && !values.includes(filters.platform_account)) {
       filters.platform_account = ''
       ElMessage.info('筛选里那个账号已改名或删除，已为你清掉筛选')
-      reload()
+      applyFilters()
     }
   }
 }
@@ -224,14 +224,19 @@ async function load() {
     if (my === loadSeq) loading.value = false
   }
 }
-function reload() { page.value = 1; load() }
+// 名字要说清它做了两件事：**回到第一页** + 重新拉数据。
+// 叫 reload 时它比行为窄，读的人会以为只是「重拉当前页」，
+// 而筛选条件变了却不回第一页的话，用户会停在一个空的第 3 页上。
+// ⚠️ 与 NotionTable 的组件事件 `@reload="load"` 是两回事：那个是「表格请父页重拉行」，
+// 不重置分页，名字没问题。
+function applyFilters() { page.value = 1; load() }
 function onPage(p) { page.value = p; load() }
 
 async function saveCell(row, key, value) {
   try {
     // 入队串行：同一行的格子、邮费、物品三条写路径各自读一次 version，
     // 重叠时后到的那个必 409。链的 key 加 `staging:` 前缀，与订单页的 id 空间分开。
-    await queueOrderWrite(`staging:${row.id}`, async () => {
+    await queueRowWrite(`staging:${row.id}`, async () => {
       const patch = { version: row.version, [key]: value }
       const updated = await stagingApi.update(row.id, patch)
       applyRowUpdate(row, patch, updated)    // 没送 items → 不覆盖展开面板里未保存的物品编辑
@@ -274,7 +279,7 @@ async function saveItems(row) {
     // 最短的触发路径不需要任何并发意识：在邮费框里填个数，直接点「保存物品」——
     // 按钮的 mousedown 先让邮费框失焦触发 savePostage，click 再触发 saveItems，
     // 后者读到的还是同一个旧 version ⇒ 必 409 ⇒ 整表重拉，刚填的物品全没了。
-    await queueOrderWrite(`staging:${row.id}`, async () => {
+    await queueRowWrite(`staging:${row.id}`, async () => {
       const patch = { version: row.version, items }
       const updated = await stagingApi.update(row.id, patch)
       // 送出去之后、响应回来之前本地又被改过 ⇒ 那份响应算的是旧数组，整体覆盖
@@ -293,7 +298,7 @@ async function saveItems(row) {
 async function savePostage(row) {
   const postage = (row.postage_cny === '' || row.postage_cny == null) ? null : Number(row.postage_cny)
   try {
-    await queueOrderWrite(`staging:${row.id}`, async () => {
+    await queueRowWrite(`staging:${row.id}`, async () => {
       const patch = { version: row.version, postage_cny: postage }
       const updated = await stagingApi.update(row.id, patch)
       applyRowUpdate(row, patch, updated)

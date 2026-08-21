@@ -58,7 +58,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Delete, Plus, QuestionFilled } from '@element-plus/icons-vue'
 import { ordersApi } from '@/api'
 import { handled } from '@/api/http'
-import { applyRowUpdate, queueOrderWrite } from '@/utils/orderWrites'
+import { applyRowUpdate, queueRowWrite } from '@/utils/rowWrites'
 
 // order 必须含 id / version / items / postage_cny / title（订单页的行 或 ordersApi.get 的结果都满足）
 const props = defineProps({ order: { type: Object, required: true } })
@@ -152,7 +152,7 @@ async function saveItems() {
   const sent = JSON.stringify(items)   // 送出去的那一份，回来时拿它比对（见下）
   try {
     // 整个「读 version→PATCH→回写」入队串行，避免与同订单的其它保存并发撞 version 互相 409
-    await queueOrderWrite(props.order.id, async () => {
+    await queueRowWrite(`order:${props.order.id}`, async () => {
       const patch = { version: props.order.version, items }
       const updated = await ordersApi.update(props.order.id, patch)
       // **响应回来时，本地数组还是我送出去的那一份吗？** 不是就别整体覆盖。
@@ -187,7 +187,7 @@ function onItemEdit(it) {
 // 邮费改动：写库并让订单价随之重算（不填=包邮）。不覆盖未保存的物品编辑
 async function savePostage() {
   try {
-    await queueOrderWrite(props.order.id, async () => {
+    await queueRowWrite(`order:${props.order.id}`, async () => {
       const patch = { version: props.order.version, postage_cny: itemPrice(props.order.postage_cny) }
       const updated = await ordersApi.update(props.order.id, patch)
       applyRowUpdate(props.order, patch, updated)

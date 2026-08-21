@@ -272,6 +272,10 @@ _PLUGIN_CLOSED = {
     "POST /api/shipment/{shipment_id}/ocr-express",
     "POST /api/shipment/{shipment_id}/order/{order_id}",  # 挂靠/解挂是人的决定
     "DELETE /api/shipment/{shipment_id}/order/{order_id}",
+    # 手填汇率。**不是权限问题，是语义问题**：`manual` 那个源名是核心保留给人的，
+    # `ingest/kinds/fx_rate.py` 明文拒绝插件用它。给这条开插件入口 = 给那道检查开后门。
+    # 插件要报汇率走通用写入通道的 fx_rate，会记成它自己的源名。
+    "POST /api/fx",
 }
 
 
@@ -1011,3 +1015,73 @@ def test_the_group_sweep_happens_before_the_output_drains():
         with mod._PROCS_LOCK:
             mod._ALIVE_PROCS.clear()
             mod._OWN_GROUP.clear()
+
+
+# --- 核心侧事实：REST 通道也要记 -------------------------------------------------
+
+def test_core_refusals_on_the_rest_channel_are_recorded(client, session):
+    """卡片上显示的是插件自己 print 的那句话。一个不看回执的插件——推 30 条、
+    核心逐条拒收、照常 print「已导入 30 单」并 exit 0——会让卡片显示绿色的成功而库里零写入。
+
+    `runlog` 就是为这件事建的，但它此前**只覆盖 `/api/ingest`**，
+    而唯一批量写数据的淘宝插件走的是 REST（`/api/staging`）——保证装在了不需要它的那一侧。
+    """
+    import uuid
+
+    from app.plugins import runlog, scopes
+
+    class _U:
+        id, username = 1, "admin"
+
+    runlog.reset()
+    tok, jti = scopes.issue(_U(), "demo", {"staging:write", "staging:read"})
+    h = {"Authorization": f"Bearer {tok}"}
+    try:
+        # 422：schema 挡下（`import_status` 不许建行时自称已导入）
+        r = client.post("/api/staging", json={"order_no": "REST-" + uuid.uuid4().hex[:6],
+                                              "import_status": "已导入"}, headers=h)
+        assert r.status_code == 422, r.text
+        rec = runlog.peek(jti)
+        assert rec and rec["rejected"] == 1, f"REST 侧的拒收没被记下来：{rec}"
+        assert "api/staging" in rec["first"], rec["first"]
+
+        # **反面**：409 刻意不记。撞唯一键在淘宝插件那里是「这单已经在暂存里了」
+        # 这个正常结局（它靠 409 做幂等 upsert）——记了的话每次正常抓取卡片都变黄，
+        # 而黄色一旦成为常态，真正的黄就没人看了。
+        no = "RESTDUP-" + uuid.uuid4().hex[:6]
+        assert client.post("/api/staging", json={"order_no": no}, headers=h).status_code == 200
+        before = (runlog.peek(jti) or {}).get("rejected", 0)
+        dup = client.post("/api/staging", json={"order_no": no}, headers=h)
+        assert dup.status_code == 409, dup.text
+        after = (runlog.peek(jti) or {}).get("rejected", 0)
+        assert after == before, f"409 被记成拒收了（{before} → {after}）"
+
+        # **反面二**：正常写入不许留下任何痕迹
+        ok_no = "RESTOK-" + uuid.uuid4().hex[:6]
+        assert client.post("/api/staging", json={"order_no": ok_no}, headers=h).status_code == 200
+        assert (runlog.peek(jti) or {}).get("rejected", 0) == after
+    finally:
+        scopes.revoke(jti)
+        runlog.reset()
+
+
+def test_a_scope_violation_is_also_a_core_side_fact(client, session):
+    """越权被闸挡下（403）同样要记：那正是「核心拒绝了插件这一次」最典型的一种，
+    而插件那边只看到一个 403，用户只看卡片。
+    """
+    from app.plugins import runlog, scopes
+
+    class _U:
+        id, username = 1, "admin"
+
+    runlog.reset()
+    tok, jti = scopes.issue(_U(), "demo", set())      # 一项授权都没有
+    try:
+        r = client.post("/api/staging", json={"order_no": "NOPERM-1"},
+                        headers={"Authorization": f"Bearer {tok}"})
+        assert r.status_code == 403, r.text
+        rec = runlog.peek(jti)
+        assert rec and rec["rejected"] == 1, f"越权没被记成核心侧事实：{rec}"
+    finally:
+        scopes.revoke(jti)
+        runlog.reset()
