@@ -162,10 +162,37 @@ async function save() {
     }
     const r = await settingsApi.save(patch)
     saved.value = r.values
-    draft.value = JSON.parse(JSON.stringify(r.values))
+    // **别拿服务端的整包值盖掉「在途期间又改过」的那些格子。**
+    // 保存按钮转圈时输入框并没有禁用，用户完全可能接着改别的项——
+    // 而原先这一句 `draft.value = 深拷贝(r.values)` 会把那些改动当场抹掉：
+    // 值跳回旧的、`dirty` 变 false（保存/撤销一起置灰）、同时弹「已保存，即时生效」。
+    // 用户看到的是「两项都存了」，**实际第二项一个字都没提交，界面上也不再有未保存的痕迹**。
+    //
+    // 判据与幽灵新建行那条一致（utils/rowWrites.js 的 keysToClearAfterCreate）：
+    // 只接受**这次送出去的那些键**的服务端值，其余保留 draft 现有的。
+    const fresh = JSON.parse(JSON.stringify(r.values))
+    for (const k of Object.keys(fresh)) {
+      // 这次没送的键：如果 draft 已被改过（与提交前的 saved 不同），保留用户改的那份
+      const untouched = !(k in patch) && JSON.stringify(draft.value[k]) === JSON.stringify(fresh[k])
+      if ((k in patch) || untouched) draft.value[k] = fresh[k]
+    }
     specs.value = r.specs
-    fx.value = await fxApi.get()          // 手填汇率保存后可能立刻生效，刷新展示
-    ElMessage.success('已保存，即时生效')
+    // 还有没保存的改动就说清楚，别让「已保存」把它盖过去
+    ElMessage.success(dirty.value ? '已保存；下面还有未保存的改动' : '已保存，即时生效')
+    // **这一句只是刷新展示，它失败不能改口说「没保存成功」。**
+    // 原先它排在 success 之前、又共用外层那个 catch：`PUT /api/settings` 已经 200、
+    // 值已落库、`saved.value` 已回写，紧接着这句 `fxApi.get()` 挂了（后端在重启、
+    // 局域网抖动、503 用完两次重试），于是「已保存」永远弹不出来，屏幕上只剩一条红色报错。
+    // 更糟的是此刻 `saved.value` 已等于服务端新值 ⇒ `dirty` 为 false ⇒ 模板里
+    // `:disabled="!dirty"` 的「保存」和「撤销改动」**同时置灰**，「有未保存的改动」
+    // 那句提示也消失。用户的结论只能是「这次没存上」——而它已经生效了；
+    // 他想再点一次都点不动，只有刷新整页才会发现原来存住了。
+    //
+    // 判据与 `utils/listRows.js::afterCreate` 一致：**一件事成没成，只看它自己那一步**，
+    // 与随后那次刷新拿没拿到无关。
+    try {
+      fx.value = await fxApi.get()        // 手填汇率保存后可能立刻生效，刷新展示
+    } catch (_) { /* 拦截器已提示。保存本身是成功的，不因为展示没刷新就改口 */ }
   } catch (_) { /* 拦截器已提示（422 会显示后端的具体原因） */ } finally { saving.value = false }
 }
 

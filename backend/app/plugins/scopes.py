@@ -103,7 +103,11 @@ _BASELINE = frozenset(k for k, v in SCOPES.items() if v.baseline)
 # 进程内活跃令牌集：jti → 到期单调时刻。任务收割后立即剔除。
 # 这是 `auth.py` 明确拒绝过的「令牌版本列 + 迁移」之外唯一便宜的撤销手段；
 # 重启即全清，是 fail-closed 的那一侧，符合本项目取向。
-_ALIVE: dict[str, float] = {}
+# jti → (plugin_id, 到期时刻)。**带上 plugin_id 是为了「撤销授权要能撤掉在飞的那枚」**：
+# 用户唯一一次真的去点撤销，就是他正看着某个插件在乱写的时候——
+# 那一刻如果只改数据库里的 `granted_scopes`，在飞的子进程照样能用旧令牌写到跑完
+# （最长 30 分钟），而卡片上已经显示「未授权」了。见 `revoke_plugin`。
+_ALIVE: dict[str, tuple[str, float]] = {}
 _ALIVE_LOCK = threading.Lock()
 # 硬上限：清单只能调低，不能调高。**必须严格大于子进程的收割超时**
 # （routers/plugins.py 的 _REAP_TIMEOUT，今天是 30 分钟）——取 30 分钟的话，
@@ -129,7 +133,7 @@ def issue(user, plugin_id: str, granted: set[str], timeout_s: int = 600) -> tupl
         settings.SECRET_KEY, algorithm=settings.ALGORITHM,
     )
     with _ALIVE_LOCK:
-        _ALIVE[jti] = time.monotonic() + ttl.total_seconds()
+        _ALIVE[jti] = (plugin_id, time.monotonic() + ttl.total_seconds())
     return tok, jti
 
 
@@ -141,13 +145,30 @@ def revoke(jti: Optional[str]) -> None:
         _ALIVE.pop(jti, None)
 
 
+def revoke_plugin(plugin_id: str) -> int:
+    """撤销这个插件**当前所有在飞的令牌**。返回撤了几枚。
+
+    用户在界面上取消勾选一项授权时调用。不撤的话，那一刻正在跑的子进程会拿着
+    旧令牌一直写到跑完（`_reap` 最长等 30 分钟）——**而卡片上已经显示「未授权」了**。
+    「用户唯一一次真的去用撤销，恰好是它什么都不做的那一次」。
+
+    只撤在飞的，不影响下一次执行（下次会按新的授权重新签发）。
+    """
+    with _ALIVE_LOCK:
+        gone = [j for j, (plg, _) in _ALIVE.items() if plg == plugin_id]
+        for j in gone:
+            _ALIVE.pop(j, None)
+    return len(gone)
+
+
 def alive(jti: Optional[str]) -> bool:
     if not jti:
         return False
     with _ALIVE_LOCK:
-        exp = _ALIVE.get(jti)
-        if exp is None:
+        ent = _ALIVE.get(jti)
+        if ent is None:
             return False
+        _, exp = ent
         if exp < time.monotonic():          # 顺手清理过期项，别让表无限长
             _ALIVE.pop(jti, None)
             return False

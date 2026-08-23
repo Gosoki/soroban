@@ -146,6 +146,34 @@ SHIPMENT_EXCLUDED = frozenset({ShipmentStatus.cancelled.value})   # 集运已取
 EXCLUDED_STATUSES = PURCHASE_EXCLUDED | SHIPMENT_EXCLUDED
 
 
+def is_unconverted(price_cny, jpy_settled) -> bool:
+    """这一行算不算「有钱、却没折算成日元」。**全仓唯一真相。**
+
+    三个出口都要用它，判据必须逐条一致：看板的 `_uncounted`、列表页脚的 `list_totals`、
+    集运到岸成本的 `_landed`。分叉的现象不是报错，而是**两个数字互相打脸**——
+    同一件事，页脚说 1 条、看板说 0 条，用户没有任何办法判断该信哪个。
+
+    `!= 0` 那一条是必须的：显式填 0 的行（预付 / 包邮 / 全是赠品的单）折算过去也是 0 円，
+    没有任何金额会被 `SUM` 吞掉，报出来只是噪音——而用户按告警去补汇率也消不掉它。
+
+    这三处历史上已经分叉过两次（审计报告 §151.3、§169），每次都是漏抄了 `!= 0`。
+    所以把它变成一个函数，而不是一条「记得三处都改」的约定。
+    """
+    return price_cny is not None and price_cny != 0 and jpy_settled is None
+
+
+def unconverted_clause(model):
+    """同一条判据的 **SQL 形态**：给 `where()` / `case()` 用的过滤条件。
+
+    为什么要有两种形态：三个出口里有两个（看板 `_uncounted`、列表页脚 `list_totals`）
+    在数据库里聚合，构造的是 SQLAlchemy 表达式，调不动上面那个 Python 版；
+    第三个（集运到岸 `_landed`）子订单已经在内存里，用 Python 版。
+    **规则只有一份，形态有两种**——这正是它们历史上分叉两次的地方
+    （每次都是漏抄 `!= 0`）。改判据时两个函数必须一起改，就在彼此隔壁。
+    """
+    return (model.price_cny.isnot(None)) & (model.price_cny != 0) & (model.jpy_settled.is_(None))
+
+
 def guard_cny(p: Decimal) -> Decimal:
     """人民币金额的上限卡口，越界抛 ValueError（main 里统一转 422）。
 

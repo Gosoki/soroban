@@ -15,6 +15,7 @@ from sqlmodel import Session, select
 from ..auth import get_current_user
 from ..database import get_session
 from ..db.dialect import ci_contains
+from ..models.base import guard_cny
 from ..models import (
     OrderItem,
     CreatedVia,
@@ -277,6 +278,26 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
                         detail="该记录已导入账本，导入状态不能直接修改"
                                "（要撤销请先在「商品订单」页删除对应订单）",
                     )
+        # **插件不许改一张已导入订单的钱。**
+        # 下面那几行是「写穿账本」——暂存与账本是同一条记录的两个视图，人在哪一页改都该一致，
+        # 这对**人**是对的。但对插件不是：那笔钱可能是人导入后手工核过、改过的，
+        # 而插件回灌是**定时反复**发生的，覆盖一次就永久了（HTTP 200、无 409、runlog 也不记）。
+        #
+        # 仓库里那个淘宝插件自己很克制（已导入的行只推进状态、只在账本那格为空时补快递号），
+        # 但那是**插件的自觉，不是核心的强制**——`runlog` 存在的理由逐字就是这一句。
+        # 换一个插件、或哪天改这段时忘了，同一个洞立刻复发。
+        #
+        # 只挡「带钱的字段」，不挡状态/快递号/链接那些——插件补空格正是它该做的事，
+        # 也是它现在唯一会对已导入行做的事。所以这条闸对现有插件**一次都不会触发**，
+        # 它防的是下一个插件。
+        if getattr(current, "_plugin_claims", None):
+            money = [f for f in ("items", "price_cny", "postage_cny", "fx_rate")
+                     if getattr(payload, f, None) is not None]
+            if money:
+                raise HTTPException(status_code=403, detail=(
+                    f"这一行已经导入账本了，插件不能再改它的金额字段（{'、'.join(money)}）。"
+                    "那笔钱可能已经被人工核对过——要更正请在「商品订单」页改。"
+                    "状态、快递单号、快递公司、商品链接不受此限。"))
         if payload.items is not None:                   # 物品写穿账本（单一真源）+ 暂存镜像，两页一致
             # 种子只认本次显式传来的 price_cny，不回退到当前价——理由同 orders.update_order
             seed_goods = goods_seed(payload.price_cny, order.postage_cny, payload.items)
@@ -309,7 +330,21 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
         stamp_fx(session, order)
         row.fx_rate = order.fx_rate                     # 暂存镜像跟着走，免得两页显示不同汇率
         order.sync_from_items()                         # 账本价+日元由物品派生（fx 变也重算）
-        row.sync_from_items()                           # 暂存价镜像
+        # **暂存价从账本单镜像过来，不是拿暂存自己那份物品重算。**
+        # 这一行原先写的是 `row.sync_from_items()`，注释还写着「暂存价镜像」——
+        # 但它做的是重算，不是镜像。已导入的**0 物品**暂存行（`import_staging` 的 else 分支
+        # 只给账本单补物品、不回写 `row.items`）走到这里，算出来的就是 `0 + 邮费`：
+        #
+        #   暂存 ¥300 / 0 物品 → 导入得到订单 ¥300 → 在**暂存页**改一下标题
+        #   （甚至只送一个 version、一个字段都没改，也会走到这里；插件的 express_no 更新同样）
+        #   ⇒ 暂存行变 ¥0.00，而 PATCH 的响应里还是 300（`_overlay` 用账本值覆盖显示）
+        #   → 在订单页删掉该单（暂存复位成「待处理」，此时不再有账本值可覆盖）
+        #   → 再点「导入账本」⇒ 建出一张 **¥0.00 / 0 円** 的订单。
+        #
+        # 与 `common.mirror_to_staging` 是**同一个伤害的两条路**（见审计报告 §154）。
+        # 那次只修了订单 PATCH 那条，这条漏了——而 §154 的守卫走的正是订单那条路，
+        # 够不到这一行，所以它一直是绿的。
+        row.price_cny = guard_cny(order.price_cny) if order.price_cny is not None else None
         session.add(order)
         session.add(row)
         session.commit()                                # order_no 撞账本唯一索引 → IntegrityError → 409

@@ -1692,6 +1692,13 @@ def test_a_filter_stuck_on_a_renamed_value_is_cleared():
     改名之后旧名在库里已经没有了，拿它精确匹配会查回 0 行，
     空态显示「没有符合条件的记录」——用户刚改完名就看到「单子没了」。
     留着一个查不到东西的筛选值，比清掉它更糟：他不会想到问题出在筛选上。
+
+    **2026-08-23 更新判据**：原先钉的是 `!values.includes(filters.platform_account)`
+    这个**按字段写死**的字面量。那正是问题所在——四个页面都按字段枚举，
+    于是「来源(platform)」这个同样是标签列、同样有筛选框的字段一直漏在外面，
+    而这条守卫**恒绿**（它只问 platform_account 有没有被处理）。
+    现在钉的是那句**通用**写法；覆盖面由
+    `test_tag_rename_clears_a_stale_filter_on_every_page_generically` 一起管。
     """
     import re
 
@@ -1700,14 +1707,14 @@ def test_a_filter_stuck_on_a_renamed_value_is_cleared():
         b = re.sub(r"//.*$", "", src[src.index("<script"):], flags=re.M)
         fn = b[b.index("function onTagsChanged"):]
         fn = fn[:fn.index("\n}") + 2]
-        assert "!values.includes(filters.platform_account)" in fn, \
-            f"{page} 没有检查筛选值是否还在候选集里"
-        assert "filters.platform_account = ''" in fn, f"{page} 没有清掉失效的筛选值"
+        assert "!values.includes(filters[field])" in fn, \
+            f"{page} 没有（通用地）检查筛选值是否还在候选集里"
+        assert "filters[field] = ''" in fn, f"{page} 没有清掉失效的筛选值"
         assert "ElMessage" in fn, f"{page} 清了筛选却没告诉用户，他会以为筛选自己乱了"
 
 
 def test_the_seven_list_pages_share_one_failure_sentence_verbatim():
-    """七个列表页的失败态文案必须**逐字相同**。
+    """凡是「列表拿不到」的失败态，文案必须**逐字相同**。
 
     它们是同一种处境（请求挂了、列表拿不到），说两种话就是割裂。
     这一条钉的是字面量本身——文案漂移不会有任何测试红，只能靠它。
@@ -1718,13 +1725,28 @@ def test_the_seven_list_pages_share_one_failure_sentence_verbatim():
     差异有理由，不是遗漏。
     """
     SENTENCE = "加载失败——请检查网络或后端，然后重试"
+    CONST = "MSG_LOAD_FAILED"
     root = _REPO / "frontend" / "src" / "views"
-    for page in ("Orders", "Staging", "Shipment", "Misc", "Items", "Fx", "Plugins"):
+    # 2026-08-23 把「数据库」页也纳进来：它的备份列表同样有「拿不到」这个形态，
+    # 而加它的时候我另写了一句「备份列表加载失败——请检查后端，然后重试」——
+    # 第 8 种说法，正是这条守卫存在的理由。
+    #
+    # 同日**判据升级**（不是放松）：这句话已提到 `constants.js` 的 `MSG_LOAD_FAILED`，
+    # 八页各自引用同一个常量。原判据「每个文件里都有这句话」现在恒假；
+    # 而新判据比它**更强**——原判据只保证八处字面量此刻相同，谁改其中一处它就红了
+    # 但也只能事后发现；引用同一个常量则让「不一致」从结构上不可能发生。
+    for page in ("Orders", "Staging", "Shipment", "Misc", "Items", "Fx", "Plugins", "Database"):
         src = (root / page / "index.vue").read_text(encoding="utf-8")
-        assert SENTENCE in src, f"{page} 的失败态文案与其余几页不一致"
+        assert CONST in src, f"{page} 的失败态没有用共用文案 {CONST}"
+        assert SENTENCE not in src, \
+            f"{page} 又把那句话硬编码回去了——共用文案只许有 constants.js 一个出处"
+
+    defn = (_REPO / "frontend" / "src" / "constants.js").read_text(encoding="utf-8")
+    assert f"{CONST} = '{SENTENCE}'" in defn, \
+        f"{CONST} 的定义变了或没了——八页的失败文案全挂在它一个人身上"
 
     dash = (root / "Dashboard" / "index.vue").read_text(encoding="utf-8")
-    assert SENTENCE not in dash, \
+    assert SENTENCE not in dash and CONST not in dash, \
         "看板套用了列表页那句——它要分「初值」与「旧数据」两种情形，套用会在其中一种上说假话"
 
 
@@ -2324,3 +2346,709 @@ def test_the_503_retry_policy_under_node():
     got = json.loads(r.stdout.strip().splitlines()[-1])
     failed = [k for k, v in got.items() if not v]
     assert not failed, f"这些行为不成立：{failed}"
+
+
+def test_every_tag_managed_column_uses_binary_collation():
+    """凡是登记进标签体系的列，都必须是 `BinStr`（二进制排序规则）。
+
+    标签的改名/删除走 `WHERE col = value` 的**批量精确匹配**。MySQL 的表默认排序规则是
+    `utf8mb4_0900_ai_ci`——大小写与重音都不敏感。一根 ci 的列落进这套机制里，后果是：
+
+      · `SELECT DISTINCT col` 把 'EMS' 与 'ems' 折成一个，用户在下拉里看不到另一个值；
+      · 改名的 UPDATE 会**连另一个变体的行一起改掉**，并推进它们的乐观锁版本
+        ——一笔无关的记录被悄悄改了，没有任何提示；
+      · `tag_value_in_use()` 误判，合法的大小写变体改名被 409 拒掉。
+
+    **这条在 SQLite 上永远看不出来**（无 COLLATE 即 BINARY），只有切到 MySQL 才炸——
+    正是这个项目最典型的那类双引擎发散。
+
+    2026-08-22 把杂项分类接进标签体系时就漏了这一脚：迁移 `f2a3b4c5d6e7` 当年
+    明确把「商品分类」列为**不需要**二进制排序规则的那一类（当时它确实不是键列），
+    而接进来这个动作改变了前提，却没人回头改列类型。
+    这条守卫钉的是那条不变量本身，而不是某一根具体的列。
+    """
+    from sqlalchemy.dialects import mysql
+
+    from app.db.dialect import BIN_COLLATION
+    from app.routers.tags import _FIELD_SOURCES
+
+    assert _FIELD_SOURCES, "标签字段登记表是空的，探测方式可能已过期"
+
+    # 判据是**编译成 MySQL 方言之后的 DDL 片段**，不是 isinstance——
+    # `BinStr` 是个返回 `String(...).with_variant(...)` 的函数，不是类型，
+    # 而真正决定行为的正是这段会落到库里的 DDL。
+    dialect = mysql.dialect()
+    bad = []
+    for field, sources in _FIELD_SOURCES.items():
+        for model, col in sources:
+            ddl = model.__table__.c[col.key].type.compile(dialect)
+            if BIN_COLLATION not in ddl:
+                bad.append(f"{model.__tablename__}.{col.key}（标签字段 {field}）→ {ddl}")
+    assert not bad, (
+        "这些列被标签的批量改名/删除按值精确匹配，却不是 BinStr：\n  "
+        + "\n  ".join(bad)
+        + "\n（MySQL 上 'EMS' 与 'ems' 会被判为同一个值 ⇒ 改一个会连另一个一起改掉。"
+          "改列类型要配一条迁移，参见 e5f6a7b8c0d1。）")
+
+
+def test_every_bulk_update_on_a_ledger_table_bumps_the_version():
+    """凡是直接 `sa_update(<账本表>)` 的语句，都必须在 `.values()` 里推进 `version`。
+
+    账本的并发安全建立在乐观锁上：前端带着读到的 `version` 保存，对不上就 409。
+    绕过它的批量 UPDATE（标签改名、挂靠/解挂、按账号清空、导入领取…）如果不推进 version，
+    后果是**静默覆盖**——甲改了一批行，乙手上那行的 version 仍然匹配，
+    乙一保存就把甲的改动顶掉，而且**不会 409**。这正是「2–3 个人同时编辑」下最难查的那种。
+
+    2026-08-22 人工审过一遍，当时 11 处全部合规。这条把结论钉成守卫——
+    人工结论会过期，守卫不会。
+
+    判据按 **AST** 解析同一条链上的 `.values(...)`：
+    直接写 `version=...` 算，`**某个字典` 则回溯那个字典的字面量。
+    按「函数里出现过 version 这个词」判是不够的——那会被同函数里别的用途满足。
+    """
+    import ast
+    from pathlib import Path
+
+    LEDGER = {"Order", "ShipmentOrder", "MiscExpense", "OrderStaging"}
+    root = Path(__file__).resolve().parents[1] / "app"
+
+    def dict_has_version(fn, name):
+        """在函数体里找那个字典，看它有没有 version 键。
+
+        两种写法都要认：字面量里直接带（`vals = {"version": ...}`），
+        以及**事后下标赋值**（`vals["version"] = model.version + 1`——`tags.rename_tag_value`
+        就是这么写的，因为它要先判 `hasattr(model, "version")`）。
+        只认第一种的话，这条守卫会把一处**合规**的代码报成违规。
+        """
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assign):
+                # ① vals = {...}
+                if any(isinstance(t, ast.Name) and t.id == name for t in node.targets) \
+                        and isinstance(node.value, ast.Dict):
+                    if any(isinstance(k, ast.Constant) and k.value == "version"
+                           for k in node.value.keys):
+                        return True
+                # ② vals["version"] = ...
+                for t in node.targets:
+                    if (isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name)
+                            and t.value.id == name
+                            and isinstance(t.slice, ast.Constant) and t.slice.value == "version"):
+                        return True
+        return False
+
+    bad = []
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+            for call in [n for n in ast.walk(fn) if isinstance(n, ast.Call)]:
+                # 找 `.values(...)`，再看它这条链的底部是不是 sa_update(<账本表>)
+                if not (isinstance(call.func, ast.Attribute) and call.func.attr == "values"):
+                    continue
+                base = call.func.value
+                while isinstance(base, ast.Call) and isinstance(base.func, ast.Attribute):
+                    base = base.func.value
+                if not (isinstance(base, ast.Call) and isinstance(base.func, ast.Name)
+                        and base.func.id in ("sa_update", "update")):
+                    continue
+                arg = base.args[0] if base.args else None
+                model = arg.id if isinstance(arg, ast.Name) else None
+                if model not in LEDGER and model != "model":
+                    continue        # `model` 是 tags 里按字段动态取的账本模型，一并要求
+                ok = any(kw.arg == "version" for kw in call.keywords)
+                if not ok:
+                    for kw in call.keywords:
+                        if kw.arg is None and isinstance(kw.value, ast.Name):
+                            ok = ok or dict_has_version(fn, kw.value.id)
+                if not ok:
+                    bad.append(f"{path.relative_to(root.parent)}:{call.lineno} "
+                               f"sa_update({model}).values(...) 没有推进 version（函数 {fn.name}）")
+
+    assert not bad, (
+        "这些批量 UPDATE 直接改账本表却不推进乐观锁版本：\n  " + "\n  ".join(bad)
+        + "\n（后果是静默覆盖：别人改过的行，你手上那份 version 仍然匹配，保存不会 409。）")
+
+
+def test_tag_rename_clears_a_stale_filter_on_every_page_generically():
+    """标签改名后清掉停在旧值上的筛选，必须写成**通用**的，不能按字段逐个 if。
+
+    改名之后库里再没有旧值，拿它精确匹配会查回 0 行，空态显示「没有符合条件的记录」
+    ——用户刚改完名就看到「单子没了」，而且多半不会想到去点筛选框的 ✕。
+
+    原先四个页面都是按字段枚举（只处理 `recipient` / `platform_account`），
+    于是「来源(platform)」这个同样是标签列、同样有筛选框的字段一直漏在外面。
+    **按字段枚举正是它被漏掉的原因**，所以判据钉的是「有没有那句通用清理」，
+    而不是「有没有处理 platform」——后者补一个字段就绿了，下一个字段照样漏。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src" / "views"
+    GENERIC = "if (filters[field] && !values.includes(filters[field]))"
+    bad = []
+    for page in ("Orders", "Staging", "Items", "Misc", "Shipment"):
+        src = (root / page / "index.vue").read_text(encoding="utf-8")
+        if "onTagsChanged" not in src:
+            continue                    # 这一页没接标签事件，无需
+        if GENERIC not in src:
+            bad.append(page)
+    assert not bad, (
+        f"这些页面的 onTagsChanged 还在按字段枚举，新标签字段会漏：{bad}\n"
+        f"应当有一句通用的：{GENERIC}")
+
+# --- 幽灵新建行清草稿的**行为**测试：拿 node 真跑 -------------------------------
+
+_CLEAR_HARNESS = r"""
+import { keysToClearAfterCreate } from './frontend/src/utils/rowWrites.js'
+
+const results = {}
+
+// ① 送出去什么就清什么（正常情形：请求在途期间没人再敲）
+{
+  const draft = { name: '打包袋', price_cny: 12.5 }
+  const sent = { name: '打包袋', price_cny: 12.5 }
+  results.clears_what_was_sent =
+    JSON.stringify(keysToClearAfterCreate(draft, sent).sort()) === JSON.stringify(['name', 'price_cny'])
+}
+
+// ② **请求在途时新敲进别的格子的内容不许被清掉** —— 这条是这个函数存在的理由
+{
+  const draft = { name: '打包袋', price_cny: 12.5 }   // price 是 POST 之后才填的
+  const sent = { name: '打包袋' }
+  results.keeps_what_was_typed_after = 
+    JSON.stringify(keysToClearAfterCreate(draft, sent)) === JSON.stringify(['name'])
+}
+
+// ③ 送出之后**同一格**又被改过 → 那是新草稿的内容，也要留
+{
+  const draft = { name: '打包袋（大）' }
+  const sent = { name: '打包袋' }
+  results.keeps_an_edited_cell = keysToClearAfterCreate(draft, sent).length === 0
+}
+
+// ④ 边界：草稿已经被清空 / payload 为空，不许抛
+{
+  results.tolerates_empty =
+    keysToClearAfterCreate({}, { a: 1 }).length === 0 &&
+    keysToClearAfterCreate({ a: 1 }, {}).length === 0 &&
+    keysToClearAfterCreate({ a: 1 }, null).length === 0
+}
+
+console.log(JSON.stringify(results))
+"""
+
+
+def test_ghost_row_clearing_behaviour_under_node():
+    """幽灵新建行提交成功后清草稿的**行为**测试——真跑，不是 grep 组件源码。
+
+    错法很隐蔽：无条件 `Object.keys(newRow).forEach(delete)` 在正常情形下完全正确，
+    只有「请求在途时用户又敲了别的格子」才会把那些内容一起抹掉——
+    而那正是这个函数存在的全部理由，所以它必须被单独测到。
+    """
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        import os
+
+        if os.environ.get("SOROBAN_NO_NODE"):
+            pytest.skip("显式声明了本机没有 node（SOROBAN_NO_NODE=1）")
+        raise AssertionError("找不到 node；真没有请设 SOROBAN_NO_NODE=1")
+
+    harness = _REPO / "node-ghost-row-clear.test.mjs"
+    harness.write_text(_CLEAR_HARNESS, encoding="utf-8")
+    try:
+        r = subprocess.run([node, str(harness)], cwd=_REPO, capture_output=True,
+                           text=True, timeout=60)
+    finally:
+        harness.unlink(missing_ok=True)
+    assert r.returncode == 0, f"node 跑挂了：{r.stderr[-800:]}"
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    failed = [k for k, v in got.items() if not v]
+    assert not failed, f"这些行为不成立：{failed}"
+
+
+def test_ocr_bind_writes_into_the_row_that_is_actually_on_screen():
+    """集运「绑定快递单」OCR 回来时，必须写进**当前列表里**那一行。
+
+    OCR 要跑好几秒，期间用户改一下筛选就会走 `load()`，那一句 `rows.value = res.items`
+    把整页换成全新对象——入队时捕获的行对象从此不再挂在界面上。
+    写进它等于写进一个没人看的地方：屏幕上那一行仍是挂靠前的子订单列表、旧状态、
+    旧到岸金额，而下面照常弹绿色的「已关联 N 单」，用户只能靠手动刷新才知道挂没挂上。
+    """
+    src = (_REPO / "frontend" / "src" / "views" / "Shipment" / "index.vue").read_text(encoding="utf-8")
+    seg = src[src.index("const res = await shipmentApi.ocrExpress"):]
+    seg = seg[:seg.index("loadUnassigned")]
+    assert "rows.value.find" in seg, \
+        "OCR 回来后直接写了入队时捕获的行对象——那个对象可能已经被 load() 换掉了"
+    assert "Object.assign(shipmentRow, res.shipment)" not in seg, \
+        "还在写那个可能已经过期的行对象"
+
+
+def test_every_page_that_loads_has_a_request_sequence_gate():
+    """凡是会重复发起加载的页面，都要有**请求序号门**：迟到的响应不许覆盖新结果。
+
+    没有它的现象不是报错，而是「数据错了」：连点两次筛选/重试时，慢的那次后到，
+    把 A 的结果画在 B 的上下文里，或者**在刚拉回来的正确数据上方挂出红色「加载失败」**。
+    全程没有任何提示。
+
+    七个列表页一直都有这一道，**看板此前没有**——而它在看板上后果更刺眼，
+    因为看板会把「上次成功是几点」写在失败横幅里，两者一起错。
+
+    判据是「有 seq 变量、发请求前自增、**三条路径都比对**」：
+    成功（别覆盖新数据）、失败（迟到的失败别盖掉新鲜数据）、finally（别乱改 loading）。
+    七个页面现在都是 3 处。
+
+    **不能只查「有没有比对」**：第一版就是那么写的，于是把成功路径那一处删掉之后
+    它照样绿——catch 里还留着一处就够骗过它了。而漏掉的恰恰可能是最要命的那条
+    （看板漏 catch ⇒ 在刚拉回来的正确数据上方挂出红色「加载失败」）。
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src" / "views"
+    bad = []
+    for page in ("Orders", "Staging", "Shipment", "Misc", "Items", "Fx", "Dashboard"):
+        src = (root / page / "index.vue").read_text(encoding="utf-8")
+        body = src[src.index("<script"):]
+        body = re.sub(r"//.*$", "", body, flags=re.M)        # 注释里提到不算数
+        has_var = re.search(r"let\s+loadSeq\s*=\s*0", body)
+        has_bump = re.search(r"\+\+loadSeq", body)
+        checks = len(re.findall(r"!==\s*loadSeq|===\s*loadSeq", body))
+        if not (has_var and has_bump and checks >= 3):
+            bad.append(f"{page}（变量 {bool(has_var)} / 自增 {bool(has_bump)} / 比对 {checks} 处，要 ≥3）")
+    assert not bad, (
+        "这些页面缺请求序号门，迟到的响应会覆盖新结果：\n  " + "\n  ".join(bad))
+
+
+def test_no_async_route_does_sync_database_work_on_the_event_loop():
+    """`async def` 路由里不许直接跑同步的写库循环——要搬进线程池。
+
+    这是本仓库修过**三次**的同一个故障：`scheduler_loop`（plugins.py）、
+    `wal_checkpoint_loop`（database.py，注释里写着「实测单次卡了 384 秒」），
+    以及 `ocr_attach_express`（一张 20 个号的截图 = 80+ 次 pymysql 同步往返）。
+
+    后果不是慢，是**整站冻住**：事件循环被占着，health、静态资源、
+    插件卡片的轮询、其他人的所有请求一起停。切到 MySQL 之后尤其明显——
+    `read_timeout=30` 让**单条**卡住的语句就能冻 30 秒。
+
+    判据：`async def` 的路由函数体里，不许出现 `session.commit()` / `session.execute(`
+    这类同步调用**除非**它被包在一个内层 def 里交给 `run_in_threadpool`。
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "app" / "routers"
+    # `get` 也在名单里：它同样是一次同步网络往返。
+    # 第一版漏了它，而漏掉的那一处（`ocr_order` 里逐插件 `session.get(PluginConfig)`）
+    # 正是审计单独报出来的另一条——守卫的名单不全，等于给了「这一类已经守住了」的假象。
+    SYNC_DB = {"commit", "execute", "refresh", "exec", "get"}
+    bad = []
+    for f in sorted(root.glob("*.py")):
+        tree = ast.parse(f.read_text(encoding="utf-8"))
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)]:
+            # 内层 def 里的调用不算——那正是搬进线程池的写法
+            inner = {id(n) for d in ast.walk(fn) if isinstance(d, ast.FunctionDef)
+                     for n in ast.walk(d)}
+            for call in [n for n in ast.walk(fn) if isinstance(n, ast.Call)]:
+                if id(call) in inner:
+                    continue
+                fx = call.func
+                if (isinstance(fx, ast.Attribute) and fx.attr in SYNC_DB
+                        and isinstance(fx.value, ast.Name) and fx.value.id == "session"):
+                    bad.append(f"{f.name}:{call.lineno} {fn.name}() 直接 session.{fx.attr}()")
+    # `session.rollback()` 不在名单里：它是纯本地操作，不发网络往返
+            # **把 session 传出去的调用同样算数。** 只看 `session.X()` 是不够的：
+            # 助手函数（`platform_provider(session, ...)`）在**另一个文件**里碰库，
+            # 直接调它照样把同步往返压在事件循环上，而上面那条判据一个字都看不到。
+            # 判据：实参里出现 `session` 这个名字，且这次调用不是 `run_in_threadpool(...)`
+            # 的第一个参数。
+            for call in [n for n in ast.walk(fn) if isinstance(n, ast.Call)]:
+                if id(call) in inner:
+                    continue
+                fname = getattr(call.func, "id", None) or getattr(call.func, "attr", "")
+                if fname in ("run_in_threadpool", "Depends", "get_session"):
+                    continue
+                passes_session = any(isinstance(a, ast.Name) and a.id == "session"
+                                     for a in call.args)
+                if not passes_session:
+                    continue
+                # 被 run_in_threadpool 包着的形式是 `run_in_threadpool(fn, session, ...)`，
+                # 那种情况下 `session` 是**外层**调用的实参，不是这里这个 Call 的
+                bad.append(f"{f.name}:{call.lineno} {fn.name}() 直接调 {fname}(session, ...)")
+
+    assert not bad, (
+        "这些 async 路由在事件循环线程上跑同步数据库调用：\n  " + "\n  ".join(bad)
+        + "\n（把那一段包成内层 def，或 `await run_in_threadpool(fn, session, ...)`。）")
+
+
+def test_a_destructive_action_never_sits_unmarked_in_the_cancel_slot():
+    """确认框的**取消位**要么是「取消」，要么必须染成 danger。
+
+    全项目 9 处删除确认口径完全一致：破坏性动作在 confirm 位，取消位永远是
+    `'取消'`＝什么都不做。用户的肌肉记忆就建立在这个一致性上。
+
+    `Database/index.vue` 是唯一的例外——取消位放的是「仍然切换（放弃这些改动）」，
+    点下去会**不可逆地**丢掉未迁移的改动。那处的设计是有意的（× / Esc 承接
+    「什么都不做」），但它必须自带视觉标记，否则就是拿全项目建立起来的习惯去坑人。
+
+    这条守卫不禁止将来再出现这种设计，只要求它**明码标价**。
+    """
+    import re
+
+    src = _REPO / "frontend" / "src"
+    offenders = []
+    for f in list(src.rglob("*.vue")) + list(src.rglob("*.js")):
+        text = f.read_text(encoding="utf-8")
+        for m in re.finditer(r"cancelButtonText:\s*'([^']*)'", text):
+            if m.group(1) == "取消":
+                continue
+            # 同一个 options 对象里必须有 danger 标记——取最近的 400 字符窗口
+            window = text[max(0, m.start() - 400):m.start() + 400]
+            if "el-button--danger" not in window:
+                offenders.append(f"{f.relative_to(_REPO)}: 取消位是「{m.group(1)}」却没染 danger")
+    assert not offenders, "取消位放了破坏性动作又不做标记：\n" + "\n".join(offenders)
+
+
+def test_the_query_planner_gets_statistics_on_a_fresh_database():
+    """建完库就该有 `sqlite_stat1`——否则规划器只能瞎猜，而它猜错的方式是可预测的。
+
+    没有统计信息时 SQLite 会挑中 `ix_orders_is_delete`——全表**最没有选择性**的那根
+    （97.5% 的行 is_delete=0）——再把捞出来的行丢进临时 B 树全排一遍才取 LIMIT 50。
+    实测 6000 单：列表页 2.6 ms、第 20 页 8.8 ms 且随 OFFSET 线性变差；
+    有统计之后分别是 0.24 / 0.57 ms。
+
+    这条守卫盯的是**前提有没有被建立**，不是快了多少毫秒（56 单的库两条路都是微秒级，
+    量时间只会得到一条随机抖动的绿）。判据就一条：stat1 在不在。
+
+    它同时钉住一个容易被「优化」掉的事实：把 ANALYZE 换成 `PRAGMA optimize` 这里会变红。
+    optimize 看的是**本连接的查询历史**，而这是个刚开的连接——实测它一次都没建出 stat1。
+    """
+    import sqlite3
+    import tempfile
+    from pathlib import Path
+
+    from sqlalchemy import create_engine
+
+    import app.database as db
+
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "fresh.db"
+        eng = create_engine(f"sqlite:///{f}")
+        with eng.connect() as c:
+            # 带上索引：无索引的表本来就没多少可分析的，拿它当场景会让这条守卫
+            # **红对结论、错原因**。真实的 orders 有九根索引。
+            c.exec_driver_sql(
+                "CREATE TABLE orders (id INTEGER PRIMARY KEY, is_delete INT, date TEXT)")
+            c.exec_driver_sql("CREATE INDEX ix_is_delete ON orders(is_delete)")
+            c.exec_driver_sql("CREATE INDEX ix_date ON orders(date)")
+            c.exec_driver_sql(
+                "INSERT INTO orders (is_delete, date) VALUES (0,'2025-01-01'),(0,'2025-01-02'),(1,'2025-01-03')")
+            c.commit()
+
+        original = db.get_engine
+        db.get_engine = lambda: eng
+        try:
+            db.refresh_planner_stats()
+        finally:
+            db.get_engine = original
+            eng.dispose()
+
+        con = sqlite3.connect(f"file:{f}?mode=ro", uri=True)
+        got = con.execute("SELECT name FROM sqlite_master WHERE name='sqlite_stat1'").fetchone()
+        con.close()
+        assert got, "建完库没有 sqlite_stat1：规划器会挑中选择性最差的索引再全表排序"
+
+
+def test_switching_the_data_engine_refreshes_planner_statistics():
+    """**换库要一起换统计**——旧库的数据分布对新库毫无意义。
+
+    `set_data_engine` 是全项目唯一的热切换点（切 MySQL、迁回本地、从备份恢复后重绑
+    都过它）。统计刷新挂在那里而不是各个调用点，就是为了让下次新增一条切换路径的人
+    不需要记得带上它。这条守卫用 AST 钉住这个事实。
+    """
+    import ast
+
+    src = (_REPO / "backend" / "app" / "database.py").read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "set_data_engine")
+    called = {c.func.id for c in ast.walk(fn)
+              if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+    assert "refresh_planner_stats" in called, (
+        "set_data_engine 换了库却没刷新统计：新库多半连 sqlite_stat1 都没有"
+        "（replace_data 只搬业务表，备份恢复出来的库同理）")
+
+
+def test_planner_statistics_are_refreshed_even_when_they_already_exist():
+    """统计**已经有了**也要重算——陈旧的统计和没有统计一样会把规划器带沟里。
+
+    这条是给「已经有 stat1 就跳过」那个看起来很省的优化准备的。它省下的是
+    56 单时的 2.6 ms，代价是库涨到几千单以后 stat1 还记着 56 单的分布——
+    那时规划器照样选错，而且比一开始就没有统计更难查（表面上「统计是有的」）。
+
+    实测 ANALYZE 在 56 / 6000 / 100000 单上是 2.6 / 5.4 / 49.5 ms，没有省的必要。
+    """
+    import sqlite3
+    import tempfile
+    from pathlib import Path
+
+    from sqlalchemy import create_engine
+
+    import app.database as db
+
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "grown.db"
+        eng = create_engine(f"sqlite:///{f}")
+        with eng.connect() as c:
+            c.exec_driver_sql(
+                "CREATE TABLE orders (id INTEGER PRIMARY KEY, is_delete INT, date TEXT)")
+            c.exec_driver_sql("CREATE INDEX ix_is_delete ON orders(is_delete)")
+            c.exec_driver_sql("CREATE INDEX ix_date ON orders(date)")
+            c.exec_driver_sql(
+                "INSERT INTO orders (is_delete, date) VALUES (0,'2025-01-01'),(0,'2025-01-02')")
+            c.exec_driver_sql("ANALYZE")            # 先有一份「小库时代」的统计
+            c.commit()
+
+        def rows_in_stat1() -> int:
+            con = sqlite3.connect(f"file:{f}?mode=ro", uri=True)
+            try:
+                got = con.execute(
+                    "SELECT stat FROM sqlite_stat1 WHERE tbl='orders'").fetchone()
+            finally:
+                con.close()
+            return int(got[0].split()[0])       # stat 的第一个数字就是表行数
+
+        assert rows_in_stat1() == 2, "前提没建立：这一步本该留下一份 2 行的旧统计"
+
+        with eng.connect() as c:                # 库长大了
+            c.exec_driver_sql(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<3000) "
+                "INSERT INTO orders (is_delete, date) SELECT 0, '2025-06-01' FROM n")
+            c.commit()
+
+        original = db.get_engine
+        db.get_engine = lambda: eng
+        try:
+            db.refresh_planner_stats()
+        finally:
+            db.get_engine = original
+            eng.dispose()
+
+        got = rows_in_stat1()
+        assert got > 100, (
+            f"统计没跟着库一起长：stat1 还记着 {got} 行，实际已经 3002 行。"
+            "规划器会按一个两行的表来估算，选出来的计划对现在这个库毫无意义")
+def test_the_no_rate_warning_does_not_flood_a_bulk_import(caplog):
+    """「库里没有任何汇率」**每分钟只喊一次**——它是全局状态，不是每行的属性。
+
+    实测灌 120 单刷了 120 行一模一样的 WARNING；爬虫一趟 2000 单就是 2000 行。
+    那不是「更详细」，是**把同一批里真正该看的东西冲掉了**——比如同一次请求里
+    被拒的那三条记录，夹在两千行重复告警中间根本找不到。
+
+    判据是两条，缺一条这守卫就是假的：
+    ① 第一行必须照喊（不能把提醒也一起吞掉）；
+    ② 后面 199 行必须合并，且合并后的那句要**说清楚省了多少**——
+       静默地少记日志比刷屏更糟，用户会以为只有一行出过问题。
+    """
+    import logging
+
+    from app.services import fx
+
+    fx.reset_warning_throttle()
+    with caplog.at_level(logging.WARNING, logger="soroban.fx"):
+        for i in range(200):
+            fx._warn_no_rate(f"建商品订单 N{i:05d}")
+
+    lines = [r for r in caplog.records if "库里还没有任何汇率" in r.getMessage()]
+    assert len(lines) == 1, f"200 行刷出了 {len(lines)} 条告警，节流没生效"
+    assert "N00000" in lines[0].getMessage(), "喊的不是第一行"
+
+    # ②：被吞掉的那些要在下一次露面时报数
+    fx._no_rate_warned_at = 0.0                 # 让窗口过期，模拟一分钟后
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="soroban.fx"):
+        fx._warn_no_rate("建商品订单 N00200")
+    msg = caplog.records[0].getMessage()
+    assert "199" in msg, f"没说清楚省了多少行，用户会以为只有一行出过问题：{msg}"
+
+
+def test_a_vue_template_attribute_is_never_an_unquoted_bare_identifier():
+    """模板属性 `attr=SOME_CONST`（等号后不带引号）几乎总是一个**渲染成字面量**的 bug。
+
+    2026-08-23 就是这么踩的：把 `placeholder="搜物品/商品/单号/快递号"` 里的字面量
+    提成常量时，脚本盲替换出了 `placeholder=MSG_SEARCH_ORDER_LIKE`——
+    既没有引号，也没有 `:` 绑定前缀。于是搜索框的占位符**真的显示成
+    「MSG_SEARCH_ORDER_LIKE」**。
+
+    要害在于它**什么都不报**：HTML 允许无引号属性值，`vite build` 一路绿灯，
+    没有类型检查会管，只有人打开那个页面才看得见。三个视图 + 两处 `el-empty`，
+    五个地方一起中招。
+
+    正确形态永远是 `:attr="CONST"`（动态绑定）或 `attr="字面量"`（静态）。
+    HTML 注释里的示意文字要排除——`GotionCell.vue` 的注释里就写着 `date=null`。
+    """
+    import re
+
+    src = _REPO / "frontend" / "src"
+    offenders = []
+    for f in src.rglob("*.vue"):
+        text = f.read_text(encoding="utf-8")
+        m = re.search(r"<template>(.*?)\n</template>", text, re.S)
+        if not m:
+            continue
+        tpl = re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S)     # 注释里的示意不算
+        for a in re.finditer(
+                r'(?<=[\s])([a-zA-Z][\w.-]*)=([A-Za-z_$][\w$.]*)(?=[\s/>])', tpl):
+            offenders.append(f"{f.relative_to(_REPO)}  {a.group(0)}")
+    assert not offenders, (
+        "模板属性的值是个不带引号的裸标识符，它会被当成**字符串字面量**渲染出去"
+        "（build 不会报，只有打开页面才看得见）。改成 `:attr=\"...\"`：\n  "
+        + "\n  ".join(offenders))
+
+
+def test_shared_user_facing_copy_lives_in_one_place():
+    """跨视图共用的用户可见文案只许有**一个**出处。
+
+    这五句原先在 3~8 个文件里逐字复制。它们读起来一致，靠的是复制粘贴，不是结构——
+    改一处漏七处只是时间问题，而「同一件事在不同页面说法不同」正是最伤信任的那种割裂。
+
+    守卫盯的是**硬编码的引号包裹形态**，不是这句话本身：`constants.js` 里的定义
+    当然含有它，视图里通过常量名引用也含有它——那都是对的。
+    """
+    import re
+
+    src = _REPO / "frontend" / "src"
+    shared = {
+        "加载失败——请检查网络或后端，然后重试": "MSG_LOAD_FAILED",
+        "数据已变，已刷新": "MSG_STALE_RELOADED",
+        "筛选里那个值已改名或删除，已为你清掉筛选": "MSG_FILTER_CLEARED",
+        "当前筛选下没有记录，没有导出文件": "MSG_NOTHING_TO_EXPORT",
+        "搜物品/商品/单号/快递号": "MSG_SEARCH_ORDER_LIKE",
+    }
+    offenders = []
+    for f in list(src.rglob("*.vue")) + list(src.rglob("*.js")):
+        if f.name == "constants.js":
+            continue                        # 这里就是那个唯一的出处
+        text = f.read_text(encoding="utf-8")
+        for lit, const in shared.items():
+            if f"'{lit}'" in text or f'"{lit}"' in text:
+                offenders.append(f"{f.relative_to(_REPO)}: 硬编码了「{lit}」，用 {const}")
+    assert not offenders, "共用文案被复制到了别处：\n  " + "\n  ".join(offenders)
+
+
+def test_every_page_with_tag_columns_reloads_after_a_tag_is_renamed():
+    """凡是有标签列的页面，都必须接 `@reload`——改完标签值要把行重新拉一遍。
+
+    `NotionTable.renameTag` 改完会 `emit('reload')`。杂项页曾是五个里唯一没接的那个，
+    后果有两层，第二层才是真伤人的：
+
+    ① 库里已经全改成新名字，屏幕上每一行还写着旧名——改名确认框刚说完
+       「会一并把用到它的订单迁到新名字」，表格里却一条都没变，像是只改了下拉选项；
+    ② `tags.rename_tag_value` 对有 version 的表做了 `version + 1`（`MiscExpense`
+       继承 `LedgerBase`），于是本地每一行的 version 全部过期。此后在任意一条受影响的
+       行上改金额 → `guarded_bump` 版本不匹配 → 409「数据已变，已刷新」，刚敲的金额退回。
+       **而这台机器上只有他一个人在操作**，那句话在他看来就是假的，他多半会再敲一遍。
+
+    判据盯的是**全集**（谁有标签列谁就得有 `@reload`），不是点名杂项页——
+    「五个里有四个做了」这种遗漏，逐个点名的守卫只会在下次新增第六个页面时继续漏掉。
+    """
+    import re
+
+    views = _REPO / "frontend" / "src" / "views"
+    missing = []
+    for f in views.rglob("index.vue"):
+        text = f.read_text(encoding="utf-8")
+        if "tags-changed" not in text:
+            continue                     # 没有标签列的页面不在此列
+        tag = re.search(r"<NotionTable\b[^>]*>", text, re.S)
+        assert tag, f"{f.parent.name} 有 tags-changed 却找不到 NotionTable"
+        if "@reload" not in tag.group(0):
+            missing.append(f.parent.name)
+    assert not missing, (
+        f"这些页面有标签列却没接 @reload：{missing}。"
+        "改完标签值表格不会重拉——屏幕上还是旧名字，而每一行的 version 都已经过期，"
+        "下一次编辑会吃 409")
+
+
+def test_settings_save_reports_success_before_any_cosmetic_refresh():
+    """「已保存」不能被随后那次**纯展示**的刷新失败吞掉。
+
+    `PUT /api/settings` 已经 200、值已落库、`saved.value` 已回写，紧接着的
+    `fxApi.get()`（只为把汇率展示刷新一下）挂了——后端在重启、局域网抖动、
+    503 用完两次自动重试。原先这句排在 `ElMessage.success` **之前**、又共用外层那个
+    `catch`，于是「已保存」永远弹不出来，屏幕上只剩一条红色报错。
+
+    更糟的是此刻 `dirty` 已经是 false ⇒ 模板里 `:disabled="!dirty"` 的「保存」和
+    「撤销改动」**同时置灰**，「有未保存的改动」那句提示也消失。用户的结论只能是
+    「这次没存上」——而它已经生效了；他想再点一次都点不动，只有刷新整页才会发现。
+
+    判据与 `utils/listRows.js::afterCreate` 一致：**一件事成没成，只看它自己那一步**。
+    这条守卫用源码顺序钉住它——`success` 必须排在 `fxApi.get()` 前面，
+    且那次刷新要有自己的 `catch`。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "views" / "Settings" / "index.vue").read_text(encoding="utf-8")
+    body = src[src.index("async function save()"):]
+    body = body[:body.index("\n}\n")]
+    # **先把注释剥掉再找名字。** 上面那段解释这件事的注释里逐字写着 `fxApi.get()`，
+    # 于是 `body.index("fxApi.get()")` 命中的是注释、不是真正那一行，
+    # `between` 在注释中间就截断了——守卫在正确的代码上变红。
+    # 同一条规律的又一次：**守卫要找某个名字时，先问这个名字会不会因为别的原因也在那儿。**
+    body = re.sub(r"//.*$", "", body, flags=re.M)
+
+    ok = body.index("ElMessage.success")
+    refresh = body.index("fxApi.get()")
+    assert ok < refresh, (
+        "设置页把「已保存」排在了那次展示刷新之后：刷新一失败，"
+        "保存明明成功了却只弹红色报错，而两个按钮已经一起置灰，用户连重试都点不动")
+
+    # 判据必须是「它自己新开了一个 try」，不能写成「后面某处有 catch」——
+    # 函数末尾本来就有外层那个 `} catch (_) { ... } finally { saving = false }`，
+    # 于是「后面有 catch」被外层满足，破坏验证当场判它零覆盖（第 ③ 类假绿，
+    # 见 memory 的「假绿的五种成因」）。这里只看 success 与 fxApi.get() **之间**。
+    between = body[ok:refresh]
+    assert "try {" in between, (
+        "那次展示刷新没有自己的 try/catch，会掉进函数外层那个——"
+        "保存成功与否就又跟它绑在一起了")
+
+
+def test_only_the_pages_that_accept_dropped_images_say_they_do():
+    """页面说明里承诺「拖截图」的，必须真的接了窗口拖拽；接了的，也该说。
+
+    §37 把 OCR 整个搬到暂存页之后，商品订单页的说明文字留了下来——
+    「把截图拖到页面任意位置即可 OCR 录单」。而这一页既没有 `OcrButton`
+    也没有 `useWindowFileDrop`，模板里零个拖拽处理器。
+
+    照做的后果不是「没反应」：没有 `dragover` 的 `preventDefault`，
+    浏览器就按默认行为**把当前标签页导航到那张图片**——整个 SPA 被顶掉，
+    幽灵新建行里敲了一半的草稿、正在编辑的格子全没，全程零报错。
+    这个失败模式在 `utils/windowFileDrop.js` 的文件头逐字记着（「少 ④」），
+    当时修了暂存页，订单页的这句文案没跟着改。
+
+    判据是**双向**的，缺一边就会退化成「改文案就能骗过去」：
+    ① 说了要真有；② 有了也要说（暂存页确实能拖，说明里却一个字没提，
+    用户不会去试一个没人告诉他的功能）。
+    """
+    import re
+
+    views = _REPO / "frontend" / "src" / "views"
+    CLAIM = "拖到页面任意位置"
+    said, does = set(), set()
+    for f in views.rglob("index.vue"):
+        text = f.read_text(encoding="utf-8")
+        head = re.search(r"<PageHeader>(.*?)</PageHeader>", text, re.S)
+        if head and CLAIM in head.group(1):
+            said.add(f.parent.name)
+        if "useWindowFileDrop" in text:
+            does.add(f.parent.name)
+
+    lied = said - does
+    assert not lied, (
+        f"这些页面的说明写着可以拖截图，实际没接窗口拖拽：{sorted(lied)}。"
+        "照做会被浏览器导航到那张图片——整个页面被顶掉，没保存的编辑一起没")
+
+    silent = does - said
+    assert not silent, (
+        f"这些页面能拖截图却没在说明里写：{sorted(silent)}。"
+        "没人告诉他的功能等于不存在")

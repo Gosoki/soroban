@@ -10,6 +10,8 @@ from sqlalchemy import update as sa_update
 from sqlmodel import Session
 
 from ..models import utcnow
+from ..models.base import unconverted_clause
+from ..models.base import guard_cny
 
 log = logging.getLogger("soroban")
 
@@ -264,7 +266,21 @@ def mirror_to_staging(session: Session, order, built_items) -> None:
         setattr(st, staging_field, getattr(order, order_field))
     if built_items is not None:
         st.items = [StagingItem(**d) for d in built_items]
-    st.sync_from_items()
+    # **价从账本单镜像过来，不要拿暂存自己那份 items 重算。**
+    # 原先无条件调 `st.sync_from_items()`，而 `built_items is None` 的意思恰恰是
+    # 「这次没动物品」。暂存行**没有物品**时（`import_staging` 的 0 物品分支明确会产出
+    # 这种状态，`tools/backfill_item_price.py` 整个工具也是为它写的），
+    # 重算出来的就是 `0 + 邮费` ⇒ 暂存行的金额被静默改写成 0。
+    #
+    # 实测过的完整链路：暂存 ¥300 / 0 物品 → 导入得到 ¥300、6000 円 → 给订单随手加个备注
+    # （任何一次 PATCH 都会走到这里）⇒ 暂存行变 ¥0.00 → 在订单页删掉该单
+    # （`delete_order` 把暂存复位成「待处理」）→ 再点一次「导入账本」
+    # ⇒ 建出一张 **¥0.00 / 0 円** 的订单，看板合计随之静默缩水。
+    # 导入期间界面还看不出来——`_overlay` 用账本值覆盖显示。
+    #
+    # 镜像账本价在两种情形下都对：物品被镜像过来时，`Σ(items)+邮费` 本来就等于账本价；
+    # 没镜像时，账本价才是唯一可信的那个数。这也正是本函数的定位——「暂存 = 账本镜像」。
+    st.price_cny = guard_cny(order.price_cny) if order.price_cny is not None else None
     st.updated_at = utcnow()
     st.version = st.version + 1   # 镜像也算一次对暂存行的写：必须自增乐观锁版本，
     #                              否则暂存页拿旧 version 保存不会 409，会用陈旧表单悄悄覆盖镜像值。
@@ -336,9 +352,10 @@ def list_totals(session: Session, model, conds: list) -> dict:
         select(
             func.count(),
             func.coalesce(func.sum(model.jpy_settled), 0),
-            func.coalesce(func.sum(
-                case((model.price_cny.isnot(None) & model.jpy_settled.is_(None), 1), else_=0)
-            ), 0),
+            # 判据走 `models.base.unconverted_clause`——与看板、集运到岸同一份规则。
+            # 这三处历史上分叉过两次，每次都是漏抄 `!= 0`（显式填 0 的行折算过去也是 0 円，
+            # 没有任何金额会被 SUM 吞掉，报出来只是噪音）。
+            func.coalesce(func.sum(case((unconverted_clause(model), 1), else_=0)), 0),
         ).select_from(model).where(*conds)
     ).one()
     return {"total": int(n), "sum_jpy": int(total_jpy), "unconverted": int(missing)}

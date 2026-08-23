@@ -142,7 +142,13 @@ def list_backups():
     for f in sorted((x for x in d.iterdir() if _MINE.match(x.name)), reverse=True):
         st = f.stat()
         items.append({"name": f.name, "bytes": st.st_size,
-                      "mtime": dt.datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")})
+                      # **带时区的 UTC**，与全站其它时间戳同一口径（`models.base.utcnow`）。
+                      # 原先是 `fromtimestamp(ts)` —— 服务器**本地**时间且不带时区，
+                      # 是全站唯一一处这么干的地方，也是唯一绕开前端 `parseUtc` 那条管线的。
+                      # 服务器在 JST、看的人在别的时区时，这一列会与页面上所有别的时间差 9 小时，
+                      # 而没有任何东西提示它们口径不同。
+                      "mtime": dt.datetime.fromtimestamp(
+                          st.st_mtime, dt.timezone.utc).isoformat(timespec="seconds")})
     return {"dir": str(d), "items": items}
 
 
@@ -267,11 +273,20 @@ def migrate(t: Target):
         existing = db_migrate.target_rows(tgt)
         if existing and not t.confirm_overwrite:
             # 单行不带 \n：前端用 ElMessageBox 显示，它默认不保留换行。
+            # **必须说清「已经动过什么」。** 上面那句 `run_migrations(url)` 已经把目标库的
+            # 表结构升到 head 了——那是 DDL，MySQL 上隐式提交、本仓库也没有 downgrade 路径。
+            # 顺序是被迫的：表还没建就数不出行数（`target_rows` 要 select 业务表），
+            # 反过来排会让「目标尚未建表」被误报成「目标是空的」，把用户推向覆盖。
+            # 但用户看到这句 409 点了取消，会以为**什么都没发生**——而如果另一台机器
+            # 还在用旧版 soroban 连同一个库，它下次启动就会撞上「库比代码新」。
+            # 数据没动是真的，schema 动了也是真的，两句都要说。
             raise HTTPException(status_code=409, detail=(
                 "目标库里已经有数据（"
                 + "、".join(f"{k} {v} 条" for k, v in existing.items())
                 + "），迁移会先把它们全部删除，再用当前库整表覆盖。"
-                "请先确认目标库里没有当前库所没有的东西——这一步没有备份，无法撤销。"))
+                "请先确认目标库里没有当前库所没有的东西——这一步没有备份，无法撤销。"
+                "（注意：为了能数出上面这些行数，目标库的**表结构**已经升到本版；"
+                "数据一个字都没动，但若还有旧版 soroban 连着同一个库，它需要一并升级。）"))
 
         problems = db_migrate.preflight(get_engine(), tgt)
         if problems:
@@ -337,7 +352,7 @@ def switch(t: Target):
     # 场景很平常：迁到 MySQL 用一阵 → 切回本地 SQLite → 升级 soroban → 再切回 MySQL，
     # 那份 MySQL 的 schema 还停在切走那天。两个方向对称，故对 SQLite 目标也一并执行。
     #
-    # 选「自动升级」而不是「拒绝并提示先迁移」：进程重启时 create_db_and_tables 本来就会
+    # 选「自动升级」而不是「拒绝并提示先迁移」：进程重启时 migrate_to_latest 本来就会
     # 对当前后端 run_migrations，拒绝在这里反而不一致；更要紧的是，拒绝会把用户推向
     # 「迁移到此库」按钮——那个按钮会用源库快照**覆盖**目标库，把「schema 落后」变成
     # 「数据被旧快照盖掉」，是更难收拾的后果。
@@ -363,32 +378,46 @@ def switch(t: Target):
             tgt.dispose()
         raise HTTPException(status_code=400, detail="目标数据库无数据，请先点「迁移到此库」")
 
-    # 「迁移之后源库又被改过没有」——改过的那些**不会**跟着切换过去，切完就静默消失了。
-    # 拿不到指纹（老版本迁的 / 换过机器）时不拦，只是没法给出这层保护。
-    recorded = control.read_migrate_fingerprint(control_engine(), _target_key(t))
-    if recorded is not None and not t.confirm_changed:
-        changes = db_migrate.describe_fingerprint_diff(
-            recorded, db_migrate.source_fingerprint(get_engine()))
-        if changes:
-            if owns:
-                tgt.dispose()
-            raise HTTPException(
-                status_code=409,
-                detail="迁移之后当前库又有改动（" + "、".join(changes) + "）。"
-                       "这些改动不在目标库里，直接切换会丢失。"
-                       "建议先重新点「迁移到此库」；确认要放弃这些改动请再确认一次。",
-            )
+    # **临界段挂只读屏障。** 从这里到引擎交换完成为止，源库不许再有写入。
+    #
+    # 上面那段 `run_migrations(target)` 刻意**不**在屏障里：MySQL 目标落后几个版本时
+    # 它要跑几十秒，把全站写入冻那么久是不划算的——而且它写的是**目标**库，
+    # 期间源库照常被写也不会丢：下面的指纹检查会把那些改动查出来并 409。
+    #
+    # 真正关不上的是**指纹检查到 `set_data_engine` 之间**那几毫秒：落在那里的写会提交进
+    # 旧库，切换之后既不在新库里、也没有任何提示——一张已经 200 的订单凭空消失。
+    # 窗口很小，但后果是静默丢账，而代价只有这一行；`migrate()` 本来就挂着屏障，
+    # 两个同级操作没有理由一个挂一个不挂。
+    #
+    # 顺带把指纹也挪进屏障内计算：这样「指纹之后没有新的写」是由构造保证的，
+    # 而不是靠窗口足够窄。
+    with barrier.hold("切换数据库中"):
+        # 「迁移之后源库又被改过没有」——改过的那些**不会**跟着切换过去，切完就静默消失了。
+        # 拿不到指纹（老版本迁的 / 换过机器）时不拦，只是没法给出这层保护。
+        recorded = control.read_migrate_fingerprint(control_engine(), _target_key(t))
+        if recorded is not None and not t.confirm_changed:
+            changes = db_migrate.describe_fingerprint_diff(
+                recorded, db_migrate.source_fingerprint(get_engine()))
+            if changes:
+                if owns:
+                    tgt.dispose()
+                raise HTTPException(
+                    status_code=409,
+                    detail="迁移之后当前库又有改动（" + "、".join(changes) + "）。"
+                           "这些改动不在目标库里，直接切换会丢失。"
+                           "建议先重新点「迁移到此库」；确认要放弃这些改动请再确认一次。",
+                )
 
-    if backend == "mysql":
-        host, port, user, pw, db = _mysql_conn_fields(t)
-        control.write_config(control_engine(), "mysql", url)
-        set_data_engine(tgt, url)                              # tgt 成为线上引擎，不再 dispose
-        cid = _remember(host, port, user, pw, db)
-        control.touch_connection(control_engine(), cid)
-    else:
-        # 切回本地 SQLite：数据引擎复位为控制引擎（set_data_engine 会释放旧 MySQL 引擎）
-        control.write_config(control_engine(), "sqlite", None)
-        set_data_engine(control_engine(), control_url())
+        if backend == "mysql":
+            host, port, user, pw, db = _mysql_conn_fields(t)
+            control.write_config(control_engine(), "mysql", url)
+            set_data_engine(tgt, url)                          # tgt 成为线上引擎，不再 dispose
+            cid = _remember(host, port, user, pw, db)
+            control.touch_connection(control_engine(), cid)
+        else:
+            # 切回本地 SQLite：数据引擎复位为控制引擎（set_data_engine 会释放旧 MySQL 引擎）
+            control.write_config(control_engine(), "sqlite", None)
+            set_data_engine(control_engine(), control_url())
     return {"ok": True, "backend": backend}
 
 

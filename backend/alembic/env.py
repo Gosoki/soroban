@@ -3,6 +3,7 @@ render_as_batch 仅 SQLite 开（其「建新表拷贝」批处理是 SQLite ALT
 MySQL 支持直接 ALTER，开 batch 反而多余、且会干扰生成列等 MySQL 专属 DDL）。"""
 
 import sys
+import logging
 from logging.config import fileConfig
 from pathlib import Path
 
@@ -22,8 +23,23 @@ if not _ini_url or _ini_url.startswith("driver://"):
     # alembic 的 Config 底层是 ConfigParser，% 会被当成插值语法（MySQL 密码里的 %40 会炸）；
     # 写入时转义 %→%%，get_section 读回时插值会还原成真实 URL。
     config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("%", "%%"))
-if config.config_file_name is not None:
-    # disable_existing_loggers=False：在 app 进程内跑迁移时别把 uvicorn/soroban 等宿主 logger 禁掉（否则启动后日志静默）
+# **只在没人配过日志时才由 alembic 来配。**
+#
+# `fileConfig()` 会按 alembic.ini 的 `[handlers]` **重建 root 的 handler 列表**。
+# `disable_existing_loggers=False` 只保住了 logger 不被禁用，管不到 handler 被换掉。
+# 在别人的进程里跑迁移时，那一句会把宿主已经装好的 handler 掀掉：
+#
+#   · 应用进程：`app/main.py` 的 `basicConfig` 装的那个 handler 没了
+#     （启动时会 run_migrations，此后的日志靠 alembic.ini 里那份配置，而不是应用自己的）；
+#   · **pytest**：装在 root 上的 caplog handler 没了 ⇒ 用例内跑过迁移之后
+#     `caplog.records` **恒为空**，日志照常打印在终端上，断言却什么都抓不到——
+#     于是被读成「这条日志根本没打」。2026-08-22 写备份守卫时当场撞上，
+#     排查了半天才发现不是代码没打日志。
+#
+# 判据是「root 上有没有 handler」：独立跑 `alembic upgrade` 时没有，由 alembic 配；
+# 被宿主进程（应用 / pytest）驱动时有，就别插手——alembic 自己的日志会照常
+# 沿 logger 树传播到宿主的 handler 上，一条都不会少。
+if config.config_file_name is not None and not logging.getLogger().handlers:
     fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = SQLModel.metadata

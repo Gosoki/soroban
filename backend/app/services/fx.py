@@ -23,7 +23,8 @@
 """
 import datetime as dt
 import logging
-from decimal import Decimal, InvalidOperation
+import time
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Optional
 
 from sqlmodel import Session, col, select
@@ -46,11 +47,19 @@ _MIN, _MAX = FX_MIN, FX_MAX     # 合理区间，越界视为脏数据不入库�
 
 
 def _sane(rate: Decimal) -> Decimal:
-    """区间校验 + 量化。插件独立发版，交回来的值核心必须自己再验一遍。"""
+    """区间校验 + 量化。插件独立发版，交回来的值核心必须自己再验一遍。
+
+    **舍入方式必须显式写出来。** 这里曾是全仓唯一一个不带 `rounding=` 的 `quantize()`，
+    于是它用 decimal 的默认值 `ROUND_HALF_EVEN`，而 `schemas._q_fx`（手填那条路）
+    对**同一个量**用的是 `ROUND_HALF_UP`。同一个汇率值走两条路会存成两个数：
+    `20.00005` → 手填得 20.0001、插件回灌得 20.0000。
+    差在第 4 位小数上，金额层面几乎看不出来——正因为看不出来才更该钉住：
+    「同一个输入两条路两个结果」是这类账本最难查的一类不一致。
+    """
     r = Decimal(rate)
     if not r.is_finite() or not (_MIN <= r <= _MAX):
         raise ValueError(f"汇率 {r} 不在合理区间 [{_MIN}, {_MAX}]（1元≈20円）")
-    return r.quantize(_Q)
+    return r.quantize(_Q, rounding=ROUND_HALF_UP)
 
 
 def latest_stored(session: Session) -> Optional[FxRate]:
@@ -258,6 +267,45 @@ def ensure_manual_rate(session: Session) -> Optional[FxRate]:
     return row
 
 
+_NO_RATE_QUIET_FOR = 60.0        # 秒
+_no_rate_warned_at = 0.0
+_no_rate_suppressed = 0
+
+
+def _warn_no_rate(what: str) -> None:
+    """「库里没有任何汇率」**每分钟只喊一次**，后面的合并成一句计数。
+
+    这是个**全局状态**，不是每一行的属性：库里没有汇率，就是所有行都没有。
+    原先逐行喊，一次爬虫回灌 2000 单就是 2000 行一模一样的 WARNING——
+    实测灌 120 单刷了 120 行。那不是「更详细」，是**把同一批里真正该看的东西冲掉了**
+    （比如同一次请求里被拒的那三条记录，夹在两千行重复告警中间）。
+
+    不做成「整批只喊一次」是因为这里看不见批的边界（六条调用路径，有的根本没有批）。
+    时间窗对两种形态都成立：批量回灌落在一个窗口里，手工记账隔几分钟一单也照样提醒。
+    """
+    global _no_rate_warned_at, _no_rate_suppressed
+
+    now = time.monotonic()
+    if now - _no_rate_warned_at < _NO_RATE_QUIET_FOR:
+        _no_rate_suppressed += 1
+        return
+    tail = (f"（同样原因的还有 {_no_rate_suppressed} 行没有单独记）"
+            if _no_rate_suppressed else "")
+    _no_rate_warned_at, _no_rate_suppressed = now, 0
+    log.warning("%s：库里还没有任何汇率，本行日元金额留空"
+                "（去设置页填「手填汇率」，或装汇率插件）%s", what, tail)
+
+
+def reset_warning_throttle() -> None:
+    """把节流状态清零。**测试专用**——它是模块级的，会跨用例泄漏。
+
+    与 `runlog.reset()` 同一个道理：一条用例灌了几十单把窗口占住，
+    下一条用例断言「应该有这条告警」就会莫名其妙地红，而且红的是**无关的**那条。
+    """
+    global _no_rate_warned_at, _no_rate_suppressed
+    _no_rate_warned_at, _no_rate_suppressed = 0.0, 0
+
+
 def _rate_with_freshness_warning(session: Session, row: Optional[FxRate], what: str,
                                  *, exact: bool = False) -> Optional[Decimal]:
     """选中一条汇率并按需告警。**所有给账本行盖汇率的路径都从这里出去。**
@@ -269,8 +317,7 @@ def _rate_with_freshness_warning(session: Session, row: Optional[FxRate], what: 
     """
     if row is None:
         if what:
-            log.warning("%s：库里还没有任何汇率，本行日元金额留空"
-                        "（去设置页填「手填汇率」，或装汇率插件）", what)
+            _warn_no_rate(what)
         return None
     if what and is_expired(session, row):
         if exact:

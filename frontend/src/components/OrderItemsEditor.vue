@@ -53,6 +53,7 @@
 </template>
 
 <script setup>
+import { MSG_STALE_RELOADED } from '@/constants'
 import { computed, reactive, ref, watchEffect } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Delete, Plus, QuestionFilled } from '@element-plus/icons-vue'
@@ -169,7 +170,7 @@ async function saveItems() {
     // 分工固定：**组件只管 409**（拦截器刻意放行它），其余一律交给拦截器。
     // 这里再弹一次的话会出现两条提示，而且 detail 是 FastAPI 的校验数组时，
     // 这条会把 JSON 原样打进提示框（拦截器那边是展平过的）。
-    if (e.response?.status === 409) { handled(e); ElMessage.warning('数据已变，已刷新'); emit('conflict') }
+    if (e.response?.status === 409) { handled(e); ElMessage.warning(MSG_STALE_RELOADED); emit('conflict') }
     return false
   }
 }
@@ -198,7 +199,7 @@ async function savePostage() {
     // 分工固定：**组件只管 409**（拦截器刻意放行它），其余一律交给拦截器。
     // 这里再弹一次的话会出现两条提示，而且 detail 是 FastAPI 的校验数组时，
     // 这条会把 JSON 原样打进提示框（拦截器那边是展平过的）。
-    if (e.response?.status === 409) { handled(e); ElMessage.warning('数据已变，已刷新'); emit('conflict') }
+    if (e.response?.status === 409) { handled(e); ElMessage.warning(MSG_STALE_RELOADED); emit('conflict') }
     return false
   }
 }

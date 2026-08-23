@@ -10,13 +10,13 @@ import os
 from sqlmodel import Session, select
 
 from .auth import hash_password
-from .database import create_db_and_tables, get_engine
+from .database import migrate_to_latest, get_engine
 from .models import User
 
 
 def main() -> None:
     """命令行入口：建表 + 确保有 admin。"""
-    create_db_and_tables()
+    migrate_to_latest()
     ensure_admin()
 
 
@@ -25,7 +25,7 @@ def ensure_admin() -> None:
 
     与 `main()` 分开是因为进程启动时这一步必须跑在**单进程闸之后**：
     原先 `run.py` 在 `uvicorn.run()` 之前调 `main()`，而闸是在 lifespan 里拿的，
-    于是 `create_db_and_tables()`（完整 alembic upgrade）跑在闸**之前** ——
+    于是 `migrate_to_latest()`（完整 alembic upgrade）跑在闸**之前** ——
     改端口开第二个实例时，新进程会对**正在被老进程使用的库**跑完迁移，
     然后才在 lifespan 里被闸拒绝。而 `main.py` 的 lifespan 特意把
     `single_process.acquire()` 排在建表之前，理由原话是「不要几个进程同时 ALTER 同一个库」。

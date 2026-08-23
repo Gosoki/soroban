@@ -14,6 +14,7 @@ from sqlmodel import Session, select
 from ..auth import get_current_user
 from ..database import get_session
 from ..db.dialect import is_mysql
+from ..models.base import unconverted_clause
 from ..models import ShipmentOrder, MiscExpense, Order
 from ..schemas import DashboardRead, MonthTotal
 from ..services.fx import current_rate
@@ -63,10 +64,9 @@ def _uncounted(session: Session, model) -> tuple[int, Decimal]:
     判据用 `price_cny` 真值而不是 `is not None`：显式填 0 的行（预付/包邮）
     没有任何金额会被吞，报出来只是噪音。
     """
-    conds = [*_valid_conds(model),
-             model.jpy_settled.is_(None),
-             model.price_cny.is_not(None),
-             model.price_cny != 0]
+    # 判据走 `models.base.unconverted_clause`——与列表页脚、集运到岸同一份规则。
+    # 这三处历史上分叉过两次，每次都是漏抄 `!= 0`。
+    conds = [*_valid_conds(model), unconverted_clause(model)]
     n, cny = session.exec(
         select(func.count(), func.coalesce(func.sum(model.price_cny), 0)).where(*conds)
     ).one()

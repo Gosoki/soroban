@@ -31,8 +31,11 @@ import datetime as dt
 import re
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
+
+from .paths import runtime_dir
 
 _STAMP_FMT = "%Y%m%d-%H%M%S"
 # 轮换只认**本模块自己造的**这个确切形状。刻意不用 `soroban-*.db` 这种宽匹配：
@@ -42,13 +45,40 @@ _MINE = re.compile(r"^soroban-\d{8}-\d{6}\d{0,2}\.db$")   # 末尾两位是同�
 
 
 def _default_dir() -> Path:
-    """默认落点：`backend/backups/`——迁移前快照本来就落在这里，备份归拢到一处。"""
-    return Path(__file__).resolve().parent.parent / "backups"
+    """默认落点：**跟着账本走**——账本是哪个 sqlite 文件，就落在它旁边的 `backups/`。
+
+    正常部署下 `DATABASE_URL` 就是 `backend/soroban.db`，所以结果仍是 `backend/backups/`，
+    与从前一致。不一致的只有两种情况，而在这两种情况下「跟着账本走」都更对：
+
+      · 有人把账本指到别处 ⇒ 备份跟过去，而不是留在一个跟它无关的目录里；
+      · 跑测试时账本是个临时库 ⇒ 快照落在那个临时目录，**不会污染真实的 backups/**。
+        （加迁移前自动快照那天，测试当场往真实备份目录里写了一份，就是这么来的。）
+
+    MySQL 后端没有「文件旁边」可言，退回运行时目录。
+    """
+    from sqlalchemy.engine import make_url
+
+    from .config import settings
+    
+    url = settings.DATABASE_URL
+    if url.startswith("sqlite"):
+        try:
+            db = make_url(url).database
+        except Exception:                               # noqa: BLE001
+            db = None
+        if db and db != ":memory:":
+            return Path(db).resolve().parent / "backups"
+    return runtime_dir() / "backups"
 
 
 def make_backup(out_dir: Optional[Path] = None, *, stream=None,
-                keep: int = 30) -> tuple[Path, dict]:
+                keep: int = 30, tag: str = "") -> tuple[Path, dict]:
     """备份一次。返回 (快照文件路径, 各表行数)。
+
+    `tag` 给文件名加一个后缀（`soroban-<时间戳>-<tag>.db`）。**带 tag 的快照永远不参与轮换**
+    ——`_MINE` 只认不带后缀的那种形状。迁移前快照就走这条：它是某一次升级的撤销点，
+    被 30 次日常备份轮换掉就完全失去了意义。（历史上手工留的
+    `soroban-20260808-093421-pre-<revision>.db` 也是这个形状，两者自然对齐。）
 
     `keep` = 保留最近几份，更旧的删掉。**只删本函数自己造的那种文件名**
     （`soroban-<时间戳>.db`），绝不碰目录里别的东西——备份目录里往往还躺着
@@ -71,8 +101,9 @@ def make_backup(out_dir: Optional[Path] = None, *, stream=None,
         stamp = dt.datetime.now().strftime(_STAMP_FMT) + ("" if not attempt else f"{attempt:02d}")
         # 先写 `.part`，全部成功后再改名。中途失败/断电时留下的是一个显然没写完的名字，
         # 而不是一个看起来正常、其实缺表的 `.db`——后者会在真要用它的时候才暴露。
-        part = dest_dir / f"soroban-{stamp}.db.part"
-        final = dest_dir / f"soroban-{stamp}.db"
+        suffix = f"-{tag}" if tag else ""
+        part = dest_dir / f"soroban-{stamp}{suffix}.db.part"
+        final = dest_dir / f"soroban-{stamp}{suffix}.db"
         try:
             # `x` 模式原子占位：两个进程同时跑时，只有一个人能占到这个 `.part`。
             part.touch(exist_ok=False)
@@ -91,7 +122,13 @@ def make_backup(out_dir: Optional[Path] = None, *, stream=None,
     # 占位符**不撤**：SQLite 把 0 字节文件当成一个空库，alembic 直接往里建表就行。
     # 撤掉再让 alembic 重建会重新打开一个窗口，别人正好在这一瞬占同一个名字。
 
-    run_migrations(f"sqlite:///{part}")
+    # 从这里开始任何一步失败，都必须把占位的 `.part` 收掉——否则失败一次就永久留一个残file，
+    # 而它们会在备份目录里越堆越多，看上去像一堆坏掉的备份。
+    try:
+        run_migrations(f"sqlite:///{part}")
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
     dst = build_engine(f"sqlite:///{part}")
     try:
         # **拷贝期间必须挂只读屏障**：SQLite 侧没有读快照（pysqlite 只在写之前才 BEGIN，
@@ -99,15 +136,19 @@ def make_backup(out_dir: Optional[Path] = None, *, stream=None,
         # ——订单拷过去了、它的物品还没拷。详见 app/maintenance.py。
         with barrier.hold("备份中"):
             counts = replace_data(get_engine(), dst)
+    except BaseException:
+        dst.dispose()
+        part.unlink(missing_ok=True)
+        raise
     finally:
         dst.dispose()
     part.rename(final)
 
-    env = Path(__file__).resolve().parent.parent / ".env"
+    env = runtime_dir() / ".env"      # 不用 __file__，理由见 snapshot_sqlite_file 里同名处
     if env.is_file():
         # `SECRET_KEY` 丢了，已保存的 MySQL 连接串就再也解不开。
-        shutil.copy2(env, dest_dir / f"env-{stamp}.txt")
-        say(f"  同时备份了 .env（{dest_dir / f'env-{stamp}.txt'}）——它里面的 SECRET_KEY "
+        shutil.copy2(env, dest_dir / f"env-{stamp}{suffix}.txt")
+        say(f"  同时备份了 .env（{dest_dir / f'env-{stamp}{suffix}.txt'}）——它里面的 SECRET_KEY "
             f"是解开已保存 MySQL 连接串的唯一钥匙")
 
     total = sum(counts.values())
@@ -177,19 +218,103 @@ def restore(snapshot: Path, *, assume_yes: bool = False, stream=None) -> int:
             return 1
 
     # 恢复之前先给当前状态留一份。恢复错了还有退路。
+    #
+    # **`keep=0`（这一次不轮换）是必须的，不是保守。** 安全备份默认落在
+    # `_default_dir()`——跟着账本走，也就是用户放快照的**同一个** `backups/`。
+    # 稳定态（cron 每天一次、keep=30）目录里正好 30 份，安全备份写进去变 31 份，
+    # `_prune` 就会删掉 `snaps[30:]`——**最旧的那一份**。而人来拿最旧那份的动机，
+    # 通常正是「新的几份已经是坏数据」。于是这条命令在读它之前先把它删了，
+    # 下面 `shutil.copy2` 裸抛 FileNotFoundError，恢复一步没跑。
+    # 屏幕上确实会有一行「已清理旧备份 <那个文件名>」，但它夹在一段备份输出里、
+    # 措辞是「清理旧备份」——没有任何东西说明它就是崩溃的原因。
+    # 连带删掉的还有配对的 `env-<同一时间戳>.txt`（那天的 SECRET_KEY 副本）。
+    #
+    # 而且这不只发生在失败那次：恢复**任何**一份快照都会驱逐最旧那份，
+    # 保留窗口每恢复一次就静默少一天。README 里写的 `--keep 60` 更糟——
+    # 安全备份用的是模块默认的 30，61 份里 `snaps[30:]` 是**一次删 31 份**，
+    # 而这次恢复本身还成功了，用户没有任何理由回头去数文件。
+    #
+    # `tag` 是另一件事，理由独立：这份快照是**某一次危险操作的撤销点**，
+    # 与迁移前快照 `soroban-<时间戳>-pre-<revision>.db` 同一类，
+    # 被后来的 30 次日常备份轮换掉就完全失去了意义。带 tag 即永不参与轮换。
     try:
-        safety, _ = make_backup(stream=out)
+        safety, _ = make_backup(stream=out, keep=0, tag="pre-restore")
         say(f"（已先把当前账本备份到 {safety.name}，恢复错了可以用它退回来）")
     except Exception as e:  # noqa: BLE001
         say(f"⚠️ 恢复前的安全备份失败（{e}）。已中止——没有退路就不动手。")
         return 1
 
-    src = build_engine(f"sqlite:///{snapshot}")
-    try:
-        run_migrations(f"sqlite:///{snapshot}")   # 老快照可能停在旧 revision
-        with barrier.hold("恢复备份中"):
-            counts = replace_data(src, target)
-    finally:
-        src.dispose()
+    # **在副本上迁移，绝不动用户那份快照。**
+    # 老快照可能停在旧 revision，`replace_data` 要求两边 schema 一致，所以必须先升级。
+    # 但就地升级会**改掉用户手里那份「动手之前的拷贝」**——而迁移前快照的全部意义
+    # 正是「保住动手之前的样子」。更糟的情况很具体：如果要撤销的那次迁移**删过一列**，
+    # 就地升级等于在快照上把同一列再删一次，那一列的数据就永远拿不回来了。
+    # 拷一份到临时目录再升级，原件保持原样，人还能从它里面把东西捞出来。
+    with tempfile.TemporaryDirectory(prefix="soroban-restore-") as td:
+        working = Path(td) / snapshot.name
+        shutil.copy2(snapshot, working)
+        src = build_engine(f"sqlite:///{working}")
+        try:
+            run_migrations(f"sqlite:///{working}")
+            with barrier.hold("恢复备份中"):
+                counts = replace_data(src, target)
+        finally:
+            src.dispose()
     say(f"已恢复 {sum(counts.values())} 行。")
     return 0
+
+
+def snapshot_sqlite_file(src_url: str, dest_dir: Path, tag: str) -> Path:
+    """对 SQLite 账本做**文件级**在线备份（sqlite3 自带的 backup API）。返回快照路径。
+
+    **为什么迁移前快照不能走 `replace_data`**：那个函数按**模型声明的列**去 SELECT，
+    而迁移前的库还停在**旧 schema** 上。只要这次待跑的迁移加了一列（绝大多数迁移都是），
+    读的时候那一列还不存在 ⇒ `no such column` ⇒ 快照失败。
+    也就是说：安全网恰恰在**唯一真正需要它**的时候不在。
+    （2026-08-22 实测：迁到倒数第二个修订号再跑一次，当场
+     `no such column: pluginconfig.last_ok_at`，一份快照都没留下。）
+
+    `Connection.backup()` 拷的是**磁盘上真实的那个库**，不认识也不需要认识 schema，
+    WAL 里的内容也一并带走，并且是在线一致的（不需要停写）。
+    这正是「动手之前那一刻的完整拷贝」该有的语义。
+
+    日常备份仍然走 `replace_data`：那条路要能 SQLite↔MySQL 双向、要产出
+    **当前 schema** 的可移植快照。两种机制的分界很清楚——
+    **只有迁移前这一种情况，源库的 schema 是故意与模型不一致的。**
+    """
+    import sqlite3
+
+    from sqlalchemy.engine import make_url
+
+    src_path = make_url(src_url).database
+    if not src_path or src_path == ":memory:":
+        raise ValueError(f"这不是一个文件型 SQLite 库：{src_url}")
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now().strftime(_STAMP_FMT)
+    final = dest_dir / f"soroban-{stamp}-{tag}.db"
+    part = final.with_suffix(".db.part")
+    part.unlink(missing_ok=True)
+
+    src = sqlite3.connect(src_path)
+    try:
+        dst = sqlite3.connect(part)
+        try:
+            src.backup(dst)                     # 在线一致拷贝，不需要停写
+        finally:
+            dst.close()
+    except BaseException:
+        part.unlink(missing_ok=True)            # 失败不留残file
+        raise
+    finally:
+        src.close()
+
+    # **必须走 `runtime_dir()`，不能用 `__file__`。** 打包之后 `__file__` 落在 PyInstaller
+    # 的临时解包目录里，而 `.env` 在 exe 旁边——`is_file()` 于是恒为 False，
+    # `.env` 备份**静默地根本不发生**。而它存在的唯一理由就是保住 SECRET_KEY，
+    # 偏偏打包版才是分发形态（也就是最不可能另有一份副本的那种部署）。
+    env = runtime_dir() / ".env"
+    if env.is_file():
+        shutil.copy2(env, dest_dir / f"env-{stamp}-{tag}.txt")
+    part.rename(final)
+    return final

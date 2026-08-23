@@ -3,6 +3,7 @@
 import datetime as dt
 from typing import Optional
 
+from fastapi.concurrency import run_in_threadpool
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import func, or_
 from sqlalchemy import update as sa_update
@@ -12,6 +13,7 @@ from sqlmodel import Session, select
 from ..auth import get_current_user
 from ..database import get_session
 from ..db.dialect import ci_contains
+from ..models.base import is_unconverted
 from ..models import ShipmentOrder, Order, utcnow
 from ..schemas import (
     ShipmentCreate, ShipmentOcrAttachResult, ShipmentRead, ShipmentUpdate, OrderItemRead, OrderBrief,
@@ -26,11 +28,20 @@ router = APIRouter(
 )
 
 
+def _excluded_statuses() -> frozenset:
+    """不计入货款合计的采购段状态。**从模型上取**，全仓只此一处解释权。"""
+    return frozenset(v for _col, vals in Order.ledger_exclusions() for v in vals)
+
+
 def _brief(order: Order) -> OrderBrief:
     return OrderBrief(
         id=order.id, order_no=order.order_no, date=order.date, title=order.title,
         purchase_status=order.purchase_status, jpy_settled=order.jpy_settled,
         items=[OrderItemRead(id=it.id, name=it.name, quantity=it.quantity) for it in order.items],
+        # 让**后端**说清这一单算不算进合计。不给的话，前端要么自己抄一份状态清单
+        # （两份迟早对不上），要么就像对账单那样把所有行都列出来、下面却写一个
+        # 剔除过的合计——明细加起来 21000、合计写 10000，收到的人只能认为这单子是错的。
+        counted=order.purchase_status not in _excluded_statuses(),
     )
 
 
@@ -50,11 +61,14 @@ def _landed(s: ShipmentOrder, children: list[Order]) -> dict:
     不数出来的话，缺汇率的单会让合计**静默变小**而笔数照旧——看板那边为同一件事
     专门有个 `_uncounted`，这里不能重蹈。本单自己缺汇率也算一条。
     """
-    excluded = {v for _col, vals in Order.ledger_exclusions() for v in vals}
+    excluded = _excluded_statuses()
     counted = [c for c in children if c.purchase_status not in excluded]
     orders_jpy = sum(c.jpy_settled or 0 for c in counted)
-    missing = sum(1 for c in counted if c.price_cny is not None and c.jpy_settled is None)
-    if s.price_cny is not None and s.jpy_settled is None:
+    # 判据走 `models.base.is_unconverted`——与看板、列表页脚同一个函数。
+    # 这里原先自己写了一份，漏了 `!= 0`：一张全是赠品（¥0）的子订单会被报成「未折算」，
+    # 而同一页的页脚与看板都说 0 条。同一件事三个出口，说法必须一样。
+    missing = sum(1 for c in counted if is_unconverted(c.price_cny, c.jpy_settled))
+    if is_unconverted(s.price_cny, s.jpy_settled):
         missing += 1
     return {"orders_jpy": orders_jpy,
             "landed_jpy": orders_jpy + (s.jpy_settled or 0),
@@ -75,6 +89,23 @@ def _shipment_read(s: ShipmentOrder, children: list[Order],
                if k not in _DERIVED_FIELDS}
     extra = _landed(s, children) if landed else {}
     return ShipmentRead(**scalars, orders=[_brief(c) for c in children], **extra)
+
+
+def _may_see_orders(current) -> bool:
+    """这个调用方能不能看到集运单里挂的**账本订单**明细。
+
+    人类登录恒为真（他本来就有全部权限）。插件令牌则要看它有没有 `orders:read`——
+    没有的话这里只回一个空列表。
+
+    **不是在收紧权限模型**（用户明确说过插件都是自己写的、不用防恶意插件），
+    而是让那个勾选框说的话成立：用户取消勾选「读商品订单」，界面上就是这么写的，
+    而 `GET /api/shipment` 会把每张集运单挂着的订单号、标题、状态、结算日元、
+    以及每件物品的名称/数量/单价原样发出去——**他留下的那道闸，从另一个门整个绕开了**。
+    """
+    claims = getattr(current, "_plugin_claims", None)
+    if not claims:
+        return True                      # 人类登录
+    return "orders:read" in set(claims.get("scp") or [])
 
 
 def _read_many(session: Session, shipments: list[ShipmentOrder],
@@ -122,6 +153,7 @@ def list_orders(
         description="已废弃：查询参数 status 已按业务段改名"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    current=Depends(get_current_user),
 ):
     # FastAPI 对未知 query 参数**默认忽略**：改名后漏改一处调用方，
     # 表现就是「筛选点了没反应、返回全量、HTTP 200、零日志」。响亮拒掉比静默返回错数据强。
@@ -157,7 +189,9 @@ def list_orders(
         .offset(offset)
         .limit(limit)
     ).all()
-    return {"items": _read_many(session, rows, brief=brief), **totals}
+    # 没有 `orders:read` 的插件令牌只拿集运单本身——理由见 `_may_see_orders`
+    return {"items": _read_many(session, rows, brief=brief or not _may_see_orders(current)),
+            **totals}
 
 
 @router.post("/ocr")
@@ -180,12 +214,16 @@ async def ocr_attach_express(
     单号匹配不上商品订单 → 只在 unmatched 里回报（不建占位单）；已挂在别的集运单 → 跳过
     不强改（沿用 attach_order 的防误抢语义）。重复上传同一张截图是幂等的。
     路由为 async（run_ocr 要 await 读文件）；DB 用同步 Session，SQLite 建连时已
-    check_same_thread=False，本地库单次查询亚毫秒级，不构成事件循环阻塞。"""
+    check_same_thread=False。**所有碰库的调用都交给线程池**——包括下面那次
+    fail-fast 的 `session.get`。原先这里写的是「本地库单次查询亚毫秒级，
+    不构成事件循环阻塞」，那句话**只对 SQLite 成立**：切到 MySQL（一等公民后端）
+    就是一次网络往返，卡住时按 `read_timeout=30` 能把事件循环冻半分钟。
+    与其留一条理由半真的豁免，不如一次调用也包起来——代价为零。"""
     # 长度下界与 ocr.py 共用**同一个常量**：抄一份数字过去，两边一旦漂移，
     # 表现是「识别时判为可疑、挂靠时照挂」（或反过来），而两处都看不出不一致。
     from ..services.ocr import _TRACK_TYPICAL_MIN, recognize_shipment
 
-    shipment = session.get(ShipmentOrder, shipment_id)
+    shipment = await run_in_threadpool(session.get, ShipmentOrder, shipment_id)
     if not shipment or shipment.is_delete:
         raise_not_found("集运订单")
 
@@ -207,75 +245,86 @@ async def ocr_attach_express(
     fields = await run_ocr(file, recognize_shipment)
     express_nos = fields.get("express_nos") or []
 
-    attached: list[Order] = []
-    skipped: list[Order] = []
-    unmatched: list[str] = []
+    # **整段写库搬进线程池。** 这是 `async def` 路由，而下面每个快递单号要发 4 条同步语句
+    # （SELECT orders / UPDATE orders / refresh 再 SELECT / mirror_to_staging 的 SELECT），
+    # 一张 20 个号的截图就是 80+ 次 pymysql 同步往返。跑在事件循环线程上时，
+    # 整站（health、静态资源、插件卡片的轮询、其他人的所有请求）全部冻住；
+    # MySQL 中途卡一下，`read_timeout=30` 会让**单条语句**把事件循环冻 30 秒。
+    #
+    # 这是本仓库修过三次的同一个故障：`scheduler_loop`（plugins.py）与
+    # `wal_checkpoint_loop`（database.py，注释里写着「实测单次卡了 384 秒」）。
+    # 第三次是这里。
+    def _attach_all():
+        attached: list[Order] = []
+        skipped: list[Order] = []
+        unmatched: list[str] = []
 
-    for no in express_nos:
-        # **短到不像快递单号的，一律不拿去自动挂靠。**
-        # OCR 会把一个长号断成两截（`SF1234 56789012` → 取到 `56789012`）。
-        # ocr.py 的 `_looks_split` 已经挡掉了「旁边紧邻另一段数字」那种，但那条判据
-        # 依赖排版，挡不住所有情形——而这里是**不可逆后果**的所在：
-        # 半截号拿去 `Order.express_no == no` 精确匹配，匹配不上只是漏一单，
-        # 万一撞上别人的单号，就是把货挂到一张无关订单上，且挂靠是自动提交的。
-        # 主流快递单号最短 12 位（顺丰/圆通/中通/申通），留 2 位余量取 10。
-        # 判为读不出而不是静默丢弃：它会出现在 unmatched 里，用户看得见、能手动挂。
-        if len(no) < _TRACK_TYPICAL_MIN:
-            unmatched.append(no)
-            continue
-        matches = session.exec(
-            select(Order).where(Order.express_no == no, Order.is_delete.is_(False))
-        ).all()
-        if not matches:
-            unmatched.append(no)
-            continue
-        for od in matches:
-            if od.shipment_order_id is not None and od.shipment_order_id != shipment_id:
-                skipped.append(od)                       # 已挂别的集运单：交给用户手动处理
+        for no in express_nos:
+            # **短到不像快递单号的，一律不拿去自动挂靠。**
+            # OCR 会把一个长号断成两截（`SF1234 56789012` → 取到 `56789012`）。
+            # ocr.py 的 `_looks_split` 已经挡掉了「旁边紧邻另一段数字」那种，但那条判据
+            # 依赖排版，挡不住所有情形——而这里是**不可逆后果**的所在：
+            # 半截号拿去 `Order.express_no == no` 精确匹配，匹配不上只是漏一单，
+            # 万一撞上别人的单号，就是把货挂到一张无关订单上，且挂靠是自动提交的。
+            # 主流快递单号最短 12 位（顺丰/圆通/中通/申通），留 2 位余量取 10。
+            # 判为读不出而不是静默丢弃：它会出现在 unmatched 里，用户看得见、能手动挂。
+            if len(no) < _TRACK_TYPICAL_MIN:
+                unmatched.append(no)
                 continue
-            # **只挂靠，不动状态**：订单的 status 只记国内段，国际段由所挂集运单表达
-            # （见 Order.fulfillment_status）。这里曾写过 status="集运中"——那会污染国内段状态，
-            # 一旦释放出来，回落到的就是被覆盖过的值而不是真实的「已签收」。
-            values = {"shipment_order_id": shipment_id,
-                      "version": Order.version + 1, "updated_at": utcnow()}
-            if od.shipment_order_id == shipment_id:
-                # **已经挂在本单上了 → 一个字节都不写**。
-                # 原先这里也照发 UPDATE（WHERE 里放行了「已挂本单」以求幂等），
-                # 可 SET 里带着 `version + 1`——于是「幂等」只对挂靠关系成立，
-                # 对乐观锁不成立：同一张截图重传一次，这些订单的 version 就 +1，
-                # 正在编辑其中某单的人下一次保存直接 409，而他什么都没做错。
-                attached.append(od)
+            matches = session.exec(
+                select(Order).where(Order.express_no == no, Order.is_delete.is_(False))
+            ).all()
+            if not matches:
+                unmatched.append(no)
                 continue
-            # 原子挂靠，守卫与 attach_order 同款：仍未挂靠、未软删、
-            # 且集运单在极小竞态窗内没被并发软删。靠 rowcount 判定，避免「读-判断-写」双挂。
-            res = session.execute(
-                sa_update(Order)
-                .where(
-                    Order.id == od.id,
-                    Order.is_delete.is_(False),
-                    Order.shipment_order_id.is_(None),
-                    select(ShipmentOrder.id)
-                    .where(ShipmentOrder.id == shipment_id, ShipmentOrder.is_delete.is_(False))
-                    .exists(),
+            for od in matches:
+                if od.shipment_order_id is not None and od.shipment_order_id != shipment_id:
+                    skipped.append(od)                       # 已挂别的集运单：交给用户手动处理
+                    continue
+                # **只挂靠，不动状态**：订单的 status 只记国内段，国际段由所挂集运单表达
+                # （见 Order.fulfillment_status）。这里曾写过 status="集运中"——那会污染国内段状态，
+                # 一旦释放出来，回落到的就是被覆盖过的值而不是真实的「已签收」。
+                values = {"shipment_order_id": shipment_id,
+                          "version": Order.version + 1, "updated_at": utcnow()}
+                if od.shipment_order_id == shipment_id:
+                    # **已经挂在本单上了 → 一个字节都不写**。
+                    # 原先这里也照发 UPDATE（WHERE 里放行了「已挂本单」以求幂等），
+                    # 可 SET 里带着 `version + 1`——于是「幂等」只对挂靠关系成立，
+                    # 对乐观锁不成立：同一张截图重传一次，这些订单的 version 就 +1，
+                    # 正在编辑其中某单的人下一次保存直接 409，而他什么都没做错。
+                    attached.append(od)
+                    continue
+                # 原子挂靠，守卫与 attach_order 同款：仍未挂靠、未软删、
+                # 且集运单在极小竞态窗内没被并发软删。靠 rowcount 判定，避免「读-判断-写」双挂。
+                res = session.execute(
+                    sa_update(Order)
+                    .where(
+                        Order.id == od.id,
+                        Order.is_delete.is_(False),
+                        Order.shipment_order_id.is_(None),
+                        select(ShipmentOrder.id)
+                        .where(ShipmentOrder.id == shipment_id, ShipmentOrder.is_delete.is_(False))
+                        .exists(),
+                    )
+                    .values(**values)
                 )
-                .values(**values)
-            )
-            if res.rowcount != 1:                        # 并发被抢走/集运单被并发删除
-                skipped.append(od)
-                continue
-            session.refresh(od)                          # 裸 UPDATE 绕过身份映射，重读拿新状态
-            mirror_to_staging(session, od, None)         # 若由暂存导入：把新状态镜像回暂存行
-            attached.append(od)
+                if res.rowcount != 1:                        # 并发被抢走/集运单被并发删除
+                    skipped.append(od)
+                    continue
+                session.refresh(od)                          # 裸 UPDATE 绕过身份映射，重读拿新状态
+                mirror_to_staging(session, od, None)         # 若由暂存导入：把新状态镜像回暂存行
+                attached.append(od)
 
-    session.commit()
-    return ShipmentOcrAttachResult(
-        shipment=_read(session, shipment),
-        attached=[_brief(o) for o in attached],
-        skipped=[_brief(o) for o in skipped],
-        unmatched=unmatched,
-        express_nos=express_nos,
-        unreadable=int(fields.get("unreadable") or 0),
-    )
+        session.commit()
+        return ShipmentOcrAttachResult(
+            shipment=_read(session, shipment),
+            attached=[_brief(o) for o in attached],
+            skipped=[_brief(o) for o in skipped],
+            unmatched=unmatched,
+            express_nos=express_nos,
+            unreadable=int(fields.get("unreadable") or 0),
+        )
+    return await run_in_threadpool(_attach_all)
 
 
 @router.post("", response_model=ShipmentRead)

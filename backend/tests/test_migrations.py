@@ -223,7 +223,7 @@ def test_a_newer_database_gets_its_own_message(caplog, monkeypatch):
     monkeypatch.setattr(db, "run_migrations", boom)
     monkeypatch.setattr(db.control, "ensure_schema", lambda *a, **k: None)
     with caplog.at_level(logging.ERROR), pytest.raises(CommandError):
-        db.create_db_and_tables()
+        db.migrate_to_latest()
 
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "更新版本的 soroban" in text, f"没认出「库比代码新」：{text[:300]}"
@@ -272,7 +272,7 @@ def test_mysql_users_are_not_told_to_delete_the_control_db(monkeypatch, caplog):
     monkeypatch.setattr(db.control, "ensure_schema", lambda *a, **k: None)
     monkeypatch.setattr(db, "current_backend", lambda: "mysql")
     with caplog.at_level(logging.ERROR), pytest.raises(CommandError):
-        db.create_db_and_tables()
+        db.migrate_to_latest()
 
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "更新版本的 soroban" in text, f"没认出「库比代码新」：{text[:300]}"
@@ -331,3 +331,115 @@ def test_the_rebuild_still_clears_an_empty_leftover(fresh_url):
         assert {"plugin_id", "kind", "key", "data"} <= cols, f"空壳没被换成真表：{cols}"
     finally:
         e.dispose()
+
+
+def test_running_a_migration_does_not_silence_caplog(tmp_path, caplog):
+    """用例内跑过迁移之后，`caplog` 仍然抓得到日志。
+
+    `alembic/env.py` 的 `fileConfig()` 会按 alembic.ini 的 `[handlers]` **重建 root 的
+    handler 列表**（`disable_existing_loggers=False` 只保住 logger 不被禁用，管不到
+    handler 被换掉）。pytest 装在 root 上的 caplog handler 于是被掀掉，
+    `caplog.records` **恒为空**——而日志照常打印在终端上，所以断言失败会被读成
+    「这条日志根本没打」。2026-08-22 写备份守卫时当场撞上，排查了半天。
+
+    这条把它钉住：**先跑一次真迁移，再打一条日志，caplog 必须看得见。**
+    判据不能是「env.py 里有没有那个 if」——那是源码 grep，换个写法就失效。
+    """
+    import logging
+
+    from app.database import run_migrations
+
+    run_migrations(f"sqlite:///{tmp_path / 'x.db'}")     # 真的跑一次 alembic
+
+    with caplog.at_level(logging.WARNING):
+        logging.getLogger("soroban.db").warning("迁移之后这条要抓得到")
+
+    assert any("迁移之后这条要抓得到" in r.getMessage() for r in caplog.records), (
+        "跑过迁移之后 caplog 什么都抓不到——alembic 的 fileConfig 把 root 的 handler 掀了。"
+        f"当前记录：{[r.getMessage()[:40] for r in caplog.records]}")
+
+
+def test_offline_sql_mode_fails_with_a_readable_message_not_a_traceback():
+    """`alembic upgrade --sql` 撞上「要读数据」的迁移时，给一句话而不是 traceback。
+
+    离线模式下 `op.get_bind()` 是 `None`，任何 `conn.execute(...)` 都以
+    `AttributeError: 'NoneType' object has no attribute 'fetchall'` 收场——
+    而且是在**前十条 revision 的 DDL 已经打印出来之后**才炸。
+    那份半截输出看起来完全正常，照着执行会漏掉后面所有步骤。
+
+    `--sql` 本身也确实产不出这类步骤的等价 SQL（它们要先读现有数据、按内容决定写什么），
+    所以这不是「暂未支持」，是原理上做不到——该说的就是这句话。
+
+    这条真跑 `alembic upgrade head --sql`，不是去 grep 源码里有没有那个调用。
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    backend = Path(__file__).resolve().parents[1]
+    r = subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head", "--sql"],
+                       cwd=backend, capture_output=True, text=True, timeout=180)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, "离线模式居然成功了？那说明数据迁移步骤被静默跳过了"
+    assert "无法在 `--sql` 离线模式下生成等价 SQL" in out, \
+        f"给的不是那句人话：\n{out[-1200:]}"
+    assert "AttributeError" not in out, f"还是抛了 traceback：\n{out[-1200:]}"
+
+
+def test_a_downgrade_that_cannot_work_refuses_before_touching_the_schema(tmp_path):
+    """降级撞上「本条迁移刚放开的数据」时，**在门口拒绝**，不许跑到一半才炸。
+
+    `c2d3e4f5a6b7` 的 upgrade 让「不同来源下可以同号」（闲鱼/淘宝各一条）。
+    降级要装回 `order_no` 单列唯一——而那正是升级之后**合法存在**的数据所违反的。
+
+    不先查的话：`drop_active_unique` 已经把索引和生成列删掉了，随后建唯一索引时才撞车。
+    **MySQL 的 DDL 是隐式提交的**，库会停在「新索引没了、旧索引也没建上」的半降级态——
+    此后连唯一性都没人守了，而用户只拿到一句原始报错。
+
+    判据有两半：**拒绝**，且**没动过任何东西**（旧索引仍在、数据仍在）。
+    只断言「抛了异常」是不够的——跑到一半再抛同样是抛。
+    """
+    import datetime as dt
+
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import inspect, text
+
+    import app.database as db
+
+    url = f"sqlite:///{tmp_path / 'down.db'}"
+    cfg = Config(str(db._ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(db._ROOT / "alembic"))
+    cfg.set_main_option("sqlalchemy.url", url)
+    command.upgrade(cfg, "c2d3e4f5a6b7")
+
+    eng = db.build_engine(url)
+    try:
+        with eng.connect() as c:
+            # 造出本条迁移刚刚放开的那种数据：同号、不同来源
+            for plat in ("淘宝", "闲鱼"):
+                # 列名按**那个 revision 当时**的样子写（`source` 还没改名成 `created_via`，
+                # `status` 还没改成 `purchase_status`）——迁移测试必须用历史 schema，
+                # 不能照抄今天的模型。
+                c.execute(text(
+                    "INSERT INTO taobaoorder (date, order_no, platform, status, source,"
+                    " created_at, updated_at, version) VALUES (:d, 'SAME-1', :p, '待收货', '手填',"
+                    " :t, :t, 1)"),
+                    {"d": "2026-05-01", "p": plat, "t": dt.datetime.now(dt.timezone.utc)})
+            c.commit()
+            before = {i["name"] for i in inspect(c).get_indexes("taobaoorder")}
+
+        import pytest
+
+        with pytest.raises(RuntimeError) as e:
+            command.downgrade(cfg, "b1f2a3c4d5e6")
+        assert "不同来源的同号订单" in str(e.value), str(e.value)
+        assert "SAME-1" in str(e.value), f"没说出是哪个号，用户无从下手：{e.value}"
+
+        with eng.connect() as c:
+            after = {i["name"] for i in inspect(c).get_indexes("taobaoorder")}
+            rows = c.execute(text("SELECT COUNT(*) FROM taobaoorder")).scalar()
+        assert after == before, f"拒绝之前已经动过索引了：{before} → {after}"
+        assert rows == 2, "数据被动过了"
+    finally:
+        eng.dispose()

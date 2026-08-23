@@ -1081,29 +1081,55 @@ def test_a_shipping_fee_row_is_not_mistaken_for_the_product_name():
     assert ocr.parse_order_fields(res3)["product"] == "运费险专用测试品"
 
 
-def test_same_row_prefers_the_longer_candidate():
-    """同一行里有多个候选时**取最长的**，不是取 y 最接近的。
+def test_same_row_prefers_the_nearest_candidate():
+    """同一行里有多个候选时**取离锚点最近的**，长度只作确定性 tiebreak。
 
-    这两条规则此前一直不一致：docstring 写「找 key 值最长的框」，
-    而实现按 `abs(cy - anchor.cy)` 取最近——**没有任何用例能区分它们**，
-    所以那句假描述一直被后来的改动当作前提。
+    这条规则改过两次，来龙去脉值得写清楚：
 
-    哪个对：同一行的候选本来就都在 `row_tol` 之内，谁的 cy 更近几乎是随机的；
-    而订单号 15~20 位、快递号 12~15 位，这类字段「越长越像真的」。
+    · 最早：实现按 `abs(cy - anchor.cy)` 取最近，而 docstring 写的是「找 key 值最长的框」
+      ——两者不一致，且**没有任何用例能区分**，那句假描述一直被当作前提。
+    · 2026-08-19：把实现改成「取最长」去对齐那句 docstring。**那个方向是错的。**
+    · 2026-08-23：改成按 **x 距离**取最近。
+
+    为什么「取最长」错：按本模块自己写的区间，订单号 15~20 位、快递号 12~15 位。
+    一行里同时有「快递单号 …」和「商品订单号 …」时，取最长**必然**选中订单号——
+    不是偶尔选错，是系统性偏置。
+
+    当初改「取最长」的理由是「候选都在 row_tol 内，谁的 cy 更近几乎是随机的」——
+    那句话没错，错在结论：随机的是 **cy**，而 **x** 一点都不随机。
+    标签-值版式里，值就贴在标签右边。
     """
-    # 两个候选都在同一行、都够 min_len：短的那个 cy 完全对齐（老规则会选它），
-    # 长的那个偏 5px（新规则选它）。
+    # ① 两个候选都在同一行、都够 min_len：近的在 x=300、远的在 x=520 ⇒ 取近的
     res = [tok("订单号", x=100, y=40),
            tok("1234567890", x=300, y=40),
            tok("98765432109876543210", x=520, y=45)]
-    assert ocr.parse_order_fields(res)["order_no"] == "98765432109876543210"
+    assert ocr.parse_order_fields(res)["order_no"] == "1234567890"
 
-    # **反面一**：右侧优先仍然生效——左边那个再长也不该被选走
+    # ② **右侧优先仍然生效**——左边那个再近也不该被选走
     res2 = [tok("订单号", x=300, y=40),
-            tok("11111111111111111111", x=60, y=40),
+            tok("11111111111111111111", x=280, y=40),
             tok("2222222222", x=520, y=40)]
     assert ocr.parse_order_fields(res2)["order_no"] == "2222222222"
 
-    # **反面二**：只有一个候选时行为不变
+    # ③ 只有一个候选时行为不变
     res3 = [tok("订单号", x=100, y=40), tok("1234567890123456", x=300, y=40)]
     assert ocr.parse_order_fields(res3)["order_no"] == "1234567890123456"
+
+
+def test_a_longer_order_number_on_the_same_row_does_not_hijack_the_express_no():
+    """同一行里有更长的订单号时，**快递号不许被它顶掉**。
+
+    这是「取最长」那条规则最具体的伤害，也是它被换掉的直接原因。
+    选错之后不是显示一下就算了——`shipment.py` 那句 `Order.express_no == no`
+    会精确命中并**原子挂靠**（version+1、自动 commit、不可撤销），
+    而 `unreadable == 0`，前端弹的是绿色成功。
+    """
+    res = [tok("快递单号", x=100, y=200),
+           tok("SF1234567890123", x=300, y=200),
+           tok("商品订单号", x=600, y=200),
+           tok("2612345678901234", x=800, y=200)]
+    got = ocr.parse_order_fields(res)
+    assert got["express_no"] == "SF1234567890123", \
+        f"快递号被同行更长的订单号顶掉了：{got['express_no']}"
+
+

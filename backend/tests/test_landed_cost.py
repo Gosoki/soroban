@@ -243,3 +243,188 @@ def test_the_footer_sum_is_not_multiplied_by_the_number_of_items(client):
     assert len(got["items"]) == 1
     assert got["sum_jpy"] == got["items"][0]["jpy_settled"], \
         f"合计被物品条数放大了：{got['sum_jpy']} vs 单行 {got['items'][0]['jpy_settled']}"
+
+
+def test_a_zero_yuan_row_is_not_reported_as_unconverted(client, session):
+    """显式填 0 的行（预付/包邮/全是赠品）**不算**「未折算」。
+
+    0 元折算过去也是 0 円，没有任何金额被 `SUM` 吞掉，报出来只是噪音。
+    看板的 `_uncounted` 判据里明确有 `price_cny != 0` 这一条并写了理由；
+    页脚原先漏抄了它，于是全新部署、还没有汇率时记一笔 0 元，
+    **页脚亮黄标「1 条未折算」而同一时刻看板说 0 条**——两个数字对同一件事给出相反结论，
+    用户按告警去补汇率也消不掉它。
+
+    这条同时钉住「两处判据必须一致」：真正缺汇率的行仍要被数出来。
+    """
+    from sqlmodel import select
+
+    from app.models import MiscExpense
+
+    r = client.post("/api/misc", json={"date": "2026-03-01", "name": "包邮预付", "price_cny": "0.00"})
+    assert r.status_code in (200, 201), r.text
+    row = session.exec(select(MiscExpense).where(MiscExpense.id == r.json()["id"])).one()
+    row.fx_rate = row.jpy_auto = row.jpy_settled = None       # 模拟「库里还没有汇率」
+    session.add(row)
+    session.commit()
+
+    got = client.get("/api/misc", params={"q": "包邮预付"}).json()
+    assert got["total"] == 1
+    assert got["unconverted"] == 0, f"0 元的行被误报成未折算：{got}"
+
+    # 反向：真的有钱却缺汇率的行，仍然必须数出来
+    r2 = client.post("/api/misc", json={"date": "2026-03-02", "name": "真缺汇率", "price_cny": "88"})
+    row2 = session.exec(select(MiscExpense).where(MiscExpense.id == r2.json()["id"])).one()
+    row2.fx_rate = row2.jpy_auto = row2.jpy_settled = None
+    session.add(row2)
+    session.commit()
+    got2 = client.get("/api/misc", params={"q": "真缺汇率"}).json()
+    assert got2["unconverted"] == 1, f"真正缺汇率的行没被数出来：{got2}"
+
+
+def test_the_footer_and_the_dashboard_agree_on_what_unconverted_means(client, session):
+    """页脚与看板对「未折算」的判据必须**逐条一致**。
+
+    它们是同一个概念的两个出口。分叉的现象不是报错，而是「两个数字互相打脸」——
+    用户没有任何办法判断该信哪个。
+
+    用**增量**比较而不是比总数：会话共享库里还有别的用例造的行，
+    比总数会因为无关数据而红（第一版就是这么写的，红在了一个假问题上）。
+    """
+    from sqlmodel import select
+
+    from app.models import MiscExpense
+
+    def _board_uncounted():
+        b = client.get("/api/dashboard").json()
+        key = next((k for k in b if "uncounted" in k and "count" in k), None)
+        assert key, f"看板没有 uncounted 计数了，探测方式可能已过期：{sorted(b)}"
+        return b[key]
+
+    def _foot_uncounted():
+        return client.get("/api/misc", params={"limit": 1}).json()["unconverted"]
+
+    board0, foot0 = _board_uncounted(), _foot_uncounted()
+
+    def _add(name, price):
+        r = client.post("/api/misc", json={"date": "2026-03-03", "name": name, "price_cny": price})
+        assert r.status_code in (200, 201), r.text
+        row = session.exec(select(MiscExpense).where(MiscExpense.id == r.json()["id"])).one()
+        row.fx_rate = row.jpy_auto = row.jpy_settled = None      # 模拟「库里还没有汇率」
+        session.add(row)
+        session.commit()
+
+    _add("零元-一致性", "0")
+    assert _board_uncounted() - board0 == 0, "看板把 0 元的行算成了未折算"
+    assert _foot_uncounted() - foot0 == 0, "页脚把 0 元的行算成了未折算"
+
+    _add("有钱-一致性", "50")
+    assert _board_uncounted() - board0 == 1, "看板漏数了一条真正缺汇率的行"
+    assert _foot_uncounted() - foot0 == 1, "页脚漏数了一条真正缺汇率的行"
+
+
+def test_each_child_order_says_whether_it_counts_toward_the_total(client):
+    """每条子订单都要自报「算不算进货款合计」。
+
+    不给这个标记的话，前端只有两条路：抄一份「哪些状态不计入」的清单（两份迟早对不上），
+    或者像对账单原先那样把所有行都列出来、下面写一个已经剔除过的合计——
+    明细逐条加起来 21000 円、合计写 10,000 円，收到的人只能认为这单子是错的。
+    """
+    from app.models.order.order import PURCHASE_EXCLUDED
+
+    s = _mk_shipment(client, jpy_override=2500)
+    good = _mk_order(client, jpy_override=10000, title="算数的")
+    dead = _mk_order(client, jpy_override=5000, title="不算的",
+                     purchase_status=sorted(PURCHASE_EXCLUDED)[0])
+    for o in (good, dead):
+        assert client.post(f"/api/shipment/{s['id']}/order/{o['id']}").status_code == 200
+
+    got = _get(client, s["id"])
+    by_title = {o["title"]: o for o in got["orders"]}
+    assert by_title["算数的"]["counted"] is True
+    assert by_title["不算的"]["counted"] is False, "不计入的单没有被标出来"
+
+    # 标记必须与合计**自洽**：把标了 counted 的加起来，正好等于 orders_jpy
+    assert sum(o["jpy_settled"] or 0 for o in got["orders"] if o["counted"]) == got["orders_jpy"], \
+        "counted 标记与 orders_jpy 对不上——两者必须出自同一份判据"
+
+
+def test_a_zero_yuan_child_order_is_not_counted_as_unconverted(client, session):
+    """集运到岸的「未折算」判据必须与页脚、看板**逐条一致**（含 `!= 0`）。
+
+    一张全是赠品（¥0）的子订单折算过去也是 0 円，没有任何金额被吞——报出来只是噪音。
+    而这一处原先自己写了一份判据、漏了 `!= 0`：**同一页的页脚说 0 条、这里说 1 条**。
+
+    同一件事三个出口（看板 / 列表页脚 / 集运到岸），说法不一样就是互相打脸，
+    用户没有任何办法判断该信哪个。
+    """
+    from sqlmodel import select
+
+    from app.models import Order
+
+    s = _mk_shipment(client, jpy_override=1000)
+    gift = _mk_order(client, price_cny="0", title="全是赠品")
+    row = session.exec(select(Order).where(Order.id == gift["id"])).one()
+    row.fx_rate = row.jpy_auto = row.jpy_settled = None      # 模拟「库里还没有汇率」
+    session.add(row)
+    session.commit()
+    assert client.post(f"/api/shipment/{s['id']}/order/{gift['id']}").status_code == 200
+
+    got = _get(client, s["id"])
+    assert got["unconverted"] == 0, f"0 元的子订单被报成未折算：{got}"
+
+    # 反面：真的有钱却缺汇率的子订单，仍然要数出来
+    paid = _mk_order(client, price_cny="88", title="真缺汇率")
+    row2 = session.exec(select(Order).where(Order.id == paid["id"])).one()
+    row2.fx_rate = row2.jpy_auto = row2.jpy_settled = None
+    session.add(row2)
+    session.commit()
+    assert client.post(f"/api/shipment/{s['id']}/order/{paid['id']}").status_code == 200
+    assert _get(client, s["id"])["unconverted"] == 1, "真正缺汇率的子订单没被数出来"
+
+
+def test_the_three_unconverted_criteria_are_one_function():
+    """「有钱却没折算」的判据全仓只许有**一份规则**，三个出口都得用它。
+
+    历史上分叉过两次（§151.3 页脚、§169 集运到岸），每次都是漏抄 `!= 0`。
+    分叉的现象是两个数字互相打脸，而两边各自都「看起来对」。
+
+    规则一份、**形态两种**：看板与列表页脚在库里聚合，用 SQL 形态
+    `unconverted_clause(model)`；集运到岸的子订单已经在内存里，用 Python 形态
+    `is_unconverted(price, jpy)`。两个函数就住在彼此隔壁，改判据时一起改。
+
+    判据是**正向的**（三处都调了共用函数），不是反向找「谁手写了判据」——
+    第一版就是反向写的，它把 `demo.py` 的列名清单和这几处**调用本身**
+    一起报了出来，又踩了「在代码里找名字」那个坑。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "app"
+    expect = {
+        "routers/dashboard.py": "unconverted_clause",     # 看板：SQL
+        "routers/common.py": "unconverted_clause",        # 列表页脚：SQL
+        "routers/shipment.py": "is_unconverted",          # 集运到岸：Python
+    }
+    missing = []
+    for rel, fn in expect.items():
+        src = (root / rel).read_text(encoding="utf-8")
+        if f"{fn}(" not in src:
+            missing.append(f"{rel} 没有调用 {fn}()")
+    assert not missing, (
+        "这些出口没有走共用判据（会各自漂）：\n  " + "\n  ".join(missing))
+
+    # 两种形态必须同源：都在 models/base.py 里，且都带 `!= 0`
+    base = (root / "models" / "base.py").read_text(encoding="utf-8")
+    for fn in ("def is_unconverted", "def unconverted_clause"):
+        assert fn in base, f"{fn} 不在 models/base.py 里"
+    # 只看两个函数**各自的 return 语句**——不是数整段里 `!= 0` 出现几次：
+    # docstring 里也会提到它（第一版就是这么写的，数出 5 次然后红在一个假问题上）。
+    import ast
+
+    tree = ast.parse(base)
+    for fn in ("is_unconverted", "unconverted_clause"):
+        node = next(n for n in tree.body
+                    if isinstance(n, ast.FunctionDef) and n.name == fn)
+        rets = [ast.unparse(x) for x in ast.walk(node) if isinstance(x, ast.Return) and x.value]
+        assert rets, f"{fn} 没有 return"
+        assert any("!= 0" in r for r in rets), \
+            f"{fn} 的判据里漏了 `!= 0`（显式填 0 的行会被误报成未折算）：{rets}"

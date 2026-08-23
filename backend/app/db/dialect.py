@@ -146,6 +146,28 @@ def UtcDateTime():                              # noqa: N802  —— 当类型�
     return sa.DateTime().with_variant(_mysql.DATETIME(fsp=6), "mysql")
 
 
+def require_online(what: str) -> None:
+    """这条迁移要**读写数据**，离线模式（`alembic upgrade --sql`）跑不了——在门口说清楚。
+
+    离线模式下 `op.get_bind()` 返回 `None`，于是任何 `conn.execute(...)` 都会以
+    `AttributeError: 'NoneType' object has no attribute 'fetchall'` 收场：
+    操作员本来想拿一份 DDL 去人工过一遍，拿到的是一段 Python traceback，
+    而且是在前十条 revision 的 DDL **已经打印出来之后**才炸——
+    那份半截输出看起来完全正常，照着执行就会漏掉后面所有步骤。
+
+    `--sql` 本身也确实产不出这类步骤的等价 SQL：它们要先读现有数据、按内容决定写什么
+    （改列名时重映射 `columnlayout` 里存的键、按旧状态值算新值…）。
+    所以这里不是「暂未支持」，是**原理上做不到**，该说的是这句话而不是 traceback。
+    """
+    from alembic import context
+
+    if context.is_offline_mode():
+        raise RuntimeError(
+            f"这条迁移需要读写数据（{what}），无法在 `--sql` 离线模式下生成等价 SQL。"
+            "请直接对目标库跑 `alembic upgrade head`（联机），"
+            "或先用 `--sql` 导出到本条之前的那个 revision。")
+
+
 def BinStr(length: int):                        # noqa: N802  —— 当类型用，故用类型的命名风格
     """「逐字节比较」的字符串列：MySQL 显式 utf8mb4_0900_bin，SQLite 本来就是 BINARY。
 

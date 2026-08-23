@@ -157,6 +157,7 @@ import { computed, onMounted, reactive, ref, useSlots, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowRight, Brush, Check, Delete, Edit, Loading, Plus, QuestionFilled, Setting } from '@element-plus/icons-vue'
 import GotionCell from './GotionCell.vue'
+import { keysToClearAfterCreate } from '@/utils/rowWrites'
 import { layoutApi, tagsApi } from '@/api'
 import { handled } from '@/api/http'
 import { TAG_PALETTE, tagStyleAt } from '@/constants'
@@ -413,7 +414,14 @@ function commitNew() {
     }
     // 成功才清空草稿：失败（如订单号撞唯一约束）时把用户刚敲的内容留在格子里让他改，
     // 而不是连人带字一起吞掉。
-    if (ok !== false) Object.keys(newRow).forEach((k) => delete newRow[k])
+    //
+    // **只清「送出去的那一份」，不是清空整个 newRow。** 请求在途期间格子并没有禁用
+    // （只有左侧 ✓ 是 pointer-events:none），用户完全可能接着在别的格里填东西——
+    // 而那些内容属于**下一条**草稿。无条件 `delete` 全部键会把它们一起抹掉：
+    // 格子里的字凭空消失、退回占位文案，无提示、无撤销。
+    // 判据是「这一格现在的值还等不等于送出去的那个」：等于 ⇒ 是刚存下的那条，清掉；
+    // 不等于（或送出后新填的）⇒ 是用户新敲的，留着。
+    if (ok !== false) keysToClearAfterCreate(newRow, data).forEach((k) => delete newRow[k])
   }
   emit('add', data, finish)
 }

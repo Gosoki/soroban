@@ -117,7 +117,6 @@ def _one(session: Session, handler, raw: Any, ctx, index: int, seen: set) -> dic
         # 回 unchanged 带一个已不存在的 id → 这条数据再也不会出现。
         out["status"], out["message"] = "unchanged", "本轮已提交过同一条"
         return out
-    seen.add(k)
 
     sp = session.begin_nested()
     try:
@@ -126,6 +125,13 @@ def _one(session: Session, handler, raw: Any, ctx, index: int, seen: set) -> dic
             sp.rollback()
         else:
             sp.commit()
+            # **只有真的落了库才算「本轮提交过」。** 原先这一句排在 savepoint 之前，
+            # 回滚时又不撤销：于是一条被拒的项会把自己的键**毒掉**，
+            # 同一批里后面那条同键的有效项直接短路成 `unchanged` +「本轮已提交过同一条」
+            # ——而那是**假话**，那个键一个字都没写进去。
+            # 更糟的是 `unchanged` 算成功：`summary["rejected"]` 少数一条，
+            # `runlog.note_rejected` 也只被告知一次损失，卡片上的拒收数比实际少。
+            seen.add(k)
         out.update(status=res.status, id=res.id, code=res.code, message=res.message)
     except Exception as e:                                  # noqa: BLE001
         sp.rollback()

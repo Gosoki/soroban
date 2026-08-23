@@ -68,3 +68,25 @@ def test_filling_a_rate_never_touches_already_settled_orders(client, session):
     after = client.get(f"/api/orders/{r.json()['id']}").json()
     assert after["fx_rate"] == before["fx_rate"], "旧单的汇率被改了"
     assert after["jpy_settled"] == before["jpy_settled"], "旧单的日元金额被改了"
+
+
+def test_the_two_paths_that_store_a_rate_round_it_the_same_way():
+    """手填与插件回灌是存汇率的两条路，**同一个输入必须得到同一个数**。
+
+    `services/fx._sane` 曾是全仓唯一一个不带 `rounding=` 的 `quantize()`
+    （于是用 decimal 默认的 `ROUND_HALF_EVEN`），而 `schemas._q_fx` 用 `ROUND_HALF_UP`。
+    `20.00005` 走手填存成 20.0001、走插件存成 20.0000。
+
+    差在第 4 位小数、金额层面几乎看不出来——正因为看不出来才更该钉住。
+    判据是**两条路的输出相等**，不是「源码里有没有 ROUND_HALF_UP」：
+    后者换个写法就失效，前者才是真正要成立的东西。
+    """
+    from decimal import Decimal
+
+    from app.schemas import _q_fx
+    from app.services.fx import _sane
+
+    for raw in ("20.00005", "20.00015", "19.99995", "23.86425"):
+        v = Decimal(raw)
+        assert _sane(v) == _q_fx(v), (
+            f"同一个汇率 {raw} 两条路存成了两个数：插件侧 {_sane(v)} / 手填侧 {_q_fx(v)}")

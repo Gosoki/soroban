@@ -525,7 +525,7 @@
 
 ### 第三十九版：引入 Alembic 迁移 + 复审修复
 用户要「加 Alembic + 再跑一次全项目审查」。
-- **Alembic 落地**：`backend/alembic/`（env.py 用 SQLModel.metadata + `render_as_batch=True`）+ baseline 迁移 `53b7e33debd0`（autogenerate 后加了 `import sqlmodel`；已验证与 `create_all` 建的 schema **逐字节一致**，含 3 个 `deleted_at IS NULL` 部分唯一索引）。`database.py::create_db_and_tables()` 改为跑 `alembic upgrade head`，并对 **pre-Alembic 旧库自动 stamp 到 baseline 再升级**（无缝接管、不重建表、数据不动）。requirements 加 `alembic`。全场景实测：全新空库建全 13 表+admin、旧库接管保数据、`alembic check` 干净、CLI 通。
+- **Alembic 落地**：`backend/alembic/`（env.py 用 SQLModel.metadata + `render_as_batch=True`）+ baseline 迁移 `53b7e33debd0`（autogenerate 后加了 `import sqlmodel`；已验证与 `create_all` 建的 schema **逐字节一致**，含 3 个 `deleted_at IS NULL` 部分唯一索引）。`database.py::migrate_to_latest()`（2026-08-22 前叫 `create_db_and_tables`）改为跑 `alembic upgrade head`，并对 **pre-Alembic 旧库自动 stamp 到 baseline 再升级**（无缝接管、不重建表、数据不动）。requirements 加 `alembic`。全场景实测：全新空库建全 13 表+admin、旧库接管保数据、`alembic check` 干净、CLI 通。
 - **事故与恢复**：首轮复审有个 agent 擅自对**真实库**跑了 alembic 写命令，把 `alembic_version` 指向一个已删除的幻影版本 → 启动 `can't locate revision` 崩溃。已修：确认 schema 与 baseline 一致（数据完好 27 单/34 暂存）→ 重置 `alembic_version` 到真实 head → 启动恢复。并给复审加**只读铁律**（禁止对真实库/项目文件跑任何写/alembic 命令），重跑。
 - **复审 6 条已修**：(med 回归) env.py `fileConfig` 默认 `disable_existing_loggers=True` 会在 app 内跑迁移后禁掉 uvicorn/soroban 全部 logger → 传 `disable_existing_loggers=False`；(low) env.py 无条件覆盖 url 使 database.py 传入 url 失效 → 改成仅 ini 占位时才覆盖；(low 回归) 改密码失败双弹提示（拦截器已弹）→ 去掉 catch 里的重复 `ElMessage`；(low doc) `.env.example` CORS 示例端口 5173→8621。
 - **⚠️ 提交须知**：`backend/alembic/` 与 `backend/alembic.ini` 是新文件、必须 `git add` 一起提交，否则别的机器 clone/pull 后缺迁移脚本会启动失败。

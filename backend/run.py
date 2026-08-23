@@ -45,10 +45,15 @@ HOST=127.0.0.1
 
 
 def _runtime_dir() -> Path:
-    """运行时数据目录：打包后取 exe 同级，源码运行取 backend/。"""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    """运行时数据目录：打包后取 exe 同级，源码运行取 backend/。
+
+    实现在 `app/paths.py`——`.env` 与相对的 sqlite 路径也锚在同一个目录上，
+    两处各写一份迟早会漂，而漂了的现象是「应用完全正常地启动、账本却是空的」。
+    那个模块刻意零副作用（只 import sys/pathlib），所以这里可以在
+    `ensure_env()` 之前安全导入它——app.config 那种一导入就读 .env 的就不行。
+    """
+    from app.paths import runtime_dir
+    return runtime_dir()
 
 
 def _fatal(msg: str, *, hint: str = "") -> "NoReturn":       # noqa: F821
@@ -279,7 +284,7 @@ def main() -> None:
 
     # 建库/迁移 + 建管理员**都在 lifespan 里做**（`app.main.lifespan`），
     # 因为那里才拿得到单进程闸。这里原先先调一次 `seed.main()`，而它自己会
-    # `create_db_and_tables()` ⇒ 完整 alembic upgrade 跑在闸之前，
+    # `migrate_to_latest()` ⇒ 完整 alembic upgrade 跑在闸之前，
     # 改端口开第二个实例时会对正在被老进程使用的库跑完迁移。
 
     if created_env:

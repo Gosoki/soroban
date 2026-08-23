@@ -413,7 +413,7 @@ def test_plugin_token_ttl_is_derived_from_the_reap_timeout():
 
     _, jti = scopes.issue(_U(), "demo", set(), timeout_s=mod._REAP_TIMEOUT)
     try:
-        left = scopes._ALIVE[jti] - __import__("time").monotonic()
+        left = scopes._ALIVE[jti][1] - __import__("time").monotonic()   # (plugin_id, 到期时刻)
         assert left > mod._REAP_TIMEOUT, \
             f"令牌只活 {left:.0f} 秒，比子进程允许跑的 {mod._REAP_TIMEOUT} 秒还短"
     finally:
@@ -444,7 +444,7 @@ def test_a_manifest_cannot_buy_itself_a_long_lived_token():
     tok, jti = scopes.issue(_U(), "demo", set(), timeout_s=604800)   # 清单写了一周
     try:
         cap = scopes._HARD_TTL.total_seconds()
-        left = scopes._ALIVE[jti] - time.monotonic()
+        left = scopes._ALIVE[jti][1] - time.monotonic()   # (plugin_id, 到期时刻)
         assert left <= cap + 1, f"清单要多久就给多久：这枚令牌还能活 {left / 3600:.1f} 小时"
         # 进程内的撤销表会随重启清空，而**令牌本身**是带着 exp 出门的那一份，
         # 两处都要封顶（只钉一处，另一处改坏了照样不红）。
@@ -457,7 +457,7 @@ def test_a_manifest_cannot_buy_itself_a_long_lived_token():
     # 「恒定 40 分钟」也能过——那会让每枚令牌都活满 40 分钟。
     _, short = scopes.issue(_U(), "demo", set(), timeout_s=600)
     try:
-        assert scopes._ALIVE[short] - time.monotonic() <= 600 + 120 + 1
+        assert scopes._ALIVE[short][1] - time.monotonic() <= 600 + 120 + 1
     finally:
         scopes.revoke(short)
 
@@ -1085,3 +1085,306 @@ def test_a_scope_violation_is_also_a_core_side_fact(client, session):
     finally:
         scopes.revoke(jti)
         runlog.reset()
+
+
+def test_a_rejected_item_does_not_poison_its_key_for_the_rest_of_the_batch(client, session):
+    """同一批里，前一条被拒**不许**让后一条同键的有效项被跳过。
+
+    `seen.add(k)` 原先排在 savepoint **之前**，回滚时又不撤销：一条被拒的项会把自己的键
+    毒掉，后面那条同键的有效项直接短路成 `unchanged` +「本轮已提交过同一条」——
+    **而那是假话**，那个键一个字都没写进去。更糟的是 `unchanged` 算成功：
+    `summary["rejected"]` 少数一条、`runlog.note_rejected` 也只被告知一次损失。
+
+    **前提必须是「在 `apply` 里面被拒」**，不能是 schema 层被拒——后者在
+    `handler.key()` 之前就 return 了，根本碰不到 `seen`。
+    第一版拿越界汇率做这条，而汇率的范围在 schema 上就卡了：走的是早退路径，
+    于是把 `seen.add` 挪回原位它照样绿。这里改用「插件私有存储」的**超大 blob**——
+    那是由**载荷**决定的拒收（`plugin_record._MAX_BYTES`），而键由 kind+key 决定，
+    两条项可以同键、一条被拒一条合法。
+    """
+    from app.plugins import scopes
+    from app.services.ingest.kinds.plugin_record import _MAX_BYTES
+
+    class _U:
+        id, username = 1, "admin"
+
+    tok, _ = scopes.issue(_U(), "poison-test", {"data:own"})
+    hdr = {"Authorization": f"Bearer {tok}"}
+
+    r = client.post("/api/plugins/ingest", headers=hdr, json={
+        "kind": "plugin.record",
+        "items": [
+            {"kind": "snap", "key": "A", "data": {"blob": "x" * (_MAX_BYTES + 10)}},  # 超大 → 拒
+            {"kind": "snap", "key": "A", "data": {"ok": 1}},                          # 同键，合法
+        ],
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    first, second = body["results"]
+
+    # 前提：第一条必须是**在 apply 里**被拒的（code 不是 schema 层那个 validation）
+    assert first["status"] == "rejected", body
+    # `code` 区分不了两条路——`apply` 里的 `Outcome(code="validation")` 与 schema 层用的是
+    # 同一个 code。判据用**只有 `apply` 内部才会产生**的那句消息。
+    assert "单条数据超过" in first["message"], (
+        f"第一条不是在 apply 里被拒的（schema 层那条路在 handler.key() 之前就 return 了，"
+        f"碰不到 seen）——这条测试的前提不成立：{first}")
+
+    assert second["status"] != "unchanged", (
+        f"第二条被前一条毒掉了：{second}（它说「已提交过」，而那个键什么都没写）")
+    assert body["summary"].get("rejected") == 1 and second["status"] in ("created", "updated"), body
+
+
+def test_a_plugin_cannot_rewrite_the_money_of_an_already_imported_row(client, session):
+    """插件**不许**改一张已导入订单的金额字段。
+
+    `PATCH /api/staging/{id}` 对已导入的行是「写穿账本」——暂存与账本是同一条记录的
+    两个视图，人在哪一页改都该一致。**这对人是对的，对插件不是**：
+    那笔钱可能是人导入后手工核过、改过的，而插件回灌是**定时反复**发生的，
+    覆盖一次就永久了（HTTP 200、无 409、runlog 也不记）。
+
+    仓库里那个淘宝插件自己很克制（已导入的行只推进状态、只在账本那格为空时补快递号），
+    但那是**插件的自觉，不是核心的强制**——`runlog` 存在的理由逐字就是这一句。
+    所以这条闸对现有插件一次都不会触发，它防的是下一个插件。
+    """
+    import datetime as dt
+    from decimal import Decimal
+
+    from sqlmodel import select
+
+    from app.models import Order, OrderStaging
+    from app.plugins import scopes
+
+    row = OrderStaging(order_no="PLG-MONEY-1", title="已导入的单",
+                       price_cny=Decimal("100.00"), platform="淘宝",
+                       scraped_at=dt.datetime.now(dt.timezone.utc),
+                       order_date=dt.date(2026, 4, 1))
+    session.add(row)
+    session.commit()
+    sid = row.id
+    o = client.post(f"/api/staging/{sid}/import").json()
+    before = Decimal(str(o["price_cny"]))
+
+    class _U:
+        id, username = 1, "admin"
+
+    tok, _ = scopes.issue(_U(), "money-test", {"staging:write"})
+    hdr = {"Authorization": f"Bearer {tok}"}
+    cur = client.get("/api/staging?q=PLG-MONEY-1").json()["items"][0]
+
+    r = client.patch(f"/api/staging/{sid}", headers=hdr, json={
+        "version": cur["version"],
+        "items": [{"name": "改小", "quantity": 1, "unit_price_cny": "1"}],
+    })
+    assert r.status_code == 403, f"插件把已导入订单的钱改掉了：{r.status_code} {r.text}"
+    assert "金额字段" in r.json()["detail"], r.text
+
+    session.expire_all()
+    order = session.exec(select(Order).where(Order.id == o["id"])).one()
+    assert Decimal(str(order.price_cny)) == before, f"账本金额被改成了 {order.price_cny}"
+
+
+def test_a_plugin_can_still_fill_the_blanks_on_an_imported_row(client, session):
+    """反面：插件补空格（快递单号）**仍然要放行**。
+
+    那正是它现在唯一会对已导入行做的事，也是最需要的一批单
+    （要拿去和集运的「内含快递」截图对上）。一刀切会把这条路封死。
+    """
+    import datetime as dt
+    from decimal import Decimal
+
+    from app.models import OrderStaging
+    from app.plugins import scopes
+
+    row = OrderStaging(order_no="PLG-MONEY-2", title="补快递号",
+                       price_cny=Decimal("50.00"), platform="淘宝",
+                       scraped_at=dt.datetime.now(dt.timezone.utc),
+                       order_date=dt.date(2026, 4, 1))
+    session.add(row)
+    session.commit()
+    sid = row.id
+    client.post(f"/api/staging/{sid}/import")
+
+    class _U:
+        id, username = 1, "admin"
+
+    tok, _ = scopes.issue(_U(), "money-test", {"staging:write"})
+    cur = client.get("/api/staging?q=PLG-MONEY-2").json()["items"][0]
+    r = client.patch(f"/api/staging/{sid}", headers={"Authorization": f"Bearer {tok}"},
+                     json={"version": cur["version"], "express_no": "SF9988776655"})
+    assert r.status_code == 200, f"插件补快递号被挡了：{r.text}"
+
+
+def test_revoking_a_grant_also_kills_the_token_already_in_flight(client, session, monkeypatch):
+    """在界面上收回授权时，**正在跑的那枚令牌也要当场作废**。
+
+    用户唯一一次真的去点撤销，恰好是他正看着这个插件在乱写的时候。
+    而那一刻如果只改数据库里的 `granted_scopes`，正在跑的子进程会拿着旧令牌
+    一直写到跑完（`_reap` 最长等 30 分钟）——**卡片上却已经显示「未授权」了**。
+    「用户唯一一次真的去用它，恰好是它什么都不做的那一次。」
+    """
+    from app.models import PluginConfig
+    from app.plugins import scopes
+
+    pid = "soroban-plugin-taobao"
+    cfg = session.get(PluginConfig, pid) or PluginConfig(plugin_id=pid)
+    cfg.granted_scopes = '["staging:read", "staging:write"]'
+    session.add(cfg)
+    session.commit()
+
+    # 测试环境的插件目录是空的（conftest 刻意隔离），端点在 `_find_manifest` 就会 404。
+    # 只替换「找清单」这一步，授权与撤销的判定逻辑跑的是真代码。
+    from app.routers import plugins as mod
+
+    monkeypatch.setattr(mod, "_find_manifest",
+                        lambda _id: {"id": pid, "scopes": ["staging:read", "staging:write"]})
+
+    class _U:
+        id, username = 1, "admin"
+
+    tok, jti = scopes.issue(_U(), pid, {"staging:read", "staging:write"})
+    assert scopes.alive(jti), "刚签发就不在飞？前提不成立"
+
+    r = client.put(f"/api/plugins/{pid}/grants", json={"granted": ["staging:read"]})
+    assert r.status_code == 200, r.text
+    assert r.json().get("revoked_running") == 1, r.json()
+    assert not scopes.alive(jti), "收回授权之后，在飞的那枚令牌还活着"
+
+
+def test_adding_a_grant_does_not_interrupt_a_running_plugin(client, session, monkeypatch):
+    """反面：**加**授权不许打断正在跑的那次——那是帮倒忙。
+
+    没有这条的话，「变更即撤销」也能让上面那条绿，而用户每次勾一个新权限
+    都会把手头正在跑的抓取掐断。
+    """
+    from app.models import PluginConfig
+    from app.plugins import scopes
+
+    pid = "soroban-plugin-taobao"
+    cfg = session.get(PluginConfig, pid) or PluginConfig(plugin_id=pid)
+    cfg.granted_scopes = '["staging:read"]'
+    session.add(cfg)
+    session.commit()
+
+    from app.routers import plugins as mod
+
+    monkeypatch.setattr(mod, "_find_manifest",
+                        lambda _id: {"id": pid, "scopes": ["staging:read", "staging:write"]})
+
+    class _U:
+        id, username = 1, "admin"
+
+    tok, jti = scopes.issue(_U(), pid, {"staging:read"})
+    r = client.put(f"/api/plugins/{pid}/grants",
+                   json={"granted": ["staging:read", "staging:write"]})
+    assert r.status_code == 200, r.text
+    assert r.json().get("revoked_running") == 0, r.json()
+    assert scopes.alive(jti), "只是加了个权限，却把正在跑的那次掐断了"
+
+
+def test_a_failed_launch_does_not_leak_a_live_token(monkeypatch):
+    """`_launch` 失败时那枚令牌必须当场作废——**不管是因为什么失败**。
+
+    原先只有 `except PluginBusy` 那一支收。而 `_launch` 还会因为别的原因抛，
+    其中「无法创建收割线程」那一支是在 `Popen` **成功之后**才抛的——
+    子进程已经带着 `SOROBAN_TOKEN` 跑起来了，却没有任何收割线程会去 revoke 它。
+    那枚令牌就一直被 `_plugin_gate` 认到 TTL 到期（最长 30 分钟）。
+
+    这条直接测那个循环体的语义：签发 → `_launch` 抛非 PluginBusy → jti 不许还活着。
+    """
+    from app.plugins import scopes
+
+    class _U:
+        id, username = 1, "admin"
+
+    tok, jti = scopes.issue(_U(), "leak-test", {"staging:read"})
+    assert scopes.alive(jti)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("启动插件失败（无法创建收割线程）")
+
+    # 复现循环体：起不来就作废，别管抛的是哪一种
+    try:
+        try:
+            _boom()
+        except Exception:
+            scopes.revoke(jti)
+            raise
+    except RuntimeError:
+        pass
+    assert not scopes.alive(jti), "启动失败之后令牌还活着"
+
+
+def test_the_launch_loop_revokes_on_every_failure_path():
+    """上面那条测的是语义，这条钉的是**真实代码里确实有那一支**。
+
+    按 AST 找 `run_command` 里包着 `_launch(...)` 的那个 try，
+    要求它的 except 分支**全部**都会 `scopes.revoke(...)`——
+    漏掉任何一支，那条路径上的令牌就会活到 TTL 到期。
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "app" / "routers" / "plugins.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    tries = [n for n in ast.walk(tree) if isinstance(n, ast.Try)
+             and any(isinstance(c, ast.Call) and getattr(c.func, "id", "") == "_launch"
+                     for c in ast.walk(n) if isinstance(c, ast.Call))]
+    # 只看直接包着 _launch 调用、且带 except 的那些
+    tries = [t for t in tries if t.handlers]
+    assert tries, "没找到包着 _launch 的 try —— 探测方式可能已过期"
+    bad = []
+    for t in tries:
+        for h in t.handlers:
+            has_revoke = any(isinstance(c, ast.Call)
+                             and getattr(c.func, "attr", "") == "revoke"
+                             for c in ast.walk(h))
+            if not has_revoke:
+                name = getattr(h.type, "id", None) or getattr(h.type, "attr", "?")
+                bad.append(f"第 {h.lineno} 行的 except {name} 没有 revoke 令牌")
+    assert not bad, ("`_launch` 的这些失败分支没有作废令牌：\n  " + "\n  ".join(bad)
+                     + "\n（进程没起来就没人会 revoke，那枚令牌会活到 TTL 到期。）")
+
+
+def test_shipment_read_does_not_hand_over_the_orders_that_orders_read_gates(client, session):
+    """只给了「读集运单」的插件，**不该**从集运列表里拿到账本订单的明细。
+
+    用户取消勾选「读商品订单」，界面上就是这么写的；而 `GET /api/shipment` 会把每张
+    集运单挂着的订单号、标题、状态、结算日元、以及每件物品的名称/数量/单价原样发出去
+    ——**他留下的那道闸，从另一个门整个绕开了**。
+
+    这不是在收紧权限模型（插件都是用户自己写的、不防恶意插件），
+    而是让那个勾选框说的话成立。人类登录不受影响。
+    """
+    import datetime as dt
+
+    from app.plugins import scopes
+
+    s = client.post("/api/shipment", json={"date": "2026-06-01", "shipment_no": "SCOPE-1",
+                                           "shipment_status": "打包中"}).json()
+    o = client.post("/api/orders", json={"date": "2026-06-01", "title": "机密商品",
+                                         "order_no": "SCOPE-ORD-1",
+                                         "purchase_status": "待收货"}).json()
+    assert client.post(f"/api/shipment/{s['id']}/order/{o['id']}").status_code == 200
+
+    class _U:
+        id, username = 1, "admin"
+
+    tok, _ = scopes.issue(_U(), "scope-test", {"shipment:read"})
+    body = client.get("/api/shipment", params={"q": "SCOPE-1"},
+                      headers={"Authorization": f"Bearer {tok}"}).json()
+    mine = next(x for x in body["items"] if x["shipment_no"] == "SCOPE-1")
+    assert mine["orders"] == [], f"只给了 shipment:read 却拿到了订单明细：{mine['orders']}"
+    assert "机密商品" not in str(body), "订单标题还是漏出去了"
+
+    # 反面一：**人类登录照旧看得到**（他本来就有全部权限）
+    human = client.get("/api/shipment", params={"q": "SCOPE-1"}).json()
+    hm = next(x for x in human["items"] if x["shipment_no"] == "SCOPE-1")
+    assert len(hm["orders"]) == 1, "把人也一起挡了"
+
+    # 反面二：给了 orders:read 的插件照旧看得到
+    tok2, _ = scopes.issue(_U(), "scope-test", {"shipment:read", "orders:read"})
+    body2 = client.get("/api/shipment", params={"q": "SCOPE-1"},
+                       headers={"Authorization": f"Bearer {tok2}"}).json()
+    m2 = next(x for x in body2["items"] if x["shipment_no"] == "SCOPE-1")
+    assert len(m2["orders"]) == 1, "给了 orders:read 反而看不到了"

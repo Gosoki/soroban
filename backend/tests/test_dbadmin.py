@@ -540,3 +540,127 @@ def test_readme_does_not_promise_mariadb():
     readme = (Path(__file__).resolve().parents[2] / "README.md").read_text(encoding="utf-8")
     assert "MariaDB 会自动回退" not in readme
     assert "MariaDB 不支持" in readme, "得明说不支持，光删掉旧句子等于没说"
+
+
+def test_switching_holds_the_read_only_barrier_over_the_critical_section(
+        client, tmp_path, monkeypatch):
+    """切换的**临界段**必须挂只读屏障：指纹检查 → 引擎交换之间不许有写入落进旧库。
+
+    落在那个窗口里的写会提交进**旧库**，切换之后既不在新库里、也没有任何提示——
+    一张已经 200 的订单凭空消失。窗口只有几毫秒，但后果是静默丢账；
+    而 `migrate()` 本来就挂着屏障，两个同级操作没有理由一个挂一个不挂。
+
+    `run_migrations(目标)` 刻意**不**在屏障里（它写的是目标库，且可能要跑几十秒），
+    所以这条只断言临界段。判据是**交换引擎的那一刻屏障举着没有**。
+    """
+    import app.routers.dbadmin as mod
+    from app.database import build_engine, get_engine, run_migrations, set_data_engine
+    from app.maintenance import barrier
+    from app.services import db_migrate
+
+    # 造一个已经有数据的目标库（switch 要求目标非空）
+    url = f"sqlite:///{tmp_path / 'switch-target.db'}"
+    run_migrations(url)
+    tgt = build_engine(url)
+    db_migrate.replace_data(get_engine(), tgt)
+
+    seen = []
+    real_swap = mod.set_data_engine
+
+    def _spy(engine, u):
+        seen.append(barrier.blocked_reason())      # 交换的那一刻，屏障举着吗
+        return real_swap(engine, u)
+
+    monkeypatch.setattr(mod, "_resolve_target", lambda t: ("sqlite", url, tgt, False))
+    monkeypatch.setattr(mod, "_is_same_as_active", lambda backend, u: False)
+    monkeypatch.setattr(mod, "set_data_engine", _spy)
+
+    origin = get_engine()
+    try:
+        # `confirm_changed`：本文件别的用例会留下 migrate_state 指纹，那道闸不是这条要测的
+        r = client.post("/api/db/switch", json={"backend": "sqlite", "confirm_changed": True})
+        assert r.status_code == 200, r.text
+    finally:
+        set_data_engine(origin, str(origin.url))   # 切回去，别影响后面的用例
+        tgt.dispose()
+
+    assert seen, "根本没走到 set_data_engine"
+    assert seen[-1], "交换引擎时**没有**举着只读屏障——那几毫秒里的写会静默落进旧库"
+
+
+def test_the_non_empty_409_discloses_that_the_schema_was_already_upgraded(
+        client, dst_engine, monkeypatch):
+    """「目标非空」那句 409 必须说清：**表结构已经升过了，只是数据没动。**
+
+    顺序是被迫的——`target_rows` 要 select 业务表，表还没建就数不出行数，
+    所以 `run_migrations(目标)` 只能排在前面（反过来排会把「尚未建表」误报成
+    「目标是空的」，把用户推向覆盖）。改顺序会更糟，所以这条不改顺序。
+
+    但用户看到 409 点了取消，会以为**什么都没发生**。而目标库的 `alembic_version`
+    已经前进了：另一台还在用旧版 soroban 的机器连同一个库时，下次启动就会撞上
+    「库比代码新」。数据没动是真的，schema 动了也是真的，**两句都要说**。
+    """
+    from app.database import get_engine
+    from app.routers import dbadmin as mod
+
+    client.post("/api/orders", json={"date": "2027-04-02", "title": "让对面非空"})
+    db_migrate.replace_data(get_engine(), dst_engine)        # 目标库变成非空
+    monkeypatch.setattr(mod, "_resolve_target",
+                        lambda t: ("sqlite", "sqlite:///dst", dst_engine, False))
+    monkeypatch.setattr(mod, "_is_same_as_active", lambda backend, url: False)
+
+    r = client.post("/api/db/migrate", json={"backend": "sqlite"})
+    assert r.status_code == 409, f"没走到「目标非空」那道闸：{r.status_code} {r.text[:200]}"
+    detail = r.json()["detail"]
+    assert "无法撤销" in detail, detail
+    assert "表结构" in detail and "数据一个字都没动" in detail, \
+        f"没说清「schema 已经升了、数据没动」：{detail}"
+
+
+def test_preflight_catches_text_columns_that_overflow_mysql(tmp_path):
+    """`preflight` 必须捞出**超长的 TEXT**（note / title / url / params_json）。
+
+    这一支原先整个不存在：`if limit:` 对 TEXT 是 False（它的 `length` 是 None），
+    后面两支也不认它。而 SQLite 照单全收任意长度、MySQL 的 TEXT 在 STRICT_TRANS_TABLES 下
+    抛 1406——`replace_data` 是**单事务**，一行超长就让整次迁移回滚，
+    用户只看到「拷贝「商品订单」表时失败：<SQLAlchemy 原始串>」，
+    既不知道是哪一行、也不知道该怎么办。preflight 的职责恰恰是提前把这种行捞出来。
+
+    **上限数的是字节不是字符**：MySQL 的 TEXT = 65535 字节，一个汉字 3 字节，
+    所以 21845 个汉字就顶满了。按字符判会把合法的中文误放过去。
+
+    目标引擎**不需要真的连上**——`preflight` 只读它的方言名，查询全打在源库上。
+    """
+    import datetime as dt
+
+    from sqlmodel import Session
+
+    from app.models import Order
+
+    url = f"sqlite:///{tmp_path / 'src.db'}"
+    run_migrations(url)
+    src = build_engine(url)
+    try:
+        with Session(src) as s:
+            long_note = Order(date=dt.date(2027, 1, 1), title="超长备注", order_no="LONG-1",
+                              purchase_status="待收货", note="备" * 30000)   # 90000 字节
+            long_note.compute_money()
+            ok = Order(date=dt.date(2027, 1, 1), title="正常", order_no="OK-1",
+                       purchase_status="待收货", note="备" * 100)            # 300 字节
+            ok.compute_money()
+            s.add(long_note)
+            s.add(ok)
+            s.commit()
+
+        mysql_dst = build_engine("mysql+pymysql://u:p@127.0.0.1:3306/nope?charset=utf8mb4")
+        try:
+            problems = db_migrate.preflight(src, mysql_dst)
+        finally:
+            mysql_dst.dispose()
+    finally:
+        src.dispose()
+
+    hits = [p for p in problems if "note" in p]
+    assert hits, f"超长 TEXT 没被捞出来：{problems}"
+    assert "90000" in hits[0], f"报的不是字节数（一个汉字 3 字节）：{hits[0]}"
+    assert len(hits) == 1, f"把正常长度的那条也报了：{hits}"

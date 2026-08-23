@@ -297,8 +297,7 @@ def _same_row_value(anchor: dict, tokens: list[dict], row_tol: float,
 
     「取最长」这条一度只存在于注释里：实现从来没有比较过长度，而是按 y 距离取最近——
     可同一行的候选本来就都在 row_tol 之内，谁更近几乎是随机的。
-    这些字段（订单号 15~20 位、快递号 12~15 位）本身就是「越长越像真的」，
-    所以现在按注释说的做。见 `test_same_row_prefers_the_longer_candidate`。
+    同一行有多个候选时取**离锚点最近**的那个（见 `test_same_row_prefers_the_nearest_candidate`）。
 
     `allow_below=False` 用于**内容词锚点**（如快递公司名）——真标签（「订单编号」「快递单号」）
     只会出现在它的值旁边，往下兜底是安全的；而公司名可能出现在页面任何地方（商品标题里的
@@ -316,13 +315,26 @@ def _same_row_value(anchor: dict, tokens: list[dict], row_tol: float,
     same_row = [t for t in cands if abs(t["cy"] - anchor["cy"]) <= row_tol]
     if same_row:
         right = [t for t in same_row if t["x0"] >= anchor["x0"]]
-        # **同一行里有多个候选时取最长的**，y 距离只作确定性 tiebreak。
-        # 这些候选本来就都在 row_tol 之内，所以「谁的 cy 更近」几乎是随机的；
-        # 而这些字段（订单号 15~20 位、快递号 12~15 位）本身就是「越长越像真的」。
-        # 注：这条 docstring 原先就写着「找 key 值最长的框」，只是实现从没比较过长度——
-        # 现在两者对齐了。
-        pick = max(right or same_row,
-                   key=lambda t: (len(t[key]), -abs(t["cy"] - anchor["cy"])))
+        # **同一行里有多个候选时，取离锚点最近的那个**（长度只作确定性 tiebreak）。
+        #
+        # 这是标签-值版式的字面语义：值就贴在标签右边。而 2026-08-19 那次曾改成
+        # 「取最长」（为了让实现与一句早就写着「找 key 值最长的框」的 docstring 对齐），
+        # **那个方向是错的**——按本模块自己写的区间，订单号 15~20 位、快递号 12~15 位，
+        # 所以「取最长」对快递号是**系统性偏置**：一行里同时有
+        # 「快递单号 SF1234567890123」和「商品订单号 2612345678901234」时，
+        # 选中的**必然**是订单号，不是偶尔选错。
+        # 而那个号 ≥ `_TRACK_TYPICAL_MIN`，长度闸放行 ⇒ `Order.express_no == no` 精确匹配
+        # ⇒ 原子挂靠（version+1、自动 commit、不可撤销），界面还弹绿色成功。
+        #
+        # 当初改「取最长」时的理由是「候选都在 row_tol 内，谁的 cy 更近几乎是随机的」——
+        # 那句话没错，错在结论：随机的是 **cy**，而 **x** 一点都不随机。
+        # 用 x 距离既解决了原来的不确定性，又不会把长号系统性地挑出来。
+        #
+        # 噪音（日期之类）不需要靠长度来滤：`t[key]` 已经是提取归一化过的值
+        # （`digits` 取最长数字串、`tracking` 保留字母前缀），加上 `min_len`，
+        # 「2026-08-01」这种在这一步之前就没了。
+        pick = min(right or same_row,
+                   key=lambda t: (abs(t["x0"] - anchor["x0"]), -len(t[key])))
         return pick[key]
     if not allow_below:
         return None

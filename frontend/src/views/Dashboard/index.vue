@@ -123,19 +123,30 @@ const loadFailed = ref(false)   // 上一次加载是否失败：整屏据此说
 // 有值 ⇒ 屏幕上是真数据只是旧了；没有 ⇒ 屏幕上是全 0 的初值。
 const loadedAt = ref('')
 
+// 请求序号门：迟到的响应不许覆盖新结果。七个列表页都有这一道，**看板此前没有**。
+// 它在这一页的后果更刺眼：后端繁忙时进页面 → 第一次请求卡住 → 用户点「重试」→
+// 第二次很快成功、真数据已经画在屏幕上 → 第一次那笔在 15s 超时后返回 →
+// catch 无条件 `loadFailed = true` ⇒ **在刚拉回来的正确数据上方挂出红色「加载失败」**。
+// 反向同理：慢的那次若成功晚到，会用旧快照把新的一份盖掉。
+let loadSeq = 0
+
 async function load() {
+  const my = ++loadSeq
   loading.value = true
   try {
-    Object.assign(data, await dashboardApi.get())
+    const fresh = await dashboardApi.get()
+    if (my !== loadSeq) return          // 已有更新的请求发出，丢弃这次的结果
+    Object.assign(data, fresh)
     loadFailed.value = false
     loadedAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false })
   } catch (e) {
+    if (my !== loadSeq) return          // 迟到的失败同样不许盖掉新鲜数据
     loadFailed.value = true     // 拦截器已弹过 toast；这里负责让**页面本身**留下痕迹
     // 再往控制台记一条：toast 三秒就没了、alert 只说结论不说原因，
     // 事后要查「到底是网络断了还是后端 500」就只剩这一条。
     console.error('[看板] 数据加载失败', { hadDataBefore: !!loadedAt.value, error: e })
   } finally {
-    loading.value = false
+    if (my === loadSeq) loading.value = false
   }
 }
 onMounted(load)

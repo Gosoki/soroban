@@ -113,7 +113,12 @@
         <el-table-column prop="when" label="时间" width="180" />
         <el-table-column prop="size" label="大小" width="110" align="right" />
       </el-table>
-      <div v-else class="hint">还没有备份。</div>
+      <!-- **空态不许说假话。** 请求失败时 `backupList` 也是空的，
+           照着说「还没有备份」会让人以为备份从来没跑过——而实际可能是接口挂了，
+           备份好好躺在目录里。这一页的其它地方（降级提示）也是这个口径。 -->
+      <div v-else class="hint">
+        {{ backupsFailed ? MSG_LOAD_FAILED : '还没有备份。' }}
+      </div>
     </el-card>
 
     <!-- 迁移结果 -->
@@ -132,9 +137,10 @@ import PageHeader from '@/components/PageHeader.vue'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Coin, Files } from '@element-plus/icons-vue'
+import { fmtDateTime } from '@/utils/datetime'
 import { dbApi } from '@/api'
 import { handled } from '@/api/http'
-import { longToast, typeStyle } from '@/constants'
+import { MSG_LOAD_FAILED, longToast, typeStyle } from '@/constants'
 
 // active 初值刻意留空：给 `{ backend: 'sqlite' }` 的话，首帧必然渲染成
 // 「SQLite（本地文件）」并给本地那行挂上「当前」标签——实际连着 MySQL 时，
@@ -185,10 +191,12 @@ function formTarget() {
 }
 
 const backupList = ref([])
+// 上一次加载是否失败：空态文案据此说实话（与 Orders/Fx 等页同一口径）。
+const backupsFailed = ref(false)
 const backupDir = ref('')
 const backups = computed(() => backupList.value.map((b) => ({
   name: b.name,
-  when: String(b.mtime).replace('T', ' '),
+  when: fmtDateTime(b.mtime),      // 与全站其它时间戳走同一条管线（UTC → 本地）
   size: b.bytes >= 1048576 ? `${(b.bytes / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(b.bytes / 1024))} KB`,
 })))
 
@@ -197,7 +205,11 @@ async function loadBackups() {
     const r = await dbApi.backups()
     backupList.value = r.items || []
     backupDir.value = r.dir || ''
-  } catch (_) { /* 拦截器已提示 */ }
+    backupsFailed.value = false
+  } catch (_) {
+    // 拦截器已提示原因；这里负责让**页面本身**留下痕迹，否则空态在说假话。
+    backupsFailed.value = true
+  }
 }
 
 async function doBackup() {
@@ -310,6 +322,11 @@ async function onSourceChanged(target, name, detail) {
         distinguishCancelAndClose: true,
         confirmButtonText: '重新迁移再切换',
         cancelButtonText: '仍然切换（放弃这些改动）',
+        // 全项目**唯一**一处「取消位不是退出键」。其余 17 处 cancelButtonText 都是「取消」，
+        // 用户的肌肉记忆是「点左边 = 什么都没发生」——而这里点下去会不可逆地丢掉改动。
+        // 染成 danger 让它在视觉上先自我否认一次：这个位置上的红按钮不是退出键。
+        // 「什么都不做」由 × / Esc 承接（上面的 distinguishCancelAndClose 就是为此）。
+        cancelButtonClass: 'el-button--danger',
       },
     )
   } catch (action) {

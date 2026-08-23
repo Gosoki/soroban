@@ -412,3 +412,91 @@ def test_a_barrier_503_never_reaches_the_handler(client, session, monkeypatch):
     # 屏障放开之后同一笔照样能写进去（说明拦的是时机，不是内容）
     ok = client.post("/api/misc", json={"date": "2026-08-04", "name": "屏障期间"})
     assert ok.status_code in (200, 201), ok.text
+
+
+def test_a_sqlite_write_lock_becomes_a_retryable_503_not_a_bare_500(client, monkeypatch):
+    """SQLite 的写锁冲突要变成「稍后重试」，而不是「服务器错误」。
+
+    这条分支原先根本不存在：`_deadlock_handler` 只认 MySQL 的 errno
+    （那段注释里还写着「SQLite 那些就不带 args」），于是 SQLite 上的 `database is locked`
+    落成一个裸 500。而这本账现在正跑在 SQLite 上，且有 2-3 个人同时编辑。
+
+    **判 errno 不判文案**：pysqlite 不把 errno 放进 `args`，但异常实例上有
+    `sqlite_errorcode`（5=SQLITE_BUSY / 6=SQLITE_LOCKED）。
+    按 "database is locked" 这句话判的话，换个 SQLite 版本就失效了。
+
+    也钉住**不是 409**：409 的语义是「数据被别人改了」，前端据此提示「数据已变，已刷新」
+    并整表重拉——那会丢掉用户刚敲的内容，而且那句话是假的：数据一个字都没变。
+    """
+    import sqlite3
+
+    from sqlalchemy.exc import OperationalError
+
+    from app.routers import misc as mod
+
+    def _boom(*a, **kw):
+        orig = sqlite3.OperationalError("database is locked")
+        orig.sqlite_errorcode = 5           # SQLITE_BUSY
+        orig.sqlite_errorname = "SQLITE_BUSY"
+        raise OperationalError("INSERT ...", {}, orig)
+
+    monkeypatch.setattr(mod, "stamp_fx", _boom)
+    r = client.post("/api/misc", json={"date": "2026-08-05", "name": "撞锁"})
+    assert r.status_code == 503, f"应当是可重试的 503，实际 {r.status_code}：{r.text}"
+    assert r.headers.get("Retry-After"), "没带 Retry-After，前端无从知道这是暂时状态"
+    assert "正忙" in r.json()["detail"], r.text
+
+
+def test_a_real_sqlite_error_is_not_disguised_as_busy(client, monkeypatch):
+    """不是锁冲突的 OperationalError **不许**被伪装成「稍后重试」。
+
+    把「表不存在」「库损坏」报成「数据库正忙，请稍后重试」，会让人一直重试一个
+    永远不会好的东西——那比裸 500 更误导。
+    """
+    import sqlite3
+
+    from sqlalchemy.exc import OperationalError
+
+    from app.routers import misc as mod
+
+    def _boom(*a, **kw):
+        orig = sqlite3.OperationalError("no such table: orders")
+        orig.sqlite_errorcode = 1           # SQLITE_ERROR
+        orig.sqlite_errorname = "SQLITE_ERROR"
+        raise OperationalError("SELECT ...", {}, orig)
+
+    monkeypatch.setattr(mod, "stamp_fx", _boom)
+    # handler 对「不是并发冲突」的那支是 `raise exc`（交回默认处理，生产上就是 500）。
+    # TestClient 默认会把它原样抛出来，所以这里两种结局都算通过——
+    # **唯一不许发生的是 503**。
+    try:
+        r = client.post("/api/misc", json={"date": "2026-08-05", "name": "真错误"})
+    except OperationalError:
+        return                          # 原样抛出 = 没被伪装，正是要的结果
+    assert r.status_code != 503, f"把一个真错误说成了「稍后重试」：{r.text}"
+    assert r.status_code >= 500, r.status_code
+
+
+def test_a_value_too_long_for_the_column_becomes_422_not_a_bare_500(client, monkeypatch):
+    """值超出列能存的范围 → **422**（你能改的输入问题），不是裸 500（「服务器错误」）。
+
+    最常见的一种是 MySQL 的 TEXT 溢出（65535 **字节**，一个汉字 3 字节 ⇒ 21845 字顶满）：
+    粘一段很长的备注，SQLite 照单全收、MySQL 在 STRICT_TRANS_TABLES 下抛 1406。
+    `DataError` 不是 `IntegrityError`，此前没有任何 handler 认它——用户拿到「服务器错误」，
+    既不知道是自己那段文字太长、也不知道该删短，**而这恰恰是他自己能解决的事**。
+
+    这里用 mock 造异常：本机跑在 SQLite 上，它不会真的抛 DataError（弱类型照单全收）。
+    """
+    from sqlalchemy.exc import DataError
+
+    from app.routers import misc as mod
+
+    def _boom(*a, **kw):
+        raise DataError("INSERT ...", {}, Exception("Data too long for column 'note' at row 1"))
+
+    monkeypatch.setattr(mod, "stamp_fx", _boom)
+    r = client.post("/api/misc", json={"date": "2026-08-06", "name": "很长的备注"})
+    assert r.status_code == 422, f"应当是 422，实际 {r.status_code}：{r.text}"
+    detail = r.json()["detail"]
+    assert "太长" in detail, detail
+    assert "note" in detail, f"没把 MySQL 给的列名带出来（用户要靠它知道改哪一格）：{detail}"

@@ -67,10 +67,9 @@ _ACCOUNT_MAX = Order.__table__.columns["platform_account"].type.length
 _PREFIXES = ("soroban-plugin-*", "soroban-scraper-*")
 
 # 子进程最长跑多久。**令牌 TTL 必须由它推导**（见每个 scopes.issue 的 timeout_s）：
-# 原先 issue 全部走默认 600s → TTL 恒为 12 分钟，而这里等 30 分钟。
-# 任何超过 12 分钟的抓取，最后那次回灌必然 401，整批订单静默丢失——单账号也中。
-# 两个数字分别写在两个文件里，就是这么长出来的。
-_REAP_TIMEOUT = 1800
+# `_REAP_TIMEOUT` **不在这里定义**——唯一真相在 `plugins_proc.py`，本文件下面从那里再导入。
+# 这里曾经也写了一份 `= 1800`，而再导入排在它后面 ⇒ 后者覆盖前者 ⇒ 改这里那个数**静默无效**。
+# （更讽刺的是：它上面原本挂的那段注释说的正是「两个数字分别写在两个文件里，就是这么长出来的」。）
 
 
 def plugin_dir() -> Path:
@@ -1078,13 +1077,25 @@ def save_grants(plugin_id: str, payload: dict, session: Session = Depends(get_se
     want = set(payload.get("granted") or [])
     keep = sorted(want & set(m.get("scopes") or []) & set(scopes.SCOPES))
     cfg = _config_row(session, plugin_id)
+    before = set(json.loads(cfg.granted_scopes or "[]"))
     cfg.granted_scopes = json.dumps(keep, ensure_ascii=False)
     cfg.updated_at = utcnow()
     session.add(cfg)
     session.commit()
     log.info("插件 %s 的授权改为：%s", plugin_id, keep or "（无）")
+
+    # **收回了权限，就要把在飞的那枚令牌一起作废。**
+    # 用户唯一一次真的去点撤销，恰好是他正看着这个插件在乱写的时候——
+    # 而那一刻如果只改数据库里的 `granted_scopes`，正在跑的子进程会拿着旧令牌
+    # 一直写到跑完（`_reap` 最长等 30 分钟），**卡片上却已经显示「未授权」了**。
+    # 「用户唯一一次真的去用它，恰好是它什么都不做的那一次」。
+    #
+    # 只在**变窄**时撤：加授权不该打断正在跑的那次（那反而是帮倒忙）。
+    revoked = scopes.revoke_plugin(plugin_id) if (before - set(keep)) else 0
+    if revoked:
+        log.info("插件 %s 收回了权限，已作废在飞令牌 %d 枚", plugin_id, revoked)
     return {"plugin_id": plugin_id, "granted": keep,
-            "dropped": sorted(want - set(keep))}
+            "dropped": sorted(want - set(keep)), "revoked_running": revoked}
 
 
 @router.put("/{plugin_id}/config")
@@ -1262,6 +1273,9 @@ def run_command(plugin_id: str, command: str, account: Optional[str] = None,
             # **一个子进程一枚令牌**。共用一枚的话，先跑完的那个账号在 `_reap` 里
             # `revoke(jti)`，还在跑的兄弟当场全部 401——它们已经抓到的订单再也回灌不进来，
             # 而且是静默的：插件那边只看到「soroban 拒绝了我」，用户只看到少了几单。
+            # 令牌 TTL **必须**用 `_REAP_TIMEOUT`（收割超时），不能用 issue 的默认值。
+            # 原先走默认 600s → TTL 恒为 12 分钟，而收割等 30 分钟：任何超过 12 分钟的抓取，
+            # 最后那次回灌必然 401，整批订单静默丢失——单账号也中。
             token, jti = scopes.issue(current, plugin_id, cmd_scopes, timeout_s=_REAP_TIMEOUT)
             try:
                 pids.append(_launch(m, cmd.name, [*extra, "--soroban-url", _SELF_URL],
@@ -1275,6 +1289,15 @@ def run_command(plugin_id: str, command: str, account: Optional[str] = None,
                 scopes.revoke(jti)
                 running.append(who)
                 stolen += 1
+            except BaseException:
+                # **别的失败也要作废这枚令牌**，理由与上面逐字相同。
+                # 原先只有 `except PluginBusy` 那一支收，于是 `_launch` 因为别的原因失败时
+                # （比如「无法创建收割线程」——那一支在 `Popen` **成功之后**才抛，
+                # 子进程已经带着 SOROBAN_TOKEN 跑起来了、却没有任何收割线程会去 revoke），
+                # 这枚令牌会一直被 `_plugin_gate` 认到 TTL 到期（最长 30 分钟）。
+                # 用 BaseException 而不是 Exception：KeyboardInterrupt / SystemExit 时同样不该留。
+                scopes.revoke(jti)
+                raise
     finally:
         # **finally**：中途抛异常（缺 venv、令牌签发失败）时，已经起来的兄弟仍会回调，
         # 而批次还在等一个永远到不了的计划数——卡片会永久停在「执行中…」。

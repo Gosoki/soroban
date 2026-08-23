@@ -14,7 +14,7 @@
          自然反应是去查目录、重拷插件、重建 venv（重下 Playwright 浏览器）。
          而这条路径特别容易撞上：GET /api/plugins 允许每个插件跑 30-60 秒的子进程探测，
          客户端 axios 超时只有 15 秒，装完依赖后的第一次刷新几乎必然超时。 -->
-    <el-empty v-if="loadFailed" description="加载失败——请检查网络或后端，然后重试" />
+    <el-empty v-if="loadFailed" :description="MSG_LOAD_FAILED" />
     <el-empty v-else-if="!loading && !plugins.length"
               description="未发现插件（plugins/ 下没有 soroban-plugin-* 目录）" />
 
@@ -259,7 +259,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, ArrowRight, ArrowUp, Refresh, QuestionFilled } from '@element-plus/icons-vue'
 import { pluginsApi, tagsApi } from '@/api'
 import { handled } from '@/api/http'
-import { longToast, tagStyleAt, typeStyle } from '@/constants'
+import { MSG_LOAD_FAILED, longToast, tagStyleAt, typeStyle } from '@/constants'
 import { daysSince, fmtAgo, fmtDateTime } from '@/utils/datetime'
 
 const plugins = ref([])

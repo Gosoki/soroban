@@ -25,12 +25,32 @@ from fastapi.testclient import TestClient  # noqa: E402
 from sqlmodel import Session, select  # noqa: E402
 
 from app.auth import hash_password  # noqa: E402
-from app.database import create_db_and_tables, get_engine  # noqa: E402
+from app.database import migrate_to_latest, get_engine  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import FxRate, User  # noqa: E402
 
 ADMIN_USER = "admin"
 ADMIN_PASS = "admin12345"
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _never_touch_the_real_backups_dir():
+    """测试**永远**不许往仓库真实的 `backups/` 里写东西。
+
+    靠每条用例自己记得 patch `_default_dir` 是靠不住的：2026-08-22 就漏了一次，
+    一份 304 单的测试库快照落进了生产备份目录——而备份目录里多出一份来路不明的
+    「备份」，正是最会误导人的东西（真出事时可能被当成可用的那一份拿去恢复）。
+
+    这里把落点**从结构上**钉死在会话临时目录里。需要自己目录的用例照样可以再 patch 一次。
+    """
+    import app.backup as _bk
+
+    original = _bk._default_dir
+    _bk._default_dir = lambda: _TMPDIR / "backups"
+    try:
+        yield
+    finally:
+        _bk._default_dir = original
 
 
 @pytest.fixture(autouse=True)
@@ -53,6 +73,8 @@ def _reset_plugin_process_state():
             mod._OWN_GROUP.clear()
         from app.plugins import runlog
         runlog.reset()          # 同理：按 run 聚合的核心事实表也是模块级的
+        from app.services import fx as _fx
+        _fx.reset_warning_throttle()   # 「库里没汇率」的每分钟节流窗，同样是模块级的
 
     clear()
     yield
@@ -62,7 +84,7 @@ def _reset_plugin_process_state():
 @pytest.fixture(scope="session", autouse=True)
 def _schema():
     """建库 + 建 admin + 灌一条基准汇率（很多路由在缺汇率时行为不同，固定它以免测试飘）。"""
-    create_db_and_tables()
+    migrate_to_latest()
     with Session(get_engine()) as s:
         if not s.exec(select(User).where(User.username == ADMIN_USER)).first():
             s.add(User(username=ADMIN_USER, password_hash=hash_password(ADMIN_PASS), display_name="管理员"))

@@ -567,3 +567,34 @@ def test_the_card_reports_when_it_last_succeeded(client, session):
     body = client.get("/api/plugins").json()
     for p in body:
         assert "ok_at" in p["last_run"], f"{p.get('id')} 的 last_run 里没有 ok_at：{p['last_run']}"
+
+
+def test_no_module_level_constant_is_silently_shadowed_by_the_re_export():
+    """`plugins.py` 里不许再定义一份已经从 `plugins_proc` 再导入的常量。
+
+    O2 那次把进程层拆到 `plugins_proc.py`、在 `plugins.py` 里再导入回来（测试要按名字拿）。
+    但 `_REAP_TIMEOUT` 在**再导入之前**还留着一份 `= 1800` 的定义——
+    再导入排在后面，于是后者覆盖前者：**改前面那个数静默无效**。
+
+    这条按 AST 判：文件里既有顶层赋值、又出现在那条 `from .plugins_proc import (...)`
+    名单里的名字，一个都不许有。按名字 grep 判不了这件事（两处都写着同一个名字）。
+    """
+    import ast
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "app" / "routers" / "plugins.py"
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+
+    imported, assigned = set(), set()
+    for node in tree.body:                      # 只看顶层
+        if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("plugins_proc"):
+            imported |= {a.asname or a.name for a in node.names}
+        elif isinstance(node, ast.Assign):
+            assigned |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+
+    assert imported, "没找到那条 from .plugins_proc import(...)，探测方式可能已过期"
+    shadowed = sorted(imported & assigned)
+    assert not shadowed, (
+        f"这些名字在 plugins.py 里既被再导入、又被本地赋值：{shadowed}\n"
+        "再导入排在后面会覆盖本地定义 ⇒ 改本地那份**静默无效**。"
+        "唯一真相应当留在 plugins_proc.py。")

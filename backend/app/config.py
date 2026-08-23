@@ -1,9 +1,13 @@
 """App configuration. Reads from environment / .env (see .env.example)."""
 
 from decimal import Decimal
+from pathlib import Path
 from typing import Optional
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .paths import runtime_dir
 
 # 汇率合理区间 + 量化精度：**唯一真相**，手填校验(schemas)与抓取入库(services/fx)共用，
 # 避免两处各写一份而悄悄漂移（1 CNY = X JPY，X≈20）。
@@ -20,7 +24,11 @@ JPY_MAX = 2_147_483_647
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # `.env` 锚到**运行时目录**，不是当前工作目录。写成 ".env" 的话，
+    # 在别的目录里跑 `python -m app.X` / `python -m tools.X` 会**找不到它**，
+    # 于是 SECRET_KEY 静默退回下面那个默认值——而控制库里的 MySQL 连接串正是用它加密的，
+    # 解不开就会静默降级成一个空的本地库。详见 app/paths.py。
+    model_config = SettingsConfigDict(env_file=runtime_dir() / ".env", extra="ignore")
 
     SECRET_KEY: str = "dev-insecure-key-change-me"
     # 本地 SQLite 文件位置（控制/配置库，恒 SQLite）。是否走 MySQL 由应用内「数据库」页
@@ -45,6 +53,32 @@ class Settings(BaseSettings):
     # 旧名，只为兼容已有 .env。新部署用 PLUGIN_DIR——插件已经不只是爬虫了
     # （汇率、国际快递查询都没有「爬」的语义）。两个都设时以 PLUGIN_DIR 为准。
     SCRAPER_DIR: Optional[str] = None
+
+    @field_validator("DATABASE_URL")
+    @classmethod
+    def _anchor_sqlite_path(cls, v: str) -> str:
+        """相对的 sqlite 路径锚到**运行时目录**，不跟着当前工作目录跑。
+
+        原先 `sqlite:///./soroban.db` 是按 CWD 解析的：在别的目录里导入 `app.database`
+        会当场新建一个空库并把它当成账本（SQLite 模式下控制库就是账本本体）。
+        应用照常启动、一条报错都没有，只是账本是空的。
+
+        只动「相对的 sqlite 路径」这一种：内存库（`sqlite://`、`:memory:`）、
+        绝对路径（四道斜杠）、以及 MySQL 串全部原样放行。
+        测试把 DATABASE_URL 设成绝对临时路径，因此不受影响。
+        """
+        if not v.startswith("sqlite"):
+            return v
+        from sqlalchemy.engine import make_url
+
+        try:
+            url = make_url(v)
+        except Exception:                       # noqa: BLE001 - 交给 create_engine 去报真正的错
+            return v
+        db = url.database
+        if not db or db == ":memory:" or Path(db).is_absolute():
+            return v
+        return str(url.set(database=str((runtime_dir() / db).resolve())))
 
 
 settings = Settings()

@@ -567,12 +567,12 @@ def test_env_values_tolerate_a_trailing_comment(tmp_path, monkeypatch):
 def test_database_init_happens_after_the_single_process_gate():
     """建表/迁移与建管理员都必须排在**单进程闸之后**。
 
-    `main.lifespan` 特意把 `single_process.acquire()` 放在 `create_db_and_tables()`
+    `main.lifespan` 特意把 `single_process.acquire()` 放在 `migrate_to_latest()`
     之前，理由原话是「多 worker 时后来的那些会在这里当场退出，而不是先各自跑一遍迁移
     ——幂等归幂等，但那是几个进程同时 ALTER 同一个库」。
 
     而启动器原先在 `uvicorn.run()` **之前**调 `seed.main()`，那个函数自己会先
-    `create_db_and_tables()` ⇒ 完整 alembic upgrade 跑在闸之前。
+    `migrate_to_latest()` ⇒ 完整 alembic upgrade 跑在闸之前。
     改端口开第二个实例时，新进程会对**正在被老进程使用的库**跑完迁移，
     然后才在 lifespan 里被闸拒绝。
 
@@ -585,22 +585,22 @@ def test_database_init_happens_after_the_single_process_gate():
     import run as run_mod
     from app import main as main_mod
 
-    # ① lifespan 里：acquire → create_db_and_tables → ensure_admin
+    # ① lifespan 里：acquire → migrate_to_latest → ensure_admin
     tree = ast.parse(textwrap.dedent(inspect.getsource(main_mod.lifespan)))
     order = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             name = getattr(node.func, "attr", getattr(node.func, "id", ""))
-            if name in ("acquire", "create_db_and_tables", "ensure_admin"):
+            if name in ("acquire", "migrate_to_latest", "ensure_admin"):
                 order.setdefault(name, node.lineno)
-    assert set(order) == {"acquire", "create_db_and_tables", "ensure_admin"}, order
-    assert order["acquire"] < order["create_db_and_tables"] < order["ensure_admin"], (
+    assert set(order) == {"acquire", "migrate_to_latest", "ensure_admin"}, order
+    assert order["acquire"] < order["migrate_to_latest"] < order["ensure_admin"], (
         f"lifespan 里的顺序不对：{order}（闸 → 建表 → 建号）")
 
     # ② 启动器不许在 uvicorn 之前碰库
     launcher = ast.parse(textwrap.dedent(inspect.getsource(run_mod.main)))
     touched = {getattr(n.func, "attr", getattr(n.func, "id", ""))
                for n in ast.walk(launcher) if isinstance(n, ast.Call)}
-    bad = touched & {"create_db_and_tables", "seed_admin", "ensure_admin"}
+    bad = touched & {"migrate_to_latest", "seed_admin", "ensure_admin"}
     assert not bad, (f"启动器在拿到单进程闸之前就碰库了：{sorted(bad)}。"
                      "这些事都该在 app.main.lifespan 里做")

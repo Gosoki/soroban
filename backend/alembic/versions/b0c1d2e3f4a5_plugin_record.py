@@ -18,7 +18,7 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-from app.db.dialect import BinStr, UtcDateTime
+from app.db.dialect import BinStr, UtcDateTime, require_online
 
 revision: str = "b0c1d2e3f4a5"
 down_revision: Union[str, Sequence[str], None] = "a9b0c1d2e3f4"
@@ -28,6 +28,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """Upgrade schema."""
+    require_online("读取现有数据")
     # 重跑安全：MySQL 上一次失败的迁移可能已经把表建出来了（DDL 隐式提交，不回滚）。
     # 不加这个判断的话，修好问题再跑会撞「Table already exists」，看起来像另一个错误。
     #

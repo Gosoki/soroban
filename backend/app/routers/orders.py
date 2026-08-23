@@ -3,6 +3,7 @@
 import datetime as dt
 from typing import Optional
 
+from fastapi.concurrency import run_in_threadpool
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy import func
 from sqlalchemy import update as sa_update
@@ -177,7 +178,12 @@ async def ocr_order(
     # 而让前端去 GET /api/plugins 自己比对，就得在前端写一份平台↔插件的对应关系
     # ——`test_frontend_does_not_hardcode_any_plugin_id` 正是不许这么做。
     if fields.get("platform_warning"):
-        fields["platform_plugin"] = platform_provider(session, fields.get("platform") or "")
+        # **交给线程池**：`platform_provider` 对每个已发现的插件各做一次 `session.get`，
+        # 而这是 `async def` 路由——直接跑就是把 N 次同步 DB 往返压在事件循环线程上。
+        # 与 `ocr_attach_express` 同一条理由（见那里的长注释），只是量级小一些：
+        # 插件数少，但「小的也会冻」——MySQL 卡一下，单条语句就是 30 秒。
+        fields["platform_plugin"] = await run_in_threadpool(
+            platform_provider, session, fields.get("platform") or "")
     return fields
 
 

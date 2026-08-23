@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import DataError, IntegrityError, OperationalError
 from sqlalchemy.exc import TimeoutError as SATimeoutError
 
 from . import models  # noqa: F401  确保建表前所有模型已注册
@@ -18,7 +18,7 @@ from .config import settings
 from .database import (
     _control_url,
     checkpoint_and_dispose,
-    create_db_and_tables,
+    migrate_to_latest,
     wal_checkpoint_loop,
 )
 from .maintenance import barrier
@@ -79,10 +79,10 @@ async def lifespan(app: FastAPI):
     # 单进程闸：排在**建表之前**。多 worker 时后来的那些会在这里当场退出，
     # 而不是先各自跑一遍迁移（幂等归幂等，但那是几个进程同时 ALTER 同一个库）。
     single_process.acquire(_control_url())
-    create_db_and_tables()          # Alembic upgrade head（幂等；旧库自动接管，见 database.py）
+    migrate_to_latest()          # Alembic upgrade head（幂等；旧库自动接管，见 database.py）
     # 确保有管理员（首次分发即可登录；已存在则跳过）。
     # **必须在这里、不能在启动器里**：`run.py` 原先在 `uvicorn.run()` 之前调 `seed.main()`，
-    # 而那个函数自己会先 `create_db_and_tables()` ⇒ 完整 alembic upgrade 跑在
+    # 而那个函数自己会先 `migrate_to_latest()` ⇒ 完整 alembic upgrade 跑在
     # 上面那道单进程闸**之前**。改端口开第二个实例时，新进程会对
     # 正在被老进程使用的库跑完迁移，然后才在这里被闸拒绝。
     # 建号失败不阻断启动——那时用户至少还能看到界面与日志。
@@ -272,10 +272,23 @@ async def _value_error_handler(request: Request, exc: ValueError):
 # 两者都是「有人跟你抢同一批行」，重试就能过去；语义与乐观锁冲突同类。
 _RETRYABLE_MYSQL = {1213, 1205}
 
+# SQLite 的并发写冲突。同样**按 errno 判**：pysqlite 的异常实例上带 `sqlite_errorcode`
+#   5 SQLITE_BUSY    —— 另一个连接正攥着写锁，等到 busy_timeout（默认 5 秒）还没等到
+#   6 SQLITE_LOCKED  —— 同一个连接内部的表级锁冲突
+# WAL 下读者与写者不互斥，所以这两个只会在「**写**撞上另一个长写事务」时出现。
+# 原先这条分支根本不存在：`_deadlock_handler` 只认 MySQL 的 errno（那段注释里还写着
+# 「SQLite 那些就不带 args」），于是 SQLite 上的锁冲突落成一个裸 500「服务器错误」——
+# 而这本账现在正跑在 SQLite 上，且有 2-3 个人同时编辑。
+_RETRYABLE_SQLITE = {5, 6}
+
 
 @app.exception_handler(OperationalError)
 async def _deadlock_handler(request: Request, exc: OperationalError):
-    """MySQL 死锁 / 等锁超时 → 409（前端已有成熟处理），其余 OperationalError 照旧 500。
+    """并发写冲突 → 可重试的响应；其余 OperationalError 照旧 500。
+
+    MySQL 死锁/等锁超时 → 409（前端已有成熟处理）；SQLite 写锁冲突 → 503 + Retry-After。
+    两者分开是有意的：MySQL 那两个的语义确实是「有人跟你抢同一批行」，
+    而 SQLite 的 BUSY 只是「这一瞬间有人攥着写锁」，数据并没有变。
 
     **为什么不能全部 OperationalError 都转 409**：这个异常类是个大杂烩，
     「连接断了」「库不存在」「权限不足」也走它。把连接断开报成「数据已变，请刷新重试」
@@ -289,7 +302,25 @@ async def _deadlock_handler(request: Request, exc: OperationalError):
     # 取 errno 必须防空：驱动层的异常不保证带 args（SQLite 那些就不带），
     # 直接 `args[0]` 会在 handler 里抛 IndexError——异常处理器自己炸掉，
     # 用户看到的是一个完全无关的 500，而真正的原因彻底消失。
-    args = getattr(getattr(exc, "orig", None), "args", ()) or ()
+    orig = getattr(exc, "orig", None)
+
+    # SQLite：pysqlite 不把 errno 放进 args（args 只有一句英文），但实例上有
+    # `sqlite_errorcode`。判它而不是判 "database is locked" 这句话——文案会随版本变。
+    sqlite_code = getattr(orig, "sqlite_errorcode", None)
+    if sqlite_code in _RETRYABLE_SQLITE:
+        log.warning("SQLite 写锁冲突(%s) on %s %s",
+                    getattr(orig, "sqlite_errorname", sqlite_code),
+                    request.method, request.url.path)
+        # **503 而不是 409。** 409 的语义是「数据被别人改了」，前端据此提示「数据已变，已刷新」
+        # 并重新拉取——那会把用户刚敲的内容丢掉，而且那句话是**假的**：数据一个字都没变，
+        # 只是这一瞬间有人攥着写锁。503 才是「稍后重试」，前端对它已经有自动重试。
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "数据库正忙（另一个写操作占着锁），已回滚，请稍后重试"},
+            headers={"Retry-After": "2"},
+        )
+
+    args = getattr(orig, "args", ()) or ()
     code = args[0] if args else None
     if code not in _RETRYABLE_MYSQL:
         raise exc                       # 不是并发冲突：交给默认处理，别伪装成业务冲突
@@ -297,6 +328,28 @@ async def _deadlock_handler(request: Request, exc: OperationalError):
     return JSONResponse(
         status_code=409,
         content={"detail": "另一个操作正在改同一批数据（数据库死锁），已回滚，请重试"},
+    )
+
+
+@app.exception_handler(DataError)
+async def _data_error_handler(request: Request, exc: DataError):
+    """写入的值超出目标列能存的范围 → **422**，而不是裸 500。
+
+    最常见的一种是 MySQL 的 TEXT 溢出（65535 **字节**，一个汉字 3 字节 ⇒ 21845 字就顶满）：
+    粘一段很长的备注，SQLite 照单全收、MySQL 在 STRICT_TRANS_TABLES 下抛 1406。
+    `DataError` 不是 `IntegrityError`，此前没有任何 handler 认它 ⇒ 用户拿到「服务器错误」，
+    既不知道是自己那段文字太长，也不知道该删短——而这恰恰是他自己能解决的事。
+
+    刻意**不**去解析 errno / 猜是哪一列：MySQL 的原始消息里本来就带列名
+    （`Data too long for column 'note' at row 1`），照抄比自己猜准。
+    只把「这是你能改的输入问题」这层意思加上去。
+    """
+    log.warning("DataError on %s %s: %s", request.method, request.url.path,
+                getattr(exc, "orig", exc))
+    return JSONResponse(
+        status_code=422,
+        content={"detail": f"有内容超出了这个字段能存的范围（多半是某段文字太长，"
+                           f"中文一个字算 3 字节、上限 65535）：{getattr(exc, 'orig', exc)}"},
     )
 
 

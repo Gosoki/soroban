@@ -2,14 +2,15 @@
   <div>
     <PageHeader>
     账本里的<b>商品订单</b>。一单可含多件物品，订单价 = Σ(单价×数量) + 邮费，由物品派生。
-    把截图拖到页面任意位置即可 OCR 录单；已导入的暂存单也落在这里。
+    已导入的暂存单也落在这里。<b>截图 OCR 录单在「暂存」页</b>——这一页没有接拖拽，
+    往这儿拖图会被浏览器当成打开文件，整个页面被顶掉、没保存的编辑一起没。
     列可拖动换位/拖宽，宽度按浏览器记住。
     </PageHeader>
 
     <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable hide-id :open-id="focusId"
-                 table-name="orders" :empty-text="loadFailed ? '加载失败——请检查网络或后端，然后重试' : '没有符合条件的记录'" @save="saveCell" @add="addRow" @delete="delRow" @reload="load" @tags-changed="onTagsChanged">
+                 table-name="orders" :empty-text="loadFailed ? MSG_LOAD_FAILED : '没有符合条件的记录'" @save="saveCell" @add="addRow" @delete="delRow" @reload="load" @tags-changed="onTagsChanged">
       <template #toolbar>
-        <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="applyFilters" />
+        <el-input v-model="filters.q" :placeholder="MSG_SEARCH_ORDER_LIKE" clearable style="width: 200px" @change="applyFilters" />
         <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="applyFilters">
           <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
         </el-select>
@@ -112,7 +113,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check } from '@element-plus/icons-vue'
 import { shipmentApi, ordersApi, tagsApi } from '@/api'
 import { handled } from '@/api/http'
-import { ORDER_SOURCES, PAGE_SIZE, PRICE_HELP, PURCHASE_STATUS, SHIPMENT_STATUS, statusStyle, typeStyle } from '@/constants'
+import { MSG_FILTER_CLEARED, MSG_LOAD_FAILED, MSG_NOTHING_TO_EXPORT, MSG_SEARCH_ORDER_LIKE, MSG_STALE_RELOADED, ORDER_SOURCES, PAGE_SIZE, PRICE_HELP, PURCHASE_STATUS, SHIPMENT_STATUS, statusStyle, typeStyle } from '@/constants'
 import { fmtJPY } from '@/utils/money'
 import { applyRowUpdate, queueRowWrite } from '@/utils/rowWrites'
 import { today } from '@/utils/datetime'
@@ -187,21 +188,22 @@ const recipientOptions = ref([])
 // 用户刚改完名就看到「单子没了」。清掉筛选比留着一个查不到东西的值好，
 // 而且要说一句，否则他会以为筛选自己乱了。
 function onTagsChanged({ field, values }) {
-  if (field === 'recipient') {
-    recipientOptions.value = values
-    if (filters.recipient && !values.includes(filters.recipient)) {
-      filters.recipient = ''
-      ElMessage.info('筛选里那个收货人已改名或删除，已为你清掉筛选')
-      applyFilters()
-    }
-  }
-  if (field === 'platform_account') {
-    accountOptions.value = values
-    if (filters.platform_account && !values.includes(filters.platform_account)) {
-      filters.platform_account = ''
-      ElMessage.info('筛选里那个账号已改名或删除，已为你清掉筛选')
-      applyFilters()
-    }
+  // 下拉候选：谁有对应的 ref 就更新谁
+  if (field === 'recipient') recipientOptions.value = values
+  if (field === 'platform_account') accountOptions.value = values
+
+  // **通用地清掉停在旧值上的筛选。** 标签改名之后库里再没有旧值，
+  // 拿它精确匹配会查回 0 行，空态显示「没有符合条件的记录」——
+  // 用户刚改完名就看到「单子没了」，而且他多半不会想到去点筛选框的 ✕。
+  //
+  // 原先是**按字段逐个 if**（只处理了 recipient 与 platform_account），
+  // 于是「来源(platform)」这个同样是标签列、同样有筛选框的字段一直漏在外面。
+  // 按字段枚举正是它被漏掉的原因，所以改成看 `filters` 上有没有同名键——
+  // 将来再接一个标签字段进来，这里不用改。
+  if (filters[field] && !values.includes(filters[field])) {
+    filters[field] = ''
+    ElMessage.info(MSG_FILTER_CLEARED)
+    applyFilters()
   }
 }
 
@@ -291,7 +293,7 @@ async function doExport() {
       columns,
       name: 'orders',
     })
-    if (!n) ElMessage.info('当前筛选下没有记录，没有导出文件')
+    if (!n) ElMessage.info(MSG_NOTHING_TO_EXPORT)
     else ElMessage.success(`已导出 ${n} 条商品订单`)
   } catch (_) { /* 拦截器已提示 */ } finally { exporting.value = false }
 }
@@ -353,7 +355,7 @@ async function saveCell(row, key, value) {
       applyRowUpdate(row, patch, updated)
     })
   } catch (e) {
-    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
+    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || MSG_STALE_RELOADED); load() }
   }
 }
 

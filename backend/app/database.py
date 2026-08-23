@@ -15,6 +15,7 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
+from typing import Optional
 from sqlite3 import Connection as SQLite3Connection
 
 from sqlalchemy import event
@@ -23,6 +24,7 @@ from sqlalchemy.engine import Engine
 from sqlmodel import Session, create_engine
 
 from .config import settings
+from .paths import runtime_dir
 from .db import control
 
 log = logging.getLogger("soroban.db")
@@ -77,9 +79,24 @@ def build_engine(url: str) -> Engine:
 
 
 def _control_url() -> str:
-    """控制/配置存储始终是 SQLite；.env 的 DATABASE_URL 仅用来定位 sqlite 文件。"""
+    """控制/配置存储始终是 SQLite；.env 的 DATABASE_URL 仅用来定位 sqlite 文件。
+
+    **两条分支都必须是绝对路径。** `DATABASE_URL` 是 sqlite 时，`Settings._anchor_sqlite_path`
+    已经把它锚到运行时目录了；但它是 **MySQL 串**时那个校验器直接放行（它只管 sqlite），
+    于是这里的兜底字面量 `"sqlite:///./soroban.db"` **从来没有被锚过**——又变回按当前
+    工作目录解析，正是 §140 想根除的那件事，只是漏在了这一条分支上。
+
+    这个状态是够得到的：`scripts/migrate_sqlite_to_mysql.py` 就明确让人把 `.env` 的
+    `DATABASE_URL` 指向 MySQL 去建 schema（「建完记得改回去」），没改回去、
+    或者沿用切换功能之前的老 `.env`，就落在这一支上。
+    实测后果：在别的目录跑 `python -m tools.use_local_db` 会读到一个凭空新建的空控制库，
+    然后回一句「当前后端已经是本地 SQLite，无需切换」并退出 0——
+    而真正的控制库里写着 mysql，那条自救路径就这么白跑了。
+    """
     url = settings.DATABASE_URL
-    return url if url.startswith("sqlite") else "sqlite:///./soroban.db"
+    if url.startswith("sqlite"):
+        return url
+    return f"sqlite:///{runtime_dir() / 'soroban.db'}"
 
 
 @event.listens_for(Engine, "connect")
@@ -135,6 +152,11 @@ def set_data_engine(new_engine: Engine, url: str) -> None:
     if old is not _control_engine and old is not new_engine:
         old.dispose()
     log.info("数据引擎已切换 → %s", current_backend())
+    # 换了一个库，就换了一套数据分布——旧库的统计信息对它毫无意义，而新库多半
+    # 根本没有（`replace_data` 只搬 SQLModel.metadata 里的业务表，`sqlite_stat1` 不在其中；
+    # 从备份恢复出来的库同理）。挂在这里而不是各个调用点：切库、迁回本地、恢复后重绑
+    # 全都要过这一个函数，一处就够，也不会有人下次新加一条路径时忘了带上。
+    refresh_planner_stats()
 
 
 def get_session():
@@ -202,14 +224,123 @@ def _looks_like_newer_db(exc: Exception) -> bool:
     return "revision" in t and ("locate" in t or "not found" in t or "no such" in t)
 
 
-def create_db_and_tables() -> None:
+def _nothing_to_lose(url: str) -> bool:
+    """这个库里有没有值得留撤销点的东西。
+
+    全新安装（业务表还没建）与**每次跑测试的临时库**都会走到这里——
+    不挡的话，跑一次测试就往真实的 `backups/` 里写一份快照。
+    判据是「一行业务数据都没有」而不是「修订号是不是 None」：
+    pre-Alembic 的旧库修订号同样是 None，但它里面装着整本账。
+    """
+    eng = build_engine(url)
+    try:
+        from .services.db_migrate import MIGRATION_ORDER, is_target_empty
+
+        with eng.connect() as conn:
+            tables = set(sa_inspect(conn).get_table_names())
+        # 表名**从模型派生**，不写死 "orders"：这张表历史上被改过名
+        # （`taobaoorder` → `orders`），写死的话下次改名会让这里静默返回「全新库」，
+        # 于是安全网无声无息地消失。
+        if not (tables & {m.__tablename__ for m in MIGRATION_ORDER}):
+            return True                                 # 一张业务表都还没有 ⇒ 全新库
+        return is_target_empty(eng)
+    except Exception as e:                              # noqa: BLE001
+        log.warning("判断库是否为空时出错（%s），当作「有数据」处理", e)
+        return False                                    # 拿不准就留一份，宁可多备
+    finally:
+        eng.dispose()
+
+
+def _snapshot_before_migrating() -> None:
+    """真要跑迁移时，先给当前账本留一个**撤销点**。
+
+    为什么必须有：这个应用**每次启动都自动 `alembic upgrade head`**，而分发形态是
+    双击运行的 exe——没有终端、没有人会先手工备份。一旦某次迁移出事，就没有退路了。
+    而代码自己就写着：**MySQL 的 DDL 是隐式提交的**，迁移链跑到一半失败时，
+    前面几条已经落地、后面的没跑，库停在一个既不是旧版也不是新版的半升级态。
+    那种状态下最需要的东西就是「动手之前那一刻的完整拷贝」。
+
+    **只在真的有待跑迁移时才留**：每次启动都拷一份既慢又会把 backups/ 塞满，
+    而绝大多数启动是无事发生的。
+
+    **拷贝失败不阻断启动**：把「备份没成功」升级成「应用打不开」是更糟的失败形态
+    （磁盘满就会让人进不了自己的账本）。但必须响亮地记一条 —— 静默地没有安全网，
+    比明摆着没有安全网更危险。
+    """
+    try:
+        head = pending_revision(_data_url)
+    except Exception as e:                              # noqa: BLE001
+        log.warning("判断是否需要迁移时出错（%s），跳过迁移前快照", e)
+        return
+    if head is None:
+        return                                          # 已是最新，这次启动不动库
+    if _nothing_to_lose(_data_url):
+        return                                          # 一行业务数据都没有，撤销点无意义
+    log.info("检测到待跑的迁移（→ %s），先留一份迁移前快照", head)
+    if not _data_url.startswith("sqlite"):
+        # MySQL 侧拿不到「忠于旧 schema」的拷贝：文件级备份无从谈起，而 `replace_data`
+        # 会按新模型的列去读旧库（正是下面那条注释说的坑），mysqldump 又不一定装了。
+        # **说实话比假装有安全网强。**
+        log.warning("⚠️ 当前后端不是 SQLite，无法自动留迁移前快照。"
+                    "升级前请自行 mysqldump 一份：本次迁移没有撤销点。")
+        return
+    try:
+        from .backup import _default_dir, snapshot_sqlite_file
+        path = snapshot_sqlite_file(_data_url, _default_dir(), f"pre-{head}")
+        log.info("迁移前快照已留在 %s", path)
+    except Exception as e:                              # noqa: BLE001
+        log.warning("⚠️ 迁移前快照失败（%s）——本次迁移没有撤销点。"
+                    "如果接下来出事，请从 backups/ 里更早的一份恢复。", e)
+
+
+def pending_revision(url: str) -> Optional[str]:
+    """这个库离最新还差几步？返回 head 修订号（有待跑的迁移）或 None（已是最新）。
+
+    用来决定「这次启动要不要先留一个撤销点」。**判「相不相等」而不是「跑不跑得动」**：
+    `command.upgrade` 本身是幂等的，跑一次已经最新的库什么都不会发生——
+    但我们要在**动库之前**就知道会不会动，不能等它动完了再说。
+
+    **读不出来就返回 None（当成「不用迁移」）而不是 head。** 这一句是有代价地选的：
+    连上库之后读 `alembic_version` 几乎不会失败（表不存在只会返回 None），
+    所以读不出来 ≈ **库根本连不上**——那种情况下备份也做不成。
+    返回 head 的话会接着触发「判空失败」「快照失败」两条警告，
+    把三条吓人的警告堆在真正那句「能照做的指引」前面，而后者才是用户要看的。
+    """
+    from alembic.config import Config
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+
+    cfg = Config(str(_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(_ROOT / "alembic"))
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+    eng = build_engine(url)
+    try:
+        with eng.connect() as conn:
+            current = MigrationContext.configure(conn).get_current_revision()
+    except Exception as e:                              # noqa: BLE001
+        log.info("读不出当前修订号（%s）——库多半连不上，跳过迁移前快照；"
+                 "真正的原因会由下面那次迁移报出来", e)
+        return None
+    finally:
+        eng.dispose()
+    return None if current == head else head
+
+
+def migrate_to_latest() -> None:
     """启动/seed/demo 调用：保证控制表存在，并把**当前数据后端**迁移到最新。
+
+    2026-08-22 从 `create_db_and_tables` 改名而来。旧名字撞的是 SQLModel 教程里那个
+    （`metadata.create_all` 的薄壳，语义是「缺表就建，无害且幂等」），而这个函数做的是
+    **对生产库跑整条 alembic 迁移链**——风险完全不是一个量级。
+    证据是：改名前仓库里有**五处注释**专门在纠正它，每一处都要补一句
+    「⇒ 完整 alembic upgrade」。需要五处注释来更正的名字，就是错的。
 
     数据后端连不上时（MySQL 关机/换网/容器没起）**不自动降级回 SQLite**：切换是非破坏性的，
     本地 SQLite 里还留着切换那天的旧业务表；悄悄退回去会让用户对着一份陈旧数据继续记账，
     等 MySQL 回来就是两边各有一半——比起不开机，那才是真正难收拾的。
     这里只把报错换成**能照做的指引**，然后照样让启动失败（不写坏任何东西）。"""
     control.ensure_schema(_control_engine)
+    _snapshot_before_migrating()
     try:
         run_migrations(_data_url)
     except Exception as e:
@@ -268,6 +399,51 @@ def create_db_and_tables() -> None:
                 e,
             )
         raise
+    else:
+        refresh_planner_stats()
+
+
+def refresh_planner_stats() -> None:
+    """让 SQLite 的查询规划器有据可依——**这不是可选的调优，是补一个缺失的前提**。
+
+    没有 `sqlite_stat1` 表时，规划器只能按内置的默认选择性猜。实测（6000 单的库）：
+    它会挑中 `ix_orders_is_delete`——**全表最没有选择性的那根**（97.5% 的行 is_delete=0）
+    ——把捞出来的 5850 行丢进临时 B 树全排一遍，才取走 `LIMIT 50` 要的那 50 行。
+    列表页 2.6 ms、翻到第 20 页 8.8 ms，而且**随 OFFSET 线性变差**。
+
+    跑过一次之后规划器改走 `ix_orders_date`，顺序天然就对，临时 B 树消失：
+    列表页 0.24 ms、第 20 页 0.57 ms。
+
+    **今天不痛，说清楚**：生产账本 56 单，两条路径都是微秒级，用户一点感觉都没有。
+    这行是给库长大之后留的——爬虫一次回灌几百上千单，涨得比想象快。
+    **为什么是无条件 ANALYZE，不是 `PRAGMA optimize`**：optimize 看的是**本连接的查询历史**
+    ——它只重算这个连接查过、且统计已经明显陈旧的表。启动时的连接没有任何历史，
+    实测（SQLite 3.45.1，有索引/无索引 × 3 行/6000 行四种组合）它**一次都没建出 stat1**。
+    那条路在这里是恒 no-op。
+
+    也不做「已经有 stat1 就跳过」：库会从 56 单长到几千单，而 stat1 还记着 56 单的分布，
+    规划器照样会选错——那等于把今天的问题推到明天，还更难发现。
+    代价也不值得省：实测 ANALYZE 在 56 / 6000 / 100000 单（各 5 根索引）上分别是
+    2.6 / 5.4 / 49.5 ms。这个账本永远到不了十万单，五十毫秒是启动耗时里量不出来的一格。
+
+    **为什么不是加复合索引** `(is_delete, date, id)`：也量了。深翻页确实再快一点
+    （0.29 vs 0.57 ms），但它要多占 7% 的库体积、每次写入多维护一根索引，
+    还会把「合计求和」从 0.94 拖到 1.76 ms（规划器改用更宽的索引做全扫）。
+    缺的是**统计信息**，不是索引；照着症状加索引是治标。
+
+    MySQL 不做：InnoDB 自己维护统计信息。
+    """
+    eng = get_engine()
+    if eng.dialect.name != "sqlite":
+        return
+    try:
+        with eng.connect() as conn:
+            conn.exec_driver_sql("ANALYZE")
+            conn.commit()
+    except Exception as e:
+        # **不能因为它启动失败。** 这只是让查询快一点，不是正确性的前提；
+        # 而它最可能的失败是撞上写锁（另一个进程正在迁移），那属于稍后重试就好的事。
+        log.warning("刷新查询规划器统计信息失败（不影响使用，只是列表页会慢一点）：%s", e)
 
 
 def _wal_truncate() -> None:

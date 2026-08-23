@@ -49,3 +49,24 @@ export function applyRowUpdate(target, patch, updated, { itemsStale = false } = 
   const { items, ...rest } = updated
   Object.assign(target, rest)
 }
+
+/** 幽灵新建行提交成功之后，草稿里**哪些键该清掉**。
+ *
+ * **刻意零依赖**（本文件其余部分也是），这样 node 能直接跑它——
+ * 由 tests/test_consistency.py 的 node harness 做真行为测试，而不是去 grep 组件源码。
+ *
+ * 判据：只清「送出去的那一份」。请求在途期间格子并没有禁用（只有左侧 ✓ 是
+ * `pointer-events:none`），用户完全可能接着在别的格里填东西——**那些内容属于下一条草稿**。
+ * 无条件清空整个草稿会把它们一起抹掉：格子里的字凭空消失、退回占位文案，
+ * 无提示、无撤销。
+ *
+ * 「这一格现在的值还等不等于送出去的那个」是唯一可靠的判据：
+ * 等于 ⇒ 是刚存下的那条，清掉；不等于（或送出后才填的）⇒ 用户新敲的，留着。
+ *
+ * @param {object} draft 当前草稿（newRow）
+ * @param {object} sent  这次 POST 出去的 payload
+ * @returns {string[]}   应当从草稿里删掉的键
+ */
+export function keysToClearAfterCreate(draft, sent) {
+  return Object.keys(sent || {}).filter((k) => draft && draft[k] === sent[k])
+}

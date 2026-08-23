@@ -43,7 +43,7 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-from app.db.dialect import is_mysql
+from app.db.dialect import is_mysql, require_online
 
 revision: str = "f8a9b0c1d2e3"
 down_revision: Union[str, Sequence[str], None] = "e7f8a9b0c1d2"
@@ -130,6 +130,7 @@ def _move_indexes(pairs) -> None:
 
 def upgrade() -> None:
     """Upgrade schema."""
+    require_online("按旧状态值算新状态")
     mysql = is_mysql(op.get_bind())
     # 1) SQLite：先丢旧索引。不丢的话 RENAME COLUMN 会把它连同定义一起带过去，
     #    留下一条名字还叫 ix_orders_status 的索引，与 MySQL 侧永久发散。

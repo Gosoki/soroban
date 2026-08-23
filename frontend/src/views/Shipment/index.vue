@@ -2,12 +2,12 @@
   <div>
     <PageHeader>
     <b>集运订单</b>：把多张商品订单打包发往日本的那一段。运费按单据日期的汇率折算。
-    展开一行可以挂靠商品订单；也可以把「内含快递」截图拖到某一行的绑定格，
-    按快递单号自动挂靠。
+    展开一行可以挂靠商品订单；也可以把「内含快递」截图拖到页面任意位置，按快递单号自动挂靠
+    ——拖到某一行的绑定格上则直接绑到那一行。
     </PageHeader>
 
     <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable
-                 table-name="shipment" :empty-text="loadFailed ? '加载失败——请检查网络或后端，然后重试' : '没有符合条件的记录'" @save="saveCell" @add="addRow" @delete="delRow" @tags-changed="onTagsChanged" @reload="load">
+                 table-name="shipment" :empty-text="loadFailed ? MSG_LOAD_FAILED : '没有符合条件的记录'" @save="saveCell" @add="addRow" @delete="delRow" @tags-changed="onTagsChanged" @reload="load">
       <template #toolbar>
         <el-input v-model="filters.q" placeholder="搜集运单号/国际运单号/收货人" clearable style="width: 200px" @change="applyFilters" />
         <el-select v-model="filters.shipmentStatus" placeholder="状态" clearable style="width: 120px" @change="applyFilters">
@@ -168,7 +168,7 @@ import { shipmentApi, ordersApi, tagsApi } from '@/api'
 import { checkImageSize } from '@/utils/imageGate'
 import { useWindowFileDrop } from '@/utils/windowFileDrop'
 import { handled } from '@/api/http'
-import { PAGE_SIZE, SHIPMENT_STATUS, longToast } from '@/constants'
+import { MSG_FILTER_CLEARED, MSG_LOAD_FAILED, MSG_NOTHING_TO_EXPORT, MSG_STALE_RELOADED, PAGE_SIZE, SHIPMENT_STATUS, longToast } from '@/constants'
 import { fmtJPY } from '@/utils/money'
 import { today } from '@/utils/datetime'
 import { afterCreate, afterDelete } from '@/utils/listRows'
@@ -244,7 +244,7 @@ async function doExport() {
       columns,
       name: 'shipment',
     })
-    if (!n) ElMessage.info('当前筛选下没有记录，没有导出文件')
+    if (!n) ElMessage.info(MSG_NOTHING_TO_EXPORT)
     else ElMessage.success(`已导出 ${n} 条集运订单`)
   } catch (_) { /* 拦截器已提示 */ } finally { exporting.value = false }
 }
@@ -270,13 +270,22 @@ const stmtText = computed(() => {
   lines.push(`日期：${r.date || '—'}　状态：${r.shipment_status || '—'}`)
   if (r.intl_tracking_no) lines.push(`国际运单号：${r.intl_tracking_no}`)
   lines.push('')
+  // **不计入合计的行要标出来。** 后端的 `orders_jpy` 按 `Order.ledger_exclusions()`
+  // 剔掉了退款/交易关闭/待付款的单，而这里列的是全部子订单——不标的话，
+  // 明细逐条加起来 21000 円、下面却写着「货款合计 10,000 円」，
+  // 收到这份对账单的人只能得出「对方少算了 11,000 円」或者「这单子是错的」。
+  // 算不算由**后端**用 `counted` 告诉我们，前端不抄那份状态清单。
+  let skipped = 0
   for (const o of r.orders || []) {
     const what = o.title || itemSummary(o) || '（无标题）'
-    lines.push(`· ${o.order_no || '#' + o.id}　${what}　${fmtJPY(o.jpy_settled)}`)
+    const mark = o.counted === false ? `（${o.purchase_status || '不计入'}，不计入合计）` : ''
+    if (o.counted === false) skipped += 1
+    lines.push(`· ${o.order_no || '#' + o.id}　${what}　${fmtJPY(o.jpy_settled)}${mark}`)
   }
   if (!(r.orders || []).length) lines.push('（这张单下面还没有商品订单）')
   lines.push('')
-  lines.push(`货款合计：${fmtJPY(r.orders_jpy)}`)
+  lines.push(`货款合计：${fmtJPY(r.orders_jpy)}`
+    + (skipped ? `（已扣除上面 ${skipped} 条不计入的）` : ''))
   lines.push(`国际运费：${fmtJPY(r.jpy_settled)}（含特殊费）`)
   lines.push(`到岸合计：${fmtJPY(r.landed_jpy)}`)
   return lines.join('\n')
@@ -349,7 +358,7 @@ async function saveCell(row, key, value) {
       Object.assign(row, updated)
     })
   } catch (e) {
-    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
+    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || MSG_STALE_RELOADED); load() }
   }
 }
 
@@ -598,7 +607,20 @@ async function bindExpress(shipmentRow, file) {
         : '未识别到快递单号，请确认拖入的是「内含快递」页截图')
       return
     }
-    Object.assign(shipmentRow, res.shipment)
+    // **写回当前列表里那一行，而不是入队时捕获的那个对象。**
+    // OCR 要跑好几秒，期间用户改一下筛选就会走 `load()`，那一句
+    // `rows.value = res.items` 把整页换成**全新对象**——入队时捕获的 `shipmentRow`
+    // 从此不再挂在界面上。写进它等于写进一个没人看的地方：屏幕上那一行仍是挂靠前的
+    // 子订单列表、旧状态、旧到岸金额，而下面照常弹绿色的「已关联 N 单」。
+    // 用户只能靠手动刷新才知道到底挂上没有。
+    const live = rows.value.find((r) => r.id === shipmentRow.id)
+    if (live) {
+      Object.assign(live, res.shipment)
+    } else {
+      // 这一行已经不在当前筛选/当前页里了（比如状态被改到筛选之外）。
+      // 没有可写的目标，那就把整页拉一次——总比让界面停在旧样子强。
+      await load()
+    }
     await loadUnassigned()
     const parts = [`已关联 ${res.attached.length} 单`]
     if (res.skipped.length) parts.push(`跳过 ${res.skipped.length} 单（已挂其他集运单）`)
@@ -631,11 +653,15 @@ async function detach(shipmentRow, tbRow) {
 // **还要管仍停在旧名的筛选值**——改名后拿旧名精确匹配会查回 0 行，
 // 空态说「没有符合条件的记录」，用户刚改完名就看到「单子没了」。与订单页同一套处理。
 function onTagsChanged({ field, values }) {
-  if (field !== 'recipient') return
-  recipientOptions.value = values
-  if (filters.recipient && !values.includes(filters.recipient)) {
-    filters.recipient = ''
-    ElMessage.info('筛选里那个收货人已改名或删除，已为你清掉筛选')
+  if (field === 'recipient') recipientOptions.value = values
+
+  // **通用地清掉停在旧值上的筛选**（口径与订单页/暂存页/物品页逐字相同）：
+  // 标签改名后库里再没有旧值，拿它精确匹配会查回 0 行，
+  // 空态显示「没有符合条件的记录」——用户刚改完名就看到「东西没了」。
+  // 写成通用的而不是按字段 if：按字段枚举正是「来源(platform)」被漏掉四轮的原因。
+  if (filters[field] && !values.includes(filters[field])) {
+    filters[field] = ''
+    ElMessage.info(MSG_FILTER_CLEARED)
     applyFilters()
   }
 }

@@ -5,10 +5,10 @@
     </PageHeader>
 
     <NotionTable :columns="columns" :rows="rows" :loading="loading" :actions-width="60"
-                 :empty-text="loadFailed ? '加载失败——请检查网络或后端，然后重试' : '没有符合条件的记录'"
+                 :empty-text="loadFailed ? MSG_LOAD_FAILED : '没有符合条件的记录'"
                  table-name="items" hide-id :addable="false" :deletable="false" @reload="load" @tags-changed="onTagsChanged">
       <template #toolbar>
-        <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="applyFilters" />
+        <el-input v-model="filters.q" :placeholder="MSG_SEARCH_ORDER_LIKE" clearable style="width: 200px" @change="applyFilters" />
         <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="applyFilters">
           <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
         </el-select>
@@ -80,8 +80,9 @@
 <script setup>
 import PageHeader from '@/components/PageHeader.vue'
 import { computed, onMounted, reactive, ref } from 'vue'
+import { ElMessage } from 'element-plus'
 import { itemsApi, ordersApi, shipmentApi, tagsApi } from '@/api'
-import { ORDER_SOURCES, PAGE_SIZE, PURCHASE_STATUS, SHIPMENT_STATUS, platformSemanticStyle, statusStyle, tagStyleAt } from '@/constants'
+import { MSG_FILTER_CLEARED, MSG_LOAD_FAILED, MSG_SEARCH_ORDER_LIKE, ORDER_SOURCES, PAGE_SIZE, PURCHASE_STATUS, SHIPMENT_STATUS, platformSemanticStyle, statusStyle, tagStyleAt } from '@/constants'
 import NotionTable from '@/components/NotionTable.vue'
 import OrderEditPanel from '@/components/OrderEditPanel.vue'
 
@@ -124,6 +125,15 @@ const accountOptions = ref([])
 // 不同步的话，新加的账号在编辑面板里永远选不到，直到切页回来才自愈。
 function onTagsChanged({ field, values }) {
   if (field === 'platform_account') accountOptions.value = values
+
+  // **通用地清掉停在旧值上的筛选**（口径与订单页/暂存页逐字相同）：
+  // 标签改名后库里再没有旧值，拿它精确匹配会查回 0 行，
+  // 空态显示「没有符合条件的记录」——用户刚改完名就看到「东西没了」。
+  if (filters[field] && !values.includes(filters[field])) {
+    filters[field] = ''
+    ElMessage.info(MSG_FILTER_CLEARED)
+    applyFilters()
+  }
 }
 async function loadAcctColors() {
   try {

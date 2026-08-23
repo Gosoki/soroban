@@ -453,3 +453,193 @@ def test_filling_an_empty_imported_row_writes_through_to_the_ledger(client):
     client.patch(f"/api/staging/{row2['id']}",
                  json={"version": row2["version"], "price_cny": "777.00"})
     assert Decimal(client.get(f"/api/orders/{oid}").json()["price_cny"]) == Decimal("88.00")
+
+
+def test_mirroring_never_zeroes_a_staging_row_that_has_no_items(client, session):
+    """0 物品的暂存行导入后，**改一次订单不许把暂存金额清成 0**。
+
+    完整链路（实测过）：暂存 ¥300 / 0 物品 → 导入得到 ¥300 → 给订单随手加个备注
+    （任何一次 PATCH 都会走到 `mirror_to_staging`）⇒ 暂存行变 ¥0.00 →
+    在订单页删掉该单（`delete_order` 把暂存复位成「待处理」）→ 再点一次「导入账本」
+    ⇒ 建出一张 **¥0.00 / 0 円** 的订单，看板合计静默缩水。
+
+    导入期间界面还看不出来——`_overlay` 用账本值覆盖显示，所以这条只能靠测试盯住。
+
+    0 物品的暂存行是代码**自己承认**的状态：`import_staging` 有专门的 else 分支处理它，
+    `tools/backfill_item_price.py` 整个工具就是为它写的。
+    """
+    import datetime as dt
+    from decimal import Decimal
+
+    from sqlmodel import select
+
+    from app.models import OrderStaging
+
+    row = OrderStaging(order_no="ZERO-ITEMS-1", title="没有物品的老单",
+                       price_cny=Decimal("300.00"), platform="淘宝",
+                       scraped_at=dt.datetime.now(dt.timezone.utc),
+                       order_date=dt.date(2026, 4, 1))
+    session.add(row)
+    session.commit()
+    sid = row.id
+    assert not row.items, "这条测试的前提是「暂存行没有物品」"
+
+    o = client.post(f"/api/staging/{sid}/import").json()
+    assert Decimal(str(o["price_cny"])) == Decimal("300.00"), o
+
+    r = client.patch(f"/api/orders/{o['id']}", json={"version": o["version"], "note": "随手加个备注"})
+    assert r.status_code == 200, r.text
+
+    session.expire_all()
+    after = session.exec(select(OrderStaging).where(OrderStaging.id == sid)).one()
+    assert Decimal(str(after.price_cny)) == Decimal("300.00"), \
+        f"改了一次订单，暂存行的金额被改成了 {after.price_cny}"
+
+    # 走完整条链路：删单 → 复位 → 重导，金额必须还在
+    assert client.delete(f"/api/orders/{o['id']}").status_code in (200, 204)
+    again = client.post(f"/api/staging/{sid}/import").json()
+    assert Decimal(str(again["price_cny"])) == Decimal("300.00"), \
+        f"删单重导之后记成了 {again['price_cny']}"
+
+
+def test_patching_the_staging_row_itself_never_zeroes_a_zero_item_row(client, session):
+    """在**暂存页**改一下已导入的 0 物品行，金额也不许被清成 0。
+
+    这是 §154 那个伤害的**另一条路**：`mirror_to_staging`（订单 PATCH）与
+    `staging.update_staging` 的已导入分支（暂存 PATCH）都会重算暂存价，
+    而 §154 只修了前者——**它的守卫走的正是订单那条路，够不到这一行**，所以一直是绿的。
+
+    触发面比想象宽：不需要改任何字段，**只送一个 version** 也会走到那一行；
+    插件更新快递单号（`PATCH {express_no}`）同样。
+
+    完整链路：暂存 ¥300 / 0 物品 → 导入得到 ¥300 → 在暂存页改标题 ⇒ 暂存变 ¥0.00
+    （而 PATCH 的**响应里还是 300**，因为 `_overlay` 用账本值覆盖显示）
+    → 在订单页删掉该单（暂存复位成「待处理」，不再有账本值可覆盖）
+    → 再点「导入账本」⇒ 建出 **¥0.00 / 0 円** 的订单。
+    """
+    import datetime as dt
+    from decimal import Decimal
+
+    from sqlmodel import select
+
+    from app.models import OrderStaging
+
+    row = OrderStaging(order_no="ZERO-ITEMS-2", title="暂存侧的老单",
+                       price_cny=Decimal("300.00"), platform="淘宝",
+                       scraped_at=dt.datetime.now(dt.timezone.utc),
+                       order_date=dt.date(2026, 4, 1))
+    session.add(row)
+    session.commit()
+    sid = row.id
+    assert not row.items, "前提是「暂存行没有物品」"
+
+    o = client.post(f"/api/staging/{sid}/import").json()
+    assert Decimal(str(o["price_cny"])) == Decimal("300.00"), o
+
+    cur = client.get(f"/api/staging?q=ZERO-ITEMS-2").json()["items"][0]
+    r = client.patch(f"/api/staging/{sid}", json={"version": cur["version"], "title": "改个标题"})
+    assert r.status_code == 200, r.text
+
+    session.expire_all()
+    after = session.exec(select(OrderStaging).where(OrderStaging.id == sid)).one()
+    assert Decimal(str(after.price_cny)) == Decimal("300.00"), \
+        f"在暂存页改了一下，暂存行的金额被改成了 {after.price_cny}"
+
+    # 走完整条链路：删单 → 复位 → 重导，钱必须还在
+    assert client.delete(f"/api/orders/{o['id']}").status_code in (200, 204)
+    again = client.post(f"/api/staging/{sid}/import").json()
+    assert Decimal(str(again["price_cny"])) == Decimal("300.00"), \
+        f"删单重导之后记成了 {again['price_cny']}"
+
+
+def test_a_patch_that_changes_nothing_still_does_not_zero_the_row(client, session):
+    """**一个字段都不改**（只送 version）也不许把 0 物品暂存行的金额清零。
+
+    证伪者复现时指出的：那一行是无条件执行的，跟 payload 里带什么无关。
+    插件更新快递单号走的也是同一条。
+    """
+    import datetime as dt
+    from decimal import Decimal
+
+    from sqlmodel import select
+
+    from app.models import OrderStaging
+
+    row = OrderStaging(order_no="ZERO-ITEMS-3", title="空 patch",
+                       price_cny=Decimal("120.00"), platform="淘宝",
+                       scraped_at=dt.datetime.now(dt.timezone.utc),
+                       order_date=dt.date(2026, 4, 1))
+    session.add(row)
+    session.commit()
+    sid = row.id
+    client.post(f"/api/staging/{sid}/import")
+
+    cur = client.get("/api/staging?q=ZERO-ITEMS-3").json()["items"][0]
+    assert client.patch(f"/api/staging/{sid}", json={"version": cur["version"]}).status_code == 200
+
+    session.expire_all()
+    after = session.exec(select(OrderStaging).where(OrderStaging.id == sid)).one()
+    assert Decimal(str(after.price_cny)) == Decimal("120.00"), \
+        f"空 PATCH 把金额改成了 {after.price_cny}"
+
+
+def test_editing_a_not_yet_imported_zero_item_row_keeps_its_price(client, session):
+    """**未导入**的 0 物品暂存行，改个无关字段也不许把金额清成 0。
+
+    这是同一根因的第三条路（§154 / §168 的另外两条是订单 PATCH 与暂存已导入分支）。
+    这一支没有 `_overlay` 遮掩——**响应当场就回 0.00**，但用户改的是标题、不会去核对金额，
+    此后这一行导入账本就是一张 ¥0 的单。
+
+    这条也是「为什么修在模型层」的理由：前两条路还能镜像账本价，
+    而这一条**连账本单都还不存在**，没有可镜像的东西——只能是
+    「没有物品就别算」。
+    """
+    import datetime as dt
+    from decimal import Decimal
+
+    from sqlmodel import select
+
+    from app.models import OrderStaging
+
+    row = OrderStaging(order_no="ZERO-ITEMS-4", title="还没导入的老单",
+                       price_cny=Decimal("300.00"), platform="淘宝",
+                       scraped_at=dt.datetime.now(dt.timezone.utc),
+                       order_date=dt.date(2026, 4, 1))
+    session.add(row)
+    session.commit()
+    sid, before = row.id, row.version
+    assert not row.items and row.imported_order_id is None, "前提：0 物品且未导入"
+
+    r = client.patch(f"/api/staging/{sid}", json={"version": before, "title": "改个标题"})
+    assert r.status_code == 200, r.text
+    assert Decimal(str(r.json()["price_cny"])) == Decimal("300.00"), \
+        f"响应里金额就已经是 {r.json()['price_cny']} 了"
+
+    session.expire_all()
+    after = session.exec(select(OrderStaging).where(OrderStaging.id == sid)).one()
+    assert Decimal(str(after.price_cny)) == Decimal("300.00"), \
+        f"改个标题把金额改成了 {after.price_cny}"
+
+
+def test_sync_from_items_leaves_a_row_alone_when_it_has_no_items():
+    """模型层的判据本身：没有物品时 `sync_from_items()` **什么都不做**。
+
+    「没有物品」的意思是不知道明细，不是「这单值 0 元」——而按后者算出来的
+    恰好是 `0 + 邮费`。三条调用路径都靠这一条兜底，所以直接钉模型。
+    """
+    import datetime as dt
+    from decimal import Decimal
+
+    from app.models import OrderStaging, StagingItem
+
+    row = OrderStaging(order_no="MODEL-1", price_cny=Decimal("300.00"),
+                       postage_cny=Decimal("20.00"),
+                       scraped_at=dt.datetime.now(dt.timezone.utc))
+    row.sync_from_items()
+    assert row.price_cny == Decimal("300.00"), \
+        f"没有物品却把价改成了 {row.price_cny}（0 + 邮费 = 20 就是那个错误答案）"
+
+    # 反面：有物品时照旧派生，别把这条兜底写成「永远不算」
+    row.items = [StagingItem(name="甲", quantity=2, unit_price_cny=Decimal("5.00"))]
+    row.sync_from_items()
+    assert row.price_cny == Decimal("30.00"), f"有物品时没有重新派生：{row.price_cny}"

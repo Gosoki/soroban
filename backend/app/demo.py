@@ -15,7 +15,7 @@ from decimal import Decimal
 from sqlmodel import Session, select
 
 from . import single_process
-from .database import control_url, create_db_and_tables, current_backend, get_engine
+from .database import control_url, migrate_to_latest, current_backend, get_engine
 from .seed import ensure_admin
 from .models import (
     ColumnLayout, FxRate, ShipmentOrder, MiscExpense, OrderItem, StagingItem, TagOption,
@@ -42,7 +42,7 @@ def main() -> None:
     只记了集运单与杂项的新用户会被放行，然后往真库里灌 3 集运 / 9 订单 / 4 杂项 / 4 暂存，
     全程没有确认、也**不说自己在写哪个库**。
     """
-    # **闸必须排在任何一次动库之前。** 第一版把它放在 `create_db_and_tables()` 之后，
+    # **闸必须排在任何一次动库之前。** 第一版把它放在 `migrate_to_latest()` 之后，
     # 而那一句做的是「对**当前生效的数据后端**跑完整条 alembic upgrade」——
     # MySQL 后端的用户跑一次 `python -m app.demo`，生产库先被跑完整链迁移，
     # **然后**才打印「已中止」。`current_backend()` 只是比较两个模块级引擎
@@ -64,7 +64,7 @@ def main() -> None:
               "（这个脚本会跑迁移，不能和正在用库的进程同时动手）。已中止。")
         return
 
-    create_db_and_tables()
+    migrate_to_latest()
     with Session(get_engine()) as s:
         # 闸只看商品订单是不够的：只记了集运单/杂项的新用户会被放行。
         # **它必须排在建号之前**：第一版把 `ensure_admin()` 写在了前面，

@@ -141,3 +141,18 @@ export const PAGE_SIZE = 30
 export function longToast(ElMessage, type, message) {
   ElMessage({ type, message, duration: TOAST_LONG })
 }
+
+// ── 跨视图共用的用户可见文案 ────────────────────────────────────────────────
+// 这几句原先在 3~8 个文件里**逐字复制**。它们现在读起来一致，靠的是复制粘贴，
+// 不是结构——改一处漏七处只是时间问题，而「同一件事在不同页面说法不同」
+// 正是最伤信任的那种割裂。
+export const MSG_LOAD_FAILED = '加载失败——请检查网络或后端，然后重试'
+export const MSG_STALE_RELOADED = '数据已变，已刷新'          // 409 的兜底文案（后端给了 detail 就用它的）
+export const MSG_FILTER_CLEARED = '筛选里那个值已改名或删除，已为你清掉筛选'
+export const MSG_NOTHING_TO_EXPORT = '当前筛选下没有记录，没有导出文件'
+
+// 商品订单 / 物品 / 暂存三张表的模糊搜**范围完全一致**（订单号 + 标题 + 快递号 + 物品名，
+// 后端三处的 `q` 条件逐条核对过）。放在一起是为了让「文案跟着范围走」有个落点：
+// 将来后端多搜一个字段，改这一行，三个页面一起变。
+// 集运（集运单号/国际运单号/收货人）与杂项搜的是别的东西，各有各的文案，不并进来。
+export const MSG_SEARCH_ORDER_LIKE = '搜物品/商品/单号/快递号'

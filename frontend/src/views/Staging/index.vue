@@ -2,12 +2,13 @@
   <div>
     <PageHeader>
     一个账号昵称下的所有订单都放这里（一单可多物），逐单点「导入」才进入账本。（将来爬虫自动灌入）
+    把订单截图拖到页面任意位置即可 OCR 录单。
     </PageHeader>
 
     <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable
-                 table-name="staging" :empty-text="loadFailed ? '加载失败——请检查网络或后端，然后重试' : '没有符合条件的记录'" :actions-width="128" @save="saveCell" @add="addRow" @delete="doDelete" @reload="load" @tags-changed="onTagsChanged">
+                 table-name="staging" :empty-text="loadFailed ? MSG_LOAD_FAILED : '没有符合条件的记录'" :actions-width="128" @save="saveCell" @add="addRow" @delete="doDelete" @reload="load" @tags-changed="onTagsChanged">
       <template #toolbar>
-        <el-input v-model="filters.q" placeholder="搜物品/商品/单号/快递号" clearable style="width: 200px" @change="applyFilters" />
+        <el-input v-model="filters.q" :placeholder="MSG_SEARCH_ORDER_LIKE" clearable style="width: 200px" @change="applyFilters" />
         <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="applyFilters">
           <el-option v-for="p in ORDER_SOURCES" :key="p" :label="p" :value="p" />
         </el-select>
@@ -120,7 +121,7 @@ import { Camera, Delete, Plus } from '@element-plus/icons-vue'
 import { applyRowUpdate, queueRowWrite } from '@/utils/rowWrites'
 import { ordersApi, stagingApi, tagsApi } from '@/api'
 import { handled } from '@/api/http'
-import { ORDER_SOURCES, PAGE_SIZE, PRICE_HELP, IMPORT_STATUS, PURCHASE_STATUS, canAdvancePurchase, importStatusStyle } from '@/constants'
+import { IMPORT_STATUS, MSG_FILTER_CLEARED, MSG_LOAD_FAILED, MSG_SEARCH_ORDER_LIKE, MSG_STALE_RELOADED, ORDER_SOURCES, PAGE_SIZE, PRICE_HELP, PURCHASE_STATUS, canAdvancePurchase, importStatusStyle } from '@/constants'
 import { fmtDate } from '@/utils/datetime'
 import { afterCreate, afterDelete } from '@/utils/listRows'
 import NotionTable from '@/components/NotionTable.vue'
@@ -164,13 +165,21 @@ const accountOptions = ref([])   // 账号昵称下拉候选（标签接口）
 // 用户刚改完名就看到「单子没了」。清掉筛选比留着一个查不到东西的值好，
 // 而且要说一句，否则他会以为筛选自己乱了。
 function onTagsChanged({ field, values }) {
-  if (field === 'platform_account') {
-    accountOptions.value = values
-    if (filters.platform_account && !values.includes(filters.platform_account)) {
-      filters.platform_account = ''
-      ElMessage.info('筛选里那个账号已改名或删除，已为你清掉筛选')
-      applyFilters()
-    }
+  // 下拉候选：谁有对应的 ref 就更新谁
+  if (field === 'platform_account') accountOptions.value = values
+
+  // **通用地清掉停在旧值上的筛选。** 标签改名之后库里再没有旧值，
+  // 拿它精确匹配会查回 0 行，空态显示「没有符合条件的记录」——
+  // 用户刚改完名就看到「单子没了」，而且他多半不会想到去点筛选框的 ✕。
+  //
+  // 原先是**按字段逐个 if**（只处理了 recipient 与 platform_account），
+  // 于是「来源(platform)」这个同样是标签列、同样有筛选框的字段一直漏在外面。
+  // 按字段枚举正是它被漏掉的原因，所以改成看 `filters` 上有没有同名键——
+  // 将来再接一个标签字段进来，这里不用改。
+  if (filters[field] && !values.includes(filters[field])) {
+    filters[field] = ''
+    ElMessage.info(MSG_FILTER_CLEARED)
+    applyFilters()
   }
 }
 
@@ -244,7 +253,7 @@ async function saveCell(row, key, value) {
   } catch (e) {
     if (e.response?.status === 409) {
       handled(e)
-      ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新')
+      ElMessage.warning(e.response?.data?.detail || MSG_STALE_RELOADED)
       load()   // 冲突：刷新回退到服务器状态
     }
     // 非 409：拦截器已提示，单元格自动显示旧值，无需整页重拉
@@ -290,7 +299,7 @@ async function saveItems(row) {
     ElMessage.success('物品已保存')
   } catch (e) {
     // 仅 409（数据已变）才整表刷新；其它错误交拦截器提示，保留本地未保存编辑
-    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
+    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || MSG_STALE_RELOADED); load() }
   }
 }
 
@@ -304,7 +313,7 @@ async function savePostage(row) {
       applyRowUpdate(row, patch, updated)
     })
   } catch (e) {
-    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
+    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || MSG_STALE_RELOADED); load() }
   }
 }
 
@@ -448,12 +457,16 @@ function closeAsk() {
 
 // 这一批的统计。**按批而不是按张**：一次拖十几张图，每张弹一条 toast 会刷屏，
 // 而真正要回答的问题只有一个——「这十几张里，几张真进去了、几张早就有了」。
-// `hintUsed` 记的是本批用了哪个用户指定的来源（空 = 走自动判别），汇总里要说出来。
+// `hintsUsed` 记的是本批用过哪些用户指定的来源（空 = 全走自动判别），汇总里要说出来。
+// **是集合不是单值**：`pumpOcr` 里那句 `if (ocrRunning) return` 意味着「上一批还在跑时
+// 再拖一批进来」会被并进**同一个** tally。原先这里是 `hintUsed = platform` 逐张覆盖，
+// 于是汇总说的是**最后一批**选的那个来源，而先前那几张落库时写的是另一个——
+// 平台是账本活跃唯一键的一半，事后照那句话去核对会核错。
 let ocrTally = null
 
 function newTally() {
   return { created: 0, merged: 0, nochange: 0, inLedger: 0, unread: 0, failed: 0,
-           offPlatform: 0, offHint: '', hintUsed: '' }
+           offPlatform: 0, offHint: '', hintsUsed: new Set() }
 }
 
 async function pumpOcr() {
@@ -464,7 +477,7 @@ async function pumpOcr() {
     while (ocrQueue.length) {
       const { file, platform } = ocrQueue.shift()
       try {
-        if (ocrTally && platform) ocrTally.hintUsed = platform
+        if (ocrTally && platform) ocrTally.hintsUsed.add(platform)
         await processOcr(file, platform)   // 单张：识别 → 建行；内部已吞错，任何失败都不中断队列
       } finally {
         ocrPending.value--
@@ -508,9 +521,14 @@ async function reportOcr(t) {
       : '',
     // 本批按什么来源记的，必须可复核：选了淘宝、十几张全打上淘宝，
     // 事后要能一眼看出这不是 OCR 自己判的。
-    t.hintUsed
-      ? `<br>本批来源已按你选的 <b>${t.hintUsed}</b> 记入，没有用自动判别。`
-      : '',
+    // 一种来源就照直说；混了多种（上一批还在跑时又拖了一批）要说出**全部**，
+    // 否则这句话对其中一部分是假的。
+    t.hintsUsed.size === 1
+      ? `<br>本批来源已按你选的 <b>${[...t.hintsUsed][0]}</b> 记入，没有用自动判别。`
+      : t.hintsUsed.size > 1
+        ? `<br>本批混了 <b>${[...t.hintsUsed].join('、')}</b> 两种以上来源`
+          + '（上一批还在跑时又拖入了新的），各按<b>拖入时选的那个</b>记入，没有用自动判别。'
+        : '',
     '<br>核对无误后，在这张表上逐单点「导入」才进账本。',
   ].filter(Boolean)
   ElMessageBox.alert(lines.join('<br>'), `OCR 完成 · 共 ${total} 张`,

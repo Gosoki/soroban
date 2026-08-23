@@ -36,7 +36,7 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-from app.db.dialect import is_mysql
+from app.db.dialect import is_mysql, require_online
 
 # revision identifiers, used by Alembic.
 revision: str = 'e1f2a3b4c5d6'
@@ -126,6 +126,7 @@ def _remap_layout_keys(mapping: dict[str, dict[str, str]]) -> None:
 
 def upgrade() -> None:
     """Upgrade schema."""
+    require_online("重映射 columnlayout 里存的列键")
     # 1) 状态值：趁 order_status 还没改名，用旧列名改
     _rename_status_value(_STATUS_COLUMNS_BEFORE, "已签收", "已入仓")
     # 2) 索引：先按旧名 drop/rename，再改列名（SQLite 重建索引要引用新列名，故顺序是 drop→改列→create）

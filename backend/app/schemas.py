@@ -500,6 +500,10 @@ class OrderBrief(SQLModel):
     purchase_status: str    # 订单自己的采购段状态（本对象是**订单**摘要，不是集运单）
     jpy_settled: Optional[int] = None
     items: list[OrderItemRead] = []
+    # 这一单算不算进集运单的货款合计（`ShipmentRead.orders_jpy`）。
+    # 由**后端**按 `Order.ledger_exclusions()` 判定并发出来——前端不许自己抄一份
+    # 「哪些状态不计入」的清单：抄了就是两份，迟早对不上，而对账单是要发给别人的。
+    counted: bool = True
 
 
 class ShipmentRead(MoneyOut):

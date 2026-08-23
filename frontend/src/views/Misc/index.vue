@@ -5,8 +5,8 @@
     与另外两张表一样计入看板合计。
     </PageHeader>
 
-    <NotionTable :columns="columns" :rows="rows" :loading="loading" table-name="misc" :empty-text="loadFailed ? '加载失败——请检查网络或后端，然后重试' : '没有符合条件的记录'"
-                 @save="saveCell" @add="addRow" @delete="delRow" @tags-changed="onTagsChanged">
+    <NotionTable :columns="columns" :rows="rows" :loading="loading" table-name="misc" :empty-text="loadFailed ? MSG_LOAD_FAILED : '没有符合条件的记录'"
+                 @save="saveCell" @add="addRow" @delete="delRow" @reload="load" @tags-changed="onTagsChanged">
       <template #toolbar>
         <el-input v-model="filters.q" placeholder="搜名称" clearable style="width: 200px" @change="applyFilters" />
         <el-select v-model="filters.category" placeholder="分类" clearable filterable style="width: 120px" @change="applyFilters">
@@ -40,7 +40,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { miscApi, tagsApi } from '@/api'
 import { handled } from '@/api/http'
 import { today } from '@/utils/datetime'
-import { PAGE_SIZE } from '@/constants'
+import { MSG_FILTER_CLEARED, MSG_LOAD_FAILED, MSG_NOTHING_TO_EXPORT, MSG_STALE_RELOADED, PAGE_SIZE } from '@/constants'
 import { afterCreate, afterDelete } from '@/utils/listRows'
 import NotionTable from '@/components/NotionTable.vue'
 
@@ -98,7 +98,7 @@ async function doExport() {
       columns,
       name: 'misc',
     })
-    if (!n) ElMessage.info('当前筛选下没有记录，没有导出文件')
+    if (!n) ElMessage.info(MSG_NOTHING_TO_EXPORT)
     else ElMessage.success(`已导出 ${n} 条杂项支出`)
   } catch (_) { /* 拦截器已提示 */ } finally { exporting.value = false }
 }
@@ -149,7 +149,7 @@ async function saveCell(row, key, value) {
       Object.assign(row, updated)
     })
   } catch (e) {
-    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || '数据已变，已刷新'); load() }
+    if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || MSG_STALE_RELOADED); load() }
   }
 }
 
@@ -177,11 +177,15 @@ async function delRow(row) {
 
 // 与订单页/集运页同一套：标签改名后清掉停在旧名的筛选值，并说一句。
 function onTagsChanged({ field, values }) {
-  if (field !== 'category') return
-  categoryOptions.value = values
-  if (filters.category && !values.includes(filters.category)) {
-    filters.category = ''
-    ElMessage.info('筛选里那个分类已改名或删除，已为你清掉筛选')
+  if (field === 'category') categoryOptions.value = values
+
+  // **通用地清掉停在旧值上的筛选**（口径与订单页/暂存页/物品页逐字相同）：
+  // 标签改名后库里再没有旧值，拿它精确匹配会查回 0 行，
+  // 空态显示「没有符合条件的记录」——用户刚改完名就看到「东西没了」。
+  // 写成通用的而不是按字段 if：按字段枚举正是「来源(platform)」被漏掉四轮的原因。
+  if (filters[field] && !values.includes(filters[field])) {
+    filters[field] = ''
+    ElMessage.info(MSG_FILTER_CLEARED)
     applyFilters()
   }
 }

@@ -174,7 +174,7 @@ def _stub_demo(monkeypatch, demo, *, backend, engine=None):
     """
     touched = []
     monkeypatch.setattr(demo, "current_backend", lambda: backend)
-    monkeypatch.setattr(demo, "create_db_and_tables", lambda: touched.append("迁移"))
+    monkeypatch.setattr(demo, "migrate_to_latest", lambda: touched.append("迁移"))
     monkeypatch.setattr(demo.single_process, "acquire", lambda url: touched.append("拿闸"))
     if engine is not None:
         monkeypatch.setattr(demo, "get_engine", lambda: engine)
@@ -189,7 +189,7 @@ def _stub_demo(monkeypatch, demo, *, backend, engine=None):
 def test_demo_refuses_a_remote_backend_before_touching_it(monkeypatch, capsys):
     """**闸必须排在任何一次动库之前。**
 
-    第一版把它写在 `create_db_and_tables()` **之后**，而那一句做的是
+    第一版把它写在 `migrate_to_latest()` **之后**，而那一句做的是
     「对当前生效的数据后端跑完整条 alembic upgrade」——MySQL 后端的用户跑一次
     `python -m app.demo`，生产库先被跑完整链迁移，**然后**才打印「已中止」。
     而且那一路完全没有单进程闸：soroban 正开着时就是「两个进程同时 ALTER 同一个库」。
@@ -221,7 +221,7 @@ def test_demo_leaves_an_existing_ledger_completely_alone(tmp_path, monkeypatch, 
     而建号原先排在这道闸**之前** ⇒ 一本已经在用的账本会先凭空多出一个
     用公开默认口令的管理员，紧接着才打印「不覆盖任何现有数据」——那句话当场是假的。
 
-    这条在**自己的临时库**上跑真流程（上一版靠 mock 掉 `create_db_and_tables` 来避开，
+    这条在**自己的临时库**上跑真流程（上一版靠 mock 掉 `migrate_to_latest` 来避开，
     结果既遮住了上面那条 bug，又真的往会话共享库里灌了一整套演示数据）。
     """
     import datetime as dt

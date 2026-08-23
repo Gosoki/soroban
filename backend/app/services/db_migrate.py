@@ -11,11 +11,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+from contextlib import contextmanager
 from decimal import Decimal
 from urllib.parse import quote_plus
 
 import pymysql
-from sqlalchemy import BigInteger, Integer, SmallInteger, or_
+from sqlalchemy import BigInteger, Integer, LargeBinary, SmallInteger, String, or_
+from sqlalchemy import cast as sa_cast
 from sqlalchemy import func as sa_func
 from sqlmodel import Session, delete, select
 
@@ -190,6 +192,9 @@ def is_target_empty(engine) -> bool:
 # MySQL 的 INT 是 4 字节有符号；SQLite 没有这个限制，历史脏行能静默躺在里面。
 _INT32_MIN, _INT32_MAX = -2147483648, 2147483647
 
+# MySQL 的 TEXT 上限：65535 **字节**（不是字符）。模型里的 note/title/url/params_json 都是它。
+_TEXT_MAX = 65535
+
 
 def target_rows(engine) -> dict[str, int]:
     """目标库各业务表**现有**行数（只回非空的，键是中文表名）。
@@ -230,6 +235,11 @@ def preflight(src_engine, dst_engine) -> list[str]:
     # SQLite 的 length() 按字符数；MySQL 的 LENGTH() 按字节，得用 CHAR_LENGTH() 才可比
     # ——VARCHAR(n) 的 n 数的是字符。用错函数会把纯中文的合法值误报成超长。
     strlen = sa_func.length if src_is_sqlite else sa_func.char_length
+    # TEXT 的上限数的是**字节**（MySQL 的 TEXT = 65535 字节），不是字符——
+    # 一个汉字 3 字节、emoji 4 字节，所以 21845 个汉字就顶满了。
+    # SQLite 的 `length()` 对文本数字符，要先 CAST 成 BLOB 才数字节；MySQL 的 `LENGTH()` 本来就是字节。
+    bytelen = ((lambda c: sa_func.length(sa_cast(c, LargeBinary))) if src_is_sqlite
+               else sa_func.length)
 
     problems: list[str] = []
     with Session(src_engine) as s:
@@ -246,6 +256,22 @@ def preflight(src_engine, dst_engine) -> list[str]:
                         problems.append(
                             f"{label} #{key} 的「{col.name}」有 {n} 个字符，"
                             f"超过上限 {limit}：{str(val)[:40]}…"
+                        )
+                    continue
+                # **TEXT 列**（`length` 为 None 的字符串列：note / title / url / params_json）。
+                # 这一支原先整个不存在：上面 `if limit:` 对它是 False，下面两支也不认它，
+                # 于是 TEXT 完全不在检查范围内。而 SQLite 照单全收任意长度、
+                # MySQL 的 TEXT 在 STRICT_TRANS_TABLES 下抛 1406 —— `replace_data` 是**单事务**，
+                # 一行超长就让整次迁移回滚，用户只看到一句「拷贝「商品订单」表时失败：<原始串>」，
+                # 既不知道是哪一行，也不知道该怎么办。preflight 的职责恰恰就是提前捞出这种行。
+                if isinstance(col.type, String) and not limit:
+                    for key, n, val in s.exec(
+                        select(pk, bytelen(col), col).where(bytelen(col) > _TEXT_MAX).limit(3)
+                    ).all():
+                        problems.append(
+                            f"{label} #{key} 的「{col.name}」有 {n} 字节，"
+                            f"超过目标库 TEXT 的上限 {_TEXT_MAX} 字节"
+                            f"（中文一个字算 3 字节）：{str(val)[:40]}…"
                         )
                     continue
                 # **整数列**：SQLite 是弱类型，`jpy_override` 之类能静默存下超过 2^31 的值；
@@ -276,6 +302,48 @@ def preflight(src_engine, dst_engine) -> list[str]:
     return problems
 
 
+@contextmanager
+def _snapshot_read(src, dst_engine):
+    """让整次拷贝在**一个稳定的读快照**里完成。
+
+    不这么做的话，源库那 13 张表是 13 次各自独立的 SELECT（pysqlite 只在写之前才 BEGIN，
+    SELECT 一律跑在 autocommit 下）——也就是 13 个不同的时间点。期间只要有人写入，
+    拷出来的就是**撕裂的**：订单拷过去了、它的物品还没拷，或者反过来
+    （子行有了、父行没有 ⇒ 恢复时外键直接炸）。
+
+    原先挡这件事靠的是只读屏障，但**屏障是进程内的**（`threading.Lock`）。
+    `python -m tools.backup_db` 与 README 里那条 cron 都跑在**另一个进程**里，
+    屏障对正在运行的应用一点约束都没有。也就是说：唯一会天天自动跑的那条备份路径，
+    恰恰是屏障保护不到的那条。
+
+    实测（2026-08-22，SQLite+WAL）：不开显式事务时，拷贝中途别人写入会被读到；
+    显式 `BEGIN` 之后跨表读稳定，**并且不挡写入方**——WAL 的读者与写者本来就不互斥。
+    MySQL 侧用 InnoDB 的一致性快照，语义相同。
+
+    源与目标是同一个库时**不开**：那会让读事务和写事务在同一个文件上互相等。
+    这种调用本来就不该发生（迁移侧有 `_is_same_as_active` 拦着），这里只是不制造死锁。
+    """
+    conn = src.connection()
+    same = dst_engine is not None and conn.engine.url == dst_engine.url
+    if same:
+        log.warning("源与目标是同一个库，跳过读快照（避免自我等锁）")
+        yield
+        return
+    name = conn.dialect.name
+    try:
+        if name == "sqlite":
+            conn.exec_driver_sql("BEGIN")
+        elif name == "mysql":
+            conn.exec_driver_sql("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+        else:                                   # 别的方言：不认识就不硬来，退回原行为
+            log.warning("方言 %s 没有已知的快照写法，本次拷贝不保证跨表一致", name)
+    except Exception as e:                      # noqa: BLE001
+        # 开不出快照不该让备份失败——那会把「备份质量差一点」变成「根本没有备份」。
+        # 但必须说出来，否则又变成一条没人知道的静默降级。
+        log.warning("没能开启读快照（%s），本次拷贝不保证跨表一致", e)
+    yield
+
+
 def replace_data(src_engine, dst_engine) -> dict:
     """把源库业务数据**整体覆盖**到目标库（支持任意方向：SQLite↔MySQL）。
 
@@ -283,7 +351,7 @@ def replace_data(src_engine, dst_engine) -> dict:
     只写模型声明的真实列（MySQL 的「活跃唯一」生成列不在模型里，插入时由 MySQL 自算）。
     调用方须保证 dst 不是当前正在使用的库（否则会清空线上数据）。返回每表行数。"""
     counts: dict[str, int] = {}
-    with Session(src_engine) as src, Session(dst_engine) as dst:
+    with Session(src_engine) as src, Session(dst_engine) as dst, _snapshot_read(src, dst_engine):
         # 单一事务：清空 + 整表拷贝一次性提交。中途任一表失败则整体回滚，目标库退回迁移前状态，
         # 绝不留下「前几张表已拷、后几张表还空」的半成品——否则 is_target_empty 仍会判非空、
         # 让「切换到此库」把线上切到缺表的库上。
