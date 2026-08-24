@@ -2498,3 +2498,167 @@ def test_every_launched_subprocess_is_told_it_was_launched(monkeypatch, tmp_path
     assert seen["env"].get("SOROBAN_TOKEN") == "t0k"
     mod._INFLIGHT.clear()
     mod._ALIVE_PROCS.clear()
+
+def _acct_plugin(tmp_path, monkeypatch, session=None):
+    """造一个**带账号**的插件（`accounts_ledger_field = "platform"`），id 是 demo。
+
+    传了 `session` 就把 demo 的账号列表**清空**——`PluginConfig` 全库只有 demo 这一行，
+    前面的用例往里加过什么这里全看得见。不清的话，「改名到乙」会撞上别的用例留下的
+    那个「乙」而吃 409 重名，而这条守卫要的正是 409——**判据被另一个原因满足了**，
+    单独跑绿、整套跑红（memory 的「假绿的五种成因」③ + 集合污染）。
+    """
+    from app.routers import plugins as mod
+
+    d = tmp_path / "plugins" / "soroban-plugin-demo"
+    d.mkdir(parents=True)
+    (d / "plugin.toml").write_text(_ACCT_TOML, encoding="utf-8")
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "plugins"))
+    monkeypatch.setattr(mod, "_SOROBAN_ROOT", tmp_path)
+    mod._needs_cache.clear()
+    if session is not None:
+        from app.models import PluginConfig
+        cfg = session.get(PluginConfig, "demo")
+        if cfg is not None:
+            mod._save_accounts(session, cfg, [])
+            session.commit()
+    return d
+
+
+def _inflight(plugin_id: str, account: str, label: str = "抓取 · 甲"):
+    """把某个账号登记成「在飞」——用的是产品代码自己的那把键和那张表。
+
+    不自己拼字符串：键的格式（`<插件> [账号]`）由 `plugins_proc._run_key` 说了算，
+    在这儿复制一份就等于测试自己实现了一遍规则，规则改了测试还绿。
+    """
+    from app.routers import plugins as mod
+    from app.routers.plugins_proc import _run_key
+
+    key = _run_key({"id": plugin_id}, "fetch", ["--account", account])
+    with mod._PROCS_LOCK:
+        mod._INFLIGHT[key] = label
+    return key
+
+
+def test_deleting_an_account_while_it_is_running_is_refused(client, session, tmp_path, monkeypatch):
+    """账号正在跑时不许删——**删了会被那个进程自己写回来**。
+
+    抓取进程在 `finally` 里把 `storage_state` 原子写回 `.state/<账号>.json`。
+    于是「删除」在磁盘上被完整撤销，而撤销它的是核心自己起的那个子进程：
+    确认框刚承诺「之后需重新添加+扫码登录才能再抓」，几分钟后账号自己复活，
+    标着「未添加 + 已授权」，那份登录 cookie 一直有效；同时暂存表里多出一批
+    挂在这个「已删账号」名下的新单。
+
+    选 409 而不是「先杀进程」：杀到一半会留下写了一半的暂存数据，而删账号不急。
+    """
+    from app.routers import plugins as mod
+
+    import uuid
+
+    A = f"甲{uuid.uuid4().hex[:6]}"          # 理由同改名那条：别撞上前面用例留下的名字
+    _acct_plugin(tmp_path, monkeypatch, session)
+    assert client.post("/api/plugins/demo/account", params={"name": A}).status_code == 200
+
+    _inflight("demo", A)
+    r = client.delete("/api/plugins/demo/account", params={"account": A})
+    assert r.status_code == 409, f"在飞时把账号删掉了：{r.status_code} {r.text}"
+    assert "写回来" in r.json()["detail"], f"没说清楚为什么拒绝：{r.json()}"
+
+    # 反面：没在跑的时候照样能删（否则这条守卫可以靠「永远拒绝」通过）
+    with mod._PROCS_LOCK:
+        mod._INFLIGHT.clear()
+    assert client.delete("/api/plugins/demo/account",
+                         params={"account": A}).status_code == 200
+
+
+def test_renaming_an_account_while_it_is_running_is_refused(client, session, tmp_path, monkeypatch):
+    """账号正在跑时不许改名——**改名等于把互斥锁的一半换掉**。
+
+    键是 `<插件> [账号名]`。改完之后卡片上「抓这个号」算出的是 `[新名]`，
+    与在飞那把 `[旧名]` 不冲突，直接放行第二个子进程 ⇒ 同一份 cookie 上
+    并行跑两个 chromium（`_run_key` 文档和插件「风控与对策」里的红线）。
+    两个进程退出时各按自己启动时读到的会话回写，一个写 `新名.json`、
+    一个把 `旧名.json` 重新造出来——账号区于是凭空多出一个「未添加/已授权」的旧名。
+
+    **两个名字都要查**：新名可能是个已存在、且正攥着锁的账号。
+    """
+    import uuid
+
+    from app.routers import plugins as mod
+
+    # **名字必须是这条用例自己造的。** `PluginConfig` 全库只有 demo 这一行，而「新名被占用」
+    # 那道检查还会翻**历史订单与标签**——清空账号列表不够，前面的用例只要用「乙」建过一单，
+    # 这里的改名就吃 409「新名字已被占用」。而这条守卫要的**恰好也是 409**：
+    # 判据被另一个原因满足，单独跑绿、整套跑红（memory 的「假绿五种成因」③ + 集合污染）。
+    tag = uuid.uuid4().hex[:6]
+    A, B, C = f"甲{tag}", f"乙{tag}", f"丙{tag}"
+
+    _acct_plugin(tmp_path, monkeypatch, session)
+    for n in (A, C):
+        assert client.post("/api/plugins/demo/account", params={"name": n}).status_code == 200
+
+    _inflight("demo", A)
+    r = client.post("/api/plugins/demo/account/rename", params={"old": A, "new": B})
+    assert r.status_code == 409, f"旧名在飞时改名放行了：{r.status_code} {r.text}"
+    assert "互斥锁" in r.json()["detail"], f"409 是别的原因给的：{r.json()}"
+
+    # 新名那边也要查
+    with mod._PROCS_LOCK:
+        mod._INFLIGHT.clear()
+    _inflight("demo", C)
+    r2 = client.post("/api/plugins/demo/account/rename", params={"old": A, "new": C})
+    assert r2.status_code == 409, (
+        f"新名在飞时改名放行了：{r2.status_code} {r2.text}——"
+        "它可能是个已存在、且正攥着锁的账号")
+    assert "互斥锁" in r2.json()["detail"], f"409 是别的原因给的（多半是重名）：{r2.json()}"
+
+    # 反面：都不在跑时，纯改名照常工作
+    with mod._PROCS_LOCK:
+        mod._INFLIGHT.clear()
+    ok = client.post("/api/plugins/demo/account/rename", params={"old": A, "new": B})
+    assert ok.status_code == 200, f"没人在跑却改不了名：{ok.status_code} {ok.text}"
+
+
+def test_disabling_a_plugin_revokes_its_running_tokens(client, session, tmp_path, monkeypatch):
+    """关掉插件总开关**必须作废在飞令牌**——那是用户唯一能点的「叫停」。
+
+    `_plugin_gate` 只看 `alive(jti) + scope`，**不读 `cfg.enabled`**。原先 `save_config`
+    只写两个字段就 commit，于是子进程的令牌继续有效最长约 32 分钟
+    （`min(_REAP_TIMEOUT + 120, _HARD_TTL)`），一路把订单写进暂存表。
+    而全仓没有任何「停止正在跑的插件」的入口——界面上这是他唯一能点的东西，
+    点完却什么都没发生。
+
+    最说明问题的是**不一致**：比它弱的「收回一项授权」反而撤了令牌
+    （`save_grants` 里那句，注释理由是「用户唯一一次真的去点撤销，恰好是他正看着
+    这个插件在乱写的时候」）。同一个理由对总开关更成立。
+
+    只撤令牌、不杀进程：杀到一半会留下写了一半的暂存数据，而撤了令牌之后
+    它已经一个字也写不进核心了。
+    """
+    from app.models import PluginConfig
+    from app.plugins import scopes
+
+    _acct_plugin(tmp_path, monkeypatch, session)
+    cfg = session.get(PluginConfig, "demo")
+    cfg.enabled = True
+    session.add(cfg)
+    session.commit()
+
+    class _U:
+        id, username = 1, "admin"
+
+    tok, jti = scopes.issue(_U(), "demo", {"staging:write"})
+    assert scopes.alive(jti), "前提没建立：令牌应当是活的"
+
+    r = client.put("/api/plugins/demo/config", json={"enabled": False, "schedule_minutes": 0})
+    assert r.status_code == 200, r.text
+    assert not scopes.alive(jti), (
+        "停用了插件，它的在飞令牌还活着——子进程会继续往暂存表里写，最长 32 分钟。"
+        "而这是用户唯一能点的叫停")
+    assert r.json().get("revoked_running") == 1, f"没如实回报撤了几枚：{r.json()}"
+
+    # 反面：本来就停用着，再存一次配置不该去撤任何东西（那会误伤手动跑起来的一次）
+    tok2, jti2 = scopes.issue(_U(), "demo", {"staging:write"})
+    client.put("/api/plugins/demo/config", json={"enabled": False, "schedule_minutes": 0})
+    assert scopes.alive(jti2), (
+        "插件本来就是停用的，只是又存了一次配置，却把在飞令牌撤了——"
+        "判据该是「从启用变成停用」，不是「当前是停用」")

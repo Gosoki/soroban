@@ -23,6 +23,7 @@ from decimal import Decimal
 from sqlmodel import Session, select
 
 from app.models import OrderItem, StagingItem, Order, OrderStaging
+from app.models.base import items_carry_no_price
 from app.routers.common import build_items
 
 _Q = Decimal("0.01")
@@ -49,6 +50,19 @@ def _backfill_row(obj, item_cls) -> dict:
     # 两条路径都**精确**保总价：数量=1 时单价即货款原值；数量>1 时 build_items 用
     # ROUND_DOWN + 尾差行把余数补回去。所以容差是 0，任何偏移都说明有 bug。
     tolerance = Decimal("0")
+
+    # **第一道校验：造出来的物品必须真的带上了单价。**
+    # 原先只有下面那道 shift 校验，而它是**间接**的——靠「单价落 NULL ⇒ sync_from_items
+    # 把总价重算成只剩邮费 ⇒ 偏移非零」这条链子来发现拼错的字段名。
+    # 2026-08-23 那条链子被剪断了：`sync_from_items` 现在遇到「单价全 NULL」直接不动价
+    # （见 `items_carry_no_price`——那是为历史订单被 PATCH 时静默清零修的），
+    # 于是 shift 恒为 0，这道检测**静默失灵**，回填反而会把一批无价物品写进库。
+    # 直接问「物品有没有价」比观察副作用可靠：它不依赖任何下游行为，也早一步。
+    if items_carry_no_price(obj.items):
+        raise RuntimeError(
+            f"回填 {type(obj).__name__}#{obj.id} 造出的物品一条单价都没有"
+            f"（{len(obj.items)} 条）。多半是构造时字段名拼错被 SQLModel 静默丢弃了"
+            f"——table=True 关掉了 Pydantic 校验。已中止，未写入任何数据。")
 
     old = Decimal(obj.price_cny or 0)
     obj.sync_from_items()                                   # 订单同时重算日元；暂存只重算 price_cny

@@ -443,3 +443,41 @@ def test_a_downgrade_that_cannot_work_refuses_before_touching_the_schema(tmp_pat
         assert rows == 2, "数据被动过了"
     finally:
         eng.dispose()
+
+
+def test_the_collation_downgrade_checks_before_it_drops_anything():
+    """`f2a3b4c5d6e7` 的降级预检必须排在**第一次 drop 之前**。
+
+    上一条（MySQL 契约层）验的是「判据查得出冲突」，这一条验的是**位置**——
+    查得再准，排在 drop 后面也没用。两者缺一，另一半就能悄悄退化。
+
+    为什么位置是要害：降级的第一步就把三处「活跃行唯一」连同 MySQL 生成列一起
+    DROP 掉，而 **MySQL 的 DDL 是隐式提交的**；`env.py` 又开了
+    `transaction_per_migration`，所以随后那步撞 1062 时，约束已经没了、
+    版本号却回滚到原地。用户只看到一句原始报错，此后一切**看起来完全正常**
+    （`upgrade head` 从这里往后照跑），而没有任何后续迁移会把那三条约束建回来。
+
+    同一条规矩 `c2d3e4f5a6b7` 早就立过（「先查数据，再动 schema」），这条当时没跟上。
+    """
+    import ast
+    from pathlib import Path
+
+    path = (Path(__file__).resolve().parents[1] / "alembic" / "versions"
+            / "f2a3b4c5d6e7_binary_collation_for_key_columns.py")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "downgrade")
+
+    def first_line(pred) -> int | None:
+        hits = [n.lineno for n in ast.walk(fn) if pred(n)]
+        return min(hits) if hits else None
+
+    check = first_line(lambda n: isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                       and n.func.id == "_conflicts_after_downgrade")
+    drop = first_line(lambda n: isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                      and n.func.id == "drop_active_unique")
+    assert check is not None, "降级完全没有预检——撞 1062 时三处唯一约束已经删掉了"
+    assert drop is not None, "找不到 drop_active_unique，这条守卫的前提变了"
+    assert check < drop, (
+        f"预检（第 {check} 行）排在了 drop_active_unique（第 {drop} 行）后面。"
+        "MySQL 的 DDL 隐式提交，drop 之后再拦已经晚了——约束此后永远建不回来")

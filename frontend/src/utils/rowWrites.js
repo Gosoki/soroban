@@ -41,13 +41,36 @@ export function queueRowWrite(key, task) {
 // 这种情况只采纳标量。代价是这一轮拿不到后端重折算的单价——但既然用户正在编辑，
 // 他下一次保存会把完整数组再送一遍，那时就对齐了。
 // 判据放在调用方：只有它知道自己送出去的是哪一份。
-export function applyRowUpdate(target, patch, updated, { itemsStale = false } = {}) {
-  if (patch && patch.items !== undefined && !itemsStale) {
-    Object.assign(target, updated)
-    return
-  }
+//
+// `before` —— 发请求那一刻 target 的浅拷贝。**给了它，标量才不会覆盖用户正在敲的字。**
+// 上面那段说的是 items 的同一个病，而标量当时被「只采纳标量」明确放行了——
+// 没人考虑到标量在**整单编辑面板**里也是活绑定的：
+// `OrderEditPanel` / `OrderItemsEditor` 的每个字段都 `v-model` 直接绑在共享的 order 上，
+// 没有本地草稿。于是在状态下拉里选一个值（`@change` 立刻发 PATCH）→ 紧接着点进
+// 「商品标题」开始敲 → 这次 PATCH 的响应三百毫秒后到达 → 整包标量盖回来 →
+// `order.title` 变回服务端那份旧值，`el-input` 的 watcher 直接改写正在输入的 DOM、
+// 光标弹到末尾。此后用户若直接失焦，原生 `change` 因为「值与聚焦时相同」**根本不触发**
+// ⇒ 他敲的标题一个字都没保存，也没有任何报错。
+//
+// 四张列表页不需要传它：那里的格子走 `GotionCell` 的本地 `editVal` 草稿，
+// 行对象上的标量只用于展示，被盖掉不影响任何正在输入的内容。
+//
+// 判据与 `keysToClearAfterCreate`、以及设置页 `save()` 的合并逻辑**逐字同源**：
+// 这次送出去的键一律采纳（用户就是要改它），其余键只在「与请求前一模一样」时采纳
+// ——那说明它是服务端派生的新值（version / price_cny / jpy_settled）。
+export function applyRowUpdate(target, patch, updated, { itemsStale = false, before = null } = {}) {
   const { items, ...rest } = updated
-  Object.assign(target, rest)
+
+  for (const k of Object.keys(rest)) {
+    const sent = patch != null && k in patch                    // 这次就是要改它 ⇒ 采纳
+    const untouched = !before || JSON.stringify(target[k]) === JSON.stringify(before[k])
+    if (sent || untouched) target[k] = rest[k]
+  }
+
+  // items 沿用原判据（调用方自己比对过，因为只有它知道送出去的是哪一份）
+  if (patch && patch.items !== undefined && !itemsStale && items !== undefined) {
+    target.items = items
+  }
 }
 
 /** 幽灵新建行提交成功之后，草稿里**哪些键该清掉**。

@@ -7,7 +7,7 @@ from sqlalchemy import Column, Index, Text, text
 from sqlmodel import Field, Relationship
 
 from ...db.dialect import BinStr
-from ..base import PURCHASE_EXCLUDED, LedgerBase, PurchaseStatus, price_from_items
+from ..base import PURCHASE_EXCLUDED, LedgerBase, PurchaseStatus, items_carry_no_price, price_from_items
 
 
 class Order(LedgerBase, table=True):
@@ -103,6 +103,15 @@ class Order(LedgerBase, table=True):
         return None
 
     def sync_from_items(self) -> None:
-        """订单价 = Σ(物品单价×数量) + 邮费，再重算日元。改动 items/邮费 后必须调用。"""
+        """订单价 = Σ(物品单价×数量) + 邮费，再重算日元。改动 items/邮费 后必须调用。
+
+        **派生不出来就什么都不做**，理由见 `items_carry_no_price`：
+        「不知道多少钱」不是「这单值 0 元」，而按后者算出来的恰好是 `0 + 邮费`。
+        暂存侧（`OrderStaging.sync_from_items`）用的是同一条判据——
+        它先补的是「零物品」那一半，这里补齐的是「有物品、单价全 NULL」那一半，
+        而后者才是历史订单的真实形态（`f6a7b8c9d0e1` 只加列、回填靠一个没人跑过的脚本）。
+        """
+        if items_carry_no_price(self.items):
+            return
         self.price_cny = price_from_items(self.items) + (self.postage_cny or 0)
         self.compute_money()

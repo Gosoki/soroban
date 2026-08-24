@@ -209,12 +209,18 @@ def main() -> None:
     # 直接报错退出，能把这类误用从「莫名其妙的影子实例」变成一眼可见的错误。
     argv = sys.argv[1:]
     rescue = False
+    restore_from = None
     if argv:
         # --run-plugin 必须**最先**判：它后面跟的是插件自己的参数，
         # 不该被下面那条「整个 argv 必须落在白名单里」的规则误伤。
         if argv[0] == "--run-plugin":
             _run_plugin(argv[1:])
-        if set(argv) <= {"--use-local-db", "--yes"} and "--use-local-db" in argv:
+        if argv[0] == "--restore":
+            restore_from = argv[1] if len(argv) > 1 else None
+            if not restore_from:
+                print("用法： soroban --restore <快照文件>", file=sys.stderr)
+                raise SystemExit(2)
+        elif set(argv) <= {"--use-local-db", "--yes"} and "--use-local-db" in argv:
             rescue = True
         else:
             print(f"soroban 不接受命令行参数（收到 {argv}）。"
@@ -229,6 +235,23 @@ def main() -> None:
     # 自救必须排在 chdir + ensure_env 之后（app.config 在导入时就读 .env 定 SECRET_KEY，
     # 而控制库的 MySQL 连接串是用它加密的），且排在 `from app.main import app` 之前——
     # 后者会连库跑迁移，而这条路径存在的前提正是「库连不上」。
+    if restore_from:
+        # **打包版唯一的恢复入口。** 分发形态是双击运行的 exe：那台机器上没有 python，
+        # 也没有 `tools/`（`soroban.spec` 的 hiddenimports 里没有它，`backup.py` 开头
+        # 的注释也明说 `tools/` 既不在导入图里、也没被 spec 收进去）。
+        # 于是在这个入口出现之前，exe 用户**做得出备份、一份都用不了**：
+        # 界面天天给他看那张列了 N 份快照的表，真出事那天照着上面写的命令敲
+        # `python -m tools.backup_db --restore ...`，得到的是「'python' 不是内部或外部命令」。
+        #
+        # `app.backup` 在导入图里（应用自己要用它做迁移前快照），直接调它即可——
+        # 不必也不该把 `tools/` 塞进 spec：那是给源码运行准备的一层薄壳。
+        # 确认照旧要人手敲一次 yes（`assume_yes` 只在 `--yes` 时放行），
+        # 因为这是唯一一条能一键清空账本的操作。
+        from pathlib import Path as _P
+
+        from app.backup import restore as _restore
+        raise SystemExit(_restore(_P(restore_from), assume_yes="--yes" in argv))
+
     if rescue:
         from app.rescue import use_local_db
         raise SystemExit(use_local_db(assume_yes="--yes" in argv))

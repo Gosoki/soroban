@@ -4,7 +4,7 @@
     所有订单的物品拉平成一张表（对接的最小单位）。列可拖动换位/拖宽。物品编辑请到「商品订单」页展开面板里做。
     </PageHeader>
 
-    <NotionTable :columns="columns" :rows="rows" :loading="loading" :actions-width="60"
+    <NotionTable :columns="columns" :rows="rows" :loading="loading" :load-failed="loadFailed" :actions-width="60"
                  :empty-text="loadFailed ? MSG_LOAD_FAILED : '没有符合条件的记录'"
                  table-name="items" hide-id :addable="false" :deletable="false" @reload="load" @tags-changed="onTagsChanged">
       <template #toolbar>

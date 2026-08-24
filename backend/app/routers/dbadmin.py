@@ -163,7 +163,19 @@ def create_backup():
 
     buf = io.StringIO()
     try:
-        path, counts = make_backup(stream=buf)
+        # **`keep=0`：界面这一下只负责「多留一份」，不承担轮换。**
+        # 轮换是备份策略的一部分，而策略的参数在 crontab 里（`--keep 60`，README 第 242 行
+        # 明写着这个用法），应用**读不到**它。原先这里不传 keep ⇒ 走签名默认的 30 ⇒
+        # 用户按 README 配成 60 份的目录，被这一次点击剪成 30：最旧的 31 份 `.db`
+        # 连同配对的 `env-<时间戳>.txt` 一起 unlink，两个月的历史一次点击全没，不可逆。
+        #
+        # 而他什么都看不到：`_prune` 打的那 31 行「已清理旧备份 X」全进了这个
+        # `io.StringIO`，随响应的 `log` 字段回给前端，而 `doBackup()` 只读 `total` 和 `file`。
+        # 页面上唯一的痕迹是卡片角上「N 份」从 60 变成 30，没有任何东西说这是删除。
+        #
+        # 让它猜一个 keep 是错的：猜错就删掉真数据，而猜对没有任何收益
+        # （cron 下一次运行照样会把该剪的剪掉）。与 `restore()` 的安全备份同一个判据。
+        path, counts = make_backup(stream=buf, keep=0)
     except RuntimeError as e:
         # 「已有另一项维护操作在进行」——两个人同时点备份，或备份撞上迁移。
         # 这是 409 不是 500：没出错，只是现在轮不到，等几秒再点就行。

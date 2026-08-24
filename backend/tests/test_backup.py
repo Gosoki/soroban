@@ -744,3 +744,43 @@ def test_a_restore_never_evicts_anything_from_the_backup_directory(tmp_path, mon
     assert not gone, (
         f"一次恢复顺手删掉了 {len(gone)} 份备份：{sorted(gone)[:5]}…\n"
         "轮换是备份策略的一部分，该由例行备份执行；恢复只该**增加**一份退路")
+
+
+def test_the_ui_backup_button_never_prunes_anything(tmp_path, monkeypatch):
+    """界面「立刻备份」只负责**多留一份**，不许顺手剪掉别的。
+
+    轮换是备份策略的一部分，而策略的参数在 crontab 里（README 教的
+    `--keep 60`），应用**读不到**它。原先这个按钮走签名默认的 `keep=30`，
+    于是用户按 README 配成 60 份的目录，被一次点击剪成 30——最旧的 31 份
+    连同配对的 `env-<时间戳>.txt` 一起删掉，两个月的历史，不可逆。
+
+    而他什么都看不到：`_prune` 打的那 31 行「已清理旧备份 X」全进了路由里那个
+    `io.StringIO`，随响应的 `log` 字段回给前端，而 `doBackup()` 只读 `total` 和 `file`。
+    页面上唯一的痕迹是卡片角上「N 份」从 60 变成 30。
+
+    让它猜一个 keep 是错的：猜错就删真数据，猜对也没有收益——cron 下一次运行
+    照样会把该剪的剪掉。与 `restore()` 的安全备份同一个判据。
+    """
+    import datetime as dt
+    import io
+
+    from app import backup as mod
+
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    monkeypatch.setattr(mod, "_default_dir", lambda: backups)
+
+    # 按 README 的 --keep 60 配出来的稳定态
+    for i in range(60):
+        d = dt.date(2025, 1, 1) + dt.timedelta(days=i)
+        (backups / f"soroban-{d:%Y%m%d}-030000.db").write_bytes(b"x")
+        (backups / f"env-{d:%Y%m%d}-030000.txt").write_text("SECRET_KEY=x")
+    before = {p.name for p in backups.iterdir()}
+
+    from app.routers.dbadmin import create_backup
+    create_backup()
+
+    gone = before - {p.name for p in backups.iterdir()}
+    assert not gone, (
+        f"界面点一次「立刻备份」删掉了 {len(gone)} 份历史：{sorted(gone)[:4]}…\n"
+        "它读不到 crontab 里的 --keep，就不该猜一个值去执行轮换策略")

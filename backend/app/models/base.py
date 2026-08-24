@@ -194,6 +194,29 @@ def guard_cny(p: Decimal) -> Decimal:
     return d
 
 
+def items_carry_no_price(items) -> bool:
+    """这批物品**派生不出订单价**——一条都没有，或者每一条的单价都是空的。
+
+    两种情形是同一件事：**「不知道多少钱」不是「这单值 0 元」**，
+    而 `price_from_items` 对两者算出来的恰好都是后者（`Decimal(x or 0)`，再加邮费）。
+
+    第二种情形是真实的历史状态，不是假想：`f6a7b8c9d0e1` 那次迁移只加了
+    `orderitem.unit_price_cny` 这一列（nullable、无回填），docstring 明写着
+    「既有行的数据回填由一次性脚本完成（见 `tools/backfill_item_price.py`）」——
+    而**启动链和恢复链都只跑 alembic，没有任何一条会去跑那个脚本**。
+    于是那之前建的订单，物品有名称有数量、单价是 NULL。
+
+    伤害的触发条件低得离谱：在订单页对这样一张单做**任何一次** PATCH——
+    改个状态下拉、补一个快递号、加一句备注都行——`update_order` 会无条件调
+    `sync_from_items()`，货款当场从 ¥300 变成 ¥0（邮费还在），日元一起变 0。
+    没有报错、没有提示，保存成功。在列表里改状态下拉的人根本看不到金额列。
+    看板合计随之静默缩水，而且**再编辑一次也回不来**——0 已经被固化了。
+
+    「一条物品都没有」这一支同样保留（`all()` 对空序列返回 True，两种情形共用一条判据）。
+    """
+    return all(getattr(it, "unit_price_cny", None) is None for it in items)
+
+
 def price_from_items(items) -> Decimal:
     """订单/暂存的人民币总价 = Σ(物品单价 × 数量)，量化到分。空价按 0。
 

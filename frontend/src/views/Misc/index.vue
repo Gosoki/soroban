@@ -5,7 +5,7 @@
     与另外两张表一样计入看板合计。
     </PageHeader>
 
-    <NotionTable :columns="columns" :rows="rows" :loading="loading" table-name="misc" :empty-text="loadFailed ? MSG_LOAD_FAILED : '没有符合条件的记录'"
+    <NotionTable :columns="columns" :rows="rows" :loading="loading" :load-failed="loadFailed" table-name="misc" :empty-text="loadFailed ? MSG_LOAD_FAILED : '没有符合条件的记录'"
                  @save="saveCell" @add="addRow" @delete="delRow" @reload="load" @tags-changed="onTagsChanged">
       <template #toolbar>
         <el-input v-model="filters.q" placeholder="搜名称" clearable style="width: 200px" @change="applyFilters" />
@@ -31,6 +31,7 @@
 </template>
 
 <script setup>
+import { outcomeIsUnknown } from '@/api/retry'
 import PageHeader from '@/components/PageHeader.vue'
 import TableFooterSum from '@/components/TableFooterSum.vue'
 import { onMounted, reactive, ref } from 'vue'
@@ -158,8 +159,11 @@ async function addRow(data = {}, done) {
     const created = await miscApi.create({ date: today(), name: '', ...data })
     await afterCreate(created, { rows, total, page, filters, load, pageSize })
     done?.(true)
-  } catch (_) {
-    done?.(false)   // 失败时保留幽灵行里的草稿，让用户就地改，别把刚敲的内容一起吞掉
+  } catch (e) {
+    // 超时/断网 = **结果未知**（请求已经发出去了，可能已经落库）。
+    // 交给 NotionTable 说那句正确的话：「先别重复提交——刷新看看是不是已经存上了」。
+    // 草稿照旧留着：万一真没存上，用户不用重敲。
+    done?.(false, outcomeIsUnknown(e))
   }
 }
 

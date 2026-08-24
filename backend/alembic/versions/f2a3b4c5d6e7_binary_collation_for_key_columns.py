@@ -41,6 +41,7 @@ Create Date: 2026-08-06 06:20:00.000000
 """
 from typing import Sequence, Union
 
+import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import mysql
 
@@ -118,6 +119,57 @@ def upgrade() -> None:
         emit_active_unique(op, **spec)
 
 
+# 降级会把这些键列换回 ai_ci（大小写/重音不敏感），于是「原本合法的两行」变成重复。
+# (表, 人话, 用来分组的表达式) ——表达式必须与降级后那道唯一约束**逐字对应**。
+_AI_CI = "utf8mb4_0900_ai_ci"
+_DOWNGRADE_CONFLICTS = [
+    ('tagoption', '标签取值', "CONCAT(field, CHAR(31 USING utf8mb4), value)", None),
+    ('user', '用户名', "username", None),
+    ('orders', '商品订单号', "CONCAT(order_no, CHAR(31 USING utf8mb4), COALESCE(platform, ''))",
+     "order_no IS NOT NULL AND is_delete = 0"),
+    ('orderstaging', '暂存订单号', "order_no", "order_no IS NOT NULL"),
+    ('shipmentorder', '集运单号', "shipment_no", "shipment_no IS NOT NULL AND is_delete = 0"),
+]
+
+
+def _conflicts_after_downgrade(conn) -> list[str]:
+    """降级之后会撞 1062 的值，全查一遍。**在动 schema 之前调用。**
+
+    `c2d3e4f5a6b7` 已经为同一件事立过规矩（「先查数据，再动 schema」），
+    但这一条当时没跟上，而它比那条更危险：降级的第一步就把**三处**「活跃行唯一」
+    连同 MySQL 生成列一起 DROP 掉，随后才跑它自己在 docstring 里承认「可能撞 1062」的那步。
+    **MySQL 的 DDL 是隐式提交的**，而 `env.py` 开了 transaction_per_migration——
+    于是失败之后：三处唯一约束全没了，版本号却被回滚、仍停在 `f2a3b4c5d6e7`。
+
+    用户只看到一句 1062 原始报错，然后**一切看起来完全正常**：下次启动
+    `upgrade head` 从这里往后照跑（后面的迁移都成功），应用正常打开、页面正常，
+    没有任何一处会提示约束没了。他会以为「降级失败了，升回去就没事」。
+    真正的后果很久以后才显形——同一个订单号可以重复导入、重复建单，不再有 409，
+    看板合计凭空变大，而**没有任何机制会再把那三条约束建回来**（后面的迁移都不碰它们）。
+
+    一次性把五处全查完再报，而不是撞一个报一个：用户要的是「一共要清理哪些」。
+    """
+    found: list[str] = []
+    for table, label, expr, where in _DOWNGRADE_CONFLICTS:
+        # **`COLLATE` 要写在 SELECT 的表达式上、再按别名分组。** 写成
+        # `SELECT expr ... GROUP BY (expr) COLLATE ai_ci` 在 `only_full_group_by`
+        # （MySQL 8 的默认 sql_mode）下直接 1055——两个表达式不是同一个。
+        # 这个错只有真连 MySQL 才看得见，纯 SQLite 的测试一条都发现不了。
+        sql = (f"SELECT ({expr}) COLLATE {_AI_CI} AS k, COUNT(*) c FROM `{table}` "
+               + (f"WHERE {where} " if where else "")
+               + "GROUP BY k HAVING c > 1 LIMIT 5")
+        # **查询失败一律往外抛，不吞。** 到这一步五张表都必然存在，查不动只可能是
+        # 预检自己坏了或环境有问题——而「不知道有没有冲突」时继续降级是最危险的选择
+        # （下一步就 DROP 掉三处唯一约束，且 MySQL 的 DDL 隐式提交、再也建不回来）。
+        # 第一版在这里 `except` 成「查不了，请手工确认」并计入冲突，实测更糟：
+        # SQL 一写错就变成**永远拒绝降级**，而且看起来像是数据有问题。
+        rows = conn.execute(sa.text(sql)).fetchall()
+        if rows:
+            listed = "、".join(f"{r[0]}（{r[1]} 条）" for r in rows)
+            found.append(f"{label}（{table}）：{listed}")
+    return found
+
+
 def downgrade() -> None:
     """Downgrade schema.
 
@@ -125,8 +177,22 @@ def downgrade() -> None:
     值（'Alice' 与 'alice'），重建唯一索引时会撞 1062。这不是 bug，是数据真的不满足旧约束——
     先消歧义再降级。
     """
-    if not is_mysql(op.get_bind()):
+    conn = op.get_bind()
+    if not is_mysql(conn):
         return
+
+    # **先查数据，再动 schema。** 下面第一步就会 DROP 掉三处唯一约束，而 MySQL 的 DDL
+    # 隐式提交——之后任何一步失败，那三条约束就永久没了（详见 `_conflicts_after_downgrade`）。
+    if conn is not None:                        # 离线 --sql 模式查不了；那条路本来也执行不了数据步骤
+        conflicts = _conflicts_after_downgrade(conn)
+        if conflicts:
+            raise RuntimeError(
+                "降级会把这些键列换回大小写/重音**不敏感**的排序规则，"
+                "而库里存在只差大小写/重音的值——那正是本条迁移放开的东西：\n  "
+                + "\n  ".join(conflicts)
+                + "\n请先在应用里改掉或合并它们，再降级。"
+                  "（一个字节都还没改，库仍是完好的——"
+                  "真让它跑下去，三处唯一约束会先被删掉且再也建不回来。）")
 
     for spec in _ACTIVE_UNIQUE:
         drop_active_unique(op, table=spec['table'], index_name=spec['index_name'],

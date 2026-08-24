@@ -6,7 +6,7 @@
     ——拖到某一行的绑定格上则直接绑到那一行。
     </PageHeader>
 
-    <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable
+    <NotionTable :columns="columns" :rows="rows" :loading="loading" :load-failed="loadFailed" expandable
                  table-name="shipment" :empty-text="loadFailed ? MSG_LOAD_FAILED : '没有符合条件的记录'" @save="saveCell" @add="addRow" @delete="delRow" @tags-changed="onTagsChanged" @reload="load">
       <template #toolbar>
         <el-input v-model="filters.q" placeholder="搜集运单号/国际运单号/收货人" clearable style="width: 200px" @change="applyFilters" />
@@ -156,6 +156,7 @@
 </template>
 
 <script setup>
+import { outcomeIsUnknown } from '@/api/retry'
 import PageHeader from '@/components/PageHeader.vue'
 import TableFooterSum from '@/components/TableFooterSum.vue'
 import { computed, onMounted, reactive, ref, watch } from 'vue'
@@ -369,7 +370,10 @@ async function addRow(data = {}, done) {
     done?.(true)
     return created                    // OCR 建单据此判断是否真的建成（失败时拦截器已提示）
   } catch (e) {
-    done?.(false)   // 失败时保留幽灵行里的草稿，让用户就地改
+    // 超时/断网 = **结果未知**（请求已经发出去了，可能已经落库）。
+    // 交给 NotionTable 说那句正确的话：「先别重复提交——刷新看看是不是已经存上了」。
+    // 草稿照旧留着：万一真没存上，用户不用重敲。
+    done?.(false, outcomeIsUnknown(e))
     // 409 被 http 拦截器刻意跳过（留给页面处理）。不在这里提示的话，撞集运单号唯一约束时
     // 页面「什么都没发生」：没有 toast、没有新行、幽灵行里刚敲的单号也被 commitNew 清掉了。
     if (e.response?.status === 409) {

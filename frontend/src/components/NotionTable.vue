@@ -9,6 +9,19 @@
       <slot name="toolbar-right" />
     </div>
 
+    <!-- 刷新失败**但屏幕上还有旧行**。这一条不能省：`emptyText` 只在 rows 为 0 时渲染，
+         于是「筛选成功、结果就是这些」与「筛选没成功、这是上一次的结果」在界面上
+         **完全无法区分**——工具栏写着「已退款」，表格里是筛选前那 30 条各种状态的单，
+         页脚合计还是旧的那个数。拦截器那条 toast 三秒就没了。
+         翻页更明显：分页器高亮第 3 页，表格是第 2 页的行。
+         看板早就为同一件事写过判据（见 Dashboard 的 load-failed），列表页照它的语言来。 -->
+    <el-alert v-if="loadFailed && rows.length" type="error" show-icon :closable="false"
+              class="gtn-stale">
+      <template #title>这次刷新没成功</template>
+      下面是<b>上一次</b>加载的结果，可能与当前的筛选/页码对不上。
+      <el-button link type="primary" @click="emit('reload')">重试</el-button>
+    </el-alert>
+
     <div class="gtn-scroll" v-loading="loading">
       <table class="gtn-table" :style="{ width: totalWidth + 'px' }">
         <colgroup>
@@ -160,7 +173,7 @@ import GotionCell from './GotionCell.vue'
 import { keysToClearAfterCreate } from '@/utils/rowWrites'
 import { layoutApi, tagsApi } from '@/api'
 import { handled } from '@/api/http'
-import { TAG_PALETTE, tagStyleAt } from '@/constants'
+import { TAG_PALETTE, longToast, tagStyleAt } from '@/constants'
 
 const props = defineProps({
   columns: { type: Array, required: true },
@@ -174,6 +187,9 @@ const props = defineProps({
   openId: { type: [Number, String], default: null },   // 设置后自动展开该 id 的行（供跨页跳转定位）
   hideId: { type: Boolean, default: false },   // 隐藏最左「ID」列的编号与表头（仍保留该窄列的新建/删除操作）
   emptyText: { type: String, default: '没有符合条件的记录' },   // 零结果时的一行文案
+  // 这次刷新失败了。**与 emptyText 分工**：rows 为 0 时那句话承接，rows 非 0 时这里承接。
+  // 两者缺一，失败就会在其中一种情形下装成成功。
+  loadFailed: Boolean,
 })
 const emit = defineEmits(['save', 'add', 'delete', 'reload', 'tags-changed'])
 const slots = useSlots()
@@ -409,8 +425,15 @@ function commitNew() {
     settled = true
     clearTimeout(timer)
     committing.value = false
+    // `timedOut` 现在有两个来源，说的是同一件事——**结果未知**：
+    //   ① 下面那道 35 秒兜底（父页压根没调 done）；
+    //   ② 父页 `addRow` 的 catch 判定「没收到服务端答复」（`outcomeIsUnknown`）——
+    //      axios 15 秒超时、断网。这一支才是常见的那个，而它原先走的是
+    //      「确定失败」分支：提示只说「稍后重试」，草稿原样留着，看起来就是没存上。
+    //      用户再敲一次回车 ⇒ 杂项支出没有任何唯一约束 ⇒ 同一笔钱记两遍。
     if (timedOut) {
-      ElMessage.warning('等了很久还没收到结果。先别重复提交——刷新看看是不是已经存上了')
+      longToast(ElMessage, 'warning',
+        '没等到服务端的回复，这笔可能已经存上了。先别重复提交——刷新看看，确实没有再重来一次')
     }
     // 成功才清空草稿：失败（如订单号撞唯一约束）时把用户刚敲的内容留在格子里让他改，
     // 而不是连人带字一起吞掉。
@@ -498,6 +521,8 @@ function stopResize() {
    右侧的 OCR 按钮会是 24px，和左边一排 30px 的筛选框对不齐（实测 [30, 24]）。 */
 .gtn-toolbar :deep(.el-button) { height: var(--el-component-size-small); }
 .gtn-tb-gap { flex: 1; }
+/* 与看板那条 `.load-failed` 同一个间距，免得同一句话在两处长得不一样 */
+.gtn-stale { margin-bottom: 12px; }
 /* background 是**去掉外层 el-card 之后补的**：表格页现在不再套卡片，
    这圈边框自己就是容器，行底色必须由它给，否则整表掉到页面底 --bg-page（深一档），
    而表头（--bg-hover）还亮着，看起来像表头浮在一个洞上。 */

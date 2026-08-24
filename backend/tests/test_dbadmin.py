@@ -110,8 +110,14 @@ def test_migrating_onto_a_non_empty_target_needs_an_explicit_confirmation(
     # 恰恰是这条测试真正想钉的那一半。
     client.post("/api/orders", json={"date": "2027-04-01", "title": "覆盖闸的证据"})
     db_migrate.replace_data(get_engine(), dst_engine)       # 让目标库变成非空
+    # **URL 必须与 engine 指向同一个库。** 原先这里写死 `"sqlite:///dst"`，
+    # 而 engine 是夹具建在 tmp_path 里的那个——两者指向两个不同的库。
+    # 被测代码拿这个 URL 真的跑了 `run_migrations`，于是每跑一次这条用例，
+    # 就在**仓库根目录**（backend/，测试的 cwd）造出一个 221 KB、叫 `dst` 的 SQLite 库。
+    # 它没有扩展名，`.gitignore` 的 `*.db` 抓不到，谁跑完测试 `git add -A`
+    # 就把它提交并推上 GitHub——本仓 a1e36ad 就是这么来的。
     monkeypatch.setattr(mod, "_resolve_target",
-                        lambda t: ("sqlite", "sqlite:///dst", dst_engine, False))
+                        lambda t: ("sqlite", str(dst_engine.url), dst_engine, False))
     monkeypatch.setattr(mod, "_is_same_as_active", lambda backend, url: False)
     monkeypatch.setattr(mod, "run_migrations", lambda url: None)
 
@@ -138,7 +144,7 @@ def test_the_overwrite_409_is_recognisable(client, dst_engine, monkeypatch):
     client.post("/api/orders", json={"date": "2027-04-02", "title": "证据"})
     db_migrate.replace_data(get_engine(), dst_engine)
     monkeypatch.setattr(mod, "_resolve_target",
-                        lambda t: ("sqlite", "sqlite:///dst", dst_engine, False))
+                        lambda t: ("sqlite", str(dst_engine.url), dst_engine, False))
     monkeypatch.setattr(mod, "_is_same_as_active", lambda backend, url: False)
     monkeypatch.setattr(mod, "run_migrations", lambda url: None)
 
@@ -157,7 +163,7 @@ def test_migrating_onto_an_empty_target_is_not_interrupted(client, dst_engine, m
     from app.routers import dbadmin as mod
 
     monkeypatch.setattr(mod, "_resolve_target",
-                        lambda t: ("sqlite", "sqlite:///dst", dst_engine, False))
+                        lambda t: ("sqlite", str(dst_engine.url), dst_engine, False))
     monkeypatch.setattr(mod, "_is_same_as_active", lambda backend, url: False)
     monkeypatch.setattr(mod, "run_migrations", lambda url: None)
     assert db_migrate.is_target_empty(dst_engine) is True, "夹具不该是非空的"
@@ -606,7 +612,7 @@ def test_the_non_empty_409_discloses_that_the_schema_was_already_upgraded(
     client.post("/api/orders", json={"date": "2027-04-02", "title": "让对面非空"})
     db_migrate.replace_data(get_engine(), dst_engine)        # 目标库变成非空
     monkeypatch.setattr(mod, "_resolve_target",
-                        lambda t: ("sqlite", "sqlite:///dst", dst_engine, False))
+                        lambda t: ("sqlite", str(dst_engine.url), dst_engine, False))
     monkeypatch.setattr(mod, "_is_same_as_active", lambda backend, url: False)
 
     r = client.post("/api/db/migrate", json={"backend": "sqlite"})

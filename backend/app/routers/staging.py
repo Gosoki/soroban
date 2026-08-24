@@ -176,7 +176,20 @@ def create_staging(payload: StagingCreate, session: Session = Depends(get_sessio
     from ..services.fx import rate_for_date  # 局部导入避免循环
 
     row = OrderStaging(**payload.model_dump(exclude={"items", "price_cny"}))  # 价由物品派生
-    if row.fx_rate is None:                  # 按下单日期匹配汇率；无记录则退回当前(入库当天)汇率
+    # **不知道下单日期，就别替他定汇率。**
+    # 原先这里无条件盖：`order_date` 为 NULL 时 `rate_for_date(session, None)` 走
+    # `latest_stored()`，盖的是**入库当天**那条。而暂存的用法就是「放着，核对无误后逐单导入」，
+    # 中间隔几天到几周是常态；导入时 `date` 兜底成**导入当天**（JST），
+    # 汇率却还是入库那天的——**同一张单的日期与汇率来自两个相差几周的时刻**，
+    # 而且不触发任何告警（`row.fx_rate` 非空就不会再去取）。
+    #
+    # `order_date` 为 NULL 不是边角情形：OCR 认不出「下单时间」时前端根本不下发那个键
+    # （`Staging/index.vue`），淘宝 H5 模板压根没有下单时间（插件的 `fetch.py` 开头明写）。
+    #
+    # 留空之后，导入时那句 `row.fx_rate or rate_for_date(session, row.order_date)` 会按
+    # **建单那一刻**取——日期与汇率从此同源。用户在暂存页手填过的汇率照旧保留
+    # （这里只在 `is None` 时才动）。
+    if row.fx_rate is None and row.order_date is not None:
         row.fx_rate = rate_for_date(
             session, row.order_date, what=f"暂存行 {row.order_no or '(无单号)'}")
     # 最小单位是物品：至少 1 条。播种用「货款」= 种子价 - 邮费，避免邮费摊进单价再被 sync 重复计

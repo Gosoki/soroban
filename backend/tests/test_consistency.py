@@ -1220,6 +1220,39 @@ const results = {}
   results.default_is_unchanged = row.items[0].name === 'B'
 }
 
+
+// ④ **标量也会覆盖用户正在敲的字**——整单编辑面板每个字段都 v-model 直接绑共享 order。
+//    在状态下拉里选一个值（立刻 PATCH）→ 紧接着点进「商品标题」开始敲 →
+//    响应三百毫秒后到达 → 整包标量盖回来 → title 变回旧值、光标弹到末尾。
+//    此后直接失焦，原生 change 因为「值与聚焦时相同」根本不触发 ⇒ 敲的字一个都没保存。
+{
+  const order = { id: 1, version: 3, purchase_status: '待收货', title: '旧标题', price_cny: '100' }
+  const before = { ...order }
+  order.title = '用户正在敲的新标题'                      // 在途期间改的
+  applyRowUpdate(order, { version: 3, purchase_status: '已签收' },
+                 { id: 1, version: 4, purchase_status: '已签收', title: '旧标题', price_cny: '100' },
+                 { before })
+  results['在途改的标量不被服务端旧值盖掉'] = order.title === '用户正在敲的新标题'
+  results['这次送出去的键照旧采纳'] = order.purchase_status === '已签收'
+  results['服务端派生的新值照旧采纳'] = order.version === 4
+}
+
+// ⑤ 反面：没动过的标量必须采纳——否则 version 拿不到新值，下一次写就 409。
+{
+  const order = { id: 1, version: 3, title: '旧标题', price_cny: '100' }
+  const before = { ...order }
+  applyRowUpdate(order, { version: 3, postage_cny: '5' },
+                 { id: 1, version: 4, title: '旧标题', price_cny: '105' }, { before })
+  results['没动过的标量照旧采纳'] = order.version === 4 && order.price_cny === '105'
+}
+
+// ⑥ 不传 before 时行为与从前**逐字相同**（四张列表页没传，那里的格子有本地草稿）。
+{
+  const row = { id: 1, version: 3, title: '本地改的' }
+  applyRowUpdate(row, { version: 3, note: 'x' }, { id: 1, version: 4, title: '服务端的' })
+  results['不传 before 时沿用旧行为'] = row.title === '服务端的' && row.version === 4
+}
+
 console.log(JSON.stringify(results))
 """
 
@@ -3052,3 +3085,357 @@ def test_only_the_pages_that_accept_dropped_images_say_they_do():
     assert not silent, (
         f"这些页面能拖截图却没在说明里写：{sorted(silent)}。"
         "没人告诉他的功能等于不存在")
+
+
+def test_a_failed_refresh_is_visible_even_when_stale_rows_remain():
+    """刷新失败时，**屏幕上还留着旧行**的那种情形也必须有标记。
+
+    `emptyText` 只在 `rows.length === 0` 时渲染。于是列表页刷新失败、而上一次的行
+    还在屏幕上时，「筛选成功、结果就是这些」与「筛选没成功、这是上一次的结果」
+    **完全无法区分**：工具栏写着「已退款」，表格里是筛选前那 30 条各种状态的单，
+    页脚合计还是旧的那个数，拦截器那条 toast 三秒就没了。
+    翻页更明显——分页器高亮第 3 页，表格是第 2 页的行。
+
+    看板早就为同一件事写过判据（`Dashboard` 的 `.load-failed`：「加载成功过之后再失败，
+    页面上留着的恰恰就是用户的账本，只是旧的」）。这条守卫要求列表页也说这句话。
+
+    判据是**两条一起**：`NotionTable` 要有承接它的分支，且五张列表页都要把
+    `loadFailed` 传进去——只做前者等于加了个没人用的 prop。
+    """
+    import re
+
+    src = _REPO / "frontend" / "src"
+    table = (src / "components" / "NotionTable.vue").read_text(encoding="utf-8")
+    assert "loadFailed && rows.length" in table, (
+        "NotionTable 没有「失败但还有旧行」这个分支——"
+        "emptyText 只管 rows 为 0 的情形，另一半就装成了成功")
+
+    missing = []
+    for page in ("Orders", "Staging", "Shipment", "Misc", "Items"):
+        text = (src / "views" / page / "index.vue").read_text(encoding="utf-8")
+        tag = re.search(r"<NotionTable\b[^>]*>", text, re.S)
+        assert tag, f"{page} 找不到 NotionTable"
+        if "load-failed" not in tag.group(0):
+            missing.append(page)
+    assert not missing, (
+        f"这些页面没把 loadFailed 传给表格：{missing}。"
+        "刷新失败后它们会拿上一次的行和金额冒充本次筛选的答案")
+
+
+def test_editing_a_pre_backfill_order_does_not_zero_its_money(client, session, mk):
+    """改一张**回填之前**建的老订单，货款不能被重算成 0。
+
+    `f6a7b8c9d0e1` 只给 `orderitem` 加了 `unit_price_cny` 这一列（nullable、无回填），
+    docstring 写着「既有行的数据回填由一次性脚本完成」——而**启动链和恢复链都只跑
+    alembic，没有任何一条会去跑那个脚本**。于是那之前建的订单，物品有名称有数量、
+    单价是 NULL。
+
+    触发条件低得离谱：对这样一张单做**任何一次** PATCH——改个状态下拉、补一个快递号、
+    加一句备注——`update_order` 都会无条件调 `sync_from_items()`，而
+    `price_from_items` 里的 `Decimal(it.unit_price_cny or 0)` 把每条 NULL 折成 0，
+    货款当场从 ¥300 变成 ¥0（邮费还在），日元一起变 0。
+
+    没有报错、没有 422、没有提示，保存成功。在列表里改状态下拉的人根本看不到金额列；
+    看板合计随之静默缩水，而且**再编辑一次也回不来**——0 已经被固化了。
+    """
+    from decimal import Decimal
+
+    from app.models import Order, OrderItem
+
+    o = mk("/api/orders", {"date": "2026-04-01", "title": "回填前的老单",
+                           "order_no": "PREBF-1", "platform": "淘宝",
+                           "items": [{"name": "书", "quantity": 2, "unit_price_cny": "150"}]})
+    assert Decimal(o["price_cny"]) == Decimal("300.00"), f"前提没建立：{o}"
+
+    # 造出「回填之前」的真实形态：物品有名有量，单价是 NULL
+    row = session.get(Order, o["id"])
+    for it in session.query(OrderItem).filter(OrderItem.order_id == o["id"]).all():
+        it.unit_price_cny = None
+        session.add(it)
+    session.commit()
+    session.refresh(row)
+    assert all(i.unit_price_cny is None for i in row.items), "前提没建立：单价没清成 NULL"
+    assert row.price_cny == Decimal("300.00"), "前提没建立：订单价应当还留着 300"
+
+    # 用户在订单页改一个**与钱无关**的字段
+    r = client.patch(f"/api/orders/{o['id']}",
+                     json={"purchase_status": "已签收", "version": row.version})
+    assert r.status_code == 200, r.text
+    got = Decimal(r.json()["price_cny"] or 0)
+    assert got == Decimal("300.00"), (
+        f"改了个状态下拉，货款从 ¥300 变成 ¥{got}——"
+        "物品单价是 NULL（回填脚本没跑过）被当成了 0。没有任何报错，用户看不见")
+
+
+def test_the_priceless_predicate_covers_both_shapes():
+    """`items_carry_no_price` 必须同时管住两种形态，缺一种就漏掉一半伤害。
+
+    「一条物品都没有」是第 12 轮补的（暂存侧），「有物品但单价全 NULL」是第 13 轮补的
+    （账本侧才是它的主场——历史订单就长这样）。两者是同一件事：
+    **「不知道多少钱」不是「这单值 0 元」**。
+    """
+    from app.models.base import items_carry_no_price
+
+    class _It:
+        def __init__(self, p):
+            self.unit_price_cny = p
+            self.quantity = 1
+
+    assert items_carry_no_price([]), "零物品没被认出来"
+    assert items_carry_no_price([_It(None), _It(None)]), "单价全 NULL 没被认出来"
+    assert not items_carry_no_price([_It(None), _It(10)]), (
+        "有一条填了价就该派生——判据不能宽到把正常订单也挡掉")
+    assert not items_carry_no_price([_It(0)]), (
+        "单价明确写 0 与「没填」是两回事：前者是用户说了「不要钱」，该派生")
+
+
+_UNKNOWN_OUTCOME_HARNESS = """
+import { outcomeIsUnknown } from './frontend/src/api/retry.js'
+
+const cases = {
+  // 收到了服务端的答复 ⇒ **确定失败**，草稿留着让用户就地改就行
+  '422 校验失败':      outcomeIsUnknown({ response: { status: 422 } }) === false,
+  '409 乐观锁':        outcomeIsUnknown({ response: { status: 409 } }) === false,
+  '500 服务端出错':     outcomeIsUnknown({ response: { status: 500 } }) === false,
+  '503 屏障':          outcomeIsUnknown({ response: { status: 503 } }) === false,
+
+  // 没收到答复 ⇒ **结果未知**：请求已经发出去了，可能已经落库
+  'axios 15s 超时':    outcomeIsUnknown({ code: 'ECONNABORTED', message: 'timeout' }) === true,
+  '网络中断':          outcomeIsUnknown({ code: 'ERR_NETWORK' }) === true,
+  '空错误':            outcomeIsUnknown({}) === true,
+  'undefined':        outcomeIsUnknown(undefined) === true,
+}
+console.log(JSON.stringify(cases))
+"""
+
+
+def test_unknown_outcome_predicate_under_node():
+    """`outcomeIsUnknown` 的**行为**测试——直接拿 node 跑。
+
+    判据只有一条：有没有收到服务端的答复。有（4xx/5xx）⇒ 它知道并给了结论，
+    是确定失败；没有（15s 超时、断网）⇒ 请求已经发出去了，可能已经落库，**结果未知**。
+
+    这个区分决定新建那条路上说哪句话。原先四个页面的 `addRow` 一律 `done?.(false)`，
+    超时走的是「确定失败」那支——提示只说「稍后重试」，草稿原样躺着，看起来就是没存上；
+    用户按提示再敲一次，而**杂项支出没有任何唯一约束**，同一笔钱记两遍
+    （商品订单/暂存/集运有唯一索引兜底，会撞出一句「已存在」；杂项一点声音都没有）。
+
+    `retry.js` 刻意一个 import 都没有，正是为了能这么测——而不是去 grep 源码。
+    """
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        import os
+        if os.environ.get("SOROBAN_NO_NODE"):
+            pytest.skip("显式声明了本机没有 node（SOROBAN_NO_NODE=1）")
+        raise AssertionError("找不到 node。真没有请设 SOROBAN_NO_NODE=1。")
+
+    harness = _REPO / "node-unknown-outcome.test.mjs"
+    harness.write_text(_UNKNOWN_OUTCOME_HARNESS, encoding="utf-8")
+    try:
+        r = subprocess.run([node, str(harness)], cwd=_REPO, capture_output=True,
+                           text=True, timeout=60)
+    finally:
+        harness.unlink(missing_ok=True)
+    assert r.returncode == 0, f"node 跑挂了：{r.stderr[-800:]}"
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    failed = [k for k, v in got.items() if not v]
+    assert not failed, f"这些行为不成立：{failed}"
+
+
+def test_every_new_row_path_distinguishes_unknown_from_failed():
+    """四个页面的 `addRow` 都要把「结果未知」传下去，不能一律 `done?.(false)`。
+
+    `NotionTable.finish(ok, timedOut)` 本来就备好了那句正确的话，但它原先只挂在
+    35 秒兜底上——而 axios 的 15 秒超时**必然先触发** `done(false)`，
+    把那个 timer clearTimeout 掉。也就是说「结果未知」这个唯一真实的未知态，
+    走的一直是「确定失败」那条分支。
+
+    判据盯**全集**：谁有 `addRow` 谁就得传第二个参数。
+    """
+    import re
+
+    views = _REPO / "frontend" / "src" / "views"
+    bad = []
+    for f in views.rglob("index.vue"):
+        text = f.read_text(encoding="utf-8")
+        if "async function addRow" not in text:
+            continue
+        body = text[text.index("async function addRow"):]
+        body = body[:body.index("\n}\n") + 3]
+        if not re.search(r"done\?\.\(false,\s*outcomeIsUnknown\(", body):
+            bad.append(f.parent.name)
+    assert not bad, (
+        f"这些页面的新建路径没区分「结果未知」与「确定失败」：{bad}。"
+        "超时后提示会说「稍后重试」、草稿原样留着，用户再敲一次就是同一笔钱记两遍")
+
+
+def test_staging_item_edits_save_themselves_like_every_other_cell():
+    """暂存页物品三格必须**即改即存**，和同一块面板里的邮费、以及表上每个格子一致。
+
+    原先它们的 `@change` 只做 `it.auto = false`，一个字都不发出去，要另点「保存物品」
+    ——而这条规则界面上没有任何提示。页首却明写着「你在这张表上核对/改完，再逐单点『导入』」，
+    于是最自然的走法是：展开一条 OCR 抓回来的单 → 把认成 0 的单价改成 120 → 直接点「导入」。
+    `stagingApi.import(row.id)` 只送 id，服务端按**库里那份**（单价 0）建账本单；
+    紧接着的 `load()` 把 rows 整块换掉，刚敲的 120 连同痕迹一起消失。
+    用户看到的是绿色的「已导入到商品订单账本」，账本里那一单是 ¥0——要等对账才发现。
+
+    两条判据缺一不可：
+    ① 三格的 `@change` 要真的触发保存（不是只打个标记）；
+    ② 「导入」要与保存**共用同一条写队列**——点导入的 `mousedown` 会先让输入框失焦
+       触发保存，`click` 才发导入，不排队就是赛跑，导入可能按改之前那份建单。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "views" / "Staging" / "index.vue").read_text(encoding="utf-8")
+    panel = src[src.index('<template #expand='):src.index('<template #actions=')]
+
+    marks = re.findall(r'@change="([^"]+)"', panel)
+    item_marks = [m for m in marks if "it" in m]
+    assert item_marks, "物品行里一个 @change 都没有？"
+    assert all("saveItems" in m or "onItemEdited" in m for m in item_marks), (
+        f"物品格子的 @change 只打标记、不保存：{item_marks}。"
+        "用户改完直接点「导入」，进账本的是改之前那份")
+
+    imp = src[src.index("async function doImport"):]
+    imp = imp[:imp.index("\n}\n")]
+    assert "queueRowWrite" in imp, (
+        "「导入」没进同一行的写队列：点导入的 mousedown 先触发保存、click 才发导入，"
+        "两者赛跑时导入可能按改之前那份建账本单")
+    assert "staging:${row.id}" in imp, (
+        "导入用的队列 key 与保存那几条对不上，等于没排队")
+
+
+def test_the_shared_order_panels_pass_a_before_snapshot():
+    """两个直接绑共享 order 的组件必须传 `before`，否则上面那条行为测试等于没接线。
+
+    `OrderEditPanel` 与 `OrderItemsEditor` 的每个字段都是 `v-model` 绑在
+    `props.order` 上，**没有本地草稿**。四张列表页不在此列——那里走 `GotionCell`
+    的本地 `editVal`，行对象上的标量只用于展示。
+
+    判据盯全集：谁在这两个组件里调 `applyRowUpdate`，谁就得带上 `before`。
+    """
+    import re
+
+    comps = _REPO / "frontend" / "src" / "components"
+    bad = []
+    for name in ("OrderEditPanel.vue", "OrderItemsEditor.vue"):
+        text = (comps / name).read_text(encoding="utf-8")
+        for m in re.finditer(r"applyRowUpdate\([^)]*\)", text, re.S):
+            if "before" not in m.group(0):
+                line = text[:m.start()].count("\n") + 1
+                bad.append(f"{name}:{line}")
+    assert not bad, (
+        f"这些调用没传 before：{bad}。响应回来时整包标量会盖掉用户正在另一格里敲的字，"
+        "而他直接失焦时原生 change 不触发 ⇒ 敲的内容一个字都没保存，也没有任何报错")
+
+
+def test_the_delete_ledger_orders_dialog_admits_it_resets_staging():
+    """「删账本单」的确认框必须说出它会把暂存行退回「待处理」。
+
+    原文是「不影响暂存记录」——**假话**。`soft_delete_account_orders` 紧跟着就把
+    那些账本单对应的暂存行 `imported_order_id` 置 NULL、`import_status` 改回「待处理」。
+
+    **那个行为本身是对的**，全项目一致：单条 `delete_order` 一字不差地做同一件事，
+    `common.py` 的 `mirror_to_staging` docstring 明写这条设计，`test_plugins.py`
+    有断言钉着。意思是「账本单没了，暂存那条就该能重新导入」。
+
+    错的是这句话没说出来。用户以为删干净了，而那些行原封不动躺在暂存页、状态「待处理」，
+    任何人点一下「导入账本」就把刚删掉的单原样建回来（旧行已软删，唯一索引不拦），
+    看板金额跟着涨回去——他不会想到去暂存页看一眼。
+
+    判据两条：不许再说「不影响暂存」，且必须提到会退回「待处理」。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "views" / "Plugins" / "index.vue").read_text(encoding="utf-8")
+    fn = src[src.index("async function doDeleteAccountOrders"):]
+    fn = fn[:fn.index("\n}\n")]
+    # **先剥注释。** 解释这件事的注释里逐字写着「待处理」，不剥的话
+    # 「把弹窗文案改得含糊其辞」这种破坏照样通过——判据被注释满足了
+    # （memory 的「假绿五种成因」③，本轮第五次）。
+    fn = re.sub(r"//.*$", "", fn, flags=re.M)
+
+    assert "不影响暂存记录" not in fn, (
+        "确认框还在说「不影响暂存记录」——它会把已导入的暂存行退回「待处理」，"
+        "刚删掉的单可以被任何人一键原样重建")
+    assert "待处理" in fn, (
+        "确认框没说暂存行会退回「待处理」。用户以为删干净了，"
+        "而那些行还躺在暂存页等着被重新导入")
+
+
+def test_every_on_mounted_side_load_catches_its_own_failure():
+    """`onMounted` 里那些**只调一次**的辅助加载，都必须自己接住失败。
+
+    `loadShipment()` 在三张页面上各有一份（Orders / Items / Shipment），
+    做的是同一件事：进页时拉一次集运单列表喂给「所属集运」下拉。
+    Items 和 Shipment 两处都接了 catch，其中一处的注释写的正是
+    「避免 onMounted 里未捕获的 promise 拒绝」——Orders 那份是唯一漏掉的。
+
+    漏掉的后果不是「报个错」：它只在 `onMounted` 里调这一次，失败就是一个未捕获的
+    拒绝，`shipmentOptions` 永远停在 `[]`，下拉从此空着，而这一页**没有任何重取路径**
+    （`load()` 的 `loadFailed` 只覆盖列表本身，管不着它）。
+
+    判据盯全集：谁有 `loadShipment` 谁就得接。
+    """
+    views = _REPO / "frontend" / "src" / "views"
+    bare = []
+    for f in views.rglob("index.vue"):
+        text = f.read_text(encoding="utf-8")
+        if "async function loadShipment" not in text:
+            continue
+        import re
+
+        body = text[text.index("async function loadShipment"):]
+        body = body[:body.index("\n}\n") + 3]
+        # 先剥注释：解释这件事的注释里逐字写着「不接 catch」，不剥就被它满足了
+        # （memory 的「假绿五种成因」③，本轮第六次踩同一个坑）。
+        body = re.sub(r"//.*$", "", body, flags=re.M)
+        if "catch" not in body:
+            bare.append(f.parent.name)
+    assert not bare, (
+        f"这些页面的 loadShipment 没接住失败：{bare}。"
+        "它只在 onMounted 里调一次，失败后下拉永远空着，而页面没有任何重取路径")
+
+
+def test_the_test_suite_leaves_no_files_in_the_repository():
+    """**跑测试不许在仓库里留下文件。**
+
+    `test_dbadmin.py` 曾有 4 处把目标 URL 写死成 sqlite:/// 加一个裸文件名——相对路径、
+    没有扩展名的名字，而同时传进去的 `dst_engine` 指向 tmp_path 里另一个库。
+    被测代码拿这个 URL 真的跑了 `run_migrations`，于是每跑一次测试，
+    就在**仓库根目录**（backend/，测试的 cwd）造出一个 221 KB 叫 `dst` 的 SQLite 库。
+
+    它没有扩展名，`.gitignore` 的 `*.db` / `*.db-wal` / `*.db-shm` **整族都抓不到**。
+    谁跑完测试 `git add -A`，它就进了提交——本仓 a1e36ad 就是这么把它推上 GitHub 的
+    （幸好是空库，泄露的是 15 张表的 DDL；旁边 `soroban.db` 是 2.8 MB 的真账本）。
+
+    **判据只认「没有扩展名」这一种**，因为危害正来自这里：`.gitignore` 是按扩展名
+    匹配的，`sqlite:///./probe.db` 就算真建了也会被 `*.db` 挡住，而裸名字挡不住。
+    内存库（`:memory:`）不落盘，也不在此列。
+    """
+    import re
+
+    tests = _REPO / "backend" / "tests"
+    offenders = []
+    for f in tests.rglob("test_*.py"):
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            # 模式拆开拼，别让源码里出现那个连续串——否则这条守卫会**匹配到自己**
+            # （判据被自身满足，本仓踩过很多次的老毛病的又一形态）。
+            pat = '"' + "sqlite" + ':///' + r'(?!/)([^"{}\s]+)"'
+            for m in re.finditer(pat, line):
+                path = m.group(1)
+                if path.startswith(":"):            # :memory: —— 不落盘
+                    continue
+                if "." in path.rsplit("/", 1)[-1]:  # 有扩展名 ⇒ 被 *.db 之类挡得住
+                    continue
+                offenders.append(f"{f.name}:{i}  sqlite:///{path}")
+    assert not offenders, (
+        "测试里写死了相对路径的 sqlite URL，被测代码会照着它在**仓库里**建库：\n  "
+        + "\n  ".join(offenders)
+        + "\n用 tmp_path 夹具，或 str(engine.url)。")

@@ -100,8 +100,9 @@
       <div class="hint">
         把<b>当前正在用的那个库</b>整本拷成一个独立的 SQLite 文件（换成 MySQL 之后也一样）。
         拷贝那几秒会短暂只读，别人的保存会自动重试。
-        恢复不在这里——那是唯一一条能一键清空账本的操作，要到服务器上执行
-        <code>python -m tools.backup_db --restore &lt;文件&gt;</code> 并手敲一次确认。
+        恢复不在这里——那是唯一一条能一键清空账本的操作，要在命令行执行并手敲一次确认：
+        打包版 <code>soroban.exe --restore &lt;文件&gt;</code>（在 exe 所在目录开命令行），
+        源码运行 <code>python -m tools.backup_db --restore &lt;文件&gt;</code>。
       </div>
       <div class="bk-actions">
         <el-button type="primary" :disabled="!!busy" :loading="busy === 'backup'"

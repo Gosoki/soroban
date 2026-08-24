@@ -7,7 +7,7 @@
     列可拖动换位/拖宽，宽度按浏览器记住。
     </PageHeader>
 
-    <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable hide-id :open-id="focusId"
+    <NotionTable :columns="columns" :rows="rows" :loading="loading" :load-failed="loadFailed" expandable hide-id :open-id="focusId"
                  table-name="orders" :empty-text="loadFailed ? MSG_LOAD_FAILED : '没有符合条件的记录'" @save="saveCell" @add="addRow" @delete="delRow" @reload="load" @tags-changed="onTagsChanged">
       <template #toolbar>
         <el-input v-model="filters.q" :placeholder="MSG_SEARCH_ORDER_LIKE" clearable style="width: 200px" @change="applyFilters" />
@@ -104,6 +104,7 @@
 </template>
 
 <script setup>
+import { outcomeIsUnknown } from '@/api/retry'
 import PageHeader from '@/components/PageHeader.vue'
 import TableFooterSum from '@/components/TableFooterSum.vue'
 import { computed, onMounted, reactive, ref, watch } from 'vue'
@@ -341,8 +342,14 @@ function applyFilters() { page.value = 1; load() }
 function onPage(p) { page.value = p; load() }
 
 async function loadShipment() {
-  const res = await shipmentApi.list({ limit: 200, brief: true })
-  shipmentOptions.value = res.items
+  // 它在 onMounted 里被调一次、且只调这一次。不接 catch 的话失败就是一个**未捕获的
+  // promise 拒绝**：`shipmentOptions` 永远停在 []，「所属集运」下拉从此空着，
+  // 而这一页没有任何重取路径（`load()` 的 loadFailed 只覆盖列表本身，不管它）。
+  // Items 和 Shipment 两页的同一个函数都接了，其中一处的注释写的正是
+  // 「避免 onMounted 里未捕获的 promise 拒绝」——三处同一件事，这里是唯一漏掉的。
+  try {
+    shipmentOptions.value = (await shipmentApi.list({ limit: 200, brief: true })).items
+  } catch (_) { /* 拦截器已提示 */ }
 }
 
 async function saveCell(row, key, value) {
@@ -386,7 +393,10 @@ async function addRow(data = {}, done) {
     done?.(true)
     return created
   } catch (e) {
-    done?.(false)   // 失败时保留幽灵行里的草稿，让用户就地改
+    // 超时/断网 = **结果未知**（请求已经发出去了，可能已经落库）。
+    // 交给 NotionTable 说那句正确的话：「先别重复提交——刷新看看是不是已经存上了」。
+    // 草稿照旧留着：万一真没存上，用户不用重敲。
+    done?.(false, outcomeIsUnknown(e))
     // 409 被 http 拦截器刻意跳过（留给页面处理）→ 这里对「订单号+来源」重复给明确提示
     if (e.response?.status === 409) {
       handled(e)

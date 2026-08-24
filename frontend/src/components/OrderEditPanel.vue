@@ -138,9 +138,12 @@ async function saveField(key, value) {
   try {
     // 入队串行：面板里连改多个字段（或与内嵌物品编辑器并发）不会各读旧 version 互相 409
     await queueRowWrite(`order:${props.order.id}`, async () => {
+      // 请求前照一张：面板里每个字段都 v-model 直接绑在这个共享对象上，
+      // 响应回来时用户很可能正在**另一格**里敲字（见 applyRowUpdate 的 `before`）。
+      const before = { ...props.order }
       const patch = { version: props.order.version, [key]: v }
       const updated = await ordersApi.update(props.order.id, patch)
-      applyRowUpdate(props.order, patch, updated)
+      applyRowUpdate(props.order, patch, updated, { before })
       emit('saved', updated)
     })
   } catch (e) {

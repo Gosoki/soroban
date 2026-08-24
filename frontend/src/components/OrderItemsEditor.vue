@@ -151,6 +151,7 @@ async function saveItems() {
   }
   const items = toPayload(all)
   const sent = JSON.stringify(items)   // 送出去的那一份，回来时拿它比对（见下）
+  const before = { ...props.order }    // 标量那半边的同一件事，见 applyRowUpdate 的 `before`
   try {
     // 整个「读 version→PATCH→回写」入队串行，避免与同订单的其它保存并发撞 version 互相 409
     await queueRowWrite(`order:${props.order.id}`, async () => {
@@ -162,7 +163,7 @@ async function saveItems() {
       // 本机往返几十毫秒、人手点击到打字要 200-400ms，所以本地几乎复现不出来；
       // 局域网 / MySQL / 账本变大之后窗口就张开了。
       const stale = JSON.stringify(toPayload(props.order.items || [])) !== sent
-      applyRowUpdate(props.order, patch, updated, { itemsStale: stale })
+      applyRowUpdate(props.order, patch, updated, { itemsStale: stale, before })
       emit('saved', updated)
     })
     return true
@@ -189,9 +190,10 @@ function onItemEdit(it) {
 async function savePostage() {
   try {
     await queueRowWrite(`order:${props.order.id}`, async () => {
+      const before = { ...props.order }        // 理由同上：标量也是活绑定的
       const patch = { version: props.order.version, postage_cny: itemPrice(props.order.postage_cny) }
       const updated = await ordersApi.update(props.order.id, patch)
-      applyRowUpdate(props.order, patch, updated)
+      applyRowUpdate(props.order, patch, updated, { before })
       emit('saved', updated)
     })
     return true

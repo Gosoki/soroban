@@ -115,7 +115,18 @@ def test_backfill_splits_price_across_priced_items(iso_engine):
 
 
 def test_backfill_aborts_instead_of_zeroing(iso_engine, monkeypatch):
-    """事后校验的意义：万一构造又出错，必须**中止且不落库**，而不是把账本清零。"""
+    """事后校验的意义：万一构造又出错，必须**中止且不落库**，而不是把账本清零。
+
+    2026-08-23 判据从「总价偏移超容差」换成「造出的物品一条单价都没有」——
+    **同一个事故，换了个更早也更直接的抓手**，不是放松。
+
+    原判据是**间接**的：靠「单价落 NULL ⇒ `sync_from_items` 把总价重算成只剩邮费
+    ⇒ 偏移非零」这条链子。而那一天 `sync_from_items` 被改成「单价全 NULL 就不动价」
+    （历史订单被 PATCH 时会静默清零，见 `items_carry_no_price`），链子当场断了：
+    偏移恒为 0，这条守卫**静默失灵**，回填反而会把一批无价物品写进库。
+
+    这也是那次改动唯一打红的一条测试——它红得对。
+    """
     import tools.backfill_item_price as mod
 
     def dropping_item(**kw):
@@ -128,7 +139,7 @@ def test_backfill_aborts_instead_of_zeroing(iso_engine, monkeypatch):
         s.commit()
 
     monkeypatch.setattr(mod, "OrderItem", dropping_item)
-    with pytest.raises(RuntimeError, match="远超取整误差"):
+    with pytest.raises(RuntimeError, match="一条单价都没有"):
         backfill(iso_engine)
 
     with Session(iso_engine) as s:                       # 未 commit → 账本原封不动

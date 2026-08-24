@@ -604,3 +604,47 @@ def test_database_init_happens_after_the_single_process_gate():
     bad = touched & {"migrate_to_latest", "seed_admin", "ensure_admin"}
     assert not bad, (f"启动器在拿到单进程闸之前就碰库了：{sorted(bad)}。"
                      "这些事都该在 app.main.lifespan 里做")
+
+
+def test_the_packaged_exe_can_restore_a_backup():
+    """打包版必须有恢复入口——否则备份做得出、一份都用不了。
+
+    分发形态是双击运行的 exe。那台机器上没有 python，也没有 `tools/`
+    （`soroban.spec` 的 hiddenimports 里没有它，`backup.py` 开头的注释也明说
+    `tools/` 既不在导入图里、也没被 spec 收进去）。而界面上写着
+    「要到服务器上执行 `python -m tools.backup_db --restore <文件>`」——
+    用户照做得到的是「'python' 不是内部或外部命令」，换成 `soroban.exe --restore`
+    则撞上 argv 白名单：「soroban 不接受命令行参数」。
+
+    在此之前他一直以为备份是能用的——界面天天给他看那张列了 N 份快照的表。
+
+    判据三条：
+    ① `run.py` 认 `--restore`；
+    ② 它调的是 `app.backup.restore`（在导入图里），不是 `tools.backup_db`；
+    ③ 界面文案里要有 exe 那条命令——只加入口不改文案，用户照样找不到。
+    """
+    import ast
+
+    backend = Path(__file__).resolve().parents[1]
+    src = (backend / "run.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    main = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "main")
+    consts = {n.value for n in ast.walk(main)
+              if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    assert "--restore" in consts, (
+        "打包版没有恢复入口：exe 用户做得出备份，却一份都用不了")
+
+    # 判据要精确到**模块名**，不能写成 `"backup" in n.module`——
+    # `tools.backup_db` 里也含 "backup"，那个判据会被它满足，
+    # 于是「改走 tools（exe 上根本不存在）」这种破坏照样通过（实测踩过）。
+    imports = {(n.module, a.name) for n in ast.walk(main)
+               if isinstance(n, ast.ImportFrom) and n.module for a in n.names}
+    assert ("app.backup", "restore") in imports, (
+        f"恢复入口没走 app.backup.restore（实际 {sorted(imports)}）——"
+        "tools/ 不在打包图里，那条路在 exe 上不存在")
+
+    ui = (backend.parent / "frontend" / "src" / "views" / "Database" / "index.vue"
+          ).read_text(encoding="utf-8")
+    assert "--restore" in ui and "soroban.exe" in ui, (
+        "界面还在只教那条 exe 用户执行不了的命令——只加入口不改文案，他照样找不到")

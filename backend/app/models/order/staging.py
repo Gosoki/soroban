@@ -8,7 +8,7 @@ from sqlalchemy import Column, Index, Text, text
 from sqlmodel import Field, Relationship, SQLModel
 
 from ...db.dialect import BinStr, UtcDateTime
-from ..base import ImportStatus, guard_cny, price_from_items, utcnow
+from ..base import ImportStatus, guard_cny, items_carry_no_price, price_from_items, utcnow
 
 
 class OrderStaging(SQLModel, table=True):
@@ -76,7 +76,10 @@ class OrderStaging(SQLModel, table=True):
         不调 compute_money，所以必须在这里显式卡一次——否则「暂存能存、导入成账本才报错」，
         脏行会一直躺在暂存表里，还会让整个暂存列表被 response_model 打成 422。
 
-        **一条物品都没有时什么都不做。** 「没有物品」的意思是**不知道明细**，
+        **派生不出来时什么都不做**（判据见 `items_carry_no_price`，账本侧同源）。
+        它管两种情形：一条物品都没有，**以及有物品但单价全是 NULL**——
+        后者是 `f6a7b8c9d0e1` 那次只加列留下的历史形态，比前者常见得多。
+        「没有物品」的意思是**不知道明细**，
         不是「这单值 0 元」——而按前者算出来的恰好是后者（`0 + 邮费`）。
         0 物品的暂存行是真实存在的历史状态：`f6a7b8c9d0e1` 那次只加了列，
         既有行的回填留给 `tools/backfill_item_price.py`，没跑过的库里就有一堆。
@@ -86,7 +89,7 @@ class OrderStaging(SQLModel, table=True):
         不这么改的话，同一个伤害要在三条路上各打一次补丁（审计报告 §154 / §168）：
         订单 PATCH 的镜像、暂存 PATCH 的已导入分支、暂存 PATCH 的未导入分支——
         而第三条上连「账本价」都没有可镜像的东西。"""
-        if not self.items:
+        if items_carry_no_price(self.items):
             return
         self.price_cny = guard_cny(price_from_items(self.items) + (self.postage_cny or 0))
 

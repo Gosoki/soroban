@@ -5,7 +5,7 @@
     把订单截图拖到页面任意位置即可 OCR 录单。
     </PageHeader>
 
-    <NotionTable :columns="columns" :rows="rows" :loading="loading" expandable
+    <NotionTable :columns="columns" :rows="rows" :loading="loading" :load-failed="loadFailed" expandable
                  table-name="staging" :empty-text="loadFailed ? MSG_LOAD_FAILED : '没有符合条件的记录'" :actions-width="128" @save="saveCell" @add="addRow" @delete="doDelete" @reload="load" @tags-changed="onTagsChanged">
       <template #toolbar>
         <el-input v-model="filters.q" :placeholder="MSG_SEARCH_ORDER_LIKE" clearable style="width: 200px" @change="applyFilters" />
@@ -48,11 +48,11 @@
           <div class="ex-title">物品明细（一单多物）· 单价×数量汇总为订单价</div>
           <div v-for="(it, i) in row.items" :key="i" class="item-row" :class="{ 'item-auto': isTitleItem(row, it) }"
                :title="isTitleItem(row, it) ? '物品名与商品标题相同（无独立物品详情）；改成真实物品名即正常' : ''">
-            <el-input v-model="it.name" placeholder="物品名" style="width: 180px" @change="it.auto = false" />
-            <el-input-number v-model="it.quantity" :min="1" :controls="false" style="width: 80px" @change="it.auto = false" />
+            <el-input v-model="it.name" placeholder="物品名" style="width: 180px" @change="onItemEdited(row, it)" />
+            <el-input-number v-model="it.quantity" :min="1" :controls="false" style="width: 80px" @change="onItemEdited(row, it)" />
             <el-input-number v-model="it.unit_price_cny" :min="0" :precision="2" :controls="false"
-                             style="width: 110px" placeholder="单价" @change="it.auto = false" />
-            <el-button link type="danger" :icon="Delete" @click="row.items.splice(i, 1)" />
+                             style="width: 110px" placeholder="单价" @change="onItemEdited(row, it)" />
+            <el-button link type="danger" :icon="Delete" @click="onItemRemoved(row, i)" />
           </div>
           <div>
             <el-button :icon="Plus" @click="ensureItems(row).push({ name: '', quantity: 1, unit_price_cny: null, auto: false })">加物品</el-button>
@@ -114,6 +114,7 @@
 </template>
 
 <script setup>
+import { outcomeIsUnknown } from '@/api/retry'
 import PageHeader from '@/components/PageHeader.vue'
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -269,7 +270,25 @@ function itemsPayload(rows) {
     auto: !!it.auto }))
 }
 
-async function saveItems(row) {
+// 物品三格**即改即存**，与同一块面板里的邮费、以及表上每一个格子一致。
+//
+// 原先它们的 `@change` 只做 `it.auto = false`，一个字都不发出去，要另点「保存物品」
+// ——而这条规则界面上没有任何提示。页首却明写着「你在这张表上核对/改完，再逐单点『导入』」，
+// 于是最自然的走法就是：展开一条 OCR 抓回来的单 → 把认成 0 的单价改成 120 → 直接点「导入」。
+// `stagingApi.import(row.id)` 只送 id，服务端按**库里那份**（单价 0）建账本单；
+// 紧接着的 `load()` 把 rows 整块换掉，刚敲的 120 连同痕迹一起消失。
+// 用户看到的是绿色的「已导入到商品订单账本」，账本里那一单是 ¥0——要等对账才发现。
+function onItemEdited(row, it) {
+  it.auto = false                  // 手动改过就不再是「自动生成」
+  saveItems(row, { quiet: true })  // 即改即存不弹 toast，否则每敲一格响一次
+}
+
+function onItemRemoved(row, i) {
+  row.items.splice(i, 1)
+  saveItems(row, { quiet: true })
+}
+
+async function saveItems(row, { quiet = false } = {}) {
   const all = row.items || []
   // **绝不静默丢弃没名字的行。** 原先这里是 `.filter(有名字)` —— 与订单页那份逐字节相同的
   // 老写法，而订单页早就改掉了（`OrderItemsEditor.saveItems` 的 blank 拦截）。
@@ -296,7 +315,7 @@ async function saveItems(row) {
       const stale = JSON.stringify(itemsPayload(row.items || [])) !== sent
       applyRowUpdate(row, patch, updated, { itemsStale: stale })
     })
-    ElMessage.success('物品已保存')
+    if (!quiet) ElMessage.success('物品已保存')
   } catch (e) {
     // 仅 409（数据已变）才整表刷新；其它错误交拦截器提示，保留本地未保存编辑
     if (e.response?.status === 409) { handled(e); ElMessage.warning(e.response?.data?.detail || MSG_STALE_RELOADED); load() }
@@ -330,7 +349,10 @@ async function addRow(data = {}, done) {
     // 而行其实好好地建出来了——数字和事实相反，比不报还糟。
     return created
   } catch (e) {
-    done?.(false)   // 失败时保留幽灵行里的草稿，让用户就地改
+    // 超时/断网 = **结果未知**（请求已经发出去了，可能已经落库）。
+    // 交给 NotionTable 说那句正确的话：「先别重复提交——刷新看看是不是已经存上了」。
+    // 草稿照旧留着：万一真没存上，用户不用重敲。
+    done?.(false, outcomeIsUnknown(e))
     // 409 被 http 拦截器刻意跳过（留给页面处理）。撞订单号唯一约束时若这里也不提示，
     // 页面就是「什么都没发生」——连幽灵行里刚敲的单号都被 commitNew 清空了。
     if (e.response?.status === 409) {
@@ -344,7 +366,12 @@ async function addRow(data = {}, done) {
 
 async function doImport(row) {
   try {
-    await stagingApi.import(row.id)
+    // **入同一行的写队列。** 上面那些格子现在是即改即存，而「点导入」这个动作本身
+    // 会先让当前输入框失焦、触发一次保存——`mousedown` 在 `click` 之前。
+    // 不排队的话两者赛跑：导入可能先到服务端，按**改之前**那份建账本单，
+    // 而随后那次保存虽然成功，账本里已经是错的了。
+    // 队列 key 与 `saveItems` / `savePostage` / `saveCell` 逐字相同，四条路共用一条队。
+    await queueRowWrite(`staging:${row.id}`, () => stagingApi.import(row.id))
     ElMessage.success('已导入到商品订单账本')
     load()
   } catch (e) {

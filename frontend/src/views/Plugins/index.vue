@@ -729,7 +729,17 @@ async function doDeleteAccountStaging(p, account) {
 async function doDeleteAccountOrders(p, account) {
   try {
     await ElMessageBox.confirm(
-      `确定删除账号「${account}」名下的全部账本正式商品订单？将从账本移除（软删）。不影响暂存记录。`,
+      // 原文那句「不会动到暂存」是假话：`soft_delete_account_orders` 会把这些账本单对应的暂存行
+      // `imported_order_id` 置 NULL、`import_status` 改回「待处理」。
+      // **那个行为本身是对的**——全项目一致（单条 `delete_order` 一字不差地做同一件事，
+      // `common.py` 的 `mirror_to_staging` docstring 明写这条设计，`test_plugins.py`
+      // 有断言钉着），意思是「账本单没了，暂存那条就该能重新导入」。
+      // 错的是这句话没说出来：用户以为删干净了，而那些行原封不动躺在暂存页、
+      // 状态是「待处理」，任何人点一下「导入账本」就把刚删掉的单原样建回来，
+      // 看板金额跟着涨回去——他不会想到去暂存页看一眼。
+      `确定删除账号「${account}」名下的全部账本正式商品订单？将从账本移除（软删）。\n\n` +
+      `已导入过的暂存行会退回「待处理」——它们还在暂存页，可以再次导入。` +
+      `不想让它们被重新导入的话，先删暂存单。`,
       '删除该账号的账本单', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
     )
   } catch (_) { return }

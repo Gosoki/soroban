@@ -643,3 +643,77 @@ def test_sync_from_items_leaves_a_row_alone_when_it_has_no_items():
     row.items = [StagingItem(name="甲", quantity=2, unit_price_cny=Decimal("5.00"))]
     row.sync_from_items()
     assert row.price_cny == Decimal("30.00"), f"有物品时没有重新派生：{row.price_cny}"
+
+
+def test_an_undated_staging_row_takes_its_rate_at_import_time(client, session, mk):
+    """没有下单日期的暂存行，**日期和汇率必须来自同一个时刻**。
+
+    暂存的用法就是「放着，核对无误后逐单导入」，中间隔几天到几周是常态。
+    原先 `create_staging` 无条件盖汇率：`order_date` 为 NULL 时
+    `rate_for_date(session, None)` 走 `latest_stored()`，盖的是**入库当天**那条。
+    导入时 `date` 兜底成**导入当天**（JST），汇率却还是入库那天的——
+    同一张单的日期与汇率相差几周，而且不触发任何告警（`row.fx_rate` 非空就不再取）。
+
+    `order_date` 为 NULL 不是边角情形：OCR 认不出「下单时间」时前端根本不下发那个键，
+    淘宝 H5 模板压根没有下单时间（插件 `fetch.py` 开头明写）。
+    """
+    import datetime as dt
+    import uuid
+    from decimal import Decimal
+
+    from app.models import FxRate, OrderStaging
+    from app.services.fx import JST
+
+    no = f"NODATE-{uuid.uuid4().hex[:8]}"     # 测试库是会话级共享的，别撞别人的单号
+    today = dt.datetime.now(JST).date()
+    # 「入库那天」的汇率：19；后来（导入那天）变成 25
+    session.add(FxRate(date=today - dt.timedelta(days=21), rate=Decimal("19.0000")))
+    session.commit()
+
+    r = client.post("/api/staging", json={
+        "order_no": no, "title": "没有下单时间的单", "platform": "淘宝",
+        "items": [{"name": "x", "quantity": 1, "unit_price_cny": "100"}]})
+    assert r.status_code == 200, r.text
+    row = session.get(OrderStaging, r.json()["id"])
+    assert row.order_date is None, "前提没建立：这一行本该没有下单日期"
+    assert row.fx_rate is None, (
+        f"不知道下单日期却盖了汇率 {row.fx_rate}——导入时日期会兜底成当天，"
+        "而这个汇率是入库那天的，两者可以差几周")
+
+    # 三周后导入：汇率已经变了
+    session.add(FxRate(date=today, rate=Decimal("25.0000")))
+    session.commit()
+    got = client.post(f"/api/staging/{r.json()['id']}/import")
+    assert got.status_code == 200, got.text
+    o = got.json()
+    assert o["date"] == str(today), f"建单日期不是今天：{o['date']}"
+    assert Decimal(o["fx_rate"]) == Decimal("25.0000"), (
+        f"日期是今天({today})，汇率却是 {o['fx_rate']}——它们来自两个不同的时刻")
+
+
+def test_a_dated_staging_row_still_gets_its_rate_up_front(client, session):
+    """反面：**有**下单日期的行照旧当场盖汇率，按那一天取。
+
+    不加这条的话，「不知道日期就别盖」很容易被写成「一律别盖」——
+    那会把「按下单日期折算」这个核心行为一起弄丢（补录上月支出就全按今天的牌价算了）。
+    """
+    import datetime as dt
+    import uuid
+    from decimal import Decimal
+
+    from app.models import FxRate, OrderStaging
+    from app.services.fx import JST
+
+    no = f"DATED-{uuid.uuid4().hex[:8]}"      # 同上
+    d = dt.datetime.now(JST).date() - dt.timedelta(days=40)
+    session.add(FxRate(date=d, rate=Decimal("18.5000")))
+    session.commit()
+
+    r = client.post("/api/staging", json={
+        "order_no": no, "title": "有下单时间的单", "platform": "淘宝",
+        "order_date": str(d),
+        "items": [{"name": "x", "quantity": 1, "unit_price_cny": "100"}]})
+    assert r.status_code == 200, r.text
+    row = session.get(OrderStaging, r.json()["id"])
+    assert row.fx_rate == Decimal("18.5000"), (
+        f"有下单日期却没按那天盖汇率：{row.fx_rate}")

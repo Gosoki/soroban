@@ -1103,12 +1103,32 @@ def save_config(plugin_id: str, payload: PluginConfigIn, session: Session = Depe
     """只存插件级设置：启用定时 + 定时间隔。账号（昵称/平台/启用）走专用增删改端点，这里不碰。"""
     _find_manifest(plugin_id)                                    # 确认插件存在
     cfg = _config_row(session, plugin_id)
+    was_enabled = cfg.enabled
     cfg.enabled = payload.enabled
     cfg.schedule_minutes = max(0, payload.schedule_minutes)
     cfg.updated_at = utcnow()
     session.add(cfg)
     session.commit()
-    return {"ok": True}
+
+    # **关掉总开关要作废在飞令牌**，理由与「收回一项授权」那条逐字相同：
+    # 用户唯一一次真的去点它，往往正是他看着这个插件在乱写的时候。
+    #
+    # 而这里原先什么都不停：`_plugin_gate` 只看 `alive(jti) + scope`、不读 `cfg.enabled`，
+    # 于是子进程的令牌继续有效**最长约 32 分钟**（`min(_REAP_TIMEOUT + 120, _HARD_TTL)`），
+    # 一路把订单写进暂存表。界面上这是他唯一能点的「叫停」——全仓没有任何
+    # 「停止正在跑的插件」的入口——点完却什么都没发生。
+    #
+    # 更说明问题的是不一致：**比它弱的「收回一项授权」反而撤了令牌**。
+    # 那条已经这么做了（上面 `save_grants`），这里跟上。
+    #
+    # 只撤令牌、不杀进程：杀到一半会留下写了一半的暂存数据，而撤了令牌之后
+    # 它已经一个字也写不进核心了，跑完自己退出即可。
+    revoked = 0
+    if was_enabled and not cfg.enabled:
+        revoked = scopes.revoke_plugin(plugin_id)
+        if revoked:
+            log.info("插件 %s 已停用，作废在飞令牌 %d 枚", plugin_id, revoked)
+    return {"ok": True, "revoked_running": revoked}
 
 
 @router.post("/{plugin_id}/account")
@@ -1528,6 +1548,30 @@ def seal_and_report(batch: str, launched: int, plugin_id: str, label: str) -> No
             core, plugin_id, *_batch_text(label, parts, launched)))
 
 
+def _account_busy(plugin_id: str, account: str) -> Optional[str]:
+    """这个账号此刻有没有在飞的进程。有就返回它的标签，没有返回 None。
+
+    互斥键就是 `f"{plugin_id} [{账号名}]"`（见 `plugins_proc._run_key`：
+    按账号跑的命令，一个账号同时只能有一个进程）——**账号名是键的一半**。
+    于是「删账号」和「账号改名」这两件事，不看在飞进程就会各自坏掉：
+
+    · **删除**：会话文件删完，正跑着的抓取在 `finally` 里把 `storage_state` 原子写回
+      `.state/<账号>.json`——删除动作被完整撤销，**而撤销它的是核心自己起的那个进程**。
+      用户看到的是账号几分钟后自己复活，标着「未添加 + 已授权」，磁盘上那份 cookie 一直有效；
+      同时暂存表里多出一批挂在这个「已删账号」名下的新单。
+    · **改名**：锁还叫 `<插件> [甲]`，而卡片上 `乙` 的「抓这个号」算出来的是 `<插件> [乙]`
+      ——不冲突，直接放行第二个子进程。**同一份 cookie 上并行跑两个 chromium**，
+      正是 `_run_key` 文档和插件的「风控与对策」里那条红线。两个进程退出时各按自己启动时
+      读到的会话回写，一个写 `乙.json`、一个把 `甲.json` 重新造出来。
+
+    **选 409 而不是「先杀进程再操作」**：杀到一半的抓取会留下写了一半的暂存数据，
+    而这两个操作都不急——等它跑完（最长 `_REAP_TIMEOUT`）再点一次就行。
+    与「同一个命令点两次」那条 409 是同一个语言。
+    """
+    with _PROCS_LOCK:
+        return _INFLIGHT.get(f"{plugin_id} [{account}]")
+
+
 @router.delete("/{plugin_id}/account")
 def delete_account(
     plugin_id: str,
@@ -1539,6 +1583,12 @@ def delete_account(
     cfg = session.get(PluginConfig, plugin_id)
     if account not in _known_names(cfg, m):
         raise HTTPException(status_code=404, detail=f"该插件下没有账号：{account}")
+    busy = _account_busy(plugin_id, account)
+    if busy is not None:
+        raise HTTPException(status_code=409, detail=(
+            f"「{account}」正在跑（{busy or '执行中'}），现在删会被它写回来——"
+            f"那个进程结束时会把登录会话原样存回磁盘，账号过几分钟自己就复活了。"
+            f"等它跑完再删。"))
     removed = _remove_account_state(m, account)                 # 删磁盘会话（含 .tmp/.lock）
     accs = _account_list(cfg)
     if cfg and any(a["name"] == account for a in accs):         # 再从配置账号列表里摘掉它
@@ -1566,6 +1616,20 @@ def rename_account(
     if not new or "," in new:
         raise HTTPException(status_code=400, detail="新账号名不能为空、且不能含逗号（逗号是账号分隔符）")
     _state_file(m, new)                                     # 校验 new 是合法文件名（目录穿越/非法名 → 400）
+    # **两个名字都要查。** 互斥键 = `<插件> [账号名]`，改名等于把锁的一半换掉：
+    # 改完之后卡片上「抓这个号」算出的是 `[新名]`，与在飞那把 `[旧名]` 不冲突，
+    # 直接放行第二个子进程 ⇒ **同一份 cookie 上并行跑两个 chromium**
+    # （`_run_key` 的文档和插件的「风控与对策」里都写着这条红线）。
+    # 两个进程退出时各按自己启动时读到的会话回写，一个写 `新名.json`、
+    # 一个把 `旧名.json` 重新造出来——于是账号区凭空多出一个「未添加/已授权」的旧名。
+    # 新名那边同样要查：它可能是个已经存在、且正在跑的账号（虽然下面还会拒重名，
+    # 但那道检查在这之后，而且判据不同——这里问的是「有没有进程攥着它」）。
+    for who in (old, new):
+        busy = _account_busy(plugin_id, who)
+        if busy is not None:
+            raise HTTPException(status_code=409, detail=(
+                f"「{who}」正在跑（{busy or '执行中'}），现在改名会让互斥锁对不上号"
+                f"——同一份登录会话可能被同时开两个浏览器。等它跑完再改。"))
     cfg = session.get(PluginConfig, plugin_id)
     # old 有效 = 配置/磁盘里的账号，或历史数据/标签里出现过（列头改名可能改一个只存在于旧订单的账号）
     if old not in _known_names(cfg, m) and not tag_value_in_use(session, field, old):

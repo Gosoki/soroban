@@ -232,6 +232,27 @@ frontend/dist/
 # soroban backups
 backups/
 
+# **.env 的整份拷贝，文件名级兜底。** `backups/` 只挡住目录名，而 `make_backup` /
+# `snapshot_sqlite_file` 产出的 `env-<时间戳>.txt` 是 backend/.env 的**逐字节副本**
+# （含真实 SECRET_KEY——它同时签发登录 JWT、并解密控制库里 Fernet 加密的 MySQL 连接串，
+# 一份文件把两把钥匙一起给全）。自动落点恒在 `<账本目录>/backups`，所以现有路径都安全；
+# 但 `--dir` 是完全未校验的任意路径，谁临时写一个 `--dir .`，`git add -A` 就把它带走了。
+# 而这个仓库是公开的：push 之后事后删文件无效，只能换 SECRET_KEY
+# （代价是所有人退出登录 + 已保存的 MySQL 串再也解不开）。
+env-*.txt
+
+# **没有扩展名的 SQLite 库。** `*.db` 是按扩展名匹配的，抓不到叫 `dst` 这种名字的文件——
+# `backend/dst` 就是这么被 `git add -A` 带进 a1e36ad 并推上 GitHub 的（它是空库，
+# 泄露的是 15 张表的完整 DDL）。同目录里 `soroban.db` 是 2.8 MB 的真账本，
+# 同样一次手滑（`sqlite3 soroban.db ".backup dst"`）推上去的就是真实账本。
+/backend/dst
+
+# **运行期锁文件。** `app/single_process.py` 每次启动都把当前 PID 写进
+# `<账本目录>/soroban.lock`（flock 单实例保护）。它被跟踪着，于是每跑一次应用
+# `git status` 就多一个 modified、内容还是个对别人毫无意义的 PID。
+# `*.pid` 那条规则覆盖不到 `.lock` 这个后缀。
+*.lock
+
 # 依赖安装指纹：描述的是**本机环境**装了哪一版 requirements，绝不能进版本库——
 # 一旦提交，别人 clone 下来指纹恰好等于 requirements.txt 的哈希，start 脚本就会跳过
 # pip install，得到一个「以为装好了、其实什么都没装」的环境。

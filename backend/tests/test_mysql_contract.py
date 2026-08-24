@@ -229,3 +229,52 @@ def test_binstr_search_stays_case_insensitive_on_mysql(on_mysql):
     got = on_mysql.get("/api/orders", params={"q": "abcDEF", "limit": 50}).json()["items"]
     assert any(o["order_no"] == "ABCdef123" for o in got), \
         "MySQL 上按小写搜不到大写单号——ci_contains 没生效，与 SQLite 结果不一致"
+
+def test_the_collation_downgrade_precheck_finds_case_only_duplicates(mysql_engine):
+    """降级预检必须查得出「只差大小写」的重复值——那正是这条迁移放开的东西。
+
+    `f2a3b4c5d6e7` 的降级第一步就把三处「活跃行唯一」连同 MySQL 生成列一起 DROP 掉，
+    随后才跑它自己在 docstring 里承认「可能撞 1062」的那步（换回 ai_ci、重建唯一索引）。
+    **MySQL 的 DDL 是隐式提交的**，而 `env.py` 开了 `transaction_per_migration`——
+    失败之后：三处唯一约束全没了，版本号却被回滚、仍停在 `f2a3b4c5d6e7`。
+
+    用户只看到一句 1062 原始报错，然后**一切看起来完全正常**：下次启动
+    `upgrade head` 从这里往后照跑，应用正常打开，没有任何一处提示约束没了。
+    真正的后果很久以后才显形——同一个订单号可以重复导入、重复建单，不再有 409，
+    而**没有任何机制会再把那三条约束建回来**（后面的迁移都不碰它们）。
+
+    **这里不跑真降级**：`command.downgrade` 会把这一条之后的十几条一起撤掉，
+    而那条链在 MySQL 上本来就降不动（`ix_orderstaging_imported_order_id` 被外键需要），
+    测一次就把库降成半截。要验的是判据本身——它查不出来，预检就是摆设。
+    """
+    import importlib.util
+
+    from sqlalchemy import text
+
+    from app.database import _ROOT                    # noqa: PLC2701 —— 迁移测试就该碰它
+
+    path = _ROOT / "alembic" / "versions" / "f2a3b4c5d6e7_binary_collation_for_key_columns.py"
+    spec = importlib.util.spec_from_file_location("_collation_mig", path)
+    mig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mig)
+
+    with mysql_engine.connect() as c:
+        clean = mig._conflicts_after_downgrade(c)
+        assert not any("标签取值" in x for x in clean), (
+            f"库里本来就有只差大小写的标签值，这条用例的前提不成立：{clean}")
+
+    with mysql_engine.begin() as c:
+        c.execute(text("DELETE FROM tagoption WHERE value IN ('EMS-DG', 'ems-dg')"))
+        c.execute(text("INSERT INTO tagoption (field, value) VALUES ('platform', 'EMS-DG')"))
+        c.execute(text("INSERT INTO tagoption (field, value) VALUES ('platform', 'ems-dg')"))
+    try:
+        with mysql_engine.connect() as c:
+            found = mig._conflicts_after_downgrade(c)
+        assert any("标签取值" in x for x in found), (
+            f"预检没查出只差大小写的标签值：{found}。"
+            "降级会照跑下去，先删掉三处唯一约束再撞 1062——它们此后永远建不回来")
+        assert any("EMS-DG" in x or "ems-dg" in x for x in found), (
+            f"查出来了却没说是哪个值，用户没法照着清理：{found}")
+    finally:
+        with mysql_engine.begin() as c:
+            c.execute(text("DELETE FROM tagoption WHERE value IN ('EMS-DG', 'ems-dg')"))
