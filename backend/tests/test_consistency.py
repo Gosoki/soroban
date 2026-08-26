@@ -3439,3 +3439,103 @@ def test_the_test_suite_leaves_no_files_in_the_repository():
         "测试里写死了相对路径的 sqlite URL，被测代码会照着它在**仓库里**建库：\n  "
         + "\n  ".join(offenders)
         + "\n用 tmp_path 夹具，或 str(engine.url)。")
+
+
+def test_no_guard_is_satisfied_only_by_a_comment():
+    """**元守卫**：读源码做判据的测试，那个判据不能只被注释满足。
+
+    这是本仓最常复发的一类假绿。规律是：解释一件事的注释，必然包含描述这件事的
+    那些词——于是「在这段代码里找某个名字」的判据，会被**写守卫的人自己写的解释**满足。
+    2026-08-23 一轮里就踩了三次（`fxApi.get()`、「待处理」、「不接 catch」），
+    每一次都是破坏验证才抓出来的：破坏时它确实红了，红的却是别的原因。
+
+    判据很直接：把被检查文件的注释剥掉，如果那个字面量**只在注释里有**，
+    这条守卫此刻就是假的——产品代码怎么改它都不会红。
+
+    只对 `.py` / `.vue` / `.js` 剥注释。`.md` 的 `#` 是标题不是注释，
+    `.toml` 同理——按注释剥会把正文吃掉，反而造出一批误报（这条守卫自己踩过一次）。
+    """
+    import ast
+    import re
+
+    def target_path(node):
+        """从 (_REPO / "a" / "b") 这样的表达式里拼出真实路径。"""
+        parts, cur = [], node
+        while isinstance(cur, ast.BinOp) and isinstance(cur.op, ast.Div):
+            r = cur.right
+            if not (isinstance(r, ast.Constant) and isinstance(r.value, str)):
+                return None
+            parts.append(r.value)
+            cur = cur.left
+        if not (isinstance(cur, ast.Name) and cur.id in ("_REPO", "_BACKEND")):
+            return None
+        parts.reverse()
+        if any("\n" in p or len(p) > 60 for p in parts):
+            return None            # docstring 里的引号，不是路径
+        base = _REPO if cur.id == "_REPO" else _REPO / "backend"
+        p = base.joinpath(*parts)
+        return p if p.is_file() else None
+
+    def strip_comments(text: str, suffix: str) -> str:
+        if suffix in (".vue", ".js"):
+            t = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+            t = re.sub(r"^\s*//.*$", "", t, flags=re.M)
+            return re.sub(r"<!--.*?-->", "", t, flags=re.S)
+        if suffix == ".py":
+            return re.sub(r"^\s*#.*$", "", text, flags=re.M)
+        return text                # .md/.toml：# 是标题，不能当注释剥
+
+    tests_dir = _REPO / "backend" / "tests"
+    offenders = []
+    for f in sorted(tests_dir.rglob("test_*.py")):
+        src = f.read_text(encoding="utf-8")
+        for fn in ast.walk(ast.parse(src)):
+            if not isinstance(fn, ast.FunctionDef) or not fn.name.startswith("test_"):
+                continue
+            body = ast.get_source_segment(src, fn) or ""
+            if "re.sub" in body:
+                continue           # 自己剥过注释了
+            targets = [p for c in ast.walk(fn)
+                       if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                       and c.func.attr == "read_text" and (p := target_path(c.func.value))]
+            if not targets:
+                continue
+            lits = re.findall(r'assert\s+["\']([^"\']{4,60})["\']\s+in\s', body)
+            for t in targets:
+                raw = t.read_text(encoding="utf-8")
+                clean = strip_comments(raw, t.suffix)
+                for lit in lits:
+                    if lit in raw and lit not in clean:
+                        offenders.append(
+                            f"{f.name}:{fn.lineno} {fn.name}\n"
+                            f"      在 {t.name} 里找「{lit[:44]}」——**只出现在注释里**")
+    assert not offenders, (
+        "这些守卫的判据只被注释满足，产品代码怎么改都不会红：\n  "
+        + "\n  ".join(offenders)
+        + "\n判据落到产品代码上，或先 re.sub 剥掉注释再判。")
+
+
+def test_the_grant_toggle_counts_baseline_as_held():
+    """勾一次授权之后就地重算 `blocked` 时，**baseline 也算「有」**。
+
+    后端的判据是 `blocked = needs - effective`，而 effective = 令牌实际带的权限，
+    **含 baseline**（`meta:read` 那类默认给、勾选框里根本没有的）。
+    前端 `toggleGrant` 原先只减 `r.granted`，于是一条声明了
+    `needs = ["meta:read", "fx:write"]` 的命令，在用户勾上 fx:write 的**那一刻**
+    反而被算成「缺 meta:read」而灰掉——而权限区里 meta:read 恰恰是那一行
+    不可点的「默认」标记，他没有任何操作能解锁。
+
+    刷新整页又好了（后端判据是对的），于是这看起来像「界面偶尔抽风」，
+    而不是一个判据错误——那种 bug 最不容易被报上来。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "views" / "Plugins" / "index.vue").read_text(encoding="utf-8")
+    fn = src[src.index("async function toggleGrant"):]
+    fn = fn[:fn.index("\n}\n") + 3]
+    fn = re.sub(r"^\s*//.*$", "", fn, flags=re.M)      # 剥注释：解释里也写着 baseline
+
+    assert "blocked" in fn, "toggleGrant 不再重算 blocked 了？这条守卫的前提变了"
+    assert "baseline" in fn, (
+        "就地重算 blocked 时没算上 baseline——"
+        "勾一次授权，声明了 baseline 权限的命令反而会灰掉，而用户无法解锁它")

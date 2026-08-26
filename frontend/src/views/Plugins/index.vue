@@ -359,7 +359,12 @@ async function doRun(p, c, account = null) {
     // 卡片立刻进入「执行中」，然后**一直盯到它收尾**。
     // 原先只是 3 秒后刷一次：抓取动辄几分钟，那一刷必然还在跑，之后再没有人来问，
     // 于是「执行中」就一直挂着——看起来和真的卡死一模一样，而它其实早就跑完了。
-    p.last_run = { outcome: 'running',
+    // **保留 ok_at**：这次点击只改变了「正在跑什么」，没有改变「上次成功是什么时候」。
+    // 原先整体替换掉 last_run，新对象里没有 ok_at ⇒ 模板的 `v-if="p.last_run.ok_at"`
+    // 判假 ⇒ 落到下一支渲染出黄色的【从未成功】——而这个插件可能两小时前刚成功过。
+    // 那个标签是全站**唯一**会主动说「不对劲」的东西（staleOk 那套），
+    // 让它在最正常的操作上误报，等于把它训练成噪音：以后真的报警也没人当回事。
+    p.last_run = { ...(p.last_run || {}), outcome: 'running',
                    summary: `${c.label}${account ? ' ' + account : ''} 执行中…`, at: null }
     scheduleRunPoll()
   } catch (e) {
@@ -430,7 +435,15 @@ async function toggleGrant(p, key, on) {
     // 而下一次 load() 就会露馅。卡片上的比值现在只数 declared ∩ granted。
     // 就地重算每条命令还缺哪些权限。不重算的话按钮仍停在「缺权限」禁用态，
     // 要手动刷新整页才活过来——用户会以为刚才那一勾没生效。
-    for (const c of p.commands) c.blocked = (c.needs || []).filter((k) => !r.granted.includes(k))
+    // **baseline 也算「有」。** 后端的判据是 `blocked = needs - effective`，
+    // 而 effective = 令牌实际带的权限，**含 baseline**（`meta:read` 那类默认给的）。
+    // 这里原先只减 `r.granted`，于是一条声明了 `needs = ["meta:read", "fx:write"]`
+    // 的命令，在用户勾上 fx:write 的**那一刻**反而被算成「缺 meta:read」而灰掉——
+    // 而权限区里 meta:read 恰恰是那一行不可点的「默认」标记，他没有任何操作能解锁。
+    // 刷新整页又好了（后端判据是对的），于是这看起来像「界面偶尔抽风」，
+    // 而不是一个判据错误——那种 bug 最不容易被报上来。
+    const held = new Set([...r.granted, ...(p.scopes.baseline || []).map((b) => b.key)])
+    for (const c of p.commands) c.blocked = (c.needs || []).filter((k) => !held.has(k))
     ElMessage.success(on ? `已授予「${scopeMeta(p, key).label || key}」`
                          : `已收回「${scopeMeta(p, key).label || key}」`)
   } catch (_) { p._form.granted = [...(p.scopes?.granted || [])] } finally { p._busy = false }
@@ -659,6 +672,18 @@ async function doToggle(p, a, enabled) {
 //   账号行现在按清单渲染，统一走 doRun —— 连点保护、confirm、缺权限判据也随之统一。
 //   `_busy` 那道连点闸没有丢：doRun 自己就设它。）
 
+// 「改了哪几张表、各几行」的人话。后端 `moved` 是 {模型名: 行数}。
+// 表名映射只在这里一处——加一张表时不用去改提示语的拼接。
+const TABLE_LABEL = { OrderStaging: '暂存', Order: '账本', ShipmentOrder: '集运单',
+                      MiscExpense: '杂项', TagOption: '标签' }
+
+function movedText(res) {
+  const parts = Object.entries(res.moved || {})
+    .filter(([, n]) => n > 0)
+    .map(([k, n]) => `${TABLE_LABEL[k] || k} ${n}`)
+  return parts.length ? `迁移 ${parts.join(' / ')}` : '这个账号名下没有单'
+}
+
 async function doRenameAccount(p, account) {
   let value
   try {
@@ -677,7 +702,11 @@ async function doRenameAccount(p, account) {
   try {
     const res = await pluginsApi.renameAccount(p.id, account, value)
     if (res.warning) ElMessage.warning(res.warning)
-    else ElMessage.success(`已改名为「${value}」（迁移订单：暂存 ${res.staging} / 账本 ${res.orders}）`)
+    // **按后端实际改了哪几张表报数**，不写死「暂存 / 账本」两个。
+    // 那两个键是 `platform_account` 这一列的源表；声明 `accounts_ledger_field = "recipient"`
+    // 的插件（集运类的「账号」就是收货人）改完名会被告知「暂存 0 / 账本 0」——
+    // 而他刚把整本集运单的收货人改掉了。后端现在多回一个 `moved`（模型名 → 行数）。
+    else ElMessage.success(`已改名为「${value}」（${movedText(res)}）`)
     await load()
   } catch (e) {
     // 409（新名字已被占用）被 http 拦截器刻意跳过，这里显式弹出后端 detail，否则静默无反馈

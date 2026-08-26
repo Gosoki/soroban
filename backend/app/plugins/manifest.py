@@ -156,6 +156,24 @@ def _positive_int(v) -> int:
         return 0
 
 
+# 核心真正会读的顶层键。**开放键集合是个陷阱**：`parse()` 用 14 个 `raw.get(...)`
+# 逐个取自己认识的，认不出的既不进 error 也不 log——于是把
+# `accounts_ledger_field` 敲成 `account_ledger_field`，`ledger_field` 就静静地是 ""，
+# 而前端只看 `accounts_enabled` 渲染账号行，「改名 / 删暂存单 / 删账本单」
+# 三个按钮照常出现，点下去才 400。卡片上 `manifest_error` 是空的、插件一切正常，
+# 唯一线索是一行没人看的服务端日志——用户会去怀疑核心坏了，
+# 而不是去查自己 plugin.toml 里少了个 s。
+#
+# 邻近的校验其实都做了（未知 param type 告警、未知 per 告警、重名命令进 error、
+# `_scope_lint` 查 scope 拼写与 needs⊄scopes），唯独顶层键漏了这一道。
+_KNOWN_TOP_KEYS = frozenset({
+    "id", "name", "version", "python", "entry", "install", "needs",
+    "accounts", "accounts_ledger_field", "account_platforms",
+    "scopes", "settings", "params", "commands",
+    "state_dir", "schedulable", "needs_session", "default_schedule_minutes",
+})
+
+
 def parse(raw: dict, directory) -> Manifest:
     """把 tomllib 读出来的 dict 变成强类型清单。
 
@@ -168,6 +186,14 @@ def parse(raw: dict, directory) -> Manifest:
     if not pid:
         pid = directory.name
         err = "plugin.toml 里缺 id"
+
+    # 未知顶层键：**说出来**。不阻止插件加载（`error` 的语义是「清单有问题，
+    # 插件页照样列出并显示原因」），但用户至少能看见「我写的这个键核心根本不读」。
+    unknown = sorted(set(raw) - _KNOWN_TOP_KEYS)
+    if unknown:
+        note = (f"plugin.toml 有核心不认识的顶层键：{'、'.join(unknown)}"
+                f"（它们不会生效；如果是打错了，对照一下正确拼写）")
+        err = f"{err}；{note}" if err else note
 
     accounts = bool(raw.get("accounts"))
     params = tuple(p for p in (_param(x, pid) for x in (raw.get("params") or [])) if p)

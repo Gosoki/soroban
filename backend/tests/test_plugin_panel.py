@@ -1185,6 +1185,103 @@ def test_release_updates_on_version_change_but_keeps_venv_and_session(tmp_path, 
     assert (live / ".state" / "a.json").exists(), "把用户的登录会话删掉了"
 
 
+def test_release_updates_when_the_code_changed_but_the_version_did_not(tmp_path, monkeypatch):
+    """**版本号没变、代码变了**——照样要释放。这才是真实发生的那一种。
+
+    上面那条守卫用的是 1.0.0 → 1.1.0，它测的是「版本变了会不会覆盖」；
+    **没有任何东西测过「发版时版本会不会变」**——而答案是不会：
+    两个插件仓从 init 至今 29 次提交（taobao 21 / fx 8），`version` 恒为 `"0.1.0"`，
+    一次都没动过。打包这个能力 2026-08-09 才落地，之后 taobao 还改过三次代码，
+    其中包含本报告 §152.2 那条钱账修复（行合计换算成单价后不复核总额）、
+    以及 409 重试原样重发把用户手填的快递单号顶掉那条。
+
+    发布目录固定且兼作运行数据目录（`pyinstaller.bat` 明写 NEVER wipe），
+    升级 = 换个 exe 放回原目录 ⇒ `plugins/` 原样保留 ⇒ 走版本号那一支 ⇒ 两边恒等 ⇒
+    一个文件都不覆盖。而 `discover()` 只扫磁盘那份，于是同一个 exe 里
+    长期是「新核心 + 老插件」，`done` 为空连日志都不打，卡片两边都显示 v0.1.0——**零痕迹**。
+
+    所以判据换成了**内容摘要**：不依赖任何人记得改版本号，源码动一个字节就不同。
+    """
+    from app.routers import plugins as mod
+
+    _fake_bundle(tmp_path, version="0.1.0", body="修好了钱账 bug 之前的版本")
+    dst = tmp_path / "run" / "plugins"
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path / "meipass"), raising=False)
+    monkeypatch.setattr(mod, "plugin_dir", lambda: dst)
+    assert mod.seed_bundled_plugins() == {"soroban-plugin-demo": "new"}
+
+    live = dst / "soroban-plugin-demo"
+    (live / ".venv" / "bin").mkdir(parents=True)
+    (live / ".venv" / "bin" / "python").write_text("#!/bin/sh", encoding="utf-8")
+    (live / ".state").mkdir()
+    (live / ".state" / "a.json").write_text('{"cookie": "…"}', encoding="utf-8")
+
+    # 新 exe：代码改了，**版本号一个字没动**（这正是两个真插件仓的实际状态）
+    _fake_bundle(tmp_path, version="0.1.0", body="修好了钱账 bug")
+    assert mod.seed_bundled_plugins() == {"soroban-plugin-demo": "updated"}, (
+        "版本号没变、代码变了，插件没被更新——打包版会一直跑旧代码，"
+        "而卡片上的版本号与新包里那份一模一样，用户看不出任何异常")
+    assert (live / "code.py").read_text(encoding="utf-8") == "修好了钱账 bug"
+    assert (live / ".venv" / "bin" / "python").exists(), "把插件已装的依赖删掉了"
+    assert (live / ".state" / "a.json").exists(), "把用户的登录会话删掉了"
+
+    # 幂等：内容没再变就不该重复释放（每次启动都覆盖 = 每次都可能盖掉用户改的东西）
+    assert mod.seed_bundled_plugins() == {}
+
+
+def test_the_release_stamp_is_not_the_plugin_version(tmp_path, monkeypatch):
+    """判据必须是**内容**，不能退回去比那根没人维护的版本号。
+
+    这条与上面那条互补：上面验「代码变了要更新」，这条验「判据本身不依赖版本号」——
+    连 `plugin.toml` 都没有的插件树，照样要能正确判断更新。
+    """
+    from app.routers import plugins as mod
+
+    src = tmp_path / "meipass" / "plugins" / "no-manifest"
+    src.mkdir(parents=True)
+    (src / "code.py").write_text("v1", encoding="utf-8")
+    dst = tmp_path / "run" / "plugins"
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path / "meipass"), raising=False)
+    monkeypatch.setattr(mod, "plugin_dir", lambda: dst)
+
+    assert mod.seed_bundled_plugins() == {"no-manifest": "new"}
+    (src / "code.py").write_text("v2", encoding="utf-8")
+    assert mod.seed_bundled_plugins() == {"no-manifest": "updated"}, (
+        "连 plugin.toml 都没有就判断不出更新——说明判据还挂在版本号上")
+    assert (dst / "no-manifest" / "code.py").read_text(encoding="utf-8") == "v2"
+
+
+def test_the_digest_notices_a_pure_rename(tmp_path, monkeypatch):
+    """只把**文件内容**喂进摘要是不够的——改个文件名，摘要必须跟着变。
+
+    `_tree_digest` 的 docstring 写着「路径也要喂进去：只喂内容的话，
+    把 a.py 和 b.py 换个名字摘要不变」。这条把那句话变成断言——
+    否则那行 `h.update(路径)` 删掉也没人发现（实测过：删掉它其余守卫全绿）。
+
+    改名在插件里是真会发生的：拆模块、把 `scraper.py` 分成 `fetch.py` + `parse.py`，
+    内容集合不变、文件名变了。摘要认不出来，打包版就继续跑旧的那套文件名。
+    """
+    from app.routers import plugins as mod
+
+    src = tmp_path / "meipass" / "plugins" / "renamed"
+    src.mkdir(parents=True)
+    (src / "scraper.py").write_text("AAA", encoding="utf-8")
+    dst = tmp_path / "run" / "plugins"
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path / "meipass"), raising=False)
+    monkeypatch.setattr(mod, "plugin_dir", lambda: dst)
+    assert mod.seed_bundled_plugins() == {"renamed": "new"}
+
+    # 纯改名：**喂进摘要的内容序列一模一样**（都只有一个 "AAA"），只有路径变了。
+    # 不能写成「两个文件互换内容」——那样 sorted 之后内容的顺序也变了，
+    # 即使不喂路径摘要照样会变，这条守卫就被另一个原因满足了（第一版正是这么写的，实测仍绿）。
+    (src / "scraper.py").unlink()
+    (src / "fetch.py").write_text("AAA", encoding="utf-8")
+    assert mod.seed_bundled_plugins() == {"renamed": "updated"}, (
+        "文件改了个名（scraper.py → fetch.py，内容一字未动），摘要却没变——"
+        "说明路径没被喂进去，"
+        "拆模块/重命名这类改动在打包版上永远传不到磁盘")
+
+
 def test_release_is_a_noop_without_a_bundle(tmp_path, monkeypatch):
     """源码运行没有 _MEIPASS——这条路径必须是彻底的空操作，
     否则开发时每次启动都会去动仓库里的 plugins/。"""
@@ -2662,3 +2759,450 @@ def test_disabling_a_plugin_revokes_its_running_tokens(client, session, tmp_path
     assert scopes.alive(jti2), (
         "插件本来就是停用的，只是又存了一次配置，却把在飞令牌撤了——"
         "判据该是「从启用变成停用」，不是「当前是停用」")
+
+
+def _last_outcome_text(cfg) -> str:
+    """卡片上那句话 = `_write_outcome` 写进 `last_summary` 的那一段。"""
+    return cfg.last_summary or ""
+
+
+def test_a_scheduled_run_with_no_accounts_says_so_and_stops_repeating(tmp_path, monkeypatch, session):
+    """定时轮扇出到 **0 个账号**时：说实话，且不要每 60 秒重刷一次。
+
+    三条真实路径都会走到这里：把唯一的账号在卡片上「停用」；把账号全删了却没关定时；
+    换库/重置库之后 `PluginConfig` 重建、配置里的账号没了而磁盘上 `.state/甲.json` 还在
+    （`_account_list` 只读配置账号，不含孤儿）。
+
+    原先没有这个分支，直接落到 `seal_and_report(batch, 0, ...)`，卡片被写成红色的
+    「定时·抓取：一个任务都没能启动」——**原因说错了**。手动点同一条命令时核心给的是
+    准确的 400「没有可用账号：先添加账号并启用」，只有无人值守这条路说成「启动失败」，
+    用户会去查 venv、查依赖、查登录，而那些都没问题。孤儿账号那条路更误导：
+    卡片同时还显示着那个账号「已授权」的绿标。
+
+    而且 `last_run_at` 不推进 ⇒ 下一轮 60 秒后 `_due` 仍为真 ⇒ 原样再来一遍：
+    红字时间戳每分钟刷新，而「上次触发」停在很久以前——两个字段互相矛盾。
+    """
+    import datetime as dt
+
+    from app.models import PluginConfig
+    from app.routers import plugins as mod
+
+    _acct_plugin(tmp_path, monkeypatch, session)
+    cfg = session.get(PluginConfig, "demo")
+    cfg.enabled = True
+    cfg.schedule_minutes = 1
+    cfg.last_run_at = None                       # 从没跑过 ⇒ _due 为真
+    mod._save_accounts(session, cfg, [])         # **一个账号都没有**
+    session.commit()
+
+    before = cfg.last_run_at
+    mod._run_due_in_session()
+    session.refresh(cfg)
+
+    got = _last_outcome_text(cfg)
+    assert "没有可用账号" in got, (
+        f"定时轮扇出到 0 个账号，卡片上写的是「{got}」——"
+        "真实原因是没账号，说成「启动失败」会把人推去查 venv、查依赖、查登录")
+    assert cfg.last_run_at is not None and cfg.last_run_at != before, (
+        "last_run_at 没推进——下一轮 60 秒后还会原样再来一遍，"
+        "红字时间戳每分钟刷新，而「上次触发」停在很久以前，两个字段互相矛盾")
+
+
+_BAD_FIELD_TOML = """
+id = "demo"
+name = "演示插件"
+python = "inherit"
+entry = "-m demo"
+accounts = true
+accounts_ledger_field = "taobao_account"
+"""
+
+
+def test_an_unknown_ledger_field_is_refused_instead_of_silently_migrating_nothing(
+        client, session, tmp_path, monkeypatch):
+    """清单把 `accounts_ledger_field` 写成核心不认识的列名 → **当场 400**，不能报成功。
+
+    `taobao_account` 是重命名之前的老列名，打错一个字同理。原先守卫只有「非空」，
+    于是下游 `tag_value_in_use` / `check_value_fits` / `rename_tag_value` 三处
+    全走 `_FIELD_SOURCES.get(field, ())` → 空元组 → 循环体一次都不执行 →
+    `counts={}`，连重名检查都一并失效。
+
+    用户看到的是绿色的「已改名为『乙』（迁移订单：暂存 0 / 账本 0）」——
+    **那个 0 读起来正是「这个账号本来就没有单」**。而订单页与暂存页里所有行仍写着「甲」，
+    下一次抓取写进「乙」，同一个人的单从此劈成两半，账号维度的合计两边都不对。
+    """
+    from app.routers import plugins as mod
+
+    d = tmp_path / "plugins" / "soroban-plugin-demo"
+    d.mkdir(parents=True)
+    (d / "plugin.toml").write_text(_BAD_FIELD_TOML, encoding="utf-8")
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "plugins"))
+    monkeypatch.setattr(mod, "_SOROBAN_ROOT", tmp_path)
+    mod._needs_cache.clear()
+    assert client.post("/api/plugins/demo/account", params={"name": "甲"}).status_code == 200
+
+    r = client.post("/api/plugins/demo/account/rename", params={"old": "甲", "new": "乙"})
+    assert r.status_code == 400, (
+        f"声明了核心不认识的列名，改名却返回 {r.status_code}——"
+        f"下游一行数据都迁不动，却会报「已改名（迁移订单：暂存 0 / 账本 0）」：{r.text[:200]}")
+    assert "accounts_ledger_field" in r.json()["detail"], (
+        f"没指出是清单里哪个字段写错了：{r.json()}")
+
+
+def test_the_ledger_field_whitelist_comes_from_one_source():
+    """白名单必须**直接取** `tags._FIELD_SOURCES`，不能在别处另抄一份列名。
+
+    抄一份的话，将来给标签体系加一列（`category` 就是这么加进去的），
+    就又是两处要同步——而漏掉的那一处会让合法的插件被 400 拦下，
+    症状是「装上插件、账号也加了，改名却说清单写错了」。
+    """
+    import ast
+
+    src = (_REPO / "backend" / "app" / "routers" / "plugins.py").read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "_ledger_field")
+    body = ast.get_source_segment(src, fn) or ""
+    assert "_FIELD_SOURCES" in body, (
+        "_ledger_field 没引用 tags._FIELD_SOURCES——白名单要么没有，要么是另抄的一份")
+
+    # 真的取到了同一批列（不是抄了个同名的空壳）
+    from app.routers.tags import _FIELD_SOURCES
+    assert "platform_account" in _FIELD_SOURCES and "platform" in _FIELD_SOURCES, (
+        f"_FIELD_SOURCES 的内容变了，这条守卫的前提要跟着改：{sorted(_FIELD_SOURCES)}")
+
+
+def test_an_unknown_top_level_key_is_reported_not_swallowed():
+    """`plugin.toml` 里核心不认识的顶层键，要**说出来**。
+
+    `parse()` 用十几个 `raw.get(...)` 逐个取自己认识的键，认不出的原先既不进 `error`
+    也不 log。于是把 `accounts_ledger_field` 敲成 `account_ledger_field`，
+    `ledger_field` 就静静地是 `""`——而前端只看 `accounts_enabled` 渲染账号行，
+    「改名 / 删暂存单 / 删账本单」三个按钮照常出现，点下去才 400。
+    卡片上 `manifest_error` 是空的、插件一切正常，用户会去怀疑核心坏了，
+    而不是去查自己少写了个 s。
+
+    邻近的校验其实都做了（未知 param type 告警、未知 per 告警、重名命令进 error、
+    `_scope_lint` 查 scope 拼写与 needs⊄scopes），唯独顶层键这一道漏了。
+
+    加上诊断的当天它就抓到一个真的：淘宝插件里躺着 `platform = "taobao"`，
+    核心不读、插件自己也不读（`args.platform` 是核心下发的命令行参数，不是这个键），
+    是「核心里写死 `manifest["platform"]`」那次重构的遗留。
+    """
+    from app.plugins.manifest import parse
+
+    m = parse({"id": "x", "name": "X", "entry": "-m x",
+               "account_ledger_field": "platform_account"},   # 少了个 s
+              _REPO / "backend")
+    assert "account_ledger_field" in (m.error or ""), (
+        f"清单里写了核心不认识的键，却没报出来：error={m.error!r}。"
+        "用户会看到「插件一切正常」，而某项能力就是不在")
+
+
+def test_the_known_key_whitelist_matches_what_parse_actually_reads():
+    """白名单必须与 `parse()` 真正读的顶层键**同步**。
+
+    少一个 → 合法的插件被自己的诊断误报成「写错了」；
+    多一个 → 那个键写错时仍然静默。两种都比没有诊断更坏——
+    前者让人不信任提示，后者让人以为有提示。
+
+    判据用 AST 从 `parse` 里抓所有 `raw.get("…")`，与白名单对账。
+    """
+    import ast
+
+    from app.plugins.manifest import _KNOWN_TOP_KEYS
+
+    src = (_REPO / "backend" / "app" / "plugins" / "manifest.py").read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "parse")
+    read = {c.args[0].value for c in ast.walk(fn)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+            and c.func.attr == "get" and isinstance(c.func.value, ast.Name)
+            and c.func.value.id == "raw" and c.args
+            and isinstance(c.args[0], ast.Constant) and isinstance(c.args[0].value, str)}
+    missing = read - set(_KNOWN_TOP_KEYS)
+    assert not missing, (
+        f"parse() 读了这些键，白名单里却没有：{sorted(missing)}——"
+        "合法的插件会被自己的诊断误报成「写错了」")
+
+
+def test_a_late_running_cannot_overwrite_a_sealed_batch(client, session, tmp_path, monkeypatch):
+    """迟到的中间态不许盖掉这一批已经落定的终态——否则卡片**永久**停在「执行中」。
+
+    批次收尾：两个账号的收割线程几乎同时进 `done()`，`_batch_add` 在锁里原子发号
+    ——A 拿到 (1/2) ⇒ `("running", …)`、B 拿到 (2/2) ⇒ `("failed", …)`。
+    但两次写回都在**锁外**，各开 Session 各自 commit，无版本号整行覆盖。
+    B 先落库、A 后落库时，A 那句 running 就把终态冲掉了。
+
+    后果不是「显示晚了一拍」：前端 `scheduleRunPoll` 每 4 秒轮询、判据是
+    `outcome === 'running'`，于是**永远停不下来**；而「乙」那句失败连同整条
+    终态摘要一起没了——用户既看不到该去重新扫码，也会以为进程还挂着，
+    而互斥键其实早就释放了。
+
+    这里直接按真实顺序驱动：先让 B 把批次凑齐（写终态），再让 A 那枚迟到的
+    running 落库。判据是卡片上最后留下的是终态。
+    """
+    from app.models import PluginConfig
+    from app.routers import plugins as mod
+
+    _acct_plugin(tmp_path, monkeypatch, session)
+    cfg = session.get(PluginConfig, "demo")
+    cfg.last_outcome, cfg.last_summary = "running", "抓取 执行中…"
+    session.add(cfg)
+    session.commit()
+
+    batch = "B-late"
+    mod._batch_seal(batch, 2)
+    # 两个账号都回来了 ⇒ 批次凑齐 ⇒ 封口 ⇒ 写终态
+    mod._result_writer("demo", "抓取", who="甲", batch=batch)(False, "无会话")
+    mod._result_writer("demo", "抓取", who="乙", batch=batch)(False, "无会话")
+    session.expire_all()
+    sealed_text = session.get(PluginConfig, "demo").last_summary
+    assert session.get(PluginConfig, "demo").last_outcome != "running", (
+        f"批次凑齐了却没落终态：{sealed_text}")
+
+    # A：迟到的那一枚——它算出来的是 running（1/2），不能盖回去
+    mod._write_outcome("demo", "running", "抓取（1/2）：甲 ✗ 无会话", batch=batch)
+    session.expire_all()
+    got = session.get(PluginConfig, "demo")
+    assert got.last_outcome != "running", (
+        "迟到的 running 盖掉了终态——卡片会永久停在【执行中】，"
+        "前端每 4 秒轮询一次且永远停不下来，而两个账号其实都已经失败了")
+    assert got.last_summary == sealed_text, "终态摘要被冲掉了"
+
+
+def test_a_running_from_a_fresh_batch_still_gets_through(client, session, tmp_path, monkeypatch):
+    """反面：**另一个批次**的中间态照常写——否则进度就再也不显示了。
+
+    判据必须按批次，不能写成「库里当前是不是 running」：定时那条路不写「执行中」，
+    库里是上一轮的终态，那样会把定时批次的进度一起挡掉。
+    """
+    from app.models import PluginConfig
+    from app.routers import plugins as mod
+
+    _acct_plugin(tmp_path, monkeypatch, session)
+    cfg = session.get(PluginConfig, "demo")
+    cfg.last_outcome, cfg.last_summary = "failed", "上一轮的终态"
+    session.add(cfg)
+    session.commit()
+
+    mod._write_outcome("demo", "running", "抓取（1/2）：甲 ✓", batch="B-fresh")
+    session.expire_all()
+    assert session.get(PluginConfig, "demo").last_outcome == "running", (
+        "新批次的中间态被挡住了——定时抓取的进度从此不再显示")
+
+
+def test_only_writing_commands_advance_the_stale_alarm(client, session, tmp_path, monkeypatch):
+    """**只有真的会写数据的命令才配推进 `last_ok_at`。**
+
+    那一列的含义是「上次真的抓到东西是什么时候」，卡片上「成功 N 天前」的陈旧告警
+    （`staleOk`，阈值 = 定时间隔 × 3）全靠它——**那是这套系统里唯一会主动说
+    「不对劲」的东西**。
+
+    不分的话后果很具体：汇率连续几天抓不到（源改版 / 当天已有手填 / 回交被拒），
+    `last_ok_at` 停在 18 小时前、标签已经变黄；用户照着 `probe` 的 hint
+    「排查『取不到汇率』时先点这个」点了它——**零写入**的探测取到牌价 exit 0，
+    核心判 ok 并推进 `last_ok_at`，卡片当场变绿「成功 刚刚」。
+    而账本里的汇率仍然停在几天前，此后 18 小时不会再报警。
+
+    判据是命令自己声明的 `needs`，不需要 manifest 新增字段：一条不写数据的命令
+    本来就不该声明写权限。`login`（只扫码存会话）同样不该推进。
+    """
+    import datetime as dt
+
+    from app.models import PluginConfig
+    from app.routers import plugins as mod
+
+    _acct_plugin(tmp_path, monkeypatch, session)
+    cfg = session.get(PluginConfig, "demo")
+    old_ok = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    cfg.last_ok_at, cfg.last_outcome = old_ok, "running"
+    session.add(cfg)
+    session.commit()
+
+    def ok_at():
+        """读回来的时间戳。SQLite 不带 tzinfo，统一成 naive 再比——
+        这条守卫要验的是「那一刻有没有被改动」，不是时区表示。"""
+        got = session.get(PluginConfig, "demo").last_ok_at
+        return got.replace(tzinfo=None) if got else None
+
+    naive_old = old_ok.replace(tzinfo=None)
+
+    # 零写入的探测跑成功 —— 不许动那枚时间戳
+    mod._write_outcome("demo", "ok", "只测试不写入：各源都通", advances_ok=False)
+    session.expire_all()
+    assert ok_at() == naive_old, (
+        "零写入的探测把「最近抓到过东西」推到了现在——"
+        "账本里的数据还是几天前的，而唯一会报警的那个标签被清零了")
+
+    # 反面：真的写数据的命令照常推进（否则告警永远不消，同样是噪音）
+    mod._write_outcome("demo", "ok", "抓取：新建 30", advances_ok=True)
+    session.expire_all()
+    assert ok_at() != naive_old, (
+        "写命令成功了却不推进 last_ok_at——陈旧告警会一直挂着")
+
+
+def test_the_writes_predicate_reads_the_commands_own_needs():
+    """判据必须来自命令自己声明的 `needs`，别在核心里按命令名写死。
+
+    核心不认识任何具体插件（`test_core_does_not_hardcode_any_plugin_id` 钉着这条），
+    按名字判 `probe`/`fetch` 就等于把两个插件的约定偷偷编进核心。
+    """
+    from app.plugins.manifest import Command
+    from app.routers.plugins import _command_writes
+
+    assert _command_writes(Command(name="fetch", label="抓取", needs=("fx:write",)))
+    assert _command_writes(Command(name="x", label="x", needs=("staging:promote",)))
+    assert not _command_writes(Command(name="probe", label="只测试", needs=()))
+    assert not _command_writes(Command(name="fetch", label="抓取", needs=("fx:read",))), (
+        "只读权限被当成了写——判据要看冒号后面那一段")
+
+
+def _read_outcome(session, plugin_id: str) -> str:
+    """另开一个 Session 读——要看的是**已经 commit 到库里**的那一行，
+    不是当前会话里还没落盘的对象状态。"""
+    from sqlmodel import Session
+
+    from app.database import get_engine
+    from app.models import PluginConfig
+
+    with Session(get_engine()) as s:
+        row = s.get(PluginConfig, plugin_id)
+        return row.last_outcome if row else ""
+
+
+def test_a_scheduled_run_marks_itself_running_so_reclaim_can_catch_it(tmp_path, monkeypatch, session):
+    """定时抓取必须写「执行中」——否则 `reclaim_stale_runs` 那道守卫对它完全不生效。
+
+    原先全仓只有手动路径（`run_command`）在起进程前写这一行，`_run_due` 一行都没有：
+    卡片要等第一个子进程收尾、`_batch_text` 才可能给出 running，而**单目标**的
+    定时任务（fx、只有一个淘宝号）永远不会出现 running。
+
+    后果：22:50 定时触发淘宝抓取（翻页几分钟）→ 22:52 用户关掉 soroban →
+    收割线程是 daemon，`on_done` 写不进去 → 第二天开机，
+    `reclaim_stale_runs` 找不到任何「执行中」可收 → 卡片上是绿色「成功」+
+    **上一轮**的摘要，而「上次触发」停在 22:50——那一轮其实一条单都没抓回来。
+
+    同一情形手动触发会被诚实地改成「失败 · soroban 在它跑完之前退出了，结果已丢失」。
+    **定时这条路不该比手动那条更会说假话。**
+    """
+    from app.models import PluginConfig
+    from app.routers import plugins as mod
+
+    _acct_plugin(tmp_path, monkeypatch, session)
+    cfg = session.get(PluginConfig, "demo")
+    cfg.enabled, cfg.schedule_minutes, cfg.last_run_at = True, 1, None
+    cfg.last_outcome, cfg.last_summary = "ok", "上一轮：新建 12、更新 3"
+    mod._save_accounts(session, cfg, [{"name": "甲", "enabled": True}])
+    session.commit()
+
+    seen = {}
+    monkeypatch.setattr(mod, "_launch",
+                        lambda *a, **k: seen.setdefault("outcome_at_launch",
+                                                        _read_outcome(session, "demo")))
+    mod._run_due_in_session()
+
+    assert seen.get("outcome_at_launch") == "running", (
+        f"起子进程那一刻卡片上还是「{seen.get('outcome_at_launch')}」——"
+        "reclaim_stale_runs 找不到任何执行中可收，"
+        "应用中途退出后卡片会拿上一轮的绿字冒充这一轮的结果")
+
+
+def test_the_rename_report_covers_every_table_that_column_lives_in():
+    """改名的回报要覆盖那一列**实际所在的每一张表**，不能写死两个。
+
+    `rename_tag_value` 本来就是按模型名逐表回报的（`counts[model.__name__]`），
+    而调用方原先只取 `OrderStaging` / `Order`——那是 `platform_account` 这一列的源表。
+
+    声明 `accounts_ledger_field = "recipient"` 的插件（集运/快递类的「账号」
+    就是收货人，而 `recipient` 确实在 `_FIELD_SOURCES` 里、源表是 `ShipmentOrder`）
+    改完名会被告知「迁移订单：暂存 0 / 账本 0」——**他刚把整本集运单的收货人改掉了**，
+    界面却告诉他一条都没动。
+
+    这层抽象声称支持「哪个插件声明成别的列都行」（`_ledger_field` 的 docstring
+    正是为此存在的），那回报也得跟着通用。
+
+    判据不点名 `ShipmentOrder`：**`_FIELD_SOURCES` 里每一张源表**都要能被前端说出来，
+    将来给标签体系加一列（`category` 就是这么加的）时这条会自动生效。
+    """
+    import re
+
+    from app.routers.tags import _FIELD_SOURCES
+
+    # 后端：如实转述整份 counts
+    src = (_REPO / "backend" / "app" / "routers" / "plugins.py").read_text(encoding="utf-8")
+    fn = src[src.index("def rename_account"):]
+    fn = fn[:fn.index("\n@router")] if "\n@router" in fn else fn
+    fn = re.sub(r"^\s*#.*$", "", fn, flags=re.M)
+    assert "dict(raw)" in fn, (
+        "改名没有把 rename_tag_value 的整份计数转述出去，只挑了写死的那两个键")
+
+    # 前端：每一张源表都有人话标签
+    ui = (_REPO / "frontend" / "src" / "views" / "Plugins" / "index.vue").read_text(encoding="utf-8")
+    labels = re.search(r"const TABLE_LABEL = \{([^}]*)\}", ui, re.S)
+    assert labels, "前端没有表名 → 人话的映射"
+    known = set(re.findall(r"(\w+):", labels.group(1)))
+    tables = {model.__name__ for srcs in _FIELD_SOURCES.values() for model, _ in srcs}
+    missing = tables - known
+    assert not missing, (
+        f"这些源表在前端没有人话标签：{sorted(missing)}——"
+        "声明了对应列的插件改完名，提示里会直接蹦出模型类名")
+
+
+def test_a_version_constraint_in_requirements_is_actually_checked():
+    """`requirements.txt` 里的**版本约束**要真的比，不能只看包名在不在。
+
+    原先 `_declared_dists` 用 `re.split(r"[<>=!~\\[; ]", line)[0]` 把约束整个丢掉，
+    探测脚本只问 `distribution(name)` 存不存在。于是插件作者把 `httpx>=0.27`
+    提到 `>=0.28`（因为用上了新 API），而用户 venv 里装着 0.27——
+    卡片照样显示「已就绪」，点运行才 AttributeError，
+    **而那个报错指向插件代码，没有任何一处会说「你的依赖是旧的」**。
+
+    这与 §187.1（打包版换 exe 不更新插件）是同一个形状：判据只看表面。
+    那条看的是没人改过的 version 字符串，这条看的是包名在不在。
+
+    在 soroban 自己的解释器上跑探测脚本即可验证判据——
+    要问的环境是哪一个，是调用方 `_missing_dists(py, …)` 的事。
+    """
+    import subprocess
+    import sys
+
+    from app.routers.plugins import _PROBE_DISTS
+
+    r = subprocess.run(
+        [sys.executable, "-c", _PROBE_DISTS,
+         "pytest>=1.0",          # 装着且满足 → 不该报
+         "pytest>=9999.0",       # 装着但版本不够 → 该报
+         "no-such-dist-xyz"],    # 压根没装 → 该报
+        capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr[-300:]
+    out = r.stdout.strip().splitlines()
+
+    assert not any(x.startswith("pytest>=1.0") for x in out), (
+        f"装着且满足约束的包被报成缺失：{out}")
+    stale = [x for x in out if x.startswith("pytest>=9999.0")]
+    assert stale, f"版本不满足约束却没报出来：{out}"
+    assert "装的是" in stale[0], (
+        f"报了但没说实际装的是哪一版，用户不知道该升到哪：{stale}")
+    assert any(x.startswith("no-such-dist-xyz") for x in out), (
+        f"完全没装的包漏报了：{out}")
+
+
+def test_the_venv_dependency_check_passes_the_whole_requirement_line():
+    """venv 类插件的依赖检查（`probe_needs`）要把**整行**（含约束）传下去。
+
+    只做上一条（探测脚本会比版本）不够——调用方仍传只剩包名的列表的话，
+    约束在到达探测脚本之前就没了。两条一起才成立。
+
+    inherit 类插件刻意**不**这么做：它们与 soroban 共用环境，版本由 soroban
+    自己的 requirements 说了算，在插件页比一遍只会报出它管不了的事。
+    """
+    import ast
+    import re
+
+    src = (_REPO / "backend" / "app" / "routers" / "plugins.py").read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "probe_needs")
+    body = ast.get_source_segment(src, fn) or ""
+    body = re.sub(r"^\s*#.*$", "", body, flags=re.M)
+    assert "_declared_reqs" in body, (
+        "venv 依赖检查仍在传只剩包名的列表——版本约束在到达探测脚本前就丢了")

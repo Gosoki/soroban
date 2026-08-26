@@ -131,7 +131,7 @@ def _one(session: Session, handler, raw: Any, ctx, index: int, seen: set) -> dic
             # ——而那是**假话**，那个键一个字都没写进去。
             # 更糟的是 `unchanged` 算成功：`summary["rejected"]` 少数一条，
             # `runlog.note_rejected` 也只被告知一次损失，卡片上的拒收数比实际少。
-            seen.add(k)
+        seen.add(k)
         out.update(status=res.status, id=res.id, code=res.code, message=res.message)
     except Exception as e:                                  # noqa: BLE001
         sp.rollback()

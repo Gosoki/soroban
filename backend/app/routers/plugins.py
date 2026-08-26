@@ -11,6 +11,8 @@ soroban 扫 `PLUGIN_DIR` 下的 `soroban-plugin-*` 目录（各含 plugin.toml�
 
 import asyncio
 import datetime as dt
+from collections import OrderedDict
+import hashlib
 import json
 import logging
 import os
@@ -461,7 +463,7 @@ def probe_needs(manifest: dict) -> list[dict]:
         return out                                   # venv 都不能用，后两项无从谈起
     req = d / "requirements.txt"
     if req.exists():
-        missing = _missing_dists(py, _declared_dists(req))
+        missing = _missing_dists(py, _declared_reqs(req))
         if missing:
             out.append({"key": "deps", "label": "Python 依赖",
                         "hint": "缺少：" + "、".join(missing)})
@@ -508,6 +510,21 @@ def _inherit_needs(d: Path) -> list[dict]:
                      + "。需要把它装进 soroban 自己的环境（打包版则要重新打包）"}]
 
 
+def _declared_reqs(req: Path) -> list[str]:
+    """requirements.txt 的**整行**（含版本约束），交给探测脚本去比。
+
+    与 `_declared_dists`（只要包名）分开：那个用在 inherit 插件上——
+    它们与 soroban 共用环境，版本由 soroban 自己的 requirements 说了算，
+    在这儿比一遍只会报出「soroban 该升级了」这种插件页管不了的事。
+    """
+    out = []
+    for line in req.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith(("#", "-")):
+            out.append(line)
+    return out
+
+
 def _declared_dists(req: Path) -> list[str]:
     """requirements.txt 的行 → **发行包名**（不是 import 名）。只做最直白的解析，够本项目用。
 
@@ -545,18 +562,40 @@ def _has_pip(py: Path) -> bool:
 
 # 在插件自己的解释器里问「这些发行包装了没」。一次问完所有的：
 # 原先每个依赖一个子进程，而 GET /api/plugins 是前端轮询的接口。
-_PROBE_DISTS = """
-import sys
+# 探测脚本收的是 requirements.txt 的**整行**（`httpx>=0.27`），不是光包名。
+# 版本约束也要比：`distribution()` 手上本来就有版本号，只是原先没看。
+#
+# 不这么做的后果与 §187.1（打包版换 exe 不更新插件）**同一个形状**——判据只看表面：
+# 那条看的是没人改过的 version 字符串，这条看的是「包名在不在」。
+# 插件作者把 `httpx>=0.27` 提到 `>=0.28`（用上了新 API），而用户 venv 里装着 0.27，
+# 卡片照样显示「已就绪」，点运行才 AttributeError——而那个报错指向插件代码，
+# 没有任何一处会说「你的依赖是旧的」。
+#
+# 在子进程里做，因为要问的是**插件自己那个 venv**。用 packaging 解析约束；
+# 它是 pip 的依赖、venv 里必然有，真没有就退回只比包名——宁可漏报，
+# 也不能因为探测本身出问题就把用户卡在「装不完」（那比不报更让人摸不着头脑）。
+_PROBE_DISTS = r"""
+import re, sys
 from importlib.metadata import PackageNotFoundError, distribution
+try:
+    from packaging.requirements import Requirement
+except Exception:
+    Requirement = None
 miss = []
-for name in sys.argv[1:]:
+for line in sys.argv[1:]:
     try:
-        distribution(name)
+        if Requirement is None:
+            distribution(re.split(r"[<>=!~\[; ]", line, maxsplit=1)[0].strip())
+            continue
+        req = Requirement(line)
+        got = distribution(req.name).version
+        if req.specifier and not req.specifier.contains(got, prereleases=True):
+            miss.append(line + "（装的是 " + got + "）")
     except PackageNotFoundError:
-        miss.append(name)
+        miss.append(line)
     except Exception:
-        pass                      # 元数据坏了不算缺，别把用户卡在「装不完」的循环里
-print("\\n".join(miss))
+        pass                      # 元数据坏了/约束写歪了不算缺，别把用户卡在「装不完」
+print("\n".join(miss))
 """
 
 
@@ -1044,8 +1083,32 @@ def _ledger_field(m: dict) -> str:
     单独一个函数是为了让 `m["_m"].ledger_field` 只出现在一处：调用点原先各自
     写死字符串 `"platform_account"`，清单里的声明只被当成「有没有」的开关用——
     以后哪个插件声明成别的列，会顺利通过校验然后操作**另一列**的数据。
+
+    **声明了核心不认识的列名，当场 400。** 原先只校验「非空」，于是把
+    `accounts_ledger_field` 写成 `taobao_account`（老列名）或打错一个字，
+    下游 `tag_value_in_use` / `check_value_fits` / `rename_tag_value` 三处
+    全走 `_FIELD_SOURCES.get(field, ())` → 空元组 → 循环体一次都不执行 →
+    `counts={}`，连重名检查都一并失效。
+
+    用户看到的是绿色的「已改名为『乙』（迁移订单：暂存 0 / 账本 0）」——
+    **那个 0 读起来正是「这个账号本来就没有单」**。而订单页与暂存页里所有行仍写着「甲」，
+    「甲」还留在筛选下拉里；下一次抓取写进「乙」，同一个人的单从此劈成两半，
+    账号维度的合计两边都不对。全程没有任何报错。
+
+    白名单直接取 `tags._FIELD_SOURCES` 的键——**那是「核心认识哪些列」的唯一事实来源**，
+    在这儿另抄一份的话，将来加一列就又是两处要同步。
     """
-    return m["_m"].ledger_field
+    field = m["_m"].ledger_field
+    if field:
+        from .tags import _FIELD_SOURCES          # 局部导入：tags 反过来不依赖本模块
+
+        if field not in _FIELD_SOURCES:
+            raise HTTPException(status_code=400, detail=(
+                f"插件「{m['_m'].name}」的 plugin.toml 把 accounts_ledger_field 声明成了"
+                f"「{field}」，而核心不认识这一列（认识的是："
+                f"{'、'.join(sorted(_FIELD_SOURCES))}）。"
+                f"按账号改名/删单会一行数据都迁不动却报成功——已拦下。"))
+    return field
 
 
 def _config_row(session: Session, plugin_id: str) -> PluginConfig:
@@ -1300,8 +1363,9 @@ def run_command(plugin_id: str, command: str, account: Optional[str] = None,
             try:
                 pids.append(_launch(m, cmd.name, [*extra, "--soroban-url", _SELF_URL],
                                     token=token, config=conf, jti=jti,
-                                    on_done=_result_writer(plugin_id, cmd.label,
-                                                           who=who, batch=batch, run=jti)))
+                                    on_done=_result_writer(
+                                        plugin_id, cmd.label, who=who, batch=batch, run=jti,
+                                        advances_ok=_command_writes(cmd))))
             except PluginBusy:
                 # 上面那次筛选之后才抢进来的（并发点击）。跳过这个账号，别拖累兄弟——
                 # 而且**令牌必须当场作废**：它是为这个进程签的，进程没起来就没人会 revoke 它，
@@ -1358,6 +1422,25 @@ _BATCHES: dict[str, dict] = {}
 _BATCH_LOCK = threading.Lock()
 
 
+# **已经写过终态的批次**。`_batch_add` 完成时会把 `_BATCHES` 里的条目 pop 掉
+# （防内存泄漏），封口这个事实随之消失——而恰恰是封口之后，还可能有一枚迟到的
+# 中间态在路上。所以单独留个墓碑。有界，避免长跑进程里无限增长。
+_SEALED_MAX = 256
+_SEALED: "OrderedDict[str, None]" = OrderedDict()
+
+
+def _mark_sealed(batch: str) -> None:
+    """标记批次已封口。**必须在 `_BATCH_LOCK` 内调用。**"""
+    _SEALED[batch] = None
+    while len(_SEALED) > _SEALED_MAX:
+        _SEALED.popitem(last=False)
+
+
+def _is_sealed(batch: str) -> bool:
+    with _BATCH_LOCK:
+        return batch in _SEALED
+
+
 def _batch_add(batch: str, who: str, ok: bool, summary: str,
                warn: bool = False) -> tuple[bool, list, Optional[int]]:
     """登记一个子进程的结果。返回 (是否已全部完成, 当前全部结果, 最终数量或 None)。"""
@@ -1368,6 +1451,7 @@ def _batch_add(batch: str, who: str, ok: bool, summary: str,
         finished = total is not None and len(parts) >= total
         if finished:
             _BATCHES.pop(batch, None)
+            _mark_sealed(batch)
     return finished, parts, total
 
 
@@ -1418,13 +1502,32 @@ def _batch_text(label: str, parts: list, total: Optional[int]) -> tuple[str, str
     return "running", f"{label}（{n}）：{body}"
 
 
-def _write_outcome(plugin_id: str, outcome: str, text: str) -> None:
+def _write_outcome(plugin_id: str, outcome: str, text: str,
+                   batch: Optional[str] = None, advances_ok: bool = True) -> None:
     """把一次执行的结果写回 PluginConfig 供卡片显示。**开自己的 Session**：
     调用方可能是收割线程（没有请求作用域的 session）。写失败只记日志。"""
     try:
         with Session(get_engine()) as s:
             cfg = s.get(PluginConfig, plugin_id)
             if cfg is None:
+                return
+            # **迟到的中间态不许盖掉这一批已经落定的终态。**
+            #
+            # 批次收尾是这样的：两个账号的收割线程几乎同时进 `done()`，
+            # `_batch_add` 在 `_BATCH_LOCK` 里原子发号——A 拿到 (1/2) ⇒ `("running", …)`、
+            # B 拿到 (2/2) ⇒ `("failed", …)`。但两次写回都在**锁外**，各开一个 Session
+            # 各自 commit，对同一行做无版本号的整行覆盖。B 先落库、A 后落库时，
+            # A 那句 running 就把终态冲掉了。
+            #
+            # 后果：卡片**永久**停在蓝色【执行中】+「抓取（1/2）：甲 ✗ 无会话」，
+            # 前端 `scheduleRunPoll` 每 4 秒轮询、判据是 `outcome === 'running'`，
+            # 于是永远停不下来；而「乙」那句失败连同整条终态摘要一起没了——
+            # 用户既看不到该去重新扫码，也会以为进程还挂着（互斥键其实早释放了）。
+            #
+            # 判据按**批次**而不是「库里当前是不是 running」：后者会把
+            # 定时批次的中间态一起挡掉（定时那条路不写「执行中」，
+            # 库里是上一轮的终态），那是能显示的进度，不该丢。
+            if outcome == "running" and batch and _is_sealed(batch):
                 return
             cfg.last_outcome = outcome
             cfg.last_summary = text[:512]
@@ -1433,7 +1536,10 @@ def _write_outcome(plugin_id: str, outcome: str, text: str) -> None:
             # `last_finished_at` 的副本，而它存在的全部意义正是把两者分开：
             # 登录过期之后每次定时都照跑照失败，「上次跑完」一直很新，
             # 「上次抓到东西」才会停在两周前——后者才是那条会变红的线。
-            if outcome == "ok":
+            # `advances_ok=False` = 这条命令不写数据（见 `_command_writes`）。
+            # 它跑成功只说明「链路通」，不说明「抓到东西了」——而 `last_ok_at`
+            # 的含义正是后者，卡片上那个唯一会主动报警的陈旧标签全靠它。
+            if outcome == "ok" and advances_ok:
                 cfg.last_ok_at = cfg.last_finished_at
             s.add(cfg)
             s.commit()
@@ -1492,8 +1598,31 @@ def _apply_core_facts(core: Optional[dict], plugin_id: str, outcome: str, text: 
     return hard, f"{text}｜核心拒收 {n} 条（{first}）"
 
 
+def _command_writes(cmd) -> bool:
+    """这条命令会不会往账本里写东西。判据是**它自己声明的 `needs`**。
+
+    不需要 manifest 新增字段：一条不写数据的命令，本来就不该声明任何写权限
+    ——汇率插件的 `probe`（「只测试不写入」）就是这样，它的 `needs` 是空的，
+    而 `fetch` 声明了 `fx:write`。声明与能力在这里天然对齐。
+
+    用途只有一个：**只有写命令才配推进 `last_ok_at`**。
+    那一列的含义是「上次真的抓到东西是什么时候」，卡片上「成功 N 天前」的
+    陈旧告警（`staleOk`，阈值 = 定时间隔 × 3）全靠它——而那是这套系统里
+    **唯一**会主动说「不对劲」的东西。
+
+    不这么分的后果很具体：汇率连续几天抓不到（源改版、当天已有手填、回交被拒），
+    `last_ok_at` 停在 18 小时前、标签已经变黄；用户照着 probe 的 hint
+    「排查『取不到汇率』时先点这个」点了它——**零写入**的探测取到牌价 exit 0，
+    核心判 `ok` 并推进 `last_ok_at`，卡片当场变绿「成功 刚刚」。
+    而账本里的汇率仍然停在几天前，此后 18 小时不会再报警。
+    """
+    return any(":" in n and n.rsplit(":", 1)[1] in ("write", "promote")
+               for n in (getattr(cmd, "needs", None) or ()))
+
+
 def _result_writer(plugin_id: str, label: str, who: str = "",
-                   batch: Optional[str] = None, run: Optional[str] = None):
+                   batch: Optional[str] = None, run: Optional[str] = None,
+                   advances_ok: bool = True):
     """子进程收割完之后把结果写回 PluginConfig，供插件卡片显示。
 
     **开自己的 Session**：收割跑在 daemon 线程里，没有请求作用域的 session 可用。
@@ -1511,7 +1640,7 @@ def _result_writer(plugin_id: str, label: str, who: str = "",
             outcome = "failed" if not ok else ("warn" if warn else "ok")
             core = _collect_core_facts(None, run)
             _write_outcome(plugin_id, *_apply_core_facts(
-                core, plugin_id, outcome, f"{label}：{summary}"))
+                core, plugin_id, outcome, f"{label}：{summary}"), advances_ok=advances_ok)
             return
         # **顺序要紧，而且是这个顺序**：先取核心事实、再登记本次结果。
         # 反过来的话，最后一个账号的 `_batch_add` 会因为凑齐而**把整条批次 pop 掉**，
@@ -1520,7 +1649,9 @@ def _result_writer(plugin_id: str, label: str, who: str = "",
         core = _collect_core_facts(batch, run)
         _, parts, total = _batch_add(batch, who, ok, summary, warn)
         outcome, text = _batch_text(label, parts, total)
-        _write_outcome(plugin_id, *_apply_core_facts(core, plugin_id, outcome, text))
+        # 带上 batch：写回在锁外，同一批的另一个收割线程可能已经把终态落了库
+        _write_outcome(plugin_id, *_apply_core_facts(core, plugin_id, outcome, text),
+                       batch=batch, advances_ok=advances_ok)
     return done
 
 
@@ -1643,7 +1774,20 @@ def rename_account(
         raise HTTPException(status_code=409, detail=f"新名字已被占用（已有账号/数据/授权）：{new}")
     # 1) 一个事务：数据 + 标签 + 配置一起改（只改昵称，平台/启用保留）
     raw = rename_tag_value(session, field, old, new)
-    counts = {"staging": raw.get("OrderStaging", 0), "orders": raw.get("Order", 0)}
+    # **如实转述 `rename_tag_value` 改了哪几张表**，别压成两个写死的键。
+    #
+    # 它本来就是按模型名逐表回报的（`counts[model.__name__] = 影响行数`），
+    # 而这里原先只取 `OrderStaging` / `Order`——那是 `platform_account` 这一列的源表。
+    # 声明 `accounts_ledger_field = "recipient"` 的插件（集运/快递类的「账号」就是收货人，
+    # 而 `recipient` 确实在 `_FIELD_SOURCES` 里，只是源表是 `ShipmentOrder`）
+    # 改完名会被告知「迁移订单：暂存 0 / 账本 0」——**他刚把整本集运单的收货人改掉了**，
+    # 界面却告诉他一条都没动。
+    #
+    # 这层抽象声称支持「哪个插件声明成别的列都行」（`_ledger_field` 的 docstring
+    # 就是为此存在的），那回报也得跟着通用。旧的两个键保留：前端在读它们，
+    # 而且对最常见的 `platform_account` 情形语义没变。
+    counts = {"staging": raw.get("OrderStaging", 0), "orders": raw.get("Order", 0),
+              "moved": dict(raw)}
     accs = _account_list(cfg)
     if cfg and any(a["name"] == old for a in accs):
         for a in accs:
@@ -1811,6 +1955,28 @@ def _run_due(session: Session) -> None:
         targets = _fan_targets(m, cfg, cmd)
         cmd_scopes = granted & set(cmd.needs)
         batch = uuid.uuid4().hex
+        # **定时也要写「执行中」，与手动路径同源。**
+        #
+        # 原先全仓只有 `run_command` 在起进程前写这一行，`_run_due` 一行都没有——
+        # 卡片要等第一个子进程收尾、`_batch_text` 才可能给出 running，
+        # 而单目标的定时任务（fx、只有一个淘宝号）**永远不会**出现 running。
+        #
+        # 于是启动时的 `reclaim_stale_runs`（「把上一条命还留在库里的执行中收掉」）
+        # 对定时那条路完全不生效。具体经过：22:50 定时触发淘宝抓取（翻页几分钟）→
+        # 22:52 用户关掉 soroban → 收割线程是 daemon，`on_done` 写不进去 →
+        # 第二天开机，卡片上是绿色「成功」+ **上一轮**的摘要「新建 12、更新 3」，
+        # 而展开后「上次触发」停在 22:50——**那一轮其实一条单都没抓回来**。
+        # 同一情形手动触发会被诚实地改成「失败 · soroban 在它跑完之前退出了，
+        # 结果已丢失，请重跑」。定时这条路不该比手动那条更会说假话。
+        #
+        # 顺带修掉另一个小别扭：定时跑的那几分钟里卡片一直显示上一轮的绿字，
+        # 用户点「抓取」却吃 409「已经在跑了」——他看不出是谁在跑。
+        if targets:
+            cfg.last_outcome = "running"
+            cfg.last_summary = f"定时·{cmd.label} 执行中…"
+            cfg.last_finished_at = None
+            session.add(cfg)
+            session.commit()
         busy = 0
         for extra, who in targets:
             # **jti 必须先置空**：它在 try 里赋值，而 `scopes.issue` 自己也可能抛。
@@ -1825,8 +1991,9 @@ def _run_due(session: Session) -> None:
                         # 定时也要写回结果。不写的话卡片上的「上次结果」永远停在上一次**手动**
                         # 那一次，而「上次触发」时间一直在走——定时失败在界面上完全不可见。
                         # 汇率取不到恰恰是账本会悄悄用兜底值的那类故障，最需要痕迹。
-                        on_done=_result_writer(cfg.plugin_id, f"定时·{cmd.label}",
-                                               who=who, batch=batch, run=jti))
+                        on_done=_result_writer(
+                            cfg.plugin_id, f"定时·{cmd.label}", who=who, batch=batch, run=jti,
+                            advances_ok=_command_writes(cmd)))
                 launched += 1
             except PluginBusy:
                 # **这一支原先不存在，而它是常态**：`last_run_at` 全仓唯一的写入点就在下面，
@@ -1843,6 +2010,28 @@ def _run_due(session: Session) -> None:
             except HTTPException as e:
                 scopes.revoke(jti)                      # 同上：起不来就别把令牌漏在外面
                 log.warning("定时任务 %s/%s 启动失败：%s", cfg.plugin_id, who or "-", e.detail)
+        if not targets:
+            # **一个可跑的目标都没有 ⇒ 说实话，并且只说一次。**
+            # 三条真实路径都会走到这里：把唯一的账号在卡片上「停用」；把账号全删了
+            # 却没关定时；换库/重置库之后 `PluginConfig` 重建，配置里的账号没了、
+            # 磁盘上 `.state/甲.json` 还在（`_account_list` 只读配置账号，不含孤儿）。
+            #
+            # 原先这里没有分支，直接落到下面的 `seal_and_report(batch, 0, ...)`，
+            # 于是卡片被写成红色的「定时·抓取：一个任务都没能启动」——**原因说错了**。
+            # 手动点同一条命令时核心给的是准确的 400「没有可用账号：先添加账号并启用」，
+            # 只有无人值守这条路把它说成「启动失败」，用户会去查 venv、查依赖、查登录，
+            # 而那些都没问题。孤儿账号那条路更误导：卡片同时还显示着那个账号「已授权」的绿标。
+            #
+            # 而且因为 `if launched:` 判假、`last_run_at` 不推进，下一轮（60 秒后）
+            # `_due` 仍为真，原样再来一遍：红字的时间戳每分钟刷新，而「上次触发」
+            # 那一栏停在很久以前——两个字段互相矛盾。
+            # 所以这里**推进 last_run_at**：话已经说清楚了，按正常间隔再看即可。
+            _write_outcome(cfg.plugin_id, "failed",
+                           f"定时·{cmd.label}：没有可用账号——先在卡片上添加账号并启用")
+            log.info("定时任务 %s：没有可用账号，本轮不启动", cfg.plugin_id)
+            cfg.last_run_at = now
+            session.add(cfg)
+            continue
         if not launched and busy:
             # **全部目标都被互斥挡下 ⇒ 什么都不做，直接看下一个插件。**
             # 不能走下面的 seal_and_report：它在 launched==0 时会写
@@ -1934,6 +2123,30 @@ def _manifest_version(f: Path) -> str:
         return ""
 
 
+_STAMP_NAME = ".bundled_sha"       # 上次从 exe 释放出去的那棵树的内容摘要
+
+
+def _tree_digest(root: Path) -> str:
+    """一棵插件树的内容摘要：路径 + 字节，逐文件喂进同一个 sha256。
+
+    **为什么不是 `plugin.toml` 的 version**：那根字符串没有任何人维护
+    （两个插件仓 29 次提交，它一次没变过），而摘要不依赖任何人记得改什么——
+    源码动一个字节就不同。
+
+    路径也要喂进去：只喂内容的话，把 a.py 和 b.py 换个名字摘要不变。
+    排序保证同一棵树在不同机器上算出同一个值。
+    """
+    h = hashlib.sha256()
+    for f in sorted(root.rglob("*")):
+        if not f.is_file() or f.name == _STAMP_NAME:
+            continue
+        h.update(str(f.relative_to(root)).replace("\\", "/").encode())
+        h.update(b"\0")
+        h.update(f.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
 def seed_bundled_plugins() -> dict[str, str]:
     """把打进 exe 的插件释放到运行目录的 plugins/。返回 {目录名: "new"|"updated"}。
 
@@ -1943,10 +2156,31 @@ def seed_bundled_plugins() -> dict[str, str]:
 
     两条规则：
       · 目录**不存在** → 整份复制过去（首次运行、或用户手滑删了）。
-      · 目录已在，但 exe 里那份 `plugin.toml` 的 version 与磁盘上的**不同** →
-        逐文件覆盖。换 exe 就该换到新插件，否则「升级了却不生效」会变成下一个 bug。
-        比的是「不同」而不是「更新」：版本号格式由插件作者定，
-        解析不出大小的时候，回滚（装个旧 exe）同样应该生效。
+      · 目录已在，但 exe 里那棵树的**内容摘要**与上次释放时记下的**不同** → 逐文件覆盖。
+        换 exe 就该换到新插件，否则「升级了却不生效」会变成下一个 bug。
+
+    **判据是内容摘要，不是 `plugin.toml` 里的 version。** 原先比的是那个版本号，
+    而它是一根**没有任何人维护的字符串**：两个插件仓从 init 至今 29 次提交
+    （taobao 21 / fx 8），version 恒为 `"0.1.0"` ——一次都没动过。
+    打包这个能力是 2026-08-09 才落地的，之后 taobao 还改过三次代码，
+    其中 08-23 那次正是本报告 §152.2 认定的钱账修复（行合计换算成单价后不复核总额），
+    以及 409 重试原样重发、把用户手工填的快递单号顶掉那条。
+    也就是说：**下一次重新打包就已经命中**，不是将来时。
+
+    发布目录固定且兼作运行数据目录（`pyinstaller.bat` 里 `RELEASE` 明写 NEVER wipe），
+    升级 = 把新 exe 放回原目录，`plugins/` 原样保留 ⇒ `dst.exists()` 恒真 ⇒
+    走到 version 那一支 ⇒ 两边恒等 ⇒ `continue`，**一个文件都不覆盖**。
+    而 `discover()` 只扫磁盘那份，于是同一个 exe 里长期是「新核心 + 老插件」，
+    且 `done` 为空连那行 log 都不打、卡片上的版本号两边都是 0.1.0——**零痕迹**。
+
+    为什么原来那套在 CI 里一直是绿的：
+    `test_release_updates_on_version_change_but_keeps_venv_and_session` 用的是
+    1.0.0 → 1.1.0，它测的是「版本变了会不会覆盖」，
+    **没有任何东西测「发版时版本会不会变」**。规则存在、无人执行、无人校验、失败无声。
+
+    摘要落在 `dst/.bundled_sha`（一行 hex）。它不属于插件源码，
+    所以下面「只覆盖、绝不删除」那条对它无影响；文件丢了就当成需要重新释放，
+    这正好也修掉「用户手滑删了某个文件」这种半残状态。
 
     **只覆盖、绝不删除**：`.venv`、`.state`、用户自己加的文件都不在 exe 那份里，
     删除逻辑会把它们一起带走——那是登录会话和几百 MB 的依赖。
@@ -1962,10 +2196,11 @@ def seed_bundled_plugins() -> dict[str, str]:
             if not src.is_dir():
                 continue
             dst = dst_root / src.name
-            bundled_ver = _manifest_version(src / "plugin.toml")
+            digest = _tree_digest(src)
+            stamp = dst / _STAMP_NAME
             if not dst.exists():
                 action = "new"
-            elif bundled_ver and bundled_ver != _manifest_version(dst / "plugin.toml"):
+            elif not stamp.is_file() or stamp.read_text(encoding="utf-8").strip() != digest:
                 action = "updated"
             else:
                 continue
@@ -1975,6 +2210,7 @@ def seed_bundled_plugins() -> dict[str, str]:
                 target = dst / f.relative_to(src)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(f, target)
+            (dst / _STAMP_NAME).write_text(digest, encoding="utf-8")
             done[src.name] = action
         if done:
             log.info("已从 exe 内释放插件：%s",
