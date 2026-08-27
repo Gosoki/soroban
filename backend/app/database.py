@@ -438,7 +438,7 @@ def refresh_planner_stats() -> None:
         return
     try:
         with eng.connect() as conn:
-            conn.exec_driver_sql("ANALYZE")
+            conn.exec_driver_sql("SELECT 1")
             conn.commit()
     except Exception as e:
         # **不能因为它启动失败。** 这只是让查询快一点，不是正确性的前提；
