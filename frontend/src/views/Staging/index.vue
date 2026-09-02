@@ -165,7 +165,7 @@ const accountOptions = ref([])   // 账号昵称下拉候选（标签接口）
 // 拿它精确匹配会查回 0 行，空态显示「没有符合条件的记录」——
 // 用户刚改完名就看到「单子没了」。清掉筛选比留着一个查不到东西的值好，
 // 而且要说一句，否则他会以为筛选自己乱了。
-function onTagsChanged({ field, values }) {
+function onTagsChanged({ field, values, gone = [] }) {
   // 下拉候选：谁有对应的 ref 就更新谁
   if (field === 'platform_account') accountOptions.value = values
 
@@ -177,7 +177,12 @@ function onTagsChanged({ field, values }) {
   // 于是「来源(platform)」这个同样是标签列、同样有筛选框的字段一直漏在外面。
   // 按字段枚举正是它被漏掉的原因，所以改成看 `filters` 上有没有同名键——
   // 将来再接一个标签字段进来，这里不用改。
-  if (filters[field] && !values.includes(filters[field])) {
+  // **判据是 `gone`（被改名/删除的那些），不是「不在候选里」。**
+  // 后者会在两种「什么都没发生」的情形下误清：① 这个事件加载时也会发（点一下列头的 ⚙）；
+  // ② 筛选下拉的候选未必来自标签表（订单页「来源」用的是常量 ORDER_SOURCES）。
+  // 实测过的后果：筛「来源=淘宝」→ 点一下 ⚙ → 筛选被清掉 + 弹一句
+  // 「已改名或删除」，而它从来就不在标签表里。
+  if (filters[field] && gone.includes(filters[field])) {
     filters[field] = ''
     ElMessage.info(MSG_FILTER_CLEARED)
     applyFilters()
@@ -492,7 +497,7 @@ function closeAsk() {
 let ocrTally = null
 
 function newTally() {
-  return { created: 0, merged: 0, nochange: 0, inLedger: 0, unread: 0, failed: 0,
+  return { created: 0, merged: 0, nochange: 0, inLedger: 0, imported: 0, unread: 0, failed: 0,
            offPlatform: 0, offHint: '', hintsUsed: new Set() }
 }
 
@@ -525,13 +530,14 @@ async function pumpOcr() {
 //
 async function reportOcr(t) {
   if (!t) return
-  const total = t.created + t.merged + t.nochange + t.inLedger + t.unread + t.failed
+  const total = t.created + t.merged + t.nochange + t.inLedger + t.imported + t.unread + t.failed
   if (!total) return
   const lines = [
     `<b>放进暂存 ${t.created} 单</b>`,
     t.merged ? `补全 ${t.merged} 单：订单号已在暂存里，把这次多认出来的字段补了进去` : '',
     t.nochange ? `${t.nochange} 单没有新信息（订单号已有，这次没认出更多东西）` : '',
     t.inLedger ? `${t.inLedger} 单的订单号已经在账本里了，没有重复放进暂存` : '',
+    t.imported ? `${t.imported} 单已经导入账本了，没有改动它——截图不会改账本单，要改请到「商品订单」页` : '',
     t.unread ? `未识别出订单信息 ${t.unread} 张` : '',
     t.failed ? `失败 ${t.failed} 张` : '',
     // 后端**已经逐张**给出了准确的 platform_warning（这一张是不是闲鱼版式、准不准）。
@@ -604,7 +610,28 @@ async function processOcr(file, platform) {
     if (data.order_no) {
       // ① 暂存里已经有这个单号 → **只补空格**（情报更多才更新），不新建
       const dup = await findStagingByOrderNo(data.order_no)
-      if (dup) { await mergeIntoStaging(dup, data, seed); return }
+      if (dup) {
+        // **已导入的行不补。** `PATCH /api/staging/{id}` 对已导入行是**写穿账本**的
+        // （暂存与账本是同一条记录的两个视图，人在哪一页改都该一致——那对**人手动改**
+        // 是对的）。但这条路进来的不是「人往格子里敲了个数」，是「人拖了一张截图」，
+        // 而且往往是一次拖十几张。
+        //
+        // 实测：一张已导入的 ¥0.00 / 待发货 单，`mergeIntoStaging` 发的那个 PATCH
+        // 把账本单改成 ¥45.00 / 待收货 / 快递号 SF123——而页首承诺的是
+        // 「识别到的单先落在这里，不直接进账本……再逐单点『导入』」，
+        // 批次汇总也只会说「补全 N 单」，一个字都不提账本被动过。
+        //
+        // 后端分不出这两者（都是同一个人类令牌），所以闸只能加在这里。
+        // 核心对**插件**已经有对应的一道（`staging.py` 里那条 `_plugin_claims` 判据），
+        // 理由逐字相同：「那笔钱可能是人导入后手工核过、改过的」。
+        // 与「409 之后拒绝并告知，比自动合并安全」是同一条原则。
+        if (dup.imported_order_id != null) {
+          if (ocrTally) ocrTally.imported++
+          else ElMessage.info(`订单号 ${data.order_no} 已经导入账本了，截图不会改账本单——要改请到「商品订单」页`)
+          return
+        }
+        await mergeIntoStaging(dup, data, seed); return
+      }
       // ② 暂存里没有、但账本里有（手工建的单从没进过暂存）→ 不建
       //    建了也导不进去：账本对 order_no + COALESCE(platform,'') 有唯一索引，
       //    点导入只会撞一个「数据完整性冲突」，而那时用户已经不知道这行是哪来的了。

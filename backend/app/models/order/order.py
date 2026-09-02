@@ -102,8 +102,20 @@ class Order(LedgerBase, table=True):
             return ship.shipment_no
         return None
 
-    def sync_from_items(self, *, derive_price: bool = True) -> None:
+    def sync_from_items(self, *, derive_price: Optional[bool] = None) -> None:
         """订单价 = Σ(物品单价×数量) + 邮费，再重算日元。改动 items/邮费 后必须调用。
+
+        `derive_price` 是**三态**，说的是「调用方对『这次知不知道钱是多少』有没有依据」：
+          · `None`（默认）= 没依据 → 按 items 自行推断（`items_carry_no_price`）。
+            这是**安全默认**：它保住存量 NULL，挡的是「改个状态下拉就把 ¥300 变 ¥0」。
+          · `True`  = 确知这次知道钱是多少 → 派生。建单站点用它（没有存量可保护，
+            payload 就是全部真相），以及「用户主动清空了全部单价」那种明确决定。
+          · `False` = 确知这次**不**知道 → 一个字都不动货款，只重算日元。
+
+        推断只是**存量保护**，不是判断力：调用方手里有 payload、有替换前的存量状态，
+        它知道的严格多于事后看 items。所以显式结论必须能压过推断——
+        「存量有价 + 传来全空 = 用户主动清空 → 归零」就只能靠 `True` 表达，
+        事后看 items 与「本来就全空」一模一样（见 `test_clearing_all_prices_zeroes_them`）。
 
         `derive_price=False` = **调用方已经知道这次不该派生货款**，只重算日元。
         它挡的是一个 `items_carry_no_price` 看不见的漏洞：带 items 的 PATCH 会先过
@@ -134,6 +146,8 @@ class Order(LedgerBase, table=True):
         而这两列在订单页是**并排显示**的，用户同时看到「覆盖 3500」和「结算 6000」，
         看板也仍按旧值算。改汇率、`stamp_fx` 自愈存量脏行，同样一并被跳过。
         """
-        if derive_price and not items_carry_no_price(self.items):
+        if derive_price is None:                       # 没依据 → 退回按 items 推断
+            derive_price = not items_carry_no_price(self.items)
+        if derive_price:
             self.price_cny = price_from_items(self.items) + (self.postage_cny or 0)
         self.compute_money()

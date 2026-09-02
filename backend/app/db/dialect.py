@@ -112,7 +112,28 @@ def ci_contains(col, q: str, bind=None):
     两个后端返回不同结果——正是引入 BinStr 那一版想消灭的那类发散。
 
     引入 BinStr 是为了「唯一性」与「等值批改」两件事，不包括搜索；这里把搜索口径拉回原状。
-    非 BinStr 列（title / express_no / 物品名）本来就是 ci，不必也不该走这里。"""
+    非 BinStr 列（title / express_no / 物品名）本来就是 ci，不必也不该走这里。
+
+    ⚠️ **「拉回原状」只对 ASCII 成立。** 2026-09-02 在真 MySQL 9.7 上实测：
+
+    | 存的值 | 搜 | SQLite | MySQL |
+    |---|---|---|---|
+    | `Hello` | `hello` / `HELLO` | ✓ | ✓ |
+    | `ＳＦ１２３` | `ｓｆ`（全角小写） | ✗ | ✓ |
+    | `ＳＦ１２３` | `SF`（**半角**） | ✗ | ✓ |
+    | `Café Latte` | `cafe` | ✗ | ✓ |
+    | `Straße` | `strasse` | ✗ | ✗ |
+
+    `utf8mb4_0900_ai_ci` 连**全角↔半角**与**重音**都不敏感，而 SQLite 的 LIKE 只折叠 ASCII
+    大小写（换成 `NOCASE` 排序规则也一样，它同样只管 ASCII）。淘宝标题里全角与重音字母
+    都真实存在（`ＳＫ－Ⅱ`、`L'Oréal`），所以这不是构造出来的边角。
+
+    **没有去消除这一段发散**，理由：让 SQLite 做 Unicode 折叠需要 ICU 构建，
+    代价远大于收益；而发散的方向是「MySQL 多搜到几条」，不是搜错或漏搜关键数据——
+    去重与等值批改走的是二进制 `=`，完全不受影响。
+    现状由 `test_mysql_contract.py::test_fuzzy_search_agrees_on_ascii_and_document_where_it_does_not`
+    钉住：ASCII 那一半必须一致（那才是本函数的职责），非 ASCII 的现状被记录下来，
+    哪天有人「顺手统一」会当场变红。"""
     if not is_mysql(bind):
         return col.contains(q, autoescape=True)
     return col.collate(_ci_collation(bind)).contains(q, autoescape=True)

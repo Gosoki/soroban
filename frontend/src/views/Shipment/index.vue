@@ -73,8 +73,19 @@
                 <span :class="t.items && t.items.length ? '' : 'ph'">{{ itemSummary(t) }}</span>
               </template>
             </el-table-column>
-            <el-table-column label="结算（円）" width="110">
-              <template #default="{ row: t }">{{ fmtJPY(t.jpy_settled) }}</template>
+            <!-- **不计入的行要当场标出来。** 这张表逐行列出子订单的结算额，
+                 而它上面那一行的「到岸（円）」是按 `ledger_exclusions()` 剔过退款/关闭之后的合计。
+                 不标的话：表里 2000+5000+10000+6000=23000，上面写着 7000，
+                 **中间 16000 的差没有任何一处解释**——收到这份数字的人只能认为这单子是错的。
+                 §151.4 为「对账单」修过一模一样的形状（那句注释就在 `copyStatement` 里），
+                 只修了对账单、没修它上面这张表。
+                 算不算由**后端**用 `counted` 告诉我们，前端不抄那份状态清单——
+                 抄了就是两份，迟早对不上。措辞与对账单逐字一致。 -->
+            <el-table-column label="结算（円）" width="150">
+              <template #default="{ row: t }">
+                <span :class="{ 'not-counted': t.counted === false }">{{ fmtJPY(t.jpy_settled) }}</span>
+                <span v-if="t.counted === false" class="nc-mark">（{{ t.purchase_status || '不计入' }}，不计入合计）</span>
+              </template>
             </el-table-column>
             <el-table-column label="" width="72">
               <template #default="{ row: t }">
@@ -102,7 +113,8 @@
             </el-select>
             <!-- **只有真的一条都没有时才这么说。** 之前它在「被 200 截断」时也会出现，
                  把用户骗去以为不存在，而其实还有更旧的、以及另外两条可用路径。 -->
-            <span v-if="!unassignedOptions.length && unassignedTotal === 0" class="ph small">没有未挂靠的商品订单</span>
+            <span v-if="unassignedFailed" class="ph small">{{ MSG_LOAD_FAILED }}（未挂靠订单没能拉到，不是没有）</span>
+            <span v-else-if="!unassignedOptions.length && unassignedTotal === 0" class="ph small">没有未挂靠的商品订单</span>
             <span v-else-if="unassignedTotal > unassignedOptions.length" class="ph small">
               仅列出最近 {{ unassignedOptions.length }} 条（共 {{ unassignedTotal }}），输订单号可搜更早的
             </span>
@@ -227,7 +239,8 @@ const pageSize = PAGE_SIZE
 const filters = reactive({ range: null, shipmentStatus: '', q: '', recipient: '' })
 const recipientOptions = ref([])   // 收货人下拉候选（标签接口，与订单页同一套）
 const unassignedOptions = ref([])
-const unassignedTotal = ref(0)   // 后端说共有多少条未挂靠；用来判断本地这 200 条是不是被截断了
+const unassignedTotal = ref(0)      // 后端说共有多少条未挂靠；用来判断本地这 200 条是不是被截断了
+const unassignedFailed = ref(false)   // 拉**失败** ≠ 一条都没有；见 loadUnassigned 的 catch
 
 // 请求序号：筛选/翻页可以在上一次响应回来前再发一次，慢的那次后到会把新数据整个覆盖掉
 // （表现为「清了筛选却只剩一部分」「内容是第2页、页码高亮第3页」）。只认最后一次发出的请求。
@@ -415,7 +428,18 @@ async function loadUnassigned() {
     const res = await ordersApi.list({ unassigned: true, limit: 200 })
     unassignedOptions.value = res.items
     unassignedTotal.value = res.total          // 截断了没有，只有它说得清
-  } catch (_) { /* 拦截器已提示；避免 onMounted 里未捕获的 promise 拒绝 */ }
+    unassignedFailed.value = false
+  } catch (_) {
+    // **失败不能长得像「一条都没有」。** 这一句原先是空的 catch：
+    // 拉挂了之后 `unassignedOptions` 停在 `[]`、`unassignedTotal` 停在 `0`，
+    // 而下面那句空态的判据恰恰是 `!length && total === 0` —— 于是页面白纸黑字写着
+    // 「没有未挂靠的商品订单」，**把一次加载失败说成了账本事实**。
+    // 用户据此判断「所有单都挂好了」，而拦截器那条 toast 三秒就没了。
+    // 触发路径很平常：后端刚重启（ERR_NETWORK）、迁移期 DB 被锁（15s 超时）、
+    // 503 被 retry.js 重试两次后放弃。
+    // 与列表页那条 `loadFailed` 是同一条口径（见 NotionTable 的 `empty-text`）。
+    unassignedFailed.value = true
+  }
 }
 
 // 远程搜索未挂靠订单。照 OrderEditPanel 的 searchShipment 同一形状（seq 防乱序）。
@@ -660,14 +684,19 @@ async function detach(shipmentRow, tbRow) {
 // 表格里改了收货人标签（改名/新增/删除）之后，工具栏那份候选集要跟着变；
 // **还要管仍停在旧名的筛选值**——改名后拿旧名精确匹配会查回 0 行，
 // 空态说「没有符合条件的记录」，用户刚改完名就看到「单子没了」。与订单页同一套处理。
-function onTagsChanged({ field, values }) {
+function onTagsChanged({ field, values, gone = [] }) {
   if (field === 'recipient') recipientOptions.value = values
 
   // **通用地清掉停在旧值上的筛选**（口径与订单页/暂存页/物品页逐字相同）：
   // 标签改名后库里再没有旧值，拿它精确匹配会查回 0 行，
   // 空态显示「没有符合条件的记录」——用户刚改完名就看到「东西没了」。
   // 写成通用的而不是按字段 if：按字段枚举正是「来源(platform)」被漏掉四轮的原因。
-  if (filters[field] && !values.includes(filters[field])) {
+  // **判据是 `gone`（被改名/删除的那些），不是「不在候选里」。**
+  // 后者会在两种「什么都没发生」的情形下误清：① 这个事件加载时也会发（点一下列头的 ⚙）；
+  // ② 筛选下拉的候选未必来自标签表（订单页「来源」用的是常量 ORDER_SOURCES）。
+  // 实测过的后果：筛「来源=淘宝」→ 点一下 ⚙ → 筛选被清掉 + 弹一句
+  // 「已改名或删除」，而它从来就不在标签表里。
+  if (filters[field] && gone.includes(filters[field])) {
     filters[field] = ''
     ElMessage.info(MSG_FILTER_CLEARED)
     applyFilters()
@@ -739,4 +768,7 @@ onMounted(() => {
 .tb-opt { display: flex; flex-direction: column; line-height: 1.25; }
 .tb-meta { color: var(--txt-3); font-size: 11px; }
 .small { font-size: 12px; }
+/* 不计入合计的子订单：数字灰掉 + 一句原因，与对账单同口径 */
+.not-counted { color: var(--txt-3); text-decoration: line-through; }
+.nc-mark { color: var(--txt-3); font-size: 11px; margin-left: 4px; }
 </style>

@@ -78,6 +78,9 @@ def build_engine(url: str) -> Engine:
     )
 
 
+_WARNED_NON_SQLITE_DATABASE_URL = False
+
+
 def _control_url() -> str:
     """控制/配置存储始终是 SQLite；.env 的 DATABASE_URL 仅用来定位 sqlite 文件。
 
@@ -96,6 +99,29 @@ def _control_url() -> str:
     url = settings.DATABASE_URL
     if url.startswith("sqlite"):
         return url
+    # **落到这一支要出声。** 上面说的都对，但它一直是**静默**的：
+    # 谁把 `DATABASE_URL` 填成 MySQL 串，谁就以为自己连的是 MySQL，
+    # 而拿到的是运行时目录下那个**真实的 SQLite 账本**。两边都不报错。
+    #
+    # 2026-09-02 我自己撞了一次：一个基准脚本 `os.environ["DATABASE_URL"]=mysql://...`，
+    # 又显式 `run_migrations(那个 mysql url)`——于是**迁移跑在 MySQL 上、
+    # 引擎连的却是本地账本**，六行测试数据直接写进了用户的账本
+    # （已按精确单号删回，`integrity_check ok`）。半边脑子在 MySQL、半边在 SQLite，
+    # 而这个进程从头到尾一个字都没说。
+    #
+    # 只 warning、不 `_fatal`：`scripts/migrate_sqlite_to_mysql.py` 正当地要求
+    # 在 MySQL 串下把 app 导进来建 schema，硬失败会把那条既定迁移路径打断。
+    # 这与本仓对未知 query 参数的态度同源——「响亮拒掉比静默返回错数据强」，
+    # 这里够不到「拒掉」，那就至少做到「响亮」。
+    global _WARNED_NON_SQLITE_DATABASE_URL
+    if not _WARNED_NON_SQLITE_DATABASE_URL:
+        _WARNED_NON_SQLITE_DATABASE_URL = True
+        log.warning(
+            "`.env` 的 DATABASE_URL 填的是非 SQLite 串（%s…），它**不会**生效："
+            "控制库恒为 SQLite，是否走 MySQL 由应用内「数据库」页决定。"
+            "本次实际连的是 %s。若你正在按 scripts/migrate_sqlite_to_mysql.py 建 schema，"
+            "建完记得把 DATABASE_URL 改回去。",
+            url.split("://")[0] + "://", runtime_dir() / "soroban.db")
     return f"sqlite:///{runtime_dir() / 'soroban.db'}"
 
 

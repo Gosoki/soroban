@@ -15,6 +15,7 @@ from ..auth import get_current_user
 from .common import MAX_OFFSET
 from ..database import get_session
 from ..db.dialect import ci_contains
+from ..models.base import not_deleted
 from ..models import OrderItem, Order, ShipmentOrder
 from ..schemas import ItemListRead
 
@@ -46,7 +47,7 @@ def list_items(
     if legacy_status:
         raise HTTPException(status_code=400,
                             detail="查询参数 status 已改名为 fulfillment_status（显示口径）或 purchase_status（订单自身）")
-    conds = [Order.is_delete.is_(False)]   # 只列未软删订单的物品
+    conds = [not_deleted(Order)]   # 只列未软删订单的物品
     if date_from:
         conds.append(Order.date >= date_from)
     if date_to:
@@ -58,7 +59,7 @@ def list_items(
         ship_status = (
             select(ShipmentOrder.shipment_status)
             .where(ShipmentOrder.id == Order.shipment_order_id,
-                   ShipmentOrder.is_delete.is_(False))
+                   not_deleted(ShipmentOrder))
             .scalar_subquery()
         )
         conds.append(func.coalesce(ship_status, Order.purchase_status) == fulfillment_status)

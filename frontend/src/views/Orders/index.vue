@@ -198,7 +198,7 @@ const recipientOptions = ref([])
 // 拿它精确匹配会查回 0 行，空态显示「没有符合条件的记录」——
 // 用户刚改完名就看到「单子没了」。清掉筛选比留着一个查不到东西的值好，
 // 而且要说一句，否则他会以为筛选自己乱了。
-function onTagsChanged({ field, values }) {
+function onTagsChanged({ field, values, gone = [] }) {
   // 下拉候选：谁有对应的 ref 就更新谁
   if (field === 'recipient') recipientOptions.value = values
   if (field === 'platform_account') accountOptions.value = values
@@ -211,7 +211,12 @@ function onTagsChanged({ field, values }) {
   // 于是「来源(platform)」这个同样是标签列、同样有筛选框的字段一直漏在外面。
   // 按字段枚举正是它被漏掉的原因，所以改成看 `filters` 上有没有同名键——
   // 将来再接一个标签字段进来，这里不用改。
-  if (filters[field] && !values.includes(filters[field])) {
+  // **判据是 `gone`（被改名/删除的那些），不是「不在候选里」。**
+  // 后者会在两种「什么都没发生」的情形下误清：① 这个事件加载时也会发（点一下列头的 ⚙）；
+  // ② 筛选下拉的候选未必来自标签表（订单页「来源」用的是常量 ORDER_SOURCES）。
+  // 实测过的后果：筛「来源=淘宝」→ 点一下 ⚙ → 筛选被清掉 + 弹一句
+  // 「已改名或删除」，而它从来就不在标签表里。
+  if (filters[field] && gone.includes(filters[field])) {
     filters[field] = ''
     ElMessage.info(MSG_FILTER_CLEARED)
     applyFilters()

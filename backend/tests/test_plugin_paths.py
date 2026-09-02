@@ -1532,3 +1532,151 @@ def test_one_plugin_with_a_bad_account_declaration_does_not_open_the_gate_for_th
         "多了一个与「甲」毫无关系的坏声明插件之后，这道闸就放行了——"
         "一个插件写错，把所有插件的账号保护一起关掉了")
 
+
+def _account_fixture(session, monkeypatch, tmp_path, n=3, account="甲"):
+    """一个插件账号 + n 条已导入的暂存行。返回插件目录已指好的 client 前提。
+
+    **账号名要传一个本用例独有的**：这套测试共用一个会话库，别的用例也会给「甲」
+    建单——按账号删的接口会把它们一起删掉，于是断言里的绝对条数在全量跑时对不上
+    （实测 `deleted` 是 4 不是 3，而单跑文件时是 3）。
+    """
+    import datetime as dt
+    import json
+    import shutil
+    from pathlib import Path
+
+    from app.config import settings
+    from app.models import OrderStaging, PluginConfig, StagingItem
+    from app.routers import plugins as pmod
+
+    real = (Path(__file__).resolve().parents[2] / "plugins"
+            / "soroban-plugin-taobao" / "plugin.toml")
+    if not real.is_file():
+        pytest.skip("仓库里没有淘宝插件清单，这条测试的前提不成立")
+    d = tmp_path / "plugins" / "soroban-plugin-taobao"
+    d.mkdir(parents=True)
+    shutil.copy(real, d / "plugin.toml")
+    monkeypatch.setattr(settings, "PLUGIN_DIR", str(tmp_path / "plugins"))
+    pmod._needs_cache.clear()
+
+    session.merge(PluginConfig(plugin_id="taobao", params_json=json.dumps(
+        {"accounts": [{"name": account, "platform": "淘宝", "enabled": True}]},
+        ensure_ascii=False)))
+    out = []
+    for i in range(n):
+        st = OrderStaging(order_date=dt.date(2027, 7, 1), order_no=f"SEQ-{account}-{i}",
+                          platform_account=account, platform="淘宝",
+                          price_cny=100, fx_rate=20, purchase_status="待收货")
+        st.items = [StagingItem(name=f"物品{i}", quantity=1, unit_price_cny=100)]
+        session.add(st)
+        out.append(st)
+    session.commit()
+    return out
+
+
+def test_the_delete_dialogs_teach_the_order_that_actually_works(client, session,
+                                                                monkeypatch, tmp_path):
+    """两个「删账号」按钮的提示，教的顺序必须是**真的管用**的那个。
+
+    实测（2026-09-02，三条已导入的暂存行）：
+
+    | 顺序 | 结果 |
+    |---|---|
+    | 先删暂存 → 再删账本（**原先文案教的**） | 暂存 `deleted:0 / skipped:3` → 账本删 3 → **暂存原封不动剩 3 条「待处理」** |
+    | 先删账本 → 再删暂存 | 账本删 3 → 暂存 `deleted:3 / skipped:0` → **干净** |
+
+    原先两句话首尾相接成一个环：
+      · 「删账本单」说「不想让它们被重新导入的话，**先删暂存单**」；
+      · 「删暂存单」跳过已导入的，并说「**请先到「商品订单」页删掉对应订单**」。
+    照第一句做就掉进第二句，而第二句又把人送回去。结果与完全不照做一模一样：
+    三条单原样躺在暂存页，8 个共用 admin 的人里任何一个点一下「导入账本」就把它们建回来，
+    看板金额跟着涨回去——**正是那句话承诺能避免的结局**。
+
+    这条钉两半：**行为**（哪个顺序有效）和**文案**（提示指向那个顺序）。
+    只钉行为的话，那两句假话可以原样留着；只钉文案的话，哪天顺序的语义变了没人发现。
+    """
+    import re
+    from pathlib import Path
+
+    from sqlmodel import select
+
+    from app.models import OrderStaging
+
+    ACC = "顺序验证专用账号"          # 本用例独有，免得与别的用例共用「甲」互相删
+    rows = _account_fixture(session, monkeypatch, tmp_path, account=ACC)
+    for st in rows:
+        assert client.post(f"/api/staging/{st.id}/import").status_code == 200
+
+    # —— 行为：先删账本、再删暂存，才是真的清干净 ——
+    r1 = client.delete("/api/plugins/taobao/account/orders", params={"account": ACC})
+    assert r1.status_code == 200 and r1.json()["deleted"] == 3, r1.text
+    r2 = client.delete("/api/plugins/taobao/account/staging", params={"account": ACC})
+    assert r2.status_code == 200, r2.text
+    assert r2.json() == {"ok": True, "deleted": 3, "skipped": 0}, (
+        f"先删账本之后，暂存应当能整批删掉，实际 {r2.json()}")
+    session.expire_all()
+    assert not session.exec(select(OrderStaging).where(
+        OrderStaging.platform_account == ACC)).all(), "暂存没清干净"
+
+    # —— 文案：两处提示都要指向这个顺序，且不许再教反的 ——
+    src = (Path(__file__).resolve().parents[2] / "frontend" / "src"
+           / "views" / "Plugins" / "index.vue").read_text(encoding="utf-8")
+    code = re.sub(r"//[^\n]*", "", src)          # 先剥注释：说明里必然写到这些词
+    assert "先删暂存单" not in code, (
+        "「删账本单」还在教『先删暂存单』——照做的话暂存那步会把已导入的整批跳过，"
+        "等于没删，而那些行随后能被任何人一键重建")
+    assert "再点「删暂存单」" in code, "「删账本单」没告诉用户接下来该做什么"
+    assert "先点上面的「删账本单」" in code, "「删暂存单」跳过时没指向真正管用的那一步"
+
+
+
+def test_a_timed_out_plugin_reports_what_it_was_doing_when_it_hung():
+    """超时被终止时，卡片上必须带上它挂住之前说的最后一句话。
+
+    原先这里只报「超时（30 分钟）已终止」——用户等了半小时，拿到的是一句
+    没有信息量的结论：不知道它卡在哪、也不知道下一步该查什么。
+    而 `_drain` 攒下的 stderr 尾巴里恰恰就是唯一的线索
+    （「正在等待浏览器登录…」「已加载第 3 页」之类），此前整个被丢掉。
+
+    这条与「插件崩了要报真异常」（`test_runtime_paths.py`）是同一个毛病的两面：
+    **把一个没有信息量的结论摆在唯一能解释问题的那句话前面**。
+    """
+    import subprocess
+    import time
+
+    from app.routers import plugins as mod
+    # `_REAP_TIMEOUT` 与 `_reap` 都住在 `plugins_proc` 里；`plugins` 只是 `from … import`
+    # 再导出了一份**独立的绑定**。改 `plugins._REAP_TIMEOUT` 对 `_reap` 读到的那个毫无影响
+    # ——2026-09-02 第一版就是这么写的，于是它老老实实等满了 sleep 60。
+    from app.routers import plugins_proc as procmod
+
+    child = subprocess.Popen(
+        ["sh", "-c", 'echo "正在等待浏览器登录…" >&2; sleep 60'],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True, text=True)
+    got = []
+    old_timeout = procmod._REAP_TIMEOUT
+    try:
+        procmod._REAP_TIMEOUT = 1                   # 别真等 30 分钟
+        with mod._PROCS_LOCK:
+            mod._ALIVE_PROCS[child.pid] = (child, "test/timeout-says-why")
+            mod._remember_group(child.pid, "test/timeout-says-why")
+        t0 = time.monotonic()
+        mod._reap(child, "test/timeout-says-why", "test/timeout-says-why",
+                  on_done=lambda ok, summary, warn=False: got.append((ok, summary)))
+        spent = time.monotonic() - t0
+        assert spent < 15, f"超时收尾自己挂了 {spent:.1f}s——join 没有上限？"
+        assert got and got[0][0] is False, f"超时被终止却报成功：{got}"
+        summary = got[0][1]
+        assert "超时" in summary, f"没说是超时：{summary!r}"
+        assert "正在等待浏览器登录" in summary, (
+            f"把它挂住前唯一的线索丢了，用户只看到一句没有信息量的「超时」：{summary!r}")
+    finally:
+        procmod._REAP_TIMEOUT = old_timeout
+        try:
+            child.kill()
+        except OSError:
+            pass
+        with mod._PROCS_LOCK:
+            mod._ALIVE_PROCS.clear()
+            mod._OWN_GROUP.clear()

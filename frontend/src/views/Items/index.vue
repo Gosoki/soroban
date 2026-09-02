@@ -141,13 +141,18 @@ const acctColor = reactive({})
 const accountOptions = ref([])
 // 表格里改了账号标签之后，本页那份候选集要跟着变——编辑面板的 `:accounts` 吃的就是它。
 // 不同步的话，新加的账号在编辑面板里永远选不到，直到切页回来才自愈。
-function onTagsChanged({ field, values }) {
+function onTagsChanged({ field, values, gone = [] }) {
   if (field === 'platform_account') accountOptions.value = values
 
   // **通用地清掉停在旧值上的筛选**（口径与订单页/暂存页逐字相同）：
   // 标签改名后库里再没有旧值，拿它精确匹配会查回 0 行，
   // 空态显示「没有符合条件的记录」——用户刚改完名就看到「东西没了」。
-  if (filters[field] && !values.includes(filters[field])) {
+  // **判据是 `gone`（被改名/删除的那些），不是「不在候选里」。**
+  // 后者会在两种「什么都没发生」的情形下误清：① 这个事件加载时也会发（点一下列头的 ⚙）；
+  // ② 筛选下拉的候选未必来自标签表（订单页「来源」用的是常量 ORDER_SOURCES）。
+  // 实测过的后果：筛「来源=淘宝」→ 点一下 ⚙ → 筛选被清掉 + 弹一句
+  // 「已改名或删除」，而它从来就不在标签表里。
+  if (filters[field] && gone.includes(filters[field])) {
     filters[field] = ''
     ElMessage.info(MSG_FILTER_CLEARED)
     applyFilters()

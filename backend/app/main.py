@@ -216,6 +216,15 @@ async def _plugin_gate(request: Request, call_next):
     granted = set(claims.get("scp") or [])
     # 通用写入通道一条路由服务多种数据，权限由 kind 决定 → 这里只验「有权限总量」，
     # 真正的判定在 routers/ingest.py 里按 kind 做。
+    #
+    # ⚠️ **`matched` 这一项永远不影响结果**，别把它当成一道独立的闸。
+    # `route_scope` 只在匹配到路由那一支才可能返回非 None 的 scope，
+    # 所以 `need is not None` 已经蕴含了 `matched` —— 真正决定「没声明 x-scope
+    # 就默认拒绝」的是 `need is not None`，把它删掉才会变成默认放行
+    # （`test_a_route_without_an_x_scope_is_closed_to_plugin_tokens` 钉的就是它）。
+    # 留着 `matched` 是为了让这行读起来是完整的判断，代价是：**它对变异测试是隐形的**
+    # ——2026-09-02 把 `route_scope` 末尾的 `False` 翻成 `True` 跑全套，一条都不红，
+    # 差点被记成「默认拒绝零覆盖」。谁将来想靠 `matched` 表达新语义，先补一条守卫。
     ok = matched and need is not None and (need in granted or (need == "*by-kind*" and granted))
     if not ok:
         log.warning("插件 %s(run=%s) 越权：%s %s 需要 %s，持有 %s",
@@ -246,15 +255,62 @@ for r in (
     app.include_router(r)
 
 
+# 认得出来的唯一约束 → 一句人话。键是**必然出现在两种引擎报错文本里**的片段：
+#   SQLite  普通列： "UNIQUE constraint failed: orderstaging.order_no"
+#   SQLite  表达式索引： "UNIQUE constraint failed: index \'ix_orders_order_no_platform_active\'"
+#   MySQL：  "Duplicate entry \'X\' for key \'orders.ix_orders_order_no_platform_active\'"
+# 所以索引名和 `表.列` 两种形态都登记，命中任一即可。
+#
+# 这**不是**在臆断原因（那正是原注释拒绝做的事）：索引名是我们自己在模型里写死的，
+# 是查得到、也能被测试钉住的事实。`test_known_unique_constraints_still_exist`
+# 把这张表逐条拿去和真实 schema 对，改名/删索引会当场变红，
+# 而不是悄悄退回那句谁也看不懂的通用文案。
+_UNIQUE_HINTS: tuple[tuple[str, str], ...] = (
+    ("ix_orders_order_no_platform_active", "这个订单号已经有了（订单号 + 来源平台不能重复）"),
+    ("orders.order_no", "这个订单号已经有了（订单号 + 来源平台不能重复）"),
+    ("ix_staging_order_no", "这个订单号在暂存表里已经有一行了"),
+    ("orderstaging.order_no", "这个订单号在暂存表里已经有一行了"),
+    ("ix_shipmentorder_shipment_no_active", "这个集运单号已经有了"),
+    ("shipmentorder.shipment_no", "这个集运单号已经有了"),
+    ("ix_user_username", "这个用户名已经有人用了"),
+    ("user.username", "这个用户名已经有人用了"),
+    ("ix_tagoption_field_value", "这个标签值已经存在了"),
+    ("tagoption.field", "这个标签值已经存在了"),
+    ("ix_pluginrecord_owner", "这条插件记录已经存在了（同一插件下 kind + key 不能重复）"),
+    ("pluginrecord.plugin_id", "这条插件记录已经存在了（同一插件下 kind + key 不能重复）"),
+)
+
+
+def _integrity_detail(orig) -> str:
+    """把数据库的完整性报错翻成一句用户能照着办的话；认不出来就还用通用文案。"""
+    text = str(orig or "")
+    for needle, message in _UNIQUE_HINTS:
+        if needle in text:
+            return message
+    return "数据完整性冲突（唯一约束/外键/必填），请检查后重试"
+
+
 @app.exception_handler(IntegrityError)
 async def _integrity_handler(request: Request, exc: IntegrityError):
-    # 数据库完整性冲突（唯一约束/外键/必填等）→ 干净的 409，而非 500。
-    # 真实约束记进日志（前端只给通用提示，不臆断具体原因，避免误导排查方向）。
+    """数据库完整性冲突（唯一约束/外键/必填等）→ 干净的 409，而非 500。
+
+    **必须说清是哪一条约束**，因为 409 在这个前端上是**两件事共用的状态码**：
+    另一件是乐观锁冲突，页面对它的处理是弹一句话再**整表重载**
+    （`views/Orders/index.vue` 的格子保存分支：`ElMessage.warning(detail); load()`）。
+    于是「把订单号改成一个已存在的号」原先的表现是：
+    弹「数据完整性冲突（唯一约束/外键/必填），请检查后重试」，然后整表刷新、
+    刚敲的值消失——用户既不知道错在哪一格，也不知道这一步本就不允许。
+
+    这正是 `schemas.py::_reject_null_on_required` 那段注释描述的同一个毛病
+    （「用户既没看懂错在哪，也不知道自己那一步本就不允许」）。那次修的是
+    「传 null 到必填列」那一例，把它提前成 422；唯一键这一例一直留着。
+    建单那条路早就有明确提示（`addRow` 里那句「订单号 X 已存在」）——
+    修在服务端这一处，两条路和所有页面一次对齐。
+
+    真实约束仍然照旧记进日志，排查时看得到原文。
+    """
     log.warning("IntegrityError on %s %s: %s", request.method, request.url.path, exc.orig)
-    return JSONResponse(
-        status_code=409,
-        content={"detail": "数据完整性冲突（唯一约束/外键/必填），请检查后重试"},
-    )
+    return JSONResponse(status_code=409, content={"detail": _integrity_detail(exc.orig)})
 
 
 @app.exception_handler(ValueError)

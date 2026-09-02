@@ -279,16 +279,30 @@ def test_renaming_an_item_on_a_priceless_order_does_not_zero_the_money(client, s
     session.refresh(o)
     assert o.jpy_settled == 6400 and all(i.unit_price_cny is None for i in o.items), "夹具没造对"
 
-    r = client.patch(f"/api/orders/{o.id}", json={"version": o.version, "items": [
-        {"name": "甲改名", "quantity": 1, "unit_price_cny": None, "auto": False},
-        {"name": "乙", "quantity": 2, "unit_price_cny": None, "auto": False},
-    ]})
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["jpy_settled"] == 6400, (
-        f"改了个物品名，结算从 6400 变成 {body['jpy_settled']}——"
-        f"`build_items` 把 NULL 压成 0.00 之后，那道「派生不出就别动」的闸看不见它了")
-    assert str(body["price_cny"]) .startswith("320"), f"货款也变了：{body['price_cny']}"
+    # **改三次，不是一次。** 这条守卫原先只 PATCH 一次就断言，因此在
+    # 「第一次挡住、第二次丢钱」的形态下**一直是绿的**（2026-09-02 实测）：
+    # `derive_price` 闸在替换 items **之前**取 `stored_had_no_price`，所以第一次成立；
+    # 但同一次请求里 `build_items` 已经把 NULL 写成了 0.00 落库，
+    # 第二次 PATCH 时存量「有价」、payload 也带着 0.00 ⇒ 闸自己瞎了 ⇒ ¥320 → ¥0.00。
+    # 闸的 docstring 承诺的是「**任何一次** PATCH 都不会」，一次通过证明不了它。
+    version = o.version
+    for n in range(1, 4):
+        r = client.patch(f"/api/orders/{o.id}", json={"version": version, "items": [
+            {"name": f"甲改名{n}", "quantity": 1, "unit_price_cny": None, "auto": False},
+            {"name": "乙", "quantity": 2, "unit_price_cny": None, "auto": False},
+        ]})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        version = body["version"]
+        assert body["jpy_settled"] == 6400, (
+            f"第 {n} 次改物品名，结算从 6400 变成 {body['jpy_settled']}——"
+            f"`build_items` 把 NULL 压成 0.00 之后，那道「派生不出就别动」的闸看不见它了")
+        assert str(body["price_cny"]).startswith("320"), f"第 {n} 次货款也变了：{body['price_cny']}"
+        # 钉住**机制**而不只是结果：单价必须仍是 NULL。写成 0.00 的话这一轮照样绿，
+        # 而下一轮（或用户下一次保存）就丢钱——那正是上面说的假绿形态。
+        assert [i["unit_price_cny"] for i in body["items"]] == [None, None], (
+            f"第 {n} 次之后单价被写成了 {[i['unit_price_cny'] for i in body['items']]}——"
+            f"「不知道多少钱」被编码成了「就是 0 元」，下一次 PATCH 会照它把钱抹掉")
 
 
 def test_deliberately_clearing_every_price_still_zeroes_the_order(client):

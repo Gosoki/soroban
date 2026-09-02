@@ -53,25 +53,35 @@ def test_seed_split_never_inflates_or_zeroes_the_order(client, price, qty):
 
 
 def test_partially_priced_items_zero_the_rest(client):
-    """只要有**任一**物品带价，就按原样采用；无价的记 0 并标 auto（灰显=待补价）。"""
+    """只要有**任一**物品带价，就按原样采用；无价的**保持 NULL** 并标 auto（灰显=待补价）。
+
+    单价 NULL 是「不知道多少钱」的**唯一**编码，不能写成 0.00 —— 0.00 的意思是
+    「知道，就是 0 元」（包邮/赠品单是真有的，上面的种子折算就在造）。
+    `items_carry_no_price` 全靠 NULL 区分这两者，一旦被 0.00 顶掉就再也分不出来
+    （见 `build_items` 返回处的说明）。金额不受影响：`price_from_items` 走 `x or 0`。"""
     o = mk_order(client, price_cny="99.00",
                  items=[{"name": "a", "quantity": 1, "unit_price_cny": "5.00"}, {"name": "b", "quantity": 1}])
     assert Decimal(o["items"][0]["unit_price_cny"]) == Decimal("5.00")
-    assert Decimal(o["items"][1]["unit_price_cny"]) == Decimal("0.00")
+    assert o["items"][1]["unit_price_cny"] is None       # 「不知道」，不是「0 元」
     assert o["items"][0]["auto"] is False and o["items"][1]["auto"] is True
     assert Decimal(o["price_cny"]) == Decimal("5.00")   # 种子价被物品明细覆盖
 
 
 def test_clearing_all_prices_zeroes_them(client):
-    """清空全部单价 = 「单价未知」，一律记 0 + auto（灰显待补价）——与「只清空部分单价」同口径。
-    （旧行为是把旧总价整个折到第一条上，同一个动作两种结果，已修。）"""
+    """清空全部单价 = 「单价未知」，一律 NULL + auto（灰显待补价）——与「只清空部分单价」同口径。
+    （旧行为是把旧总价整个折到第一条上，同一个动作两种结果，已修。）
+
+    **货款仍然归零**：这是用户的明确决定，由 `update_order` 显式传
+    `derive_price=True` 表达，压过 `sync_from_items` 事后看 items 的推断——
+    事后看，「主动清空」和「本来就全空」长得一模一样，而后者一个字都不该动
+    （那是历史订单，钱只在订单行上）。区别只有替换 items **之前**才看得见。"""
     o = mk_order(client, items=[{"name": "a", "quantity": 1, "unit_price_cny": "10.00"},
                                 {"name": "b", "quantity": 1, "unit_price_cny": "20.00"}])
     assert Decimal(o["price_cny"]) == Decimal("30.00")
     body = client.patch(f"/api/orders/{o['id']}", json={
         "version": o["version"],
         "items": [{"name": "a", "quantity": 1}, {"name": "b", "quantity": 1}]}).json()
-    assert [Decimal(i["unit_price_cny"]) for i in body["items"]] == [Decimal("0.00"), Decimal("0.00")]
+    assert [i["unit_price_cny"] for i in body["items"]] == [None, None]
     assert all(i["auto"] for i in body["items"])
     assert Decimal(body["price_cny"]) == Decimal("0.00")
 
@@ -84,11 +94,11 @@ def test_clearing_one_price_zeroes_only_that_one(client):
         "version": o["version"],
         "items": [{"name": "a", "quantity": 1, "unit_price_cny": "10.00"},
                   {"name": "b", "quantity": 1}]}).json()
-    assert [Decimal(i["unit_price_cny"]) for i in body["items"]] == [Decimal("10.00"), Decimal("0.00")]
+    assert [i["unit_price_cny"] for i in body["items"]] == ["10.00", None]
 
 
 def test_postage_change_with_unpriced_items_does_not_rebase_goods(client):
-    """同一次 PATCH 既改邮费又送「无单价」物品：无单价就是无单价，记 0；
+    """同一次 PATCH 既改邮费又送「无单价」物品：无单价就是无单价，落 NULL；
     不再拿「旧总价 − 新邮费」倒推货款（那会让总价看着没变、货款却悄悄改了）。"""
     o = mk_order(client, postage_cny="10.00",
                  items=[{"name": "a", "quantity": 1, "unit_price_cny": "100.00"}])
@@ -96,7 +106,7 @@ def test_postage_change_with_unpriced_items_does_not_rebase_goods(client):
     body = client.patch(f"/api/orders/{o['id']}", json={
         "version": o["version"], "postage_cny": "20.00",
         "items": [{"name": "a", "quantity": 1}]}).json()
-    assert Decimal(body["items"][0]["unit_price_cny"]) == Decimal("0.00")
+    assert body["items"][0]["unit_price_cny"] is None
     assert Decimal(body["price_cny"]) == Decimal("20.00")     # 只剩邮费
 
 

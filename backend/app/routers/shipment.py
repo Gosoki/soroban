@@ -13,7 +13,7 @@ from sqlmodel import Session, select
 from ..auth import get_current_user
 from ..database import get_session
 from ..db.dialect import ci_contains
-from ..models.base import is_unconverted
+from ..models.base import is_unconverted, not_deleted
 from ..models import ShipmentOrder, Order, utcnow
 from ..schemas import (
     ShipmentCreate, ShipmentOcrAttachResult, ShipmentRead, ShipmentUpdate, OrderItemRead, OrderBrief,
@@ -29,9 +29,28 @@ router = APIRouter(
 )
 
 
-def _excluded_statuses() -> frozenset:
-    """不计入货款合计的采购段状态。**从模型上取**，全仓只此一处解释权。"""
-    return frozenset(v for _col, vals in Order.ledger_exclusions() for v in vals)
+def _counts_toward_total(order: Order) -> bool:
+    """这一单算不算进货款合计。**逐条按列判**，与看板 `_valid_conds` 同构。
+
+    原先这里是 `_excluded_statuses()`：把 `ledger_exclusions()` **拍平**成一个值集合，
+    再拿它去比 `order.purchase_status`——列名（那个参数当时就叫 `_col`，
+    名字本身已经承认它没被用上）被丢掉了。
+
+    今天两张表各自只声明**一条**轴，所以拍平恰好等价、不出错。
+    但 `LedgerBase.ledger_exclusions` 的 docstring 明写着这是个列表**正是为了**
+    「将来加卖出/退货这类并行的状态轴时，往列表里追一项」——
+    追那一项的当天，这里就会拿新轴的值（比如「已退款」）去比 `purchase_status`，
+    **永远不命中**，于是集运页把一张退了款的单算进货款合计，
+    而看板（按列判）不算。同一笔钱两个页面两个说法，且两边都不报错。
+
+    看板那边为「别用鸭子类型取列」写过一整段（见 `dashboard._valid_conds`），
+    这里是同一件事的另一半：**别把列丢掉**。
+
+    `col.key` 取的是 ORM 属性名，与 `getattr` 对得上；写错列名会当场 AttributeError，
+    而不是静默恒不命中。
+    """
+    return all(getattr(order, col.key) not in vals
+               for col, vals in Order.ledger_exclusions())
 
 
 def _brief(order: Order) -> OrderBrief:
@@ -42,7 +61,7 @@ def _brief(order: Order) -> OrderBrief:
         # 让**后端**说清这一单算不算进合计。不给的话，前端要么自己抄一份状态清单
         # （两份迟早对不上），要么就像对账单那样把所有行都列出来、下面却写一个
         # 剔除过的合计——明细加起来 21000、合计写 10000，收到的人只能认为这单子是错的。
-        counted=order.purchase_status not in _excluded_statuses(),
+        counted=_counts_toward_total(order),
     )
 
 
@@ -62,8 +81,7 @@ def _landed(s: ShipmentOrder, children: list[Order]) -> dict:
     不数出来的话，缺汇率的单会让合计**静默变小**而笔数照旧——看板那边为同一件事
     专门有个 `_uncounted`，这里不能重蹈。本单自己缺汇率也算一条。
     """
-    excluded = _excluded_statuses()
-    counted = [c for c in children if c.purchase_status not in excluded]
+    counted = [c for c in children if _counts_toward_total(c)]
     orders_jpy = sum(c.jpy_settled or 0 for c in counted)
     # 判据走 `models.base.is_unconverted`——与看板、列表页脚同一个函数。
     # 这里原先自己写了一份，漏了 `!= 0`：一张全是赠品（¥0）的子订单会被报成「未折算」，
@@ -127,7 +145,7 @@ def _read_many(session: Session, shipments: list[ShipmentOrder],
     if ids:
         children = session.exec(
             select(Order)
-            .where(Order.shipment_order_id.in_(ids), Order.is_delete.is_(False))
+            .where(Order.shipment_order_id.in_(ids), not_deleted(Order))
             .options(selectinload(Order.items))
             .order_by(Order.date.desc(), Order.id.desc())
         ).all()
@@ -170,7 +188,7 @@ def list_orders(
     if legacy_status:
         raise HTTPException(status_code=400,
                             detail="查询参数 status 已改名为 shipment_status")
-    conds = [ShipmentOrder.is_delete.is_(False)]
+    conds = [not_deleted(ShipmentOrder)]
     if date_from:
         conds.append(ShipmentOrder.date >= date_from)
     if date_to:
@@ -282,7 +300,7 @@ async def ocr_attach_express(
                 unmatched.append(no)
                 continue
             matches = session.exec(
-                select(Order).where(Order.express_no == no, Order.is_delete.is_(False))
+                select(Order).where(Order.express_no == no, not_deleted(Order))
             ).all()
             if not matches:
                 unmatched.append(no)
@@ -310,10 +328,10 @@ async def ocr_attach_express(
                     sa_update(Order)
                     .where(
                         Order.id == od.id,
-                        Order.is_delete.is_(False),
+                        not_deleted(Order),
                         Order.shipment_order_id.is_(None),
                         select(ShipmentOrder.id)
-                        .where(ShipmentOrder.id == shipment_id, ShipmentOrder.is_delete.is_(False))
+                        .where(ShipmentOrder.id == shipment_id, not_deleted(ShipmentOrder))
                         .exists(),
                     )
                     .values(**values)
@@ -415,9 +433,9 @@ def attach_order(shipment_id: int, order_id: int, session: Session = Depends(get
         .where(
             Order.id == order_id,
             Order.shipment_order_id.is_(None),
-            Order.is_delete.is_(False),
+            not_deleted(Order),
             select(ShipmentOrder.id)
-            .where(ShipmentOrder.id == shipment_id, ShipmentOrder.is_delete.is_(False))
+            .where(ShipmentOrder.id == shipment_id, not_deleted(ShipmentOrder))
             .exists(),
         )
         .values(shipment_order_id=shipment_id, version=Order.version + 1, updated_at=utcnow())
@@ -452,10 +470,24 @@ def delete_shipment(shipment_id: int, session: Session = Depends(get_session)):
     shipment = session.get(ShipmentOrder, shipment_id)
     if not shipment or shipment.is_delete:
         raise_not_found("集运订单")
-    # 解除关联淘宝订单的挂靠，避免留下指向已删集运单的悬空外键
+    # 解除关联商品订单的挂靠，避免留下指向已删集运单的悬空外键。
+    #
+    # **软删的子订单也要解**（这里刻意不加 `not_deleted`，别按反射加回去）。
+    # 软删的订单**可以**挂着集运单：`delete_order` 只软删、不解挂
+    # （它自己的注释还写着「对齐集运删除时清子订单外键的做法」）。于是
+    #   删订单 A → 删它所在的集运单 S → A 仍然指着 S
+    # 而 A 是这条 UPDATE 唯一漏掉的那种行。往后只要在数据库层把 A 恢复出来
+    # （`delete_taobao_orders` 的注释写明这是既定的找回路径），它就落进一个死角：
+    # `shipment_no` / `fulfillment_status` 都判 `not ship.is_delete` ⇒ 显示为空，
+    # 而「未挂靠」筛选判的是 `shipment_order_id IS NULL` ⇒ **它也不在待挂靠列表里**。
+    # 两头都看不见，界面上再也挂不回去。
+    #
+    # 软删的语义是「回收站」，恢复出来该是**能继续用**的状态：
+    # 挂靠的那张单已经没了，就该回到「未挂靠」，而不是挂在一个幽灵上。
+    # 上面单条解挂那支（`unassign_order`）本来就没有这个过滤，两边现在口径一致。
     session.execute(
         sa_update(Order)
-        .where(Order.shipment_order_id == shipment_id, Order.is_delete.is_(False))
+        .where(Order.shipment_order_id == shipment_id)
         .values(shipment_order_id=None, version=Order.version + 1, updated_at=utcnow())
     )
     soft_delete(shipment)

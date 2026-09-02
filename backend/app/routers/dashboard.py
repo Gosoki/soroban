@@ -14,7 +14,7 @@ from sqlmodel import Session, select
 from ..auth import get_current_user
 from ..database import get_session
 from ..db.dialect import is_mysql
-from ..models.base import unconverted_clause
+from ..models.base import not_deleted, unconverted_clause
 from ..models import ShipmentOrder, MiscExpense, Order
 from ..schemas import DashboardRead, MonthTotal
 from ..services.fx import current_rate
@@ -29,7 +29,7 @@ def _valid_conds(model):
     排除规则由**模型自己**声明（见 LedgerBase.ledger_exclusions）。原先这里写的是
     `model.status`——鸭子类型，靠「两张表状态列恰好同名」成立，列一改名就是运行期
     AttributeError、看板整页 500。"""
-    conds = [model.is_delete.is_(False)]
+    conds = [not_deleted(model)]
     for col, excluded in model.ledger_exclusions():
         conds.append(col.notin_(tuple(excluded)))   # 取消/退款不计入
     return conds

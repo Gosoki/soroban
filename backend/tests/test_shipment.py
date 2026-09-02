@@ -355,3 +355,43 @@ def test_ocr_attach_reports_orders_already_on_another_shipment(client, session, 
         f"没回报给用户：skipped={got['skipped']}，用户只会看到一句绿色的「已关联 0 单」")
     # 库里没被动
     assert client.get(f"/api/orders/{od['id']}").json()["shipment_order_id"] == a["id"]
+
+
+def test_deleting_a_shipment_also_detaches_its_soft_deleted_sub_orders(client, session):
+    """删集运单时，**连软删的子订单一起解挂**。
+
+    软删的订单是**可以**挂着集运单的：`delete_order` 只软删、不解挂。
+    于是「先删订单 A、再删 A 所在的集运单 S」之后，A 仍然指着 S——
+    而这条 UPDATE 一旦带上 `not_deleted(Order)`，漏掉的恰好就是这一种行。
+
+    往后只要在数据库层把 A 恢复出来（`delete_taobao_orders` 的注释写明这是既定的
+    找回路径），它就落进一个死角：`shipment_no` / `fulfillment_status` 都判
+    `not ship.is_delete` ⇒ 显示为空；而「未挂靠」筛选判的是
+    `shipment_order_id IS NULL` ⇒ **它也不在待挂靠列表里**。两头都看不见，
+    界面上再也挂不回去。
+
+    软删的语义是「回收站」，恢复出来该是能继续用的状态。
+    """
+    from app.models import Order
+
+    s = client.post("/api/shipment", json={"date": "2027-03-01",
+                                           "shipment_no": "SH-DETACH-DELETED"}).json()
+    o = client.post("/api/orders", json={"date": "2027-03-01", "title": "会被先删掉的单",
+                                         "order_no": "NO-DETACH-DELETED",
+                                         "purchase_status": "待收货"}).json()
+    o = client.patch(f"/api/orders/{o['id']}",
+                     json={"version": o["version"], "shipment_order_id": s["id"]}).json()
+    assert o["shipment_order_id"] == s["id"], "夹具没挂上"
+
+    assert client.delete(f"/api/orders/{o['id']}").status_code == 200
+    session.expire_all()
+    assert session.get(Order, o["id"]).shipment_order_id == s["id"], (
+        "夹具前提变了：软删订单现在会自己解挂——那这条守卫要重写，别直接删掉")
+
+    assert client.delete(f"/api/shipment/{s['id']}").status_code == 200
+    session.expire_all()
+    row = session.get(Order, o["id"])
+    assert row.is_delete is True, "夹具坏了：订单没被软删"
+    assert row.shipment_order_id is None, (
+        f"软删的子订单还挂在已删的集运单 {s['id']} 上——从数据库层恢复它之后，"
+        f"它既不显示集运单号、也不出现在「未挂靠」列表里，界面上再也挂不回去")

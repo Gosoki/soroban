@@ -49,11 +49,21 @@
                        placeholder="包邮" style="width: 130px" @change="savePostage" />
       <span class="postage-hint">不填 = 包邮</span>
     </div>
+    <!-- 「订单价有钱、物品单价却全空」是 `f6a7b8c9d0e1` 只加列不回填留下的历史形态
+         （回填脚本不在任何启动/恢复链上）。此时上面那个货款框是空的，而订单列表里
+         那一栏明明写着金额——两处并排、互相矛盾，用户会以为哪一边坏了。
+         后端现在**保住**这种状态不再被静默改写成 ¥0（见 `build_items`），
+         于是它会一直显示，更需要把「为什么空」说出来。 -->
+    <div v-if="priceOnOrderOnly" class="oie-note">
+      这一单的金额（{{ fmtCNY(order.price_cny) }}）只记在订单上，没有拆到物品单价里，所以上面货款框是空的。
+      在物品行里填上单价，订单价就会改由明细算出。
+    </div>
   </div>
 </template>
 
 <script setup>
 import { MSG_STALE_RELOADED } from '@/constants'
+import { fmtCNY } from '@/utils/money'
 import { computed, reactive, ref, watchEffect } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Delete, Plus, QuestionFilled } from '@element-plus/icons-vue'
@@ -80,6 +90,15 @@ const isSingleUnitItem = computed(() => {
   const its = props.order.items || []
   return its.length <= 1 && (its.length === 0 || (Number(its[0].quantity) || 1) === 1)
 })
+// 「钱只在订单行上、物品单价全空」——历史形态，判据与后端 `items_carry_no_price` 同源。
+// 0 元不算（包邮/赠品单是真有的，那种单货款框空着不矛盾）。
+const priceOnOrderOnly = computed(() => {
+  const its = props.order.items || []
+  const p = props.order.price_cny
+  return p != null && Number(p) !== 0 && its.length > 0
+    && its.every((it) => it.unit_price_cny === null || it.unit_price_cny === undefined)
+})
+
 // 显示值 = 货款 = 订单价 − 邮费（订单价本身是派生的，见列头「?」）
 const goodsInput = ref(null)
 watchEffect(() => {
@@ -276,6 +295,9 @@ async function commitDraft() {
 .postage-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
 .postage-lb { color: var(--txt-2); font-size: 13px; }
 .postage-hint { color: var(--txt-3); font-size: 12px; }
+/* 说明条：与 postage-hint 同一档次的次要文字，仅加一点上边距独占一行 —— 
+   刻意不用 el-alert，那是「出事了」的语气，而这里陈述的是一个正常的历史状态。 */
+.oie-note { color: var(--txt-3); font-size: 12px; line-height: 1.6; margin-top: 6px; }
 /* 单元格内输入做成无边框，贴合一级列表的扁平格子观感 */
 .item-tbl :deep(.el-input__wrapper),
 .item-tbl :deep(.el-input-number .el-input__wrapper) {

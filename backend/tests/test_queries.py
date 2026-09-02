@@ -175,7 +175,12 @@ def test_binstr_columns_use_ci_contains_for_search():
     也跟着变大小写敏感，而 SQLite 的 LIKE 对 ASCII 本来就不敏感——同一份数据、
     同一个搜索词，两个后端返回不同结果。
 
-    只能静态查：**本地跑在 SQLite 上，这个差异复现不出来**。
+    这一条是**静态**查（源码层），因为默认的测试套件只跑在 SQLite 上。
+    但「复现不出来」这句话不成立——2026-09-02 连上真 MySQL 复现了，
+    并且顺带测出这个差异**只在 ASCII 上被 `ci_contains` 抹平**：
+    全角字母与重音字母两边仍然不一致（详见 `db/dialect.py::ci_contains` 的实测表）。
+    行为层的契约在 `test_mysql_contract.py::test_fuzzy_search_agrees_on_ascii_...`，
+    给 `SOROBAN_TEST_MYSQL_URL` 才跑。
     """
     import ast
     from pathlib import Path

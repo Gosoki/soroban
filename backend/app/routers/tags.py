@@ -18,6 +18,7 @@ from ..auth import get_current_user
 from ..database import get_session
 from ..db.dialect import insert_or_ignore, upsert
 from ..maintenance import barrier
+from ..models.base import not_deleted
 from ..models import (
     MiscExpense,
     ShipmentOrder,
@@ -62,16 +63,32 @@ def _check_field(field: str) -> None:
         raise HTTPException(status_code=422, detail=f"未知标签字段：{field}")
 
 
+def _only_visible(stmt, model):
+    """把「哪些行算数」这条口径加到 stmt 上。**全仓只此一份。**
+
+    两条：软删的不算；**已忽略的暂存行不算**——那是「看过后丢弃」的抓取结果，
+    留着它会让其账号被误锁、被误自动登记成标签。
+
+    收敛成一个函数而不是各处照抄：这段过滤原先在 `_data_values`（哪些值出现在下拉里）
+    与 `tag_value_in_use`（这个名字能不能用）里各写一份，
+    而后者的 docstring 逐字写着「可见性口径必须与 `_data_values` 一致」——
+    那句话是**意图**，不是**机制**。两边漂开的后果它自己也写了：
+    一个只存在于软删/已忽略行里的「幽灵值」会被误判成「在用」，
+    把本可用的新名字挡在改名之外；反过来漂则是下拉里有个选项、筛选却一条都搜不到。
+    现在两边调同一个函数，漂不出去。
+    """
+    if hasattr(model, "is_delete"):
+        stmt = stmt.where(not_deleted(model))
+    if model is OrderStaging:
+        stmt = stmt.where(OrderStaging.import_status != ImportStatus.ignored.value)
+    return stmt
+
+
 def _data_values(session: Session, field: str) -> set[str]:
     """该字段在数据里实际用到的值（订单/暂存/集运，排除软删）。"""
     out: set[str] = set()
     for model, col in _FIELD_SOURCES.get(field, ()):
-        stmt = select(col).where(col.is_not(None)).distinct()
-        if hasattr(model, "is_delete"):
-            stmt = stmt.where(model.is_delete.is_(False))
-        if model is OrderStaging:
-            # 已忽略的暂存行是「看过后丢弃」的抓取结果，不算真在用（否则其账号会被误锁、误自动登记）
-            stmt = stmt.where(OrderStaging.import_status != ImportStatus.ignored.value)
+        stmt = _only_visible(select(col).where(col.is_not(None)).distinct(), model)
         for v in session.exec(stmt).all():
             if v:
                 out.add(v)
@@ -207,14 +224,10 @@ def _column_of(model, field: str):
 def tag_value_in_use(session: Session, field: str, name: str) -> bool:
     """name 是否已被该标签字段占用：对应数据表（见 _FIELD_SOURCES）里有此值的行，或已登记为标签。改名前防重名用。
 
-    可见性口径必须与 _data_values 一致（排除软删行 + 已忽略暂存），否则一个只存在于软删/已忽略行里的
-    「幽灵值」会误判为「在用」，把本可用的新名字挡在改名之外。"""
+    可见性口径与 `_data_values` **共用 `_only_visible`**（排除软删行 + 已忽略暂存），
+    见那里的说明。此前是两份手抄、靠这句注释维持一致。"""
     for model, col in _FIELD_SOURCES.get(field, ()):
-        stmt = select(model.id).where(col == name)
-        if hasattr(model, "is_delete"):
-            stmt = stmt.where(model.is_delete.is_(False))
-        if model is OrderStaging:
-            stmt = stmt.where(OrderStaging.import_status != ImportStatus.ignored.value)
+        stmt = _only_visible(select(model.id).where(col == name), model)
         if session.exec(stmt.limit(1)).first() is not None:
             return True
     return session.exec(
@@ -292,7 +305,7 @@ def delete_account_staging(session: Session, field: str, account: str) -> tuple[
     alive = set()
     if linked_ids:
         alive = set(session.exec(
-            select(Order.id).where(Order.id.in_(linked_ids), Order.is_delete.is_(False))
+            select(Order.id).where(Order.id.in_(linked_ids), not_deleted(Order))
         ).all())
     ids = [r[0] for r in rows if r[1] not in alive]      # None not in alive → 未导入的照删
     if ids:
@@ -310,7 +323,7 @@ def soft_delete_account_orders(session: Session, field: str, account: str) -> in
     now = utcnow()
     ids = session.exec(
         select(Order.id).where(
-            _column_of(Order, field) == account, Order.is_delete.is_(False)
+            _column_of(Order, field) == account, not_deleted(Order)
         )
     ).all()
     if not ids:

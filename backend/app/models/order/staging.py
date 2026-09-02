@@ -69,7 +69,7 @@ class OrderStaging(SQLModel, table=True):
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
 
-    def sync_from_items(self) -> None:
+    def sync_from_items(self, *, derive_price: Optional[bool] = None) -> None:
         """暂存价 = Σ(物品单价×数量) + 邮费（与账本同口径）。改动 items/邮费 后调用。
 
         卡口与账本侧同源（guard_cny）：账本走 compute_money 顺带卡，暂存没有日元派生、
@@ -88,8 +88,19 @@ class OrderStaging(SQLModel, table=True):
 
         不这么改的话，同一个伤害要在三条路上各打一次补丁（审计报告 §154 / §168）：
         订单 PATCH 的镜像、暂存 PATCH 的已导入分支、暂存 PATCH 的未导入分支——
-        而第三条上连「账本价」都没有可镜像的东西。"""
-        if items_carry_no_price(self.items):
+        而第三条上连「账本价」都没有可镜像的东西。
+
+        `derive_price` 与账本侧 `Order.sync_from_items` **同一套三态语义**（见那里的说明）：
+        `None`=按 items 推断（安全默认，保住存量 NULL）、`True`=确知知道、`False`=确知不知道。
+        暂存侧原先只有推断这一条路，而推断读的是**刚被 `build_items` 替换过**的 items——
+        于是一张 ¥320、物品单价全 NULL 的历史暂存行，**改一次物品名**就变 ¥0.00
+        （HTTP 200、零提示）：`build_items` 把 NULL 写成 0.00，判据当场失效。
+        那个伪造已经拔掉了（见 `build_items` 的返回），这里补上显式结论的入口，
+        好让「用户主动清空全部单价 → 归零」仍然表达得出来。
+        """
+        if derive_price is None:                       # 没依据 → 退回按 items 推断
+            derive_price = not items_carry_no_price(self.items)
+        if not derive_price:
             return
         self.price_cny = guard_cny(price_from_items(self.items) + (self.postage_cny or 0))
 

@@ -182,7 +182,15 @@ def test_scraper_pushes_current_field_names():
 
 
 def test_frontend_status_words_match_backend():
-    """改状态字面量最容易漏前端。test_consistency.py 已全面比对，这里钉住这两个词。"""
+    """改状态字面量最容易漏前端。这里只钉几个**词**，别把它当成「两边一致」的证明。
+
+    ⚠️ 这条是**单向且部分**的：三条断言判的都是 `constants.js` 的内容，
+    所以「后端改了、前端没改」它**照样绿**——只有前端自己把那几行删掉时才红。
+    真正逐对比对前后端行为的是
+    `test_consistency.py::test_purchase_advance_rule_agrees_between_python_and_javascript`
+    （全状态对笛卡尔积 + `None`/空串/未知值，并连带钉住 `/api/meta/status-rules`）。
+    2026-09-02 补那条守卫时才发现这一条的覆盖面被高估了。
+    """
     js = (_REPO / "frontend" / "src" / "constants.js").read_text(encoding="utf-8")
     assert "'已签收'" in js and "'已送达'" in js
     assert "'已入仓'" not in js, "前端还留着已取消的「已入仓」"

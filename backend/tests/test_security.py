@@ -552,3 +552,52 @@ def test_the_plugin_gate_runs_outside_the_readonly_barrier():
     assert "_plugin_gate" in names and "_readonly_barrier" in names, names
     assert names.index("_plugin_gate") < names.index("_readonly_barrier"), (
         f"插件闸跑到了只读屏障的内层：{names}。越权请求会先占一个「在飞写」计数才被 403 挡掉")
+
+
+def test_one_persons_typos_do_not_lock_out_everyone_sharing_the_username(monkeypatch):
+    """一个人从一台机器反复敲错，**不许把共用这个用户名的其他人一起挡在门外**。
+
+    这个账本是 8 个人共用一个 `admin`（见审计报告「待你拍板」A 条）。
+    全局键 `(用户名, "*")` 原先数的是**失败总次数**，于是一个人手抖就把它顶上去。
+    实测（模拟时间）：一个人连试 5 分钟，其余人最坏被挡 **256 秒**；
+    试 15 分钟顶到上限 **300 秒**——一个忘了口令的同事能把全组关在门外 5 分钟。
+
+    改成数「有多少个不同的 IP 在错」之后，那个键仍然正好数到它要防的那件事
+    （XFF 可控时每换一个值就是一个新 IP，见 `test_throttle_survives_a_forged_client_ip`），
+    却不再被单机重试顶起来。
+
+    **必须模拟时间往前走**：不推进时间的话，被 429 挡回的尝试**不计数**
+    （`begin` 在 wait 非零时直接返回、不 bump），计数就永远停在刚越线那一档，
+    连坐还在也只显示 2 秒——判据会被「时间没走」这个另外的原因满足。
+    """
+    import app.ratelimit as rl
+
+    now = [1000.0]
+    monkeypatch.setattr(rl.time, "monotonic", lambda: now[0])
+
+    t = rl.LoginThrottle()
+    end = now[0] + 900                      # 甲折腾 15 分钟，一有机会就重试
+    worst_other = 0
+    tries = 0
+    a_was_blocked = False
+    while now[0] < end:
+        wait = t.begin("admin", "10.0.0.1")
+        if wait:
+            a_was_blocked = True
+            now[0] += wait                  # 老实等到能再试
+        else:
+            tries += 1
+            now[0] += 1                     # 敲一次口令约 1 秒
+        # 乙**在这一刻**来登录要等多久（只读、不计数）
+        worst_other = max(worst_other,
+                          t.retry_after(("admin", "10.0.0.2")),
+                          t.retry_after(("admin", "*")))
+
+    assert tries >= 10, f"夹具没跑起来：甲只试了 {tries} 次"
+    assert worst_other == 0, (
+        f"甲一个人错了 {tries} 次，同用户名的其他人最坏被挡 {worst_other} 秒——"
+        f"全局键多半又在数失败总次数，而不是「有多少个不同的 IP 在错」")
+    # 甲**自己**必须被挡过，别把闸整个拆了。
+    # 判的是「过程中挡过没有」而不是「此刻挡着没有」：循环恰好停在退避窗口边界上，
+    # 那一刻 `retry_after` 本来就是 0（第一版这么写，红的是守卫不是代码）。
+    assert a_was_blocked, "甲自己一次都没被挡——按 IP 那道闸没了"

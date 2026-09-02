@@ -428,3 +428,66 @@ def test_the_three_unconverted_criteria_are_one_function():
         assert rets, f"{fn} 没有 return"
         assert any("!= 0" in r for r in rets), \
             f"{fn} 的判据里漏了 `!= 0`（显式填 0 的行会被误报成未折算）：{rets}"
+
+
+def test_a_second_exclusion_axis_is_honoured_by_the_shipment_page(client, session, monkeypatch):
+    """`ledger_exclusions()` 里**追加一条轴**之后，集运页必须跟着不算——和看板一样。
+
+    那个返回值是个**列表**，`LedgerBase.ledger_exclusions` 的 docstring 明写着理由：
+    「将来加卖出/退货这类并行的状态轴时，是往列表里追一项」。
+    看板按 `(列, 值集合)` 逐条判（`dashboard._valid_conds`），
+    而集运页原先把它**拍平**成一个值集合、再拿去比 `purchase_status`——列名被丢掉。
+
+    今天两张表各只声明一条轴，拍平恰好等价，所以**光靠现有数据测不出来**。
+    这条守卫因此自己造出「将来」：临时给 `Order.ledger_exclusions` 追一条
+    以 `created_via` 为轴的规则，再问集运页算不算。
+    拍平的写法会拿「imported」去比 `purchase_status`、永远不命中 ⇒
+    把一张本该排除的单算进货款合计，而看板不算——**同一笔钱两个页面两个说法**。
+
+    用 `created_via` 当第二根轴，是因为它是 `LedgerBase` 上真实存在、
+    且与 `purchase_status` **取值集合完全不相交**的列：不相交才能把
+    「拿错列去比」和「拿对列去比」区分开。
+    """
+    from app.models import CreatedVia, Order
+    from app.routers import shipment as mod
+
+    s = client.post("/api/shipment", json={"date": "2027-06-01",
+                                           "shipment_no": "SH-SECOND-AXIS",
+                                           "price_cny": "0", "fx_rate": "20"}).json()
+    made = []
+    for tag, via in (("算的", CreatedVia.manual.value), ("不该算的", CreatedVia.imported.value)):
+        o = client.post("/api/orders", json={
+            "date": "2027-06-01", "title": f"{tag}", "order_no": f"AXIS-{tag}",
+            "purchase_status": "待收货", "price_cny": "100", "fx_rate": "20"}).json()
+        # **先挂靠、再改列**：反过来的话，直接改库不会 bump `version`，
+        # 而 PATCH 送的 `version+1` 就对不上（第一版这么写，夹具直接 0 円）。
+        r = client.patch(f"/api/orders/{o['id']}",
+                         json={"version": o["version"], "shipment_order_id": s["id"]})
+        assert r.status_code == 200, r.text
+        row = session.get(Order, o["id"])
+        row.created_via = via                      # 走库直接置，POST/PATCH 都不收这个字段
+        session.add(row)
+        session.commit()
+        made.append(r.json())
+
+    base = client.get(f"/api/shipment/{s['id']}").json()
+    assert base["orders_jpy"] == 4000, f"夹具没造对：两单各 2000 円，实际 {base['orders_jpy']}"
+
+    # —— 造出「将来」：追一条以 created_via 为轴的排除规则 ——
+    orig = Order.ledger_exclusions
+
+    @classmethod
+    def two_axes(cls):
+        return [*orig.__func__(cls), (cls.created_via, (CreatedVia.imported.value,))]
+
+    monkeypatch.setattr(Order, "ledger_exclusions", two_axes)
+
+    after = client.get(f"/api/shipment/{s['id']}").json()
+    assert after["orders_jpy"] == 2000, (
+        f"追加一条轴之后集运页仍然把两单都算了（{after['orders_jpy']} 円）——"
+        f"它多半又把 `ledger_exclusions()` 拍平成值集合、拿新轴的值去比 `purchase_status`，"
+        f"永远不命中。而看板按列判、会排除掉，同一笔钱两个页面两个说法")
+    by_no = {o["order_no"]: o for o in after["orders"]}
+    assert by_no["AXIS-不该算的"]["counted"] is False, (
+        "子订单表上那一行也该标成「不计入」——前端就是照这个字段渲染的")
+    assert by_no["AXIS-算的"]["counted"] is True, "把不该排的也排了"

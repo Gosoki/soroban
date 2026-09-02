@@ -786,6 +786,20 @@ def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str]
     try:
         proc = subprocess.Popen(
             cmd, cwd=str(manifest["_dir"]), env=env,
+            # **stdin 必须显式断掉。** 不写这一项时 Popen 默认是「继承父进程的 stdin」，
+            # 而打包版的父进程就是用户双击出来的那个控制台窗口 ⇒ 子进程手里有一个
+            # **真的、活着的** stdin。于是任何一次 `input()` 都会永久阻塞：
+            #   插件抛未捕获异常 → `run.py` 的 `__main__` 兜底 → `_fatal` →
+            #   冻结态下 `input("按回车关闭这个窗口…")` → 没人会去那个窗口敲回车
+            #   → 子进程不退 → `_reap` 一直等到 `_REAP_TIMEOUT`（30 分钟）
+            #   → 这 30 分钟里 `_INFLIGHT` 攥着键，用户每点一次都是 409「已经在跑了」、
+            #     卡片顶着「执行中」；30 分钟后报的还是**「超时」**——
+            #     而真相是它 2 秒就崩了，堆栈其实已经收在 `errs` 里，只是没人看它。
+            # 实测（2026-09-02，`--run-plugin` + 一个会抛异常的模块）：
+            #   stdin 可读 → 退出码 124（永久挂起）；stdin=DEVNULL → 立刻退 1。
+            # 这道闸比 `_fatal` 那边的宽：它挡的是**任何**读 stdin 的插件，
+            # 包括将来第三方写的。插件与人交互靠的是浏览器窗口，不是后端的控制台。
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
             text=True, encoding="utf-8", errors="replace",
         )

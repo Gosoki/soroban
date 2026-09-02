@@ -10,8 +10,7 @@ from sqlalchemy import update as sa_update
 from sqlmodel import Session
 
 from ..models import utcnow
-from ..models.base import unconverted_clause
-from ..models.base import guard_cny
+from ..models.base import guard_cny, not_deleted, unconverted_clause
 
 log = logging.getLogger("soroban")
 
@@ -124,7 +123,7 @@ def build_items(items_in, seed_goods, fallback_name):
     items_in = list(items_in or [])
     if not items_in:
         return [{"name": (fallback_name or "未命名物品")[:255], "quantity": 1,
-                 "unit_price_cny": seed_goods if seed_goods is not None else Decimal("0.00"),
+                 "unit_price_cny": seed_goods,      # 没种子就是不知道 → NULL，理由见下面的返回
                  "auto": True}]
     any_priced = any(it.unit_price_cny is not None for it in items_in)
     if not any_priced and seed_goods is not None:
@@ -172,9 +171,28 @@ def build_items(items_in, seed_goods, fallback_name):
             out.append({"name": f"{head}{_RESIDUAL_SUFFIX}",
                         "quantity": 1, "unit_price_cny": residual, "auto": True})
         return out
-    # 有单价的原样用；没单价的记 0 并标 auto（灰显=待补价），避免误当作真实 ¥0
+    # 有单价的原样用；**没单价的保持 NULL**、标 auto（灰显=待补价）。
+    #
+    # 这里原先写的是 `None → Decimal("0.00")`，理由是「避免误当作真实 ¥0」——
+    # 可它做的恰恰是把「不知道」编码成「就是 0」，而且**落库**。
+    # 全系统只有 NULL 这一个信号能区分这两者（`items_carry_no_price` 的唯一判据），
+    # 一旦被 0.00 顶掉就再也拿不回来，于是每一道下游闸门都在读一个假值：
+    #   · 暂存：`sync_from_items` 读的是**刚被替换过**的 items ⇒ 判据当场失效。
+    #     实测一张 ¥320、物品单价全 NULL 的历史暂存行，**改一次物品名**
+    #     → ¥0.00，HTTP 200、零提示。
+    #   · 账本：`update_order` 那道 `derive_price` 闸在替换前取 `stored_had_no_price`，
+    #     所以**第一次** PATCH 挡得住；但这一行已经把 NULL 写成 0.00，
+    #     **第二次** PATCH 时 `stored_had_no_price` 已经是 False、payload 也带着 0.00
+    #     ⇒ 闸自己瞎了。实测同一张 ¥320 历史单，改两次物品名 → ¥0.00 / 0 円。
+    #     那道闸的 docstring 承诺的是「任何一次 PATCH 都不会」，它只兑现了一次。
+    #
+    # 保持 NULL 之后金额只在一种输入下变化：**全部物品都没单价**——
+    # 也正是坏掉的那一种（此时 `items_carry_no_price` 恢复为 True，货款不再被派生成 0）。
+    # 混合输入（有的有价有的没价）金额一分不差：`price_from_items` 走 `x or 0`，
+    # NULL 与 0.00 贡献相同。前端也早就在造 NULL 单价的行
+    # （`Staging/index.vue` 的整体更新分支），`el-input-number` 绑 null 显示空格。
     return [{"name": it.name, "quantity": it.quantity,
-             "unit_price_cny": (it.unit_price_cny if it.unit_price_cny is not None else Decimal("0.00")),
+             "unit_price_cny": it.unit_price_cny,
              "auto": (True if it.unit_price_cny is None else bool(getattr(it, "auto", False)))}
             for it in items_in]
 
@@ -197,7 +215,7 @@ def guarded_bump(session: Session, model, obj_id: int, expected_version: int) ->
     在同一事务提交，保证并发下不会丢失更新。"""
     conds = [model.id == obj_id, model.version == expected_version]
     if hasattr(model, "is_delete"):                     # 暂存表用硬删、无 is_delete 列，跳过该条件
-        conds.append(model.is_delete.is_(False))
+        conds.append(not_deleted(model))
     res = session.execute(
         sa_update(model).where(*conds).values(version=model.version + 1, updated_at=utcnow())
     )

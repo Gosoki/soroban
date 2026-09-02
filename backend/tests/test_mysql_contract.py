@@ -374,3 +374,74 @@ def test_the_migration_chain_is_a_straight_line(mysql_engine):
     heads = script.get_heads()
     assert len(heads) == 1, f"迁移链有 {len(heads)} 个 head：{heads}"
 
+
+
+def test_fuzzy_search_agrees_on_ascii_and_document_where_it_does_not(mysql_engine):
+    """`ci_contains` 的双引擎口径：**ASCII 一致**；全角/重音**不一致，且这是已知的**。
+
+    `dialect.ci_contains` 的 docstring 说它「把搜索口径拉回原状」、
+    「消灭 BinStr 那一版想消灭的那类发散」。2026-09-02 实测下来，
+    那句话**只对 ASCII 成立**：
+
+    | 存的值 | 搜 | SQLite | MySQL |
+    |---|---|---|---|
+    | `Hello` | `hello` / `HELLO` | ✓ | ✓ |
+    | `ＳＦ１２３` | `ｓｆ`（全角小写） | ✗ | ✓ |
+    | `ＳＦ１２３` | `SF`（**半角**） | ✗ | ✓ |
+    | `Café Latte` | `cafe` | ✗ | ✓ |
+    | `Straße` | `strasse` | ✗ | ✗ |
+
+    MySQL 的 `utf8mb4_0900_ai_ci` 连**全角↔半角**与**重音**都不敏感，SQLite 的 LIKE
+    一样都不做（它只对 ASCII 折叠大小写）。淘宝商品标题里全角字母与重音字母都真实存在
+    （`ＳＫ－Ⅱ`、`L'Oréal`），所以这不是构造出来的边角。
+
+    **本条不是要求两边一致**——让 SQLite 做 Unicode 折叠需要 ICU 构建，代价远大于收益，
+    而发散的方向是「MySQL 多搜到几条」，不是搜错或漏搜关键数据（去重/等值批改走的是
+    二进制 `=`，不受影响）。本条要求的是：
+      ① **ASCII 那一半必须一致**——那是 `ci_contains` 真正的职责，坏了就是回归；
+      ② 非 ASCII 的**现状被钉住**——哪天有人「顺手统一」了，这条会红，
+         提醒他先去改 `ci_contains` 与本测试的 docstring，而不是让那句
+         「消灭发散」的话继续说得比实际做到的大。
+    """
+    from sqlmodel import select as _select
+
+    from app.db.dialect import ci_contains
+    from app.models import ShipmentOrder as SO
+
+    CASES = [
+        ("普通 ASCII", "Hello",      ["hello", "HELLO"],            [True, True],  [True, True]),
+        ("全角字母",   "ＳＦ１２３",  ["ｓｆ", "ＳＦ", "SF"],        [False, True, False], [True, True, True]),
+        ("重音字母",   "Café Latte", ["cafe", "café", "CAFÉ"],      [False, True, False], [True, True, True]),
+        ("德语 ß",     "Straße",     ["strasse", "straße"],         [False, True], [False, True]),
+        ("中文",       "顺丰速运",    ["顺丰"],                      [True],        [True]),
+    ]
+
+    def probe(engine):
+        out = {}
+        with Session(engine) as s:
+            for i, (_lab, val, _n, _e1, _e2) in enumerate(CASES):
+                s.add(SO(date=dt.date(2027, 1, 1), shipment_no=f"CI-{i}", recipient=val,
+                         shipment_status="待发出"))
+            s.commit()
+            for lab, val, needles, _e1, _e2 in CASES:
+                out[lab] = [s.exec(_select(SO).where(
+                    SO.recipient == val, ci_contains(SO.recipient, n, s))).first() is not None
+                    for n in needles]
+            for row in s.exec(_select(SO)).all():
+                s.delete(row)
+            s.commit()
+        return out
+
+    sqlite_got = probe(get_engine())          # 测试套件默认就跑在 SQLite 上
+    mysql_got = probe(mysql_engine)
+
+    for lab, _val, needles, want_sqlite, want_mysql in CASES:
+        assert sqlite_got[lab] == want_sqlite, (
+            f"SQLite 侧「{lab}」的行为变了：搜 {needles} 期望 {want_sqlite}，实际 {sqlite_got[lab]}")
+        assert mysql_got[lab] == want_mysql, (
+            f"MySQL 侧「{lab}」的行为变了：搜 {needles} 期望 {want_mysql}，实际 {mysql_got[lab]}")
+
+    assert sqlite_got["普通 ASCII"] == mysql_got["普通 ASCII"], (
+        f"**ASCII 大小写不敏感在两个引擎上不一致了**——这正是 ci_contains 的职责："
+        f"SQLite {sqlite_got['普通 ASCII']} vs MySQL {mysql_got['普通 ASCII']}")
+    assert sqlite_got["中文"] == mysql_got["中文"], "中文搜索在两个引擎上不一致了"

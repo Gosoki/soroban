@@ -314,3 +314,49 @@ def test_renaming_an_order_onto_a_staging_only_number_says_where_the_clash_is(cl
     ok = client.patch(f"/api/orders/{oid}", json={"version": o["version"], "order_no": free})
     assert ok.status_code == 200, ok.text
     assert client.get(f"/api/orders/{oid}").json()["order_no"] == free
+
+
+def test_patching_an_imported_row_really_reaches_the_ledger(client, session):
+    """先钉住**事实**：PATCH 一条已导入的暂存行，账本单真的会被改。
+
+    这是「暂存与账本是同一条记录的两个视图」这条设计的直接后果，对**人手动改**是对的。
+    钉住它是为了让下一条（前端不许拿截图走这条路）有据可依——
+    没有这一条的话，那条守卫会退化成「防一件不会发生的事」。
+
+    ⚠️ **判据必须用捕获的标量，不能拿 ORM 对象前后比。**
+    第一版探针写的是 `assert (o2.price_cny, …) == (o.price_cny, …)`，
+    而 `o` 与 `o2` 是同一个身份映射里的**同一个实例**——`expire_all()` 之后
+    两边一起刷成新值，等于拿自己跟自己比，**恒绿**。
+    """
+    import datetime as dt
+
+    from sqlmodel import select
+
+    from app.models import Order, OrderStaging, StagingItem
+
+    st = OrderStaging(order_date=dt.date(2027, 6, 1), order_no="MIRROR-WT-1",
+                      price_cny=0, fx_rate=20, purchase_status="待发货", title="原标题")
+    st.items = [StagingItem(name="物品", quantity=1)]
+    session.add(st)
+    session.commit()
+    session.refresh(st)
+    assert client.post(f"/api/staging/{st.id}/import").status_code == 200
+
+    session.expire_all()
+    o = session.exec(select(Order).where(Order.order_no == "MIRROR-WT-1")).one()
+    before = (str(o.price_cny), o.purchase_status, o.express_no)      # **先取成标量**
+    assert before == ("0.00", "待发货", None), before
+
+    row = session.exec(select(OrderStaging).where(OrderStaging.order_no == "MIRROR-WT-1")).one()
+    r = client.patch(f"/api/staging/{row.id}", json={
+        "version": row.version, "price_cny": "45.00", "purchase_status": "待收货",
+        "express_no": "SF123",
+        "items": [{"name": "物品", "quantity": 1, "unit_price_cny": None, "auto": True}]})
+    assert r.status_code == 200, r.text
+
+    session.expire_all()
+    o2 = session.exec(select(Order).where(Order.order_no == "MIRROR-WT-1")).one()
+    after = (str(o2.price_cny), o2.purchase_status, o2.express_no)
+    assert after == ("45.00", "待收货", "SF123"), (
+        f"写穿没有发生（{before} → {after}）——那么「截图不许走这条路」那条守卫就是在防一件不会发生的事")
+

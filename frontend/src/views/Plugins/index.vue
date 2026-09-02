@@ -746,7 +746,8 @@ async function doDeleteAccountStaging(p, account) {
     if (r.skipped) {
       longToast(ElMessage, 'warning',
         `已删除 ${account} 的暂存单 ${r.deleted} 条；跳过 ${r.skipped} 条已导入的`
-        + `（删了会在账本里留下导不回来的孤儿单，请先到「商品订单」页删掉对应订单）`)
+        + `（删了会在账本里留下导不回来的孤儿单）。要清掉这几条：先点上面的「删账本单」，`
+        + `再回来点一次「删暂存单」——顺序反过来是没用的，这一步会把它们整批跳过。`)
     } else {
       ElMessage.success(`已删除 ${account} 的暂存单 ${r.deleted} 条`)
     }
@@ -767,8 +768,8 @@ async function doDeleteAccountOrders(p, account) {
       // 状态是「待处理」，任何人点一下「导入账本」就把刚删掉的单原样建回来，
       // 看板金额跟着涨回去——他不会想到去暂存页看一眼。
       `确定删除账号「${account}」名下的全部账本正式商品订单？将从账本移除（软删）。\n\n` +
-      `已导入过的暂存行会退回「待处理」——它们还在暂存页，可以再次导入。` +
-      `不想让它们被重新导入的话，先删暂存单。`,
+      `已导入过的暂存行会退回「待处理」——它们还在暂存页，任何人点一下「导入账本」就会把它们建回来。\n` +
+      `要彻底清掉：删完这一步，再点「删暂存单」——那时它们已经不是「已导入」，会被真正删除。`,
       '删除该账号的账本单', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
     )
   } catch (_) { return }

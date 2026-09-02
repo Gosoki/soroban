@@ -57,18 +57,31 @@ def _runtime_dir() -> Path:
     return runtime_dir()
 
 
+# 本进程是不是「被 soroban 自己拉起来的子进程」（`--run-plugin`），而不是用户双击的主窗口。
+# `_fatal` 的挂住窗口只对后者有意义，见那里的说明。
+_SPAWNED_CHILD = False
+
+
 def _fatal(msg: str, *, hint: str = "") -> "NoReturn":       # noqa: F821
-    """打印人话错误并退出。**打包态下挂住窗口**。
+    """打印人话错误并退出。**打包态下挂住窗口**——但只在自己是主窗口时。
 
     打包版是双击运行的：任何异常都会让控制台窗口在几毫秒内关掉，用户看到的是
     「点了没反应」。而这些失败恰恰都是用户自己能解决的（换个目录、关掉另一个实例），
     前提是他得看见错在哪。所以冻结态下必须停下来等一次回车。
     源码运行不 pause——那会卡住 CI 与脚本。
+
+    **`--run-plugin` 子进程绝不能 pause。** 它是后端起的，没有人在看它的窗口，
+    而它的 stdin 在打包态下继承自主窗口——是**真的可读**的，于是 `input()` 永久阻塞：
+    插件抛个未捕获异常 → 下面 `__main__` 的兜底 → 这里 → 挂死 30 分钟，
+    期间插件互斥键一直占着（每次点都是 409「已经在跑了」），最后还报成「超时」。
+    调用方那侧已经把子进程的 stdin 设成 DEVNULL 了（见 `plugins.py` 的 `Popen`），
+    那是承重的一道；这里是第二道，把「谁该 pause」这件事就地说清楚，
+    免得将来有人改了 `Popen` 的参数却想不到这里。
     """
     print(f"\n[soroban 启动失败] {msg}", file=sys.stderr)
     if hint:
         print(f"  → {hint}", file=sys.stderr)
-    if getattr(sys, "frozen", False):
+    if getattr(sys, "frozen", False) and not _SPAWNED_CHILD:
         try:
             input("\n按回车关闭这个窗口…")
         except (EOFError, KeyboardInterrupt):
@@ -209,6 +222,8 @@ def _run_plugin(argv: list[str]) -> "NoReturn":                 # noqa: F821
     这里**不能**做 chdir / 建 .env / 起服务：工作目录由调用方（`_launch` 的 cwd）
     设成插件目录，令牌与配置走环境变量。做了就等于每跑一次插件顺手改一次运行目录。
     """
+    global _SPAWNED_CHILD
+    _SPAWNED_CHILD = True                   # 从这一刻起 `_fatal` 不许再挂窗口（理由见那里）
     if len(argv) < 2:
         print("--run-plugin 需要 <插件目录> <入口…>，例如 "
               "--run-plugin /path/to/plugin -m soroban_fx fetch", file=sys.stderr)
@@ -386,6 +401,16 @@ if __name__ == "__main__":
         import traceback
 
         traceback.print_exc()
+        if _SPAWNED_CHILD:
+            # 插件子进程走**另一条**收尾：这段 stderr 会被后端当成「插件为什么失败」
+            # 直接显示在插件卡片上，而 `_summarize` 取的是**最后一行非空内容**。
+            # 走下面那支的话，卡片上出现的会是主进程那套
+            # 「常见原因：数据库文件损坏或被占用、.env 里的 SECRET_KEY 被改坏、磁盘满」
+            # ——给汇率插件的一个网络错误安上一个数据库故障的名字，
+            # 而用户看不到别的解释，只会照着这句去查一个根本没坏的东西。
+            # 最后一行必须是异常本身。也不 pause（理由见 `_fatal`）。
+            print(f"插件执行失败：{e.__class__.__name__}: {e}", file=sys.stderr)
+            raise SystemExit(1)
         _fatal(f"{e.__class__.__name__}: {e}",
                hint="上面是完整堆栈。常见原因：数据库文件损坏或被占用、.env 里的 "
                     "SECRET_KEY 被改坏、磁盘满。把这段完整截图下来最好排查。")

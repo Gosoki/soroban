@@ -1133,3 +1133,155 @@ def test_a_longer_order_number_on_the_same_row_does_not_hijack_the_express_no():
         f"快递号被同行更长的订单号顶掉了：{got['express_no']}"
 
 
+def test_a_three_column_express_table_yields_every_number():
+    """「内含快递」是**真正的表格**：列头「快递单号 | 快递公司 | 状态」，每行三格。
+    三行号必须收全三个。
+
+    `_column_below` 原先只按 `cy` 排整页下方的 token，**没有任何列（x）约束**。
+    于是同一视觉行右边那个「顺丰速运」与第一个单号 cy 几乎相等、排在第 2 位，
+    当场撞上「带中文就停」——**整列只收到 1 个号**。
+    而调用点看到 `column` 非空就 `continue`，`unreadable` 保持 0，
+    前端于是弹绿色的「已关联 1 单」：3 单只挂 1 单，没有任何迹象。
+
+    （上一次修的是「只取最近的一个」，症状一样、成因不同：那次是只收一行，
+    这次是隔壁**列**串了进来。同一段代码的第二种失败方式。）
+
+    判据钉「三个号都在」而不是「至少一个」——后者在退化实现下照样绿，
+    而那正是这条 bug 的形状。
+    """
+    # 行距取 26：必须 **> row_tol(16)**，否则第一行数据会被判成「与列头同一行」、
+    # 走单值那条路（列头分支根本进不去）；同时必须 **≤ row_tol×2(32)**，
+    # 否则逐行连续那条判据会认为列到此为止。
+    result = [
+        *row(100, "内含快递"),
+        *row(200, "快递单号", "快递公司", "状态"),
+        *row(226, "SF1234567890123", "顺丰速运", "已签收"),
+        *row(252, "YT7788990011223", "圆通速递", "已签收"),
+        *row(278, "ZT5566778899001", "中通快递", "运输中"),
+    ]
+    f = ocr.parse_shipment_fields(result)
+    assert f["kind"] == "express_list", f
+    assert f["express_nos"] == ["SF1234567890123", "YT7788990011223", "ZT5566778899001"], (
+        f"三列表格只收到 {f['express_nos']}——隔壁列的中文把整列截断了，"
+        f"而 unreadable={f['unreadable']}，前端会弹绿色的「已关联 N 单」")
+
+
+def test_a_truncated_express_column_is_not_reported_as_success():
+    """**反面**：列真的到头了（下面是另一个字段的中文标签），不许把它当成完整。
+
+    这一条挡的是「把 CJK 截断整个去掉」这种偷懒修法——那样列会一路吃到页面底部，
+    把下一个字段的值也收进来，比截断更糟。
+
+    **那一行必须是「中文 + 一个合法单号」。** 第一版用的是光秃秃的「打包要求」，
+    而它本来就取不出号 ⇒ `not t[key]` 那一支已经把它挡住了，
+    `_CJK_RE` 那半根本没承重——把 CJK 判据整个删掉，那一版**照样绿**（实测）。
+    与 §197.3 的 VACUUM 是同一类：守卫写了理由，理由却没被测到。
+    """
+    result = [
+        *row(100, "内含快递"),
+        *row(200, "快递单号", "快递公司", "状态"),
+        *row(226, "SF1234567890123", "顺丰速运", "已签收"),
+        *row(252, "YT7788990011223", "圆通速递", "已签收"),
+        # 中文标签 **且自带一个合法单号**——只有 CJK 判据能挡住它
+        *row(278, "国际单号 EB861624386CN"),
+    ]
+    f = ocr.parse_shipment_fields(result)
+    assert f["express_nos"] == ["SF1234567890123", "YT7788990011223"], (
+        f"中文标签之后的东西被收进来了：{f['express_nos']}")
+
+
+
+# --- 三个几何常量的**贴边**用例 -----------------------------------------------
+#
+# 2026-09-02 变异测试实测：把 `_COL_X_ROWS` / `_COMPANY_NEAR_ROWS` / `_BELOW_ROWS`
+# 三个常量各自从 2 放宽到 10，**全套 1365 条一条都不红**。
+#
+# 成因不是没人测这三条路径——上面就有好几条测它们的用例——而是**反面用例的几何取得太极端**：
+# 比如「隔得远的那些不算一列」用的是 y=200 → y=900，间距 674，
+# 而 `_BELOW_ROWS = 2` 的阈值只有 32（row_tol 16 × 2）。放宽 5 倍照样挡得住 ⇒
+# 那条测试证明的是「跨半页不算一列」，**不是**「跨 2 行以上不算一列」。
+# 于是常量的**取值**等于没被钉住：谁把 2 改成 10，OCR 会开始从更远的地方抓东西，
+# 而没有任何测试会响。
+#
+# 下面每条都造一对**刚好在阈值两侧**的样本（tok 默认 h=20 ⇒ row_tol = 20×0.8 = 16）：
+#   · 差 32（= 2×16）→ 必须收；
+#   · 差 33         → 必须不收。
+# 常量一旦被改大，「差 33」那半边就会被收进来，测试当场红。
+
+_ROW_TOL = 16.0          # tok(h=20) → 平均字高 20 × 0.8。与 ocr.py 里那两行同源。
+
+
+def test_the_column_walk_stops_exactly_at_two_rows():
+    """沿列往下收值：行距 = 2×row_tol 收，2×row_tol + 1 不收。钉的是 `_BELOW_ROWS` 的**取值**。"""
+    from app.services import ocr
+
+    step_ok, step_no = int(_ROW_TOL * 2), int(_ROW_TOL * 2) + 1
+    y0 = 200.0
+    inside = [tok("快递单号", x=100, y=y0),
+              tok("SF1111111111", x=100, y=y0 + step_ok),
+              tok("YT2222222222", x=100, y=y0 + step_ok * 2)]
+    assert ocr.parse_shipment_fields(inside)["express_nos"] == \
+        ["SF1111111111", "YT2222222222"], "刚好 2 行的间距被误挡了"
+
+    outside = [tok("快递单号", x=100, y=y0),
+               tok("SF1111111111", x=100, y=y0 + step_ok),
+               tok("YT2222222222", x=100, y=y0 + step_ok + step_no)]
+    assert ocr.parse_shipment_fields(outside)["express_nos"] == ["SF1111111111"], (
+        "超出 2 行一格的那个被收进来了——`_BELOW_ROWS` 多半被改大了，"
+        "OCR 会开始从更远的地方抓号")
+
+
+def test_a_real_table_layout_collects_every_number_not_just_the_first():
+    """列头 + 多行数据 + **隔壁中文列**的真表格版式：三个号都要收到，不能只收第一个。
+
+    这是 `_column_below` 里那段长注释描述的原始事故：按 cy 排完，
+    隔壁列的「顺丰速运」与第一个号 cy 几乎相等、排在第 2 位，
+    当场撞上「带中文就停」⇒ **整列只收到 1 个号**，而 `unreadable` 仍是 0 ⇒
+    前端弹绿色的「已关联 1 单」，3 单只挂 1 单，没有任何迹象。
+
+    钉的是 `_COL_X_ROWS`（按左边缘先筛一遍列）。它**不是**边界用例，
+    因为这个常量有很大余量：隔壁列实测距 220px、阈值 = row_tol(16) × K，
+    K 从 2 放宽到 13 都不出事，K=20 才复现事故。
+    2026-09-02 的变异测试把它改成 10 后全套全绿——**那是空转变异**，
+    不是零覆盖；真正的判据是「这个版式下三个号都在」。
+    """
+    from app.services import ocr
+
+    y0, step = 200.0, 30.0
+    table = [tok("快递单号", x=100, y=y0), tok("快递公司", x=320, y=y0)]
+    for n, (no, co) in enumerate(((("SF1111111111"), "顺丰速运"),
+                                  ("YT2222222222", "圆通速递"),
+                                  ("JD3333333333", "京东物流")), start=1):
+        table += [tok(no, x=100, y=y0 + step * n), tok(co, x=320, y=y0 + step * n)]
+
+    got = ocr.parse_shipment_fields(table)
+    assert got["express_nos"] == ["SF1111111111", "YT2222222222", "JD3333333333"], (
+        f"表格版式下只收到 {got['express_nos']}——隔壁的中文列串进了这一列、"
+        f"在第一个号之后就把往下走的循环截断了。用户会看到绿色的「已关联 1 单」，"
+        f"而实际有 3 单，`unreadable` 还是 0")
+
+
+def test_the_company_lookup_stops_exactly_at_two_rows():
+    """就近找快递公司：差 2×row_tol 找得到，差 33 找不到。钉的是 `_COMPANY_NEAR_ROWS` 的**取值**。
+
+    走的是 `parse_order_fields`（订单截图），不是 `parse_shipment_fields`——
+    2026-09-02 第一版把入口找错了，测的那条路径根本不产出 `express_company`。
+
+    没有这道上限时，`_nearest_company` 会从**整页**按 y 距离取最近的一个，
+    于是快递行不含公司名时，它会从页面另一头把商品标题里的「顺丰包邮」捞回来，
+    而结果看起来跟真的一样（见那个函数的 ⚠️ 段）。
+    """
+    from app.services import ocr
+
+    dy_ok, dy_no = _ROW_TOL * 2, _ROW_TOL * 2 + 1
+    y0 = 200.0
+    near = ocr.parse_order_fields([tok("快递单号 SF1111111111", x=100, y=y0),
+                                   tok("顺丰速运", x=600, y=y0 + dy_ok)])
+    assert near.get("express_company") == "顺丰速运", f"两行内的公司名没找到：{near}"
+
+    far = ocr.parse_order_fields([tok("快递单号 SF1111111111", x=100, y=y0),
+                                  tok("顺丰速运", x=600, y=y0 + dy_no)])
+    assert far.get("express_company") is None, (
+        f"超出两行的公司名被捞回来了：{far.get('express_company')!r}——"
+        f"`_COMPANY_NEAR_ROWS` 多半被改大了，那会让它从页面另一头把商品标题里的"
+        f"「顺丰包邮」当成快递公司")

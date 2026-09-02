@@ -9,6 +9,7 @@ from sqlmodel import Session, select
 
 from ..auth import get_current_user
 from ..database import get_session
+from ..models.base import not_deleted
 from ..models import MiscExpense
 from ..schemas import MiscCreate, MiscRead, MiscUpdate
 from .common import (
@@ -30,7 +31,7 @@ def list_expenses(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0, le=MAX_OFFSET),
 ):
-    conds = [MiscExpense.is_delete.is_(False)]
+    conds = [not_deleted(MiscExpense)]
     if date_from:
         conds.append(MiscExpense.date >= date_from)
     if date_to:

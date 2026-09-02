@@ -10,8 +10,8 @@
 成功登录立即清零。
 
 **同时按两个键计数**，取两者中更严的那个：
-  · `(用户名, 来源 IP)` —— 一个 IP 猜多个用户名时互不稀释、同一用户名从不同 IP 尝试时互不牵连；
-  · `(用户名, "*")`     —— 与来源 IP 无关的兜底。
+  · `(用户名, 来源 IP)` —— 数这个 IP **错了多少次**；
+  · `(用户名, "*")`     —— 数**有多少个不同的 IP 在错**（不是失败总次数，理由见 `begin`）。
 
 第二个键不是冗余，它挡的是一个**实测可行**的绕过：uvicorn 默认信任来自 loopback 的
 `X-Forwarded-For`（`forwarded_allow_ips="127.0.0.1"`），而前端开发代理、以及任何同机反向代理
@@ -99,7 +99,18 @@ class LoginThrottle:
 
     def _bump_locked(self, key: tuple[str, str], now: float) -> None:
         """记一次失败。调用方必须持锁。`begin()` 与 `record_failure()` 都走这里——
-        两条路的计数语义必须逐字一致，否则测试驱动的是一套、生产跑的是另一套。"""
+        **「一次失败怎么记」这件事必须逐字一致**，否则测试驱动的是一套、生产跑的是另一套。
+
+        共享的只到这一层为止：**选哪些键是 `begin()` 的职责**，
+        而 `record_failure(key)` 按签名就只认调用方给的那一个键。
+        自 §252 起两者更不对等了——`begin()` 只在「这个 IP 是本轮第一次错」时
+        才顶全局键 `(用户名, "*")`（它数的是**有多少个不同的 IP 在错**，不是失败总次数）。
+
+        ⚠️ 因此 **`record_failure` 能造出 `begin` 造不出来的状态**：
+        直接往 `(u, "*")` 上打 N 次，就是「一个 IP 错了 N 次也把全局键顶上去」——
+        那正是 §252 修掉的旧行为。拿它当「模拟一次攻击」会得出错误结论。
+        要验涉及**两个键**的行为，必须走 `begin()`
+        （见 `test_one_persons_typos_do_not_lock_out_everyone_sharing_the_username`）。"""
         self._fails[key] = (self._count_locked(key, now) + 1, now)
 
     def retry_after(self, key: tuple[str, str]) -> int:
@@ -121,8 +132,27 @@ class LoginThrottle:
             wait = max(self._wait_locked(k, now) for k in keys)
             if wait:
                 return wait
-            for k in keys:                      # 先记后验：成功了再由 record_success 清零
-                self._bump_locked(k, now)
+            # **全局键数的是「有多少个不同的 IP 在错」，不是「一共错了多少次」。**
+            #
+            # 它防的是上面 docstring 说的那件事：XFF 可控时每换一个值就是一个新键，
+            # 于是按 IP 的那道闸整个绕开。而那种绕过的形状恰恰是**很多个不同的 IP**——
+            # 数不同 IP 就正好数到它，一次不多一次不少。
+            #
+            # 原先它数的是失败总次数，于是「一个人从一台机器上反复敲错」也会把它顶上去，
+            # 而这个账本是 **8 个人共用一个 `admin`**（见审计报告「待你拍板」A 条）。
+            # 实测（模拟时间）：一个人连续试 5 分钟，其余人最坏被挡 256 秒；
+            # 试 15 分钟就顶到上限 300 秒——一个忘了口令的同事能把全组关在门外 5 分钟。
+            #
+            # 改成数不同 IP 之后：
+            #   · 换 XFF 打 12 次 —— 12 个不同的键 ⇒ 全局计数照旧涨，第 7 次开始 429（**与原先逐字相同**）；
+            #   · 一个人从一台机器错 20 次 —— 全局计数恒为 1，只有他自己被按 IP 那道闸挡下
+            #     （**他自己被挡的时机也与原先相同**），别人不受牵连。
+            # 对攻击者等价、对手抖的人自己等价，只去掉了连坐。
+            per_ip, global_key = keys
+            new_ip = self._count_locked(per_ip, now) == 0
+            self._bump_locked(per_ip, now)      # 先记后验：成功了再由 record_success 清零
+            if new_ip:
+                self._bump_locked(global_key, now)
             self._prune(now)                    # 写完再收内存，条目数才真的封在 MAX_ENTRIES 内
             return 0
 

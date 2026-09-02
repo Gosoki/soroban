@@ -319,7 +319,21 @@ function cellCol(col) {
   return col.type === 'tag' ? (tagColCache.value[col.key] || col) : col
 }
 function applyTags(field, list) {   // list: [{value, color, in_use}]
+  // **`gone` = 原本在、这一次没了的值**，也就是逐字「被改名或删除的」。
+  // 父页据它决定要不要清掉停在旧值上的筛选。
+  //
+  // 为什么不能让父页自己判「筛选值在不在新列表里」（原先就是那样）：
+  //   · 这个事件**加载时也会发**（点一下列头的 ⚙ 就走到这里），什么都没变；
+  //   · 筛选下拉的候选**未必来自标签表**——订单页「来源」用的是常量
+  //     `ORDER_SOURCES = ['闲鱼','淘宝',…]`，而标签表里可能一个都没登记过。
+  // 两者叠加的实际后果：筛「来源=淘宝」（下拉里就有）→ 0 行（真话）→
+  // 点一下 ⚙ 想看看标签 → 筛选被清掉，还弹一句
+  // 「筛选里那个值已改名或删除」——**而它既没被改名也没被删除，它从来就不在标签表里**。
+  // 用 `gone` 之后：首次加载 `before` 是 undefined ⇒ 不清；
+  // 真改名 `甲→乙` ⇒ gone=['甲'] ⇒ 清且那句话是真的。
+  const before = tagOptions[field]
   tagOptions[field] = list.map((t) => t.value)
+  const gone = before ? before.filter((v) => !tagOptions[field].includes(v)) : []
   tagMeta[field] = Object.fromEntries(list.map((t) => [t.value, t]))
   // **所有标签变更的唯一汇合点，事件就发在这里。**
   // 表格自己那份 `tagOptions` 刷新了，但父页往往还各存一份同样的候选集
@@ -331,7 +345,7 @@ function applyTags(field, list) {   // list: [{value, color, in_use}]
   //   · 新增/删除/改色：原先**一个事件都不发**，新加的账号在工具栏筛选和编辑面板里
   //     永远选不到，直到组件重挂载（切页回来才自愈）。
   // 只发 `reload` 不够——它只让父页重拉**行**，既不刷新候选集、也不管仍停在旧名的筛选值。
-  emit('tags-changed', { field, values: tagOptions[field] })
+  emit('tags-changed', { field, values: tagOptions[field], gone })
 }
 async function loadTag(field) {   // 单字段拉取；失败**保持未拉到**（见下），供列头弹窗 @show 重试
   // 原先失败时会把候选集**固化成空数组**，而 `loadTags()` 只在 onMounted 跑一次、

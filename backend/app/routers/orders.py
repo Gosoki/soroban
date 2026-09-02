@@ -14,7 +14,7 @@ from ..auth import get_current_user
 from ..database import get_session
 from ..db.dialect import ci_contains
 from ..models import ShipmentOrder, OrderItem, ImportStatus, Order, OrderStaging, utcnow
-from ..models.base import items_carry_no_price
+from ..models.base import items_carry_no_price, not_deleted
 from ..schemas import OrderCreate, OrderRead, OrderUpdate, norm_code, norm_id
 from .common import (
     MAX_OFFSET,
@@ -49,7 +49,7 @@ def _check_shipment(session: Session, shipment_id, *, lock: bool = False):
     所以 SQLite 侧行为一字未变。"""
     if shipment_id is not None:
         stmt = select(ShipmentOrder.id).where(
-            ShipmentOrder.id == shipment_id, ShipmentOrder.is_delete.is_(False)
+            ShipmentOrder.id == shipment_id, not_deleted(ShipmentOrder)
         )
         if lock:
             stmt = stmt.with_for_update()
@@ -86,7 +86,7 @@ def list_orders(
     if legacy_status:
         raise HTTPException(status_code=400,
                             detail="查询参数 status 已改名为 fulfillment_status（显示口径）或 purchase_status（订单自身）")
-    conds = [Order.is_delete.is_(False)]
+    conds = [not_deleted(Order)]
     if only_id is not None:
         conds.append(Order.id == only_id)
     if unassigned:
@@ -97,7 +97,7 @@ def list_orders(
         # 而这种不一致没有任何报错、只会让筛选悄悄少几单。
         conds.append(Order.shipment_order_id.in_(
             select(ShipmentOrder.id).where(ShipmentOrder.recipient == recipient,
-                                           ShipmentOrder.is_delete.is_(False))
+                                           not_deleted(ShipmentOrder))
         ))
     if date_from:
         conds.append(Order.date >= date_from)
@@ -111,7 +111,7 @@ def list_orders(
         ship_status = (
             select(ShipmentOrder.shipment_status)
             .where(ShipmentOrder.id == Order.shipment_order_id,
-                   ShipmentOrder.is_delete.is_(False))
+                   not_deleted(ShipmentOrder))
             .scalar_subquery()
         )
         conds.append(func.coalesce(ship_status, Order.purchase_status) == fulfillment_status)
@@ -205,7 +205,11 @@ def create_order(payload: OrderCreate, session: Session = Depends(get_session)):
     # 播种用「货款」= 订单价种子 - 邮费，避免把邮费也摊进物品单价（否则 sync 加邮费会重复计）。
     seed_goods = goods_seed(payload.price_cny, payload.postage_cny, payload.items)
     order.items = [OrderItem(**d) for d in build_items(payload.items, seed_goods, payload.title)]
-    order.sync_from_items()                   # price_cny = Σ(单价×数量) + 邮费，并重算日元
+    # 建单：`derive_price=True` 而不是默认的「按 items 推断」。
+    # 推断的职责是**保护存量 NULL**，而建单时没有任何存量——payload 就是全部真相。
+    # 不显式说的话，「不填价 + 不填物品」建出来的单会因为占位物品单价是 NULL
+    # 而连 0 都派生不出来，price_cny 落成 None。
+    order.sync_from_items(derive_price=True)  # price_cny = Σ(单价×数量) + 邮费，并重算日元
     session.add(order)
     session.flush()                           # 写入并占写锁；FK 保证集运单硬存在
     # flush 后复核集运单仍未软删，闭合「校验通过→集运单被并发软删→订单仍挂上」的 TOCTOU。
@@ -276,7 +280,10 @@ def update_order(order_id: int, payload: OrderUpdate, session: Session = Depends
                        for d in build_items([], goods_seed(seed, order.postage_cny), order.title)]
     stamp_fx(session, order)                 # 同上：缺汇率的行每次 PATCH 都重试补，顺带自愈存量脏行
     # 日元恒重算；货款只在「这次确实知道钱是多少」时才由物品派生（理由见上面 `priced`）。
-    order.sync_from_items(derive_price=(built is None or priced or not stored_had_no_price))
+    # 只有「本次送了 items」时这里才真的有依据；没送 items 就交回给推断——
+    # 那正是 `items_carry_no_price` 守着的原始伤害（改个状态下拉 → ¥300 变 ¥0）。
+    order.sync_from_items(
+        derive_price=None if built is None else (priced or not stored_had_no_price))
     mirror_to_staging(session, order, built)  # 若由暂存导入：镜像回暂存行，避免删单后重导丢失编辑
 
     session.add(order)

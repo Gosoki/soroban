@@ -288,6 +288,7 @@ def _nearest_company(anchor: dict, tokens: list[dict], row_tol: float) -> Option
 
 
 _BELOW_ROWS = 2      # 「往下兜底」最多跨几行（× row_tol）；见 _same_row_value
+_COL_X_ROWS = 2      # 「同一列」左边缘最多差几个字高（× row_tol）；见 _column_below
 
 
 def _same_row_value(anchor: dict, tokens: list[dict], row_tol: float,
@@ -370,7 +371,23 @@ def _column_below(anchor: dict, tokens: list[dict], row_tol: float, key: str) ->
       · 取不出号的行也停。它可能是被 OCR 断开的号，但继续往下扫就等于回到
         「一路扫整页」那个老问题；停在这里最坏只是回到本次修复之前的行为。
     """
-    below = sorted((t for t in tokens if t["cy"] > anchor["cy"]), key=lambda t: t["cy"])
+    # **必须先按列（x）筛一遍，只按 cy 排序是不够的。**
+    # `below` 原先收的是**整页**下方的 token。而「内含快递」页是真正的表格：
+    # 列头行是「快递单号 | 快递公司 | 状态」，下面每一行都有三格。
+    # 按 cy 排完，同一视觉行右边那个「顺丰速运」与第一个单号 cy 几乎相等、
+    # 排在第 2 位，当场撞上下面那句「带中文就停」——**整列只收到 1 个号**。
+    # 而调用点看到 `column` 非空就 `continue`，`unreadable` 保持 0，
+    # 前端于是弹绿色的「已关联 1 单」：3 单只挂 1 单，没有任何迹象。
+    # （上一次修的是「只取最近的一个」，症状一样、成因不同；这次是隔壁**列**串了进来。）
+    #
+    # 判据用 `x0` 而不是 `cx`：与 `_same_row_value` 挑值时同一条理由——
+    # 「随机的是 cy，而 x 一点都不随机」。同一列的值左边缘对齐，
+    # 隔壁列差着整整一个列宽。容差取 `row_tol * _COL_X_ROWS`：
+    # 字高的量纲，够吸收 OCR 的框抖动，又远小于任何真实列宽。
+    x_tol = row_tol * _COL_X_ROWS
+    below = sorted((t for t in tokens
+                    if t["cy"] > anchor["cy"] and abs(t["x0"] - anchor["x0"]) <= x_tol),
+                   key=lambda t: t["cy"])
     out, prev_cy = [], anchor["cy"]
     for t in below:
         if t["cy"] - prev_cy > row_tol * _BELOW_ROWS:

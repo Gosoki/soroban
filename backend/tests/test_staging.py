@@ -717,3 +717,78 @@ def test_a_dated_staging_row_still_gets_its_rate_up_front(client, session):
     row = session.get(OrderStaging, r.json()["id"])
     assert row.fx_rate == Decimal("18.5000"), (
         f"有下单日期却没按那天盖汇率：{row.fx_rate}")
+
+
+def test_renaming_an_item_on_a_priceless_staging_row_does_not_zero_the_money(client, session):
+    """物品单价全 NULL 的历史**暂存**行，改一次物品名不许把钱变成 0。
+
+    账本侧那条同名守卫（`test_money.py`）挡的是账本 PATCH，够不到这一条路。
+    而暂存侧比账本侧更糟：账本至少有 `derive_price` 那道闸能挡住第一次，
+    暂存侧的 `sync_from_items` **只有事后推断**一条路，而推断读的是
+    `build_items` 刚刚替换过的 items ⇒ **一次 PATCH 就丢钱**。
+
+    2026-09-02 实测（修之前）：¥320.00 / 物品单价全 NULL 的暂存行，
+    改一次物品名 → ¥0.00，HTTP 200、零提示。
+    `OrderStaging.sync_from_items` 的 docstring 承诺的正是「派生不出来时什么都不做」。
+
+    这种行不是构造的：`f6a7b8c9d0e1` 只加列不回填，回填脚本
+    `tools/backfill_item_price.py` 不在任何启动/恢复链上。
+    """
+    import datetime as dt
+
+    from app.models import OrderStaging, StagingItem
+
+    row = OrderStaging(date=dt.date(2027, 5, 1), title="历史暂存形态",
+                       order_no="STG-RENAME-KEEPS-MONEY", price_cny=320)
+    row.items = [StagingItem(name="甲", quantity=1), StagingItem(name="乙", quantity=2)]
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    assert all(i.unit_price_cny is None for i in row.items), "夹具没造对"
+
+    version = row.version
+    for n in range(1, 4):
+        r = client.patch(f"/api/staging/{row.id}", json={"version": version, "items": [
+            {"name": f"甲改名{n}", "quantity": 1, "unit_price_cny": None, "auto": False},
+            {"name": "乙", "quantity": 2, "unit_price_cny": None, "auto": False},
+        ]})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        version = body["version"]
+        assert str(body["price_cny"]).startswith("320"), (
+            f"第 {n} 次改暂存物品名，货款从 ¥320 变成 {body['price_cny']}——"
+            f"`build_items` 把 NULL 压成 0.00，`items_carry_no_price` 当场失效")
+        assert [i["unit_price_cny"] for i in body["items"]] == [None, None], (
+            f"第 {n} 次之后单价被写成了 {[i['unit_price_cny'] for i in body['items']]}——"
+            f"「不知道多少钱」被编码成了「就是 0 元」")
+
+
+def test_deliberately_clearing_every_staging_price_still_zeroes_the_row(client, session):
+    """**反面，不能省**：暂存行上把单价一个个删掉再保存，货款仍然必须归零。
+
+    与上一条送来的 payload **形状完全相同**（items 都不带 `unit_price_cny`）。
+    分辨它们的唯一信号是**替换 items 之前**的存量状态，事后看 items 分不出来——
+    所以 `update_staging` 必须把结论显式传给 `sync_from_items`，
+    而不能让它自己推断。少了这一条，上一条守卫可以靠「永远不派生」骗到绿。
+    """
+    import datetime as dt
+
+    from app.models import OrderStaging, StagingItem
+
+    row = OrderStaging(date=dt.date(2027, 5, 1), title="有价暂存",
+                       order_no="STG-CLEARING-ZEROES", price_cny=30)
+    row.items = [StagingItem(name="甲", quantity=1, unit_price_cny=10),
+                 StagingItem(name="乙", quantity=1, unit_price_cny=20)]
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    assert str(row.price_cny).startswith("30"), "夹具没造对"
+
+    r = client.patch(f"/api/staging/{row.id}", json={"version": row.version, "items": [
+        {"name": "甲", "quantity": 1, "unit_price_cny": None, "auto": False},
+        {"name": "乙", "quantity": 1, "unit_price_cny": None, "auto": False},
+    ]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert str(body["price_cny"]).startswith("0"), (
+        f"主动清空全部单价之后货款应归零（待补价），实际 {body['price_cny']}")

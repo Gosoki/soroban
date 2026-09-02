@@ -389,7 +389,18 @@ def _reap(proc: subprocess.Popen, label: str, key: str,
             except subprocess.TimeoutExpired:                    # 僵而不死（D 状态等）
                 log.error("插件 %s 已发 KILL 但仍未退出，放弃收割", label)
             log.warning("插件 %s 超时(%d 秒)已终止", label, _REAP_TIMEOUT)
-            result = f"超时（{_REAP_TIMEOUT // 60} 分钟）已终止"
+            # **把它挂住之前说的最后一句话带上。**
+            # 原先这里只报「超时（30 分钟）已终止」——一句没有信息量的结论：
+            # 用户等了半小时，仍然不知道它卡在哪。而 `errs` 里攒着的恰恰是唯一的线索
+            # （「正在等待浏览器登录…」「已加载第 3 页」之类），此前整个被丢掉。
+            # join **必须有上限**：孙进程攥着写端时 EOF 永远不来（见 `_drain`），
+            # 而这里已经是收尾路径，多等一秒都是卡片多顶一秒「执行中」。
+            # 也**必须先 join 再读**：`_drain` 会 `pop(0)` 裁剪，边写边读会读到撕裂的内容。
+            t_err.join(2)
+            stuck = next((ln.strip() for ln in reversed("".join(errs).splitlines())
+                          if ln.strip()), "")
+            result = (f"超时（{_REAP_TIMEOUT // 60} 分钟）已终止"
+                      + (f"｜挂住前最后一条输出：{stuck[-160:]}" if stuck else ""))
             return
         except Exception as e:                                   # noqa: BLE001
             log.warning("插件 %s 结果回收异常：%s", label, e)

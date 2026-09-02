@@ -16,7 +16,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from enum import Enum
 from typing import Optional
 
-from sqlalchemy import Text
+from sqlalchemy import Text, false
 from sqlmodel import Field, SQLModel
 
 from ..config import CNY_MAX, JPY_MAX
@@ -144,6 +144,53 @@ SHIPMENT_EXCLUDED = frozenset({ShipmentStatus.cancelled.value})   # 集运已取
 
 # 两段的并集。现在各表只用自己那半，本常量只剩「全部不计入的状态」这层文档语义。
 EXCLUDED_STATUSES = PURCHASE_EXCLUDED | SHIPMENT_EXCLUDED
+
+
+def not_deleted(model):
+    """「这一行没被软删」的**查询条件**。所有带 `is_delete` 的查询都该用它。
+
+    **它必须渲染成 `is_delete = 0`，不能是 `IS 0`**——这不是风格问题，是索引问题。
+
+    `orders` 和 `shipmentorder` 上的唯一索引都是**部分索引**
+    （`WHERE order_no IS NOT NULL AND is_delete = 0`，见各自的 `__table_args__`；
+    部分是必须的：软删之后同一个单号要允许再出现）。而 SQLite 判断
+    「这条查询能不能用这个部分索引」靠的是**语法蕴含**，不是语义等价：
+    查询里写 `is_delete = 0` 才和索引的 `is_delete = 0` 对得上；
+    写 `is_delete IS 0`（SQLAlchemy 的 `.is_(False)` 生成的就是它）对不上，
+    于是那个索引**一次都用不上**。
+
+    2026-09-02 实测（20000 行 orders + ANALYZE，按订单号精确查一条）：
+
+    | 写法 | 执行计划 | 耗时 |
+    |---|---|---|
+    | `.is_(False)` → `is_delete IS 0` | **SCAN orders** | 4.267 ms |
+    | `== false()` → `is_delete = 0` | SEARCH ... USING INDEX `ix_orders_order_no_platform_active` | **0.020 ms** |
+
+    其余查询形状（整表计数、按日期翻页、按平台筛）计划与耗时**一模一样**——
+    这是纯赢，没有需要权衡的一侧。
+
+    受影响的是所有「按单号精确查一条」的路径：OCR 去重问「这个单号是不是已经有了」、
+    暂存导入前的查重、插件回灌时的存在性判断。它们都是**逐条**发起的，
+    所以代价随批量线性放大，而全表 SCAN 在 SQLite 上还会和唯一的写者抢锁。
+
+    六种写法逐个实测过（2000 行 + ANALYZE），只有两种会丢索引：
+
+    | 写法 | 渲染成 | 结果 |
+    |---|---|---|
+    | `.is_(False)` | `is_delete IS 0` | **全表扫** |
+    | `!= True` | `is_delete != 1` | **全表扫** |
+    | `== False` / `== false()` / `~col` / `not_(col)` | `is_delete = 0` | 走索引 |
+
+    收敛成一个具名函数而不是散着写 `== false()`：
+    ① 那个写法本身没有任何东西提示它为什么不能是 `.is_(False)`，
+       下一个人「顺手改整齐」就会静默丢掉索引，而且**没有任何报错**——
+       查询照样返回正确结果，只是慢两百倍；
+    ② `== False` 会被 flake8 的 E712 挑刺，于是更容易被改回去。
+
+    真正的兜底是 `test_the_exact_order_no_lookup_actually_uses_its_index`：
+    它问数据库「你打算怎么执行」，不猜写法。
+    """
+    return model.is_delete == false()
 
 
 def is_unconverted(price_cny, jpy_settled) -> bool:
