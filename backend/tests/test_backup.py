@@ -963,3 +963,62 @@ def test_the_file_level_snapshot_keeps_alembic_version(ledger, tmp_path):
     with sqlite3.connect(f"file:{snap}?mode=ro", uri=True) as c:
         n = c.execute("select count(*) from orders").fetchone()[0]
     assert n >= 1, f"快照当账本用之后订单没了：{n} 条"
+
+
+def test_restore_refuses_unless_the_human_actually_types_yes(ledger, tmp_path, monkeypatch):
+    """恢复前那道「输入 yes」的确认闸——**全仓最具破坏性的动作，此前零覆盖**。
+
+    `restore()` 做的是「清空这个库的全部业务表，再写入快照里的内容」。
+    2026-09-02 变异实测，这道闸一条测试都没有：
+
+        把 `if not assume_yes:` 改成 `if False:`（默认就干）→ 全套 1375 条一条不红
+        把里面那句 `!= "yes"` 改成 `if False:`（答什么都放行）→ 同样一条不红
+
+    本文件里 5 处 `restore(...)` **全都传 `assume_yes=True`**——
+    绕过它是对的（那些用例测的是恢复本身），但**绕过不等于覆盖**。
+
+    三条一起钉：
+      ① 答「不是 yes」→ 必须**什么都不动**（返回 1，账本原样）；
+      ② 答 yes → 必须真的恢复；
+      ③ 提示里必须**点名要覆盖哪个库**——`restore` 的注释逐字写着理由：
+         「说错库，人确认的就是另一件事」。
+
+    ①还要连带钉一件事：**取消时连撤销快照都不该建**。确认在安全快照**之前**，
+    取消就该是「一个字节都没写过」，而不是「取消了但目录里多出一份文件」。
+    """
+    import io
+
+    from app.backup import restore
+
+    _fill(ledger, title="原始行", jpy=111)
+    snap = make_backup(out_dir=tmp_path / "bk", stream=io.StringIO())
+    snap = snap[0] if isinstance(snap, tuple) else snap
+    _fill(ledger, title="快照之后加的", jpy=222)          # 恢复会把它清掉
+
+    def titles():
+        with Session(ledger) as s:
+            return sorted(o.title for o in s.exec(select(Order)).all())
+
+    before = titles()
+    assert "快照之后加的" in before, f"夹具没造对：{before}"
+    n_files_before = len(list((tmp_path / "bk").glob("*.db")))
+
+    # ① 答「不」
+    out = io.StringIO()
+    monkeypatch.setattr("builtins.input", lambda *_a: "no")
+    rc = restore(snap, stream=out)
+    assert rc == 1, f"答了「no」却还是恢复了（返回 {rc}）——整库被覆盖，且没有第二次确认"
+    assert titles() == before, f"答了「no」，账本却变了：{titles()} ≠ {before}"
+    assert len(list((tmp_path / "bk").glob("*.db"))) == n_files_before, (
+        "取消了却还是建了撤销快照——确认应该在安全快照**之前**，"
+        "取消就该是一个字节都没写过")
+
+    # ③ 提示必须点名目标库
+    said = out.getvalue()
+    assert "ledger.db" in said, f"提示里没说要覆盖哪个库，人确认的可能是另一件事：{said[:200]!r}"
+
+    # ② 答 yes
+    monkeypatch.setattr("builtins.input", lambda *_a: "  YES  ")   # 顺带钉住 strip + 大小写
+    rc = restore(snap, stream=io.StringIO())
+    assert rc == 0, f"答了 yes 却没恢复（返回 {rc}）"
+    assert titles() == ["原始行"], f"恢复之后内容不对：{titles()}"

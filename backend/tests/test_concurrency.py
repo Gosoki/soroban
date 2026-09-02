@@ -73,6 +73,71 @@ def test_import_gate_claims_only_once(client):
         b.rollback()
 
 
+def test_two_people_importing_the_same_row_end_up_with_one_order(client, monkeypatch):
+    """两个人同时点「导入」，账本里只能多出**一张**单。
+
+    上面那条 `test_import_gate_claims_only_once` 测的是**手抄的一份 SQL**，
+    不是 `import_staging` 端点——把生产代码那条 `imported_order_id.is_(None)`
+    整个删掉，全套 1394 条一条都不红（2026-09-02 变异实测）。
+
+    **为什么这条闸不能只靠前面那个快速检查**：端点开头确实有
+    `if row.imported_order_id is not None: 409`，但两个并发请求会**双双**在
+    任何一方提交之前读到 None ⇒ 双双建单 ⇒ 全靠这条 UPDATE 的 WHERE 分胜负。
+
+    **为什么唯一索引兜不住**：有 `order_no` 的行撞唯一约束会被全局 409 接住，
+    而 OCR 认不出单号的行 `order_no` 是 NULL ——部分唯一索引对 NULL 不生效，
+    两张单会一起落进账本，钱算两遍。所以这条用例**故意不给 order_no**，
+    测的正是没有第二道保险的那一类行。
+
+    注入点是 `Order.sync_from_items`——它在建单之后、`session.flush()` **之前**
+    无条件调用一次。**必须在 flush 之前**：flush 会拿走 SQLite 的写锁，
+    这之后另一个连接连写都写不进去（实测直接 SQLITE_BUSY → 503），
+    而那不是真实时序。真实时序是「后到的那个请求阻塞在自己的 flush 上、
+    等前一个提交完再继续」，也就是**认领发生在本请求取得写锁之前**。
+    下面第一条断言先钉住「注入点真的被调用过」，免得探测方式过期后这条测试
+    退化成一句什么都不证明的话。
+    """
+    from sqlalchemy import update as sa_update
+
+    from app.models import utcnow as real_utcnow
+
+    s = client.post("/api/staging", json={"title": "并发导入", "price_cny": "300.00"}).json()
+    assert s.get("order_no") is None, "这条用例要的就是没有单号的行"
+    other_order = client.post("/api/orders", json={"date": "2027-04-01"}).json()
+
+    stolen = []
+    original_sync = Order.sync_from_items
+
+    def steal_then_sync(self, **kw):
+        if not stolen:
+            stolen.append(True)
+            with Session(get_engine()) as thief:
+                n = thief.execute(
+                    sa_update(OrderStaging)
+                    .where(OrderStaging.id == s["id"],
+                           OrderStaging.imported_order_id.is_(None))
+                    .values(import_status=ImportStatus.imported.value,
+                            imported_order_id=other_order["id"],
+                            version=OrderStaging.version + 1, updated_at=real_utcnow())
+                ).rowcount
+                thief.commit()
+            assert n == 1, "抢先认领没成功，这条用例的前提就不成立"
+        return original_sync(self, **kw)
+
+    monkeypatch.setattr(Order, "sync_from_items", steal_then_sync)
+    r = client.post(f"/api/staging/{s['id']}/import")
+
+    assert stolen, "注入点一次都没被调用 —— utcnow 的位置变了，这条测试已经不测那个竞态了"
+    assert r.status_code == 409, (
+        f"输给了并发的另一次导入，却照样返回 {r.status_code}——"
+        f"这条暂存行会在账本里变成两张单，钱算两遍：{r.text[:200]}")
+
+    # **两半都钉**：不只要报 409，输的那一方刚建的订单必须被回滚掉。
+    with Session(get_engine()) as chk:
+        made = chk.exec(select(Order).where(Order.title == "并发导入")).all()
+    assert made == [], f"409 了，但输的那一方建的单留在库里：{[o.id for o in made]}"
+
+
 def test_attach_gate_blocks_double_attach(client):
     """挂靠守卫：shipment_order_id IS NULL 让并发的第二次挂靠 rowcount=0。"""
     from sqlalchemy import update as sa_update

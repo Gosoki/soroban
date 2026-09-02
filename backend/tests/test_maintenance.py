@@ -500,3 +500,61 @@ def test_a_value_too_long_for_the_column_becomes_422_not_a_bare_500(client, monk
     detail = r.json()["detail"]
     assert "太长" in detail, detail
     assert "note" in detail, f"没把 MySQL 给的列名带出来（用户要靠它知道改哪一格）：{detail}"
+
+
+def test_an_unusable_lock_file_does_not_stop_the_app_from_starting(tmp_path, monkeypatch, caplog):
+    """锁文件**用不了**时必须放行——这是写明的决定，而它此前零覆盖。
+
+    `acquire` 的 docstring 把两件事分得很清：
+      · **拿不到**锁 = 真的有第二个进程 → 抛异常、拒绝启动（已有守卫）；
+      · **用不了**锁（目录只读、文件系统不支持 flock，注释点名「网络盘上很常见」）
+        → 记一条 warning 继续跑。「为了一道**辅助**闸门让整个应用起不来，是本末倒置。」
+
+    2026-09-02 变异实测：把那条 fail-open 换成 `raise`，全套 1377 条**一条都不红**。
+    而它一旦变成 fail-closed，后果落在这个应用最典型的部署上——
+    exe 放在网络盘 / 只读目录上双击，**应用直接起不来**，
+    而拦住它的是一道本来就只算「辅助」的闸。
+
+    三条 fail-open 分别验：打不开文件、锁不上（非 MultipleInstances 的 OSError）、写 pid 失败。
+    最后一条要求**仍然返回 True**——pid 只是给人看的，写不进去不该让锁本身作废。
+    """
+    import logging
+
+    from app import single_process
+
+    url = f"sqlite:///{tmp_path / 'ctl.db'}"
+
+    # ① 锁文件打不开
+    real_open = open
+    monkeypatch.setattr("builtins.open",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("只读目录")))
+    with caplog.at_level(logging.WARNING):
+        assert single_process.acquire(url) is False, (
+            "锁文件打不开时抛了异常——网络盘/只读目录上应用会直接起不来，"
+            "而这道闸本来就只算「辅助」")
+    assert any("跳过检查" in r.message or "跳过检查" in str(r.msg) for r in caplog.records), \
+        "静默跳过了，日志里一句话都没有——出问题时没人知道这道闸没在守"
+    monkeypatch.setattr("builtins.open", real_open)
+
+    # ② 文件系统不支持文件锁（非「已被占用」的 OSError）
+    monkeypatch.setattr(single_process, "_lock",
+                        lambda fh: (_ for _ in ()).throw(OSError("不支持 flock")))
+    assert single_process.acquire(url) is False, "文件系统不支持锁时抛了异常"
+    monkeypatch.undo()
+
+    # ③ 写 pid 失败**不该**让锁作废
+    try:
+        real_lock = single_process._lock
+        monkeypatch.setattr(single_process, "_lock", lambda fh: None)
+
+        class _NoWrite:
+            def __init__(self, fh): self._fh = fh
+            def __getattr__(self, k): return getattr(self._fh, k)
+            def write(self, *_a): raise OSError("写不进去")
+
+        monkeypatch.setattr("builtins.open", lambda *a, **k: _NoWrite(real_open(*a, **k)))
+        assert single_process.acquire(url) is True, (
+            "只是 pid 没写进去，锁本身却被判作废了——pid 只是给人看的")
+        assert real_lock is not None
+    finally:
+        single_process.release()

@@ -420,8 +420,13 @@ def test_migrate_to_current_db_rejected(client):
 
 
 def test_switch_to_current_db_rejected(client):
+    # 断言要带上理由：`switch` 里有**五**道闸都给 400（已在使用 / MySQL 连不上 /
+    # 表结构升级失败 / 尚未建表 / 目标无数据），只看状态码分不出是哪一道。
+    # 实测：把「已在使用」那道削掉，这条测试会红在 409（指纹闸），而不是继续绿——
+    # 也就是说它没有假绿，只是说得不够准。兄弟用例 test_migrate_to_current_db_rejected
+    # 一直是带理由断言的，两边口径对齐。
     r = client.post("/api/db/switch", json={"backend": "sqlite"})
-    assert r.status_code == 400
+    assert r.status_code == 400 and "当前" in r.json()["detail"], r.text
 
 
 def test_mysql_target_missing_fields_rejected(client):
@@ -932,3 +937,46 @@ def test_switching_after_editing_the_source_is_refused_until_confirmed(client, d
     assert r.status_code == 200, (
         f"用户已经明确表示放弃那些改动，还是切不过去：{r.status_code} {r.text[:200]}")
     assert "sqlite" in str(get_engine().url)
+
+
+def test_the_connection_you_are_using_cannot_be_deleted(client, monkeypatch):
+    """不能删掉**当前正在使用**的那条连接——删了就再也回不去了。
+
+    连接列表是「一键切换」的唯一入口，而连接串（含口令）只存在这张表里。
+    删掉正在用的那条之后：界面上那一行没了 ⇒ 切不回来；
+    库里那条加密 DSN 也没了 ⇒ 无从修复。用户手里只剩一个连着某个库、
+    却在界面上查无此库的应用。
+
+    2026-09-02 变异实测，这道闸**零覆盖**：把那句 400 整个拿掉，
+    全套 1378 条一条都不红（`delete_connection` 在 tests/ 里此前出现 **0** 次）。
+
+    两半都钉：
+      ① 正在用的那条**删不掉**（400，且话要说清怎么办）；
+      ② **没在用**的那条删得掉——否则闸变成一堵墙，用户攒下的旧连接永远清不掉。
+    """
+    from app.database import control_engine
+    from app.routers import dbadmin as mod
+
+    e = control_engine()
+    active = control.upsert_connection(e, backend="mysql",
+                                       url="mysql+pymysql://u:p@act:3306/actdb",
+                                       host="act", port=3306, user="u", database="actdb")
+    other = control.upsert_connection(e, backend="mysql",
+                                      url="mysql+pymysql://u:p@oth:3306/othdb",
+                                      host="oth", port=3306, user="u", database="othdb")
+
+    # 只把 `active` 那条当成「当前正在用的」——按 URL 判，与生产逻辑同源
+    monkeypatch.setattr(mod, "_is_same_as_active",
+                        lambda backend, url: "actdb" in (url or ""))
+
+    r = client.delete(f"/api/db/connections/{active}")
+    assert r.status_code == 400, (
+        f"删掉了正在使用的那条连接（{r.status_code}）——界面上它没了、应用却还连着它，"
+        f"用户既切不回来也无从修复")
+    assert "当前正在使用" in r.json()["detail"], f"拒绝了却没说清为什么：{r.json()}"
+    assert any(c["id"] == active for c in control.list_connections(e)), "拒绝了，记录却还是没了"
+
+    # 反面：没在用的那条必须删得掉
+    r = client.delete(f"/api/db/connections/{other}")
+    assert r.status_code == 200, f"没在用的连接也删不掉：{r.status_code} {r.text[:160]}"
+    assert not any(c["id"] == other for c in control.list_connections(e)), "说删了，其实还在"

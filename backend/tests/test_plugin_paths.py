@@ -973,6 +973,78 @@ def test_a_rejection_at_the_ingest_endpoint_reaches_the_card(client, session):
         runlog.reset()
 
 
+def test_a_batch_too_large_also_reaches_the_card(client, session):
+    """**核心一个字没写**的每一种结局都要进 runlog，不只是「逐条拒收」那一种。
+
+    `413 batch_too_large` 此前掉在名单外：判据原先是白名单
+    `_CORE_REFUSED = {400, 403, 422}`，而 413 是同一个 ingest 端点自己会回的码。
+    后果与被拒收一模一样——插件超量推一批，核心一条都没写，卡片却显示插件
+    自报的「已导入 N 单」，而这正是 runlog 存在的全部理由。
+
+    白名单不会报错，它只是安静地不覆盖新码，所以判据已经反过来写成黑名单
+    （只排除 409 / 503，理由见 `main.py`）；下面那条测试钉的就是那两个排除。
+    """
+    from app.plugins import runlog
+    from app.routers import plugins as mod
+
+    ingest.load_kinds()
+    if session.get(PluginConfig, "fx") is None:
+        session.add(PluginConfig(plugin_id="fx"))
+        session.commit()
+    headers, jti = _plugin_client(client, session, {"fx:write"})
+    try:
+        h = ingest.KINDS["fx.rate"]
+        items = [{"date": "2026-09-02", "rate": "21.0", "source": "boc"}] * (h.max_batch + 1)
+        r = client.post("/api/plugins/ingest", headers=headers,
+                        json={"kind": "fx.rate", "items": items})
+        assert r.status_code == 413, r.text
+
+        rec = runlog.peek(jti)
+        assert rec and rec["rejected"] >= 1, \
+            f"核心回了 413、一条都没写，却没记下来（runlog={rec}）——卡片会显示插件自报的成功"
+
+        mod._result_writer("fx", "抓取", run=jti)(True, "已导入 30 条")
+        cfg = session.get(PluginConfig, "fx")
+        session.refresh(cfg)
+        assert cfg.last_outcome != "ok", "插件自报成功就显示成功"
+    finally:
+        scopes.revoke(jti)
+        runlog.reset()
+
+
+def test_the_two_codes_that_are_not_refusals_stay_out_of_the_card():
+    """409 与 503 **不许**进 runlog——这两条豁免本身就是判据，得跟着验。
+
+    · 409：`POST /api/staging` 撞唯一键，在淘宝插件那里是「这单已经在暂存里了」
+      这个正常结局（它靠 409 做幂等 upsert）。记成拒收的话每一次正常抓取的卡片
+      都会变黄，而黄色一旦成为常态，真正的黄就没人看了。
+    · 503：只读屏障 / 写锁冲突 / 连接池耗尽，是暂时状态，两侧都会重试。
+
+    另一半（哪些**要**记）也在这里一并钉住：漏掉任何一个，卡片就会在
+    「核心什么都没写」的时候显示绿色。
+    """
+    from types import SimpleNamespace
+
+    from app import main as app_main
+    from app.plugins import runlog
+
+    req = SimpleNamespace(method="POST", url=SimpleNamespace(path="/api/plugins/ingest"))
+    try:
+        for code in (409, 503):
+            runlog.reset()
+            app_main._note_core_refusal("JTI-x", "demo", req, code)
+            assert runlog.peek("JTI-x") is None, \
+                f"HTTP {code} 被记成了拒收——正常结局/暂时状态会把卡片刷黄"
+
+        for code in (400, 403, 413, 422, 500):
+            runlog.reset()
+            app_main._note_core_refusal("JTI-x", "demo", req, code)
+            assert runlog.peek("JTI-x") is not None, \
+                f"HTTP {code} 没被记下来——核心什么都没写，卡片却会显示插件自报的成功"
+    finally:
+        runlog.reset()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Windows 没有进程组语义")
 def test_the_group_sweep_happens_before_the_output_drains():
     """按组回收必须排在两个 `join(5)` **之前**，而且不许吃掉插件的结果行。

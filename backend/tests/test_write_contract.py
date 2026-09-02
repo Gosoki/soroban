@@ -321,9 +321,37 @@ def test_not_null_columns_are_marked_not_clearable(page, model_name, exempt):
         + "\n给列配置加 `clearable: false`；确有理由允许清空就写进 _CLEARABLE_PAGES 的豁免表并说明。")
 
 
+def test_the_writable_page_lists_cover_every_editable_page():
+    """两张按页写死的名单（`_PAGES` / `_CLEARABLE_PAGES`）必须覆盖每一个可直接编辑的页面。
+
+    「可编辑」有个结构判据：页面自己有 `async function saveCell(`。
+    `Items` 页没有——它整表 `readonly: true`，改东西走 `OrderEditPanel`，
+    所以它不在这两张名单里是对的，而不是漏了。
+
+    这条断言的作用是**把漏掉变成红的**：新增一个能改格子的页面时，
+    上面那两条守卫（写契约、必填列不许清空）不会自己长出覆盖来，
+    它们只会安静地少验一页。
+    """
+    editable = _pages_with("async function saveCell(")
+    assert {p for p, *_ in _PAGES} == editable, (
+        f"写契约名单 _PAGES 覆盖 {sorted(p for p, *_ in _PAGES)}，"
+        f"而磁盘上能改格子的是 {sorted(editable)}"
+    )
+    assert {p for p, *_ in _CLEARABLE_PAGES} == editable, (
+        f"必填列名单 _CLEARABLE_PAGES 覆盖 {sorted(p for p, *_ in _CLEARABLE_PAGES)}，"
+        f"而磁盘上能改格子的是 {sorted(editable)}"
+    )
+
+
 # --- 筛选器的声明与使用必须双向一致 -------------------------------------------
 
-_FILTER_PAGES = ["Orders", "Items", "Staging", "Shipment"]
+def _pages_with(marker: str) -> set[str]:
+    """磁盘上 `index.vue` 含 `marker` 的页面名。"""
+    return {
+        d.name for d in sorted(_VIEWS.iterdir())
+        if (d / "index.vue").is_file()
+        and marker in (d / "index.vue").read_text(encoding="utf-8")
+    }
 
 
 def test_filter_keys_declared_and_used_match_exactly(subtests=None):
@@ -339,8 +367,21 @@ def test_filter_keys_declared_and_used_match_exactly(subtests=None):
     """
     import re as _re
 
+    # **名单不写死。** 原先钉着四页（Orders/Items/Staging/Shipment），`Misc` 从没进过
+    # 视野——它有同样的筛选栏、同样的 reactive 声明，只是没人想起它。硬名单不会报错，
+    # 它只是安静地不覆盖新页。
+    filter_pages = _pages_with("const filters = reactive(")
+    # 反空转：发现方式一旦失效（换个写法、改成 ref），名单会变成空集，
+    # 上面那个循环就一句话也不验、照样全绿。所以拿另一条独立线索对一遍：
+    # 模板上挂着 `applyFilters` 的页，就是有筛选栏的页，两边必须一模一样。
+    assert filter_pages == _pages_with('@change="applyFilters"'), (
+        f"筛选页的两条线索对不上：声明 reactive 的是 {sorted(filter_pages)}，"
+        f"模板挂 applyFilters 的是 {sorted(_pages_with('@change=\"applyFilters\"'))}。"
+        "多半是发现方式过期了——这条测试会因此变成空转。"
+    )
+
     bad = []
-    for page in _FILTER_PAGES:
+    for page in sorted(filter_pages):
         src = (_VIEWS / page / "index.vue").read_text(encoding="utf-8")
         m = _re.search(r"const filters = reactive\((\{[^}]*\})\)", src)
         assert m, f"{page}: 找不到 filters 的 reactive 初始化"
@@ -437,19 +478,53 @@ def test_item_editor_never_silently_drops_a_nameless_row():
         "saveItems 必须挡下空名行并提示，而不是替用户删掉"
 
 
-@pytest.mark.parametrize("page,loader", [
-    ("Dashboard", "dashboardApi.get"),
-    ("Items", "itemsApi.list"),
-    ("Orders", "ordersApi.list"),
-    ("Staging", "stagingApi.list"),
-    ("Shipment", "shipmentApi.list"),
-    ("Misc", "miscApi.list"),
+# 每页：(页, 加载调用, 加载函数名, 失败标志名)。后两项各页不同名，不能写死成
+# `load` / `loadFailed`——设置页叫 `fxFailed`、数据库页叫 `loadBackups`/`backupsFailed`，
+# 按死锚点找的话它们会**整页落在守卫外**，而它们显示的正是同一句「加载失败」。
+_LOADER_PAGES = [
+    ("Dashboard", "dashboardApi.get", "load", "loadFailed"),
+    ("Items", "itemsApi.list", "load", "loadFailed"),
+    ("Orders", "ordersApi.list", "load", "loadFailed"),
+    ("Staging", "stagingApi.list", "load", "loadFailed"),
+    ("Shipment", "shipmentApi.list", "load", "loadFailed"),
+    ("Misc", "miscApi.list", "load", "loadFailed"),
     # 这两页的空态**在断言用户的系统状态**（「装上汇率插件」/「plugins 下没有目录」），
     # 请求失败时照样显示的话，给出的是一条错误的行动指令——比单纯的假空态更贵。
-    ("Fx", "fxApi.history"),
-    ("Plugins", "pluginsApi.list"),
-])
-def test_list_pages_do_not_render_failure_as_emptiness(page, loader):
+    ("Fx", "fxApi.history", "load", "loadFailed"),
+    ("Plugins", "pluginsApi.list", "load", "loadFailed"),
+    # 备份列表的空态是「还没有备份。」——拉失败时照样显示的话，人会以为备份没了，
+    # 而这一页紧接着就是「切换数据源」，那是本仓最贵的一个操作。
+    ("Database", "dbApi.backups", "loadBackups", "backupsFailed"),
+    # 汇率那一栏的空态是「库里没有汇率」，会把人引去装汇率插件；拉失败时它在说假话。
+    ("Settings", "fxApi.get", "load", "fxFailed"),
+]
+
+
+def test_every_page_that_shows_load_failed_is_in_the_family():
+    """凡是会显示 `MSG_LOAD_FAILED` 的页面，都必须在 `_LOADER_PAGES` 里。
+
+    名单写死就会**安静地不覆盖**新页：这条守卫原先钉着八页，而 `Database` 与
+    `Settings` 同样显示那句「加载失败」，只因为把加载函数叫 `loadBackups`、
+    把标志叫 `fxFailed`，就整页落在守卫外——不是它们不合规，是没人在看。
+
+    用 `<=` 而不是 `==`：显示那句话的页必须被覆盖，反之不必——
+    `Dashboard` 的失败态是自己的文案（「总支出」那一屏不适合套通用句），它在名单里，
+    但不引用这个常量。
+    """
+    covered = {p for p, *_ in _LOADER_PAGES}
+    shows = {
+        d.name for d in sorted(_VIEWS.iterdir())
+        if (d / "index.vue").is_file()
+        and "MSG_LOAD_FAILED" in (d / "index.vue").read_text(encoding="utf-8")
+    }
+    assert shows <= covered, (
+        f"这些页显示「加载失败」却没被守卫覆盖：{sorted(shows - covered)}。"
+        "请连同它的加载函数名与失败标志名一起加进 _LOADER_PAGES。"
+    )
+
+
+@pytest.mark.parametrize("page,loader,fn_name,flag", _LOADER_PAGES)
+def test_list_pages_do_not_render_failure_as_emptiness(page, loader, fn_name, flag):
     """请求失败**不能**渲染成「空」。
 
     这两页原先只有 `try/finally`：接口挂了，Dashboard 保持初值全 0（「总支出 ¥0、
@@ -469,18 +544,18 @@ def test_list_pages_do_not_render_failure_as_emptiness(page, loader):
     body = re.sub(r"//.*$", "", src[src.index("<script"):], flags=re.M)   # 剥注释再判
     # 锚点要带括号：Orders/Staging 里还有 `async function loadAccounts()`，
     # 用 "async function load" 会切到那个（它自己带 catch，于是这条守卫在验别人的代码）。
-    m = re.search(r"^async function load\(\) \{", body, re.M)
-    assert m, f"{page} 里找不到 load()——这条测试要跟着更新"
+    m = re.search(rf"^async function {fn_name}\(\) \{{", body, re.M)
+    assert m, f"{page} 里找不到 {fn_name}()——这条测试要跟着更新"
     fn = body[m.start():]
     end = re.search(r"^(?:async )?function |^const |^onMounted", fn[1:], re.M)
     fn = fn[:end.start() + 1] if end else fn
-    assert re.search(r"\}\s*catch\b", fn), f"{page} 的 load() 没有 catch——失败会被静默吞掉"
-    assert re.search(r"loadFailed\.value\s*=\s*true", fn), \
+    assert re.search(r"\}\s*catch\b", fn), f"{page} 的 {fn_name}() 没有 catch——失败会被静默吞掉"
+    assert re.search(rf"{flag}\.value\s*=\s*true", fn), \
         f"{page} 捕获了失败却没把状态留下来"
-    assert re.search(r"loadFailed\.value\s*=\s*false", fn), \
+    assert re.search(rf"{flag}\.value\s*=\s*false", fn), \
         f"{page} 成功时没有清掉失败标志——失败一次就永远显示失败"
     tpl = src[:src.index("<script")]
-    assert "loadFailed" in tpl, f"{page} 定义了 loadFailed 却没在模板里用——等于没修"
+    assert flag in tpl, f"{page} 定义了 {flag} 却没在模板里用——等于没修"
 
 
 def test_user_facing_copy_has_no_bare_markdown():

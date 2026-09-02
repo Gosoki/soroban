@@ -59,7 +59,10 @@ def acquire(control_url: str) -> bool:
     if path is None:
         return False
     try:
-        fh = open(path, "a+")       # noqa: SIM115  故意长期持有，见 _handle
+        # `encoding` 显式写死：今天这个文件里只有 ASCII 数字（pid），怎么解码都一样，
+        # 但不写的话它跟随机器 locale——哪天有人往里多写一个标签（实例名、启动时间），
+        # 在中文/日文 Windows 上就会变成一个跟着机器变的文件。全仓文本 IO 的口径统一。
+        fh = open(path, "a+", encoding="utf-8")   # noqa: SIM115  故意长期持有，见 _handle
     except OSError as e:
         log.warning("单进程闸：锁文件 %s 打不开（%s），跳过检查", path, e)
         return False

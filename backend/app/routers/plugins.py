@@ -337,15 +337,38 @@ def _check_account_name(manifest: dict, account: str) -> Path:
         抛裸 `OSError`。表现是「添加成功，一登录就报个看不懂的错」。
       · **保留设备名**（`CON` / `NUL` / `COM1` …）——`NUL.json` 写进空设备，
         **会话永远存不下来**：用户登录成功、下次还要再登，一次报错都没有。
-      · **结尾的点**——Windows 静默去掉它，于是 `淘宝.` 与 `淘宝` 共用一份会话。
-        这与上面 `add_account` 里那段大小写折叠是同一类坑（两个账号一份 cookie），
-        只是成因不同。结尾空格不用管：调用方都先 `strip()` 过。
+      · **结尾的点、以及首尾的空白**——它们产出的是**肉眼分不出的两个账号**。
+        账号名不只是文件名，它还**逐字**写进账本的 `Order.platform_account`
+        （见 `add_account` 上面那行注释），而那一列是 `BinStr`（逐字节比较）：
+        `「淘宝 」` 与 `「淘宝」` 是两个不同的值 ⇒ 订单筛选的下拉里多出一个
+        看上去一模一样的账号，而那些单永远不在真账号下显示。
+        这与 `add_account` 里那段大小写折叠是同一类坑（两个东西看起来是一个）。
+
+        ⚠️ 这里原先写的理由是「Windows 会把结尾的点静默去掉，于是 `淘宝.` 与 `淘宝`
+        共用一份会话」。**那个机制在当前布局下不成立**（2026-09-02 核过）：
+        Windows 去掉的是**整个路径段末尾**的点与空格，而账号名永远带着后缀出现
+        （核心 `_state_file` 是 `<账号>.json`，插件那边是 `<账号>.json` 与 `<账号>.lock`），
+        那个点落在名字中间，不会被去掉。哪天有人把布局改成「每账号一个目录」，
+        那条理由才会重新成立——所以这道闸留着，只是理由换成上面那条真的。
 
     在**添加时**拒绝，而不是等到写文件时——那时用户已经在界面上看到这个账号了，
     删掉它还要走另一条路。
+
+    **首尾空白必须在这里拒，不能指望调用方 `strip()`。** 原先的注释写着
+    「结尾空格不用管：调用方都先 strip() 过」——那是句**自称的不变式**，
+    而 `run_command` 这个调用方并不 strip（`account: Optional[str] = None`
+    直接取自查询串，`_fan_targets` 又刻意允许「配置里没登记的孤儿账号」）。
+    于是 `POST /{id}/run/fetch?account=淘宝%20` 一路通到子进程的 `--account`，
+    插件把它原样写进 `platform_account` ⇒ 账本里就此多一个假账号。
+    这条路走不到界面上（卡片发的是名单里的名字），但本文件别处已经写明口径：
+    「接口不能只靠界面把关」。
     """
     if not account or "," in account:
         raise HTTPException(status_code=400, detail="账号昵称不能为空、且不能含逗号")
+    if account != account.strip():
+        raise HTTPException(status_code=400, detail=(
+            "账号昵称不能以空格等空白字符开头或结尾——它会逐字写进账本的账号列，"
+            "而那一列逐字节比较：「淘宝 」和「淘宝」会变成两个看起来一样的账号"))
     if bad := sorted(_WIN_BAD_CHARS & set(account)):
         shown = "".join(c for c in bad if c.isprintable()) or "控制字符"
         raise HTTPException(status_code=400, detail=(
@@ -658,6 +681,39 @@ print("\n".join([]))
 """
 
 
+def _child_env(extra: Optional[dict] = None) -> dict:
+    r"""给子进程的环境变量。**`PYTHONIOENCODING` 必须钉死成 utf-8。**
+
+    父进程这边所有管道都写着 `encoding="utf-8"`，而子进程用什么编码**写出来**
+    此前没人管——那由子进程自己的 locale 决定。POSIX 上碰巧不出事（PEP 538/540：
+    locale 是 C/POSIX 时 Python 自己就切 UTF-8），**Windows 上没有这套兜底**，
+    于是两头对不上，而且是静默的：
+
+      · 中文 Windows（cp936）：插件那行 `{"ok":true,"account":"闲鱼主号",...}`
+        按 GBK 写出、按 UTF-8 读进来 ⇒ 卡片上是 `'��������'`。
+        更糟的是 GBK 的**次字节范围含 `0x5C`（反斜杠）**——常用汉字里有 116 个
+        中招（乗、僜、刓…）。它们让 JSON 串里凭空多出一个裸反斜杠 ⇒
+        `json.loads` 抛 `Invalid \escape` ⇒ `_self_reported_error` 那支
+        `except ValueError: return False` ⇒ **自报了 error 却被当成没报**，
+        `warn` 那一档（黄色）整个失效，卡片是绿的。
+      · 日文 Windows（cp932）：简体字**根本编码不出来**，
+        子进程在 `print(json.dumps(...))` 这最后一句上抛 `UnicodeEncodeError`
+        ⇒ 退出码 1、stdout 空。而这时候**活已经干完了**（订单早就通过 HTTP
+        回灌进账本），用户看到的却是一张报红的卡片，多半会再点一次运行。
+
+    注意区分：Windows 控制台走的是 `WriteConsoleW`（PEP 528），中文打印没问题——
+    出事的**只有被重定向成管道**的那一路，也就是这里每一个子进程。
+
+    所以钉的是 `PYTHONIOENCODING` 而不是 `PYTHONUTF8=1`：后者会连带改掉插件自己
+    `open()` 的默认编码和文件系统编码，那是插件的事，核心不该替它决定。
+    这里只管**核心与插件之间那对管道**，两头都说 utf-8。
+    """
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    if extra:
+        env.update(extra)
+    return env
+
+
 def _missing_dists(py: Path, names: list[str]) -> list[str]:
     """这些发行包在**插件自己的解释器**里哪些没装。不能用 soroban 的解释器判断——两个环境是隔离的。
 
@@ -668,7 +724,14 @@ def _missing_dists(py: Path, names: list[str]) -> list[str]:
         return []
     try:
         r = subprocess.run([str(py), "-c", _PROBE_DISTS, *names],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True,
+                           # 解码口径与别处一致：钉 utf-8（子进程那头由 `_child_env` 钉），
+                           # 并且 `errors="replace"` —— 缺了它，一次解码失败抛的是
+                           # `UnicodeDecodeError`，而它是 `ValueError`，下面那个
+                           # `except (OSError, SubprocessError)` **接不住**，
+                           # 于是「探测依赖」会把整个插件卡片打成 500。
+                           encoding="utf-8", errors="replace",
+                           env=_child_env(), timeout=60)
     except (OSError, subprocess.SubprocessError):
         return []
     if r.returncode != 0:
@@ -809,7 +872,7 @@ def _launch(manifest: dict, command: str, extra: list[str], token: Optional[str]
     # 与本项目一贯的 fail-closed 取向正相反，而且日志和卡片上完全看不出区别。
     # 设了哨兵之后，插件能分清「没人给我令牌」和「我是被手动跑起来的」，
     # 前者当场失败、后者照旧回落。**这不是权限模型，是让一类回归有声音。**
-    env = {**os.environ, "SOROBAN_LAUNCHED": "1"}
+    env = _child_env({"SOROBAN_LAUNCHED": "1"})
     if token:
         env["SOROBAN_TOKEN"] = token
     if config:
@@ -960,7 +1023,8 @@ def _install_worker(manifest: dict, with_browser: bool) -> None:
         log.info("插件 %s 安装：%s", pid, label)
         try:
             r = subprocess.run(build(), cwd=str(d), capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=1800)
+                               encoding="utf-8", errors="replace",
+                               env=_child_env(), timeout=1800)
         except Exception as e:                       # noqa: BLE001
             return fail(f"{label}失败：{e}")
         if r.returncode != 0:

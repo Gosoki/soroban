@@ -49,6 +49,14 @@ def _check_manual_rate(v: Any) -> None:
 
     from ..config import FX_MAX, FX_MIN
 
+    # ⚠️ **这一句在生产路径上够不着，别据此以为它在守什么。**
+    # `validate` 恒由 `_coerce` 之后调用，而 `kind="str"` 那一支是 `v = str(raw)`
+    # ——JSON 传数字/布尔/列表都会先被转成字符串（实测：`20`→`"20"` 收下，
+    # `True`→`"True"` 在下面「不是一个数」那支被 422 挡掉）。
+    # 2026-09-02 变异实测：把这两行换成 `if False:`，全套 1379 条一条都不红，
+    # 而且 PUT 各种类型的返回**逐字相同**——是**空转**，不是零覆盖。
+    # 留着它是为了「万一将来 validate 被别处直接调用」，代价是它对变异测试隐形。
+    # （同族：`main.py` 那个 `matched`、`money.js` 那个 `p === ''`，见审计报告 §273 / §279。）
     if not isinstance(v, str):
         raise ValueError("手填汇率要填成文本")
     if not v.strip():

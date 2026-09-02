@@ -19,6 +19,12 @@
             </el-tag>
             <el-tag v-if="fx.expired" :style="typeStyle('danger')">已过期 {{ ageText }}</el-tag>
           </template>
+          <!-- **拉失败 ≠ 库里没有。** 两者原先显示同一句话：`fx` 初值是 `{}`，
+               而 `load()` 那个 catch 把失败吞掉之后 `fx.rate` 同样为假 ⇒
+               后端挂了也说「库里还没有汇率」。用户据此去填手填汇率或装插件，
+               而真问题在别处；期间每张新单都拿不到日元（看板「被吞掉的钱」那条路）。
+               与集运页「没有未挂靠的商品订单」是同一个形态（审计报告 §242）。 -->
+          <span v-else-if="fxFailed" class="sub">{{ MSG_LOAD_FAILED }}（汇率没能拉到，不是库里没有）</span>
           <span v-else class="sub">库里还没有汇率</span>
           <!-- 这条**必须在 v-if="fx.rate" 之外**：一条汇率都没有的时候，恰恰最需要告诉用户
                汇率从哪来。放进去过一次，结果「没有汇率」时链接反而不见了。
@@ -106,7 +112,7 @@ import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { QuestionFilled } from '@element-plus/icons-vue'
 import { fxApi, settingsApi } from '@/api'
-import { fxSourceName, typeStyle } from '@/constants'
+import { MSG_LOAD_FAILED, fxSourceName, typeStyle } from '@/constants'
 
 
 const loading = ref(false)
@@ -115,6 +121,7 @@ const specs = ref([])
 const saved = ref({})        // 服务端当前值
 const draft = ref({})        // 页面上的改动
 const fx = ref({})
+const fxFailed = ref(false)   // 拉**失败** ≠ 库里没有汇率；见 load 的 catch
 
 // 按 group 分卡片，保持注册表里的声明顺序（Object 插入序）
 const groups = computed(() => {
@@ -147,7 +154,12 @@ async function load() {
     saved.value = r.values
     draft.value = JSON.parse(JSON.stringify(r.values))
     fx.value = await fxApi.get()
-  } catch (_) { /* 拦截器已提示 */ } finally { loading.value = false }
+    fxFailed.value = false
+  } catch (_) {
+    // 拦截器已经弹过 toast，但那句话三秒就没了，而「库里还没有汇率」会一直挂在那儿。
+    // 只在这里立旗，不改其它状态：`specs` 拉失败时整页无卡片，那是另一回事。
+    fxFailed.value = true
+  } finally { loading.value = false }
 }
 
 function reset() { draft.value = JSON.parse(JSON.stringify(saved.value)) }

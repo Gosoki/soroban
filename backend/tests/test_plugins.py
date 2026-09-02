@@ -63,15 +63,94 @@ def test_bad_account_names_rejected(client, fake_plugin, bad):
     assert r.status_code == 400, f"{bad!r} → {r.status_code}"
 
 
+def _make_it_runnable(client, d):
+    """让假插件真的能走到 `run` 端点里的账号校验。
+
+    **两道闸都得先过，否则断言会被别的原因满足**——而它们回的码正好是
+    400 与 409，看起来像是「被挡住了」：
+
+      1. `if not _python(m).exists()` → 400「插件未安装：缺 venv」。
+         它排在 `_fan_targets` **前面**，所以不造 venv 的话，
+         「断言 status == 400」对**任何**账号名都成立。
+      2. `if not cfg.enabled` → 409。`PluginConfig.enabled` 默认就是 False。
+
+    下面 traversal 那条测试此前正是被第 1 条满足的（2026-09-02 实测：
+    把 `_check_account_name` 整个换成 `pass`，那四个参数一条都不红）。
+    两支解释器路径都造，Windows 上跑也成立。
+    """
+    for rel in ((".venv", "bin", "python"), (".venv", "Scripts", "python.exe")):
+        f = d.joinpath(*rel)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("#!/bin/sh\n", encoding="utf-8")
+    client.put(f"/api/plugins/{PLUGIN_ID}/config",
+               json={"enabled": True, "schedule_minutes": 0})
+
+
 @pytest.mark.parametrize("bad", ["../evil", "a/b", "../../etc/passwd", "sub/dir"])
 def test_path_traversal_account_names_rejected(client, fake_plugin, bad):
-    """账号名会变成 <state_dir>/<name>.json，必须挡住跳出目录。"""
+    """账号名会变成 <state_dir>/<name>.json，两个端点都必须挡住带路径分隔符的名字。
+
+    **只断言 `status == 400` 是不够的**：这条路径上至少有三种机制都会给 400，
+    删掉其中任何一个，测试照样绿（2026-09-02 逐个破坏实测）：
+
+      1. `run_command` 的「插件未安装：缺 venv」——它排在账号校验**前面**，
+         而假插件本来就没有 venv ⇒ 此前 run 那一半对**任何**名字都成立，
+         与账号校验毫无关系。`_make_it_runnable` 就是为了拆掉这一条。
+      2. `_check_account_name` 的 `_WIN_BAD_CHARS`——它含 `/` 和 `\\`，
+         而上面每个用例都带 `/` ⇒ 实际上是它接住的。
+      3. `_state_file` 的 `f.parent != d`——它排在 2 之后，
+         **在这条路径上永远轮不到**（能改变父目录的字符已经被 2 挡光了）。
+         它仍是必要的：改名端点（`/account/rename`）会直接调它。
+
+    所以断言只钉两件可验的事：**被拒**，且**是账号校验拒的**（不是缺 venv 那种
+    与名字无关的原因）。想区分 2 与 3 的话得换输入，而能绕过 2 的输入并不存在。
+    """
+    _make_it_runnable(client, fake_plugin)
     for ep, params in (
         (f"/api/plugins/{PLUGIN_ID}/account", {"name": bad}),
         (f"/api/plugins/{PLUGIN_ID}/run/login", {"account": bad}),
     ):
         r = client.post(ep, params=params)
         assert r.status_code == 400, f"{bad!r} @ {ep} → {r.status_code} {r.text[:120]}"
+        assert ("账号昵称" in r.text or "非法账号名" in r.text), (
+            f"{bad!r} @ {ep} 的 400 不是账号校验给的：{r.text[:160]}")
+
+
+@pytest.mark.parametrize("bad", [" 淘宝", "淘宝 ", "\t淘宝", "淘宝\n"])
+def test_an_account_name_padded_with_whitespace_never_reaches_the_ledger(
+        client, fake_plugin, bad):
+    """首尾带空白的账号名必须在**接口**上被拒，不能只靠界面。
+
+    账号名不只是会话文件名，它还**逐字**写进账本的 `Order.platform_account`
+    （插件的 `normalize.py` 直接把 `--account` 的值放进去），而那一列是 `BinStr`
+    ——逐字节比较。于是 `「淘宝 」` 与 `「淘宝」` 是两个不同的值：
+    订单筛选的下拉里多出一个**肉眼一模一样**的账号，那些单永远不在真账号下显示。
+
+    此前挡不住：`add_account` 会先 `name.strip()`，但 `run_command` 的
+    `account` 直接取自查询串、一个字都不改，而 `_fan_targets` 又刻意允许
+    「配置里没登记的孤儿账号」⇒ `?account=淘宝%20` 一路通到子进程的 `--account`。
+    `_check_account_name` 的注释当时还写着「结尾空格不用管：调用方都先 strip() 过」
+    ——一句**自称的**不变式。
+
+    走界面碰不到这条路（卡片发的是名单里的名字），但本仓的口径写在别处：
+    「接口不能只靠界面把关——那样别的调用方（或手滑的 curl）照样能……」。
+    """
+    _make_it_runnable(client, fake_plugin)
+    r = client.post(f"/api/plugins/{PLUGIN_ID}/run/login", params={"account": bad})
+    assert r.status_code == 400, f"{bad!r} → {r.status_code} {r.text[:160]}"
+    assert "空白" in r.text, f"400 了，但不是因为首尾空白：{r.text[:200]}"
+
+
+def test_a_clean_account_name_still_gets_through_the_name_check(fake_plugin):
+    """另一半：这道闸不能变成一堵墙——正常名字必须原样通过。
+
+    只钉「拒得住」的话，把校验写成 `raise` 一句也是绿的。
+    直接调校验函数而不是走端点：端点后面还会真的去起子进程（假插件那个
+    `python` 不是真解释器），那是另一件事，不该混进这条断言。
+    """
+    m = {"_dir": fake_plugin, "state_dir": ".state"}
+    for good in ("淘宝", "闲鱼主号", "taobao-2", "CONSOLE", "a.b"):
+        plug._check_account_name(m, good)      # 不抛就算过
 
 
 def test_state_file_traversal_blocked_directly(fake_plugin):
@@ -598,3 +677,170 @@ def test_no_module_level_constant_is_silently_shadowed_by_the_re_export():
         f"这些名字在 plugins.py 里既被再导入、又被本地赋值：{shadowed}\n"
         "再导入排在后面会覆盖本地定义 ⇒ 改本地那份**静默无效**。"
         "唯一真相应当留在 plugins_proc.py。")
+
+
+def test_a_plugin_result_survives_a_hostile_console_encoding(monkeypatch):
+    r"""插件那行结果 JSON，必须**逐字**穿过管道回到核心——不管机器的 locale 是什么。
+
+    父进程这边一直钉着 `encoding="utf-8"`，但子进程用什么编码**写出来**，
+    在 2026-09-02 之前没人管：那由子进程自己的 locale 决定。
+    POSIX 上碰巧不出事（PEP 538/540 会把 C/POSIX locale 强制成 UTF-8），
+    **Windows 上没有这套兜底**，于是两头对不上，而且是静默的：
+
+      · 中文 Windows（cp936）：`{"account":"闲鱼主号"}` 回来是 `{"account":"��������"}`。
+      · 而 GBK 的次字节范围含 `0x5C`——常用汉字里 116 个中招（乗、僜、刓…），
+        它们让 JSON 串里多出一个裸反斜杠 ⇒ `json.loads` 抛 `Invalid \escape`
+        ⇒ `_self_reported_error` 的 `except ValueError: return False`
+        ⇒ **插件自报了 error 却被当成没报**，黄色那一档整个失效。
+      · 日文 Windows（cp932）：简体字编码不出来，子进程在 `print` 这最后一句上
+        抛 `UnicodeEncodeError` ⇒ 退出码 1、stdout 空。而这时候**活已经干完了**
+        （订单早就回灌进账本），用户看到的是一张报红的卡片。
+
+    **怎么在 Linux 上把这个 bug 测出来**：`LC_ALL=C` 没用（PEP 538 会救它）。
+    要模拟的是「环境里已经写着一个不是 utf-8 的口径」，所以直接把
+    `PYTHONIOENCODING=gbk` 放进 `os.environ` —— 这既是最贴近 Windows 的模拟，
+    也顺带钉住了真正要的那条性质：**`_child_env()` 必须压过环境里已有的值**，
+    而不是「环境里没有时才补一个」。
+    """
+    import json as _json
+    import subprocess
+    import sys
+
+    from app.routers import plugins as mod
+
+    # 敌意环境：机器上已经写着一个非 utf-8 的口径（Windows 上这来自 locale）
+    monkeypatch.setenv("PYTHONIOENCODING", "gbk")
+
+    # 乗 的 GBK 次字节正好是 0x5C；账号昵称是用户自己起的，中文是常态
+    payload = {"ok": False, "account": "闲鱼主号", "error": "乗车券解析失败"}
+    child = (
+        "import json,sys;"
+        "sys.stdout.write(json.dumps(%r, ensure_ascii=False));"
+        "sys.stdout.write(chr(10));"
+        "sys.stderr.write(sys.stdout.encoding)" % (payload,)
+    )
+    r = subprocess.run([sys.executable, "-c", child], capture_output=True,
+                       encoding="utf-8", errors="replace", env=mod._child_env(), timeout=60)
+
+    assert r.returncode == 0, f"子进程没能把结果打出来：{r.stderr[-300:]}"
+    assert r.stderr.strip() == "utf-8", (
+        f"子进程的 stdout 编码是 {r.stderr.strip()!r}，不是 utf-8——"
+        "_child_env() 没有压过环境里已有的 PYTHONIOENCODING")
+
+    # 两半都要钉：JSON 得解析得出来（0x5C 那一类），内容还得逐字相同（乱码那一类）
+    got = _json.loads(r.stdout.strip())
+    assert got == payload, f"结果行内容变了：{got!r} != {payload!r}"
+
+    # 而核心据以判断「插件自己说出事了」的那条路，也必须跟着成立
+    from app.routers import plugins_proc
+    assert plugins_proc._self_reported_error(r.stdout.strip()), \
+        "插件自报了 error，核心却没认出来——黄色那一档会失效，卡片显示成绿的"
+
+
+def test_every_piped_subprocess_pins_both_ends_of_the_encoding():
+    """`plugins.py` 里每一个**按文本解码**的子进程调用，两头都要钉住编码。
+
+    父进程那头是 `encoding="utf-8"`，子进程那头是 `env=_child_env(...)`。
+    只钉一头等于没钉——这正是上面那条测试描述的 bug 的成因。
+
+    判据落在 AST 的**关键字实参**上，不是搜字符串：`plugins.py` 里 `_child_env`
+    这个名字在注释与 docstring 里出现好几次，按文本搜的话，一个只在注释里
+    提过它、实参根本没传的调用照样能过。
+
+    **扫的是整个 `app/`，不是写死的某个文件。** 今天三个解码调用确实都在
+    `plugins.py`，但「当前的集合」不是「集合的定义」——写死文件名的话，
+    哪天别处起一个带管道的子进程，这条守卫会安静地不看它。
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "app"
+
+    # `env=` 常常传的是个**变量**（`env = _child_env({...})` 之后再 `env=env`），
+    # 所以先把「哪些名字是从 _child_env 来的」收一遍，认到一层赋值为止。
+    bad = []
+    seen = 0
+    for f in sorted(root.rglob("*.py")):
+        tree = ast.parse(f.read_text(encoding="utf-8"))
+        from_helper = {
+            tgt.id for n in ast.walk(tree) if isinstance(n, ast.Assign)
+            for tgt in n.targets
+            if isinstance(tgt, ast.Name) and "_child_env" in ast.unparse(n.value)
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = ast.unparse(node.func)
+            if fn not in ("subprocess.run", "subprocess.Popen"):
+                continue
+            kw = {k.arg: k.value for k in node.keywords if k.arg}
+            # 只管「会被解码成 str」的那些：text=True 或显式给了 encoding。
+            # 不解码的（拿 bytes 的）没有这个问题，别去烦它们。
+            decodes = kw.get("encoding") is not None or (
+                isinstance(kw.get("text"), ast.Constant) and kw["text"].value is True)
+            if not decodes:
+                continue
+            seen += 1
+            where = f"{f.name}:{node.lineno} 的 {fn}"
+            enc = kw.get("encoding")
+            if not (isinstance(enc, ast.Constant) and enc.value == "utf-8"):
+                bad.append(f"{where}：父进程这头没钉 encoding=\"utf-8\"")
+            if "errors" not in kw:
+                bad.append(f"{where}：没给 errors —— 解码失败会抛 UnicodeDecodeError(ValueError)，"
+                           "而这里的 except 多半只接 OSError/SubprocessError，接不住")
+            env = kw.get("env")
+            env_src = ast.unparse(env) if env is not None else ""
+            if env is None or not ("_child_env" in env_src or env_src in from_helper):
+                bad.append(f"{where}：子进程那头没钉 —— 要传 env=_child_env(...)，"
+                           "否则子进程按自己的 locale 写出来（Windows 上就不是 utf-8）")
+
+    # 反空转：一个都没找到多半是探测方式过期了，而不是「全都合规」
+    assert seen >= 3, f"只找到 {seen} 个按文本解码的子进程调用，探测方式可能已过期"
+    assert not bad, "子进程编码没有两头钉住：\n  " + "\n  ".join(bad)
+
+
+
+def test_every_text_file_is_read_and_written_as_utf8():
+    """全仓的文本 IO 一律显式 `encoding="utf-8"`，不许跟随机器 locale。
+
+    不写的话，`open()` / `read_text()` / `write_text()` 用的是
+    `locale.getpreferredencoding()`——**Linux 上是 UTF-8，中文 Windows 上是 cp936，
+    日文 Windows 上是 cp932**。于是同一份代码在开发机上一切正常，
+    到了用户机器上读出来是乱码、或者写出去的文件别的程序读不了，
+    而这些文件里装的恰恰全是中文（插件清单、requirements、摘要、状态文件）。
+
+    这与 `_child_env` 钉 `PYTHONIOENCODING` 是同一件事的两半：
+    那一半管**进程之间的管道**，这一半管**磁盘上的文件**。
+
+    `Image.open(...)` 这类不算——判据要求 `open` 是**内置函数**（裸名字调用），
+    属性调用（`Image.open`、`gzip.open`）走的不是这条路。
+    """
+    import ast
+    from pathlib import Path
+
+    roots = [Path(__file__).resolve().parents[1] / "app"]
+    bad, seen = [], 0
+    for root in roots:
+        for f in sorted(root.rglob("*.py")):
+            tree = ast.parse(f.read_text(encoding="utf-8"))
+            for n in ast.walk(tree):
+                if not isinstance(n, ast.Call):
+                    continue
+                is_builtin_open = isinstance(n.func, ast.Name) and n.func.id == "open"
+                is_path_text = (isinstance(n.func, ast.Attribute)
+                                and n.func.attr in ("read_text", "write_text"))
+                if not (is_builtin_open or is_path_text):
+                    continue
+                # 二进制模式没有编码可言
+                mode = next((a.value for a in n.args
+                             if isinstance(a, ast.Constant) and isinstance(a.value, str)), "")
+                if is_builtin_open and "b" in mode:
+                    continue
+                seen += 1
+                if not any(k.arg == "encoding" for k in n.keywords):
+                    bad.append(f"{f.name}:{n.lineno} 的 {ast.unparse(n.func)}() 没写 encoding")
+
+    # 反空转：探测方式一旦过期，`seen` 会掉到 0，上面那个循环一句都不验、照样绿
+    assert seen >= 6, f"只找到 {seen} 处文本 IO，探测方式可能已过期"
+    assert not bad, ("这些文本 IO 跟随机器 locale（Windows 上就不是 UTF-8）：\n  "
+                     + "\n  ".join(bad))

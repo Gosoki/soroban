@@ -3000,11 +3000,11 @@ console.log(JSON.stringify(cols.map((c) => cell(row, c))))
 
 
 def test_every_list_page_exports_exactly_what_the_screen_is_showing():
-    """四个列表页都要能导出，而且**导出与列表必须共用同一份筛选参数**。
+    """每个分页列表页都要能导出，而且**导出与列表必须共用同一份筛选参数**。
 
     两件事各有各的失败方式：
 
-    · **没有导出**。物品列表原先是四页里唯一没有的一个，而它用的是同一套
+    · **没有导出**。物品列表原先是唯一没有的一个，而它用的是同一套
       `NotionTable` + 列配置 + 分页 + 筛选，导出工具（`utils/exportCsv.js`）本来就是通用的。
       少这一个按钮不会报错，只会让人在那一页上手抄。
 
@@ -3012,14 +3012,26 @@ def test_every_list_page_exports_exactly_what_the_screen_is_showing():
       而这种文件往往是要发给别人的。加一个筛选条件时只改了 `load()`，
       导出就悄悄多带出被筛掉的行——文件本身看不出任何异常。
 
-    判据必须先剥注释再匹配：这条测试自己的说明里就写着 `filterParams`，
-    而页面顶上那句「列表与导出共用这一份」同样含这个词。不剥的话，
+    **名单由页面自己的结构说了算，不写死。** 这条测试原先钉着一张四页的硬名单
+    （Orders/Shipment/Misc/Items），于是 `Staging` 从来没进过视野——它有同样的
+    `NotionTable`、同样的分页、五个筛选器，只是没人想起它。硬名单不会报错，
+    它只是**安静地不覆盖**新页：第五、第六个列表页加进来时，这条测试照样全绿。
+    改成从磁盘发现，再要求每一页要么在 `EXPORTS` 里、要么在 `EXEMPT` 里，
+    新页就必须先被归类才能过。
+
+    **判据必须先剥注释再匹配。** 这条测试自己的说明里就写着 `filterParams`，
+    页面顶上那句「列表与导出共用这一份」同样含这个词——不剥的话，
     一个只有注释、没有调用的页面也能过。
+
+    剥注释只对上面这些**内容**判据起作用；**发现**这一步不靠它，靠的是
+    「真的挂了 `<NotionTable` 标签」与「真的有分页器」两个条件同时成立
+    （实测剥不剥都一样）。这两个条件缺一不可：`views/Fx` 全文出现 7 次
+    `NotionTable`，没有一次是组件，全是「本表手写，逐条对齐 NotionTable 的取值」
+    这类注释——它是只读汇率表，既没有筛选栏也没有分页，两个条件各自都能把它挡在外面。
     """
     import re
 
     root = Path(__file__).resolve().parents[2] / "frontend" / "src" / "views"
-    pages = ["Orders", "Shipment", "Misc", "Items"]
 
     def strip_comments(text: str) -> str:
         """剥注释。**块注释的开头前面不能是字母或斜杠**——否则
@@ -3030,10 +3042,32 @@ def test_every_list_page_exports_exactly_what_the_screen_is_showing():
         text = re.sub(r"(?<![\w/])/\*.*?\*/", "", text, flags=re.S)   # 块注释
         return re.sub(r"//[^\n]*", "", text)                    # 行注释
 
-    for page in pages:
-        src = strip_comments((root / page / "index.vue").read_text(encoding="utf-8"))
+    # 「分页列表页」= 剥注释后真的挂了 <NotionTable，且真的有分页器。
+    # 两个条件都要：只看 NotionTable 会把 Fx 那种手写只读表算进来（见 docstring）。
+    pages = {}
+    for d in sorted(root.iterdir()):
+        f = d / "index.vue"
+        if not f.is_file():
+            continue
+        src = strip_comments(f.read_text(encoding="utf-8"))
+        if "<NotionTable" in src and "el-pagination" in src:
+            pages[d.name] = src
 
-        assert "exportCsv(" in src, f"{page} 页没有导出——四个列表页应该一致"
+    EXPORTS = {"Orders", "Shipment", "Misc", "Items"}
+    # 暂存区是唯一的豁免：它的行是**待导入**的中间态，导出的正经出口在导入之后的订单页。
+    # 这是个产品决定，不是结构事实，所以下面**把豁免的前提当断言验**——
+    # 只要它长出第二个筛选消费者（导出、批量导入、任何一个），豁免立刻失效。
+    EXEMPT = {"Staging"}
+    assert set(pages) == EXPORTS | EXEMPT, (
+        f"列表页名单变了：磁盘上是 {sorted(pages)}，"
+        f"这条测试认得的是 {sorted(EXPORTS | EXEMPT)}。"
+        "新页要么进 EXPORTS（跟着验导出与共用筛选），要么进 EXEMPT 并写下能被断言的理由。"
+    )
+
+    for page in sorted(EXPORTS):
+        src = pages[page]
+
+        assert "exportCsv(" in src, f"{page} 页没有导出——分页列表页应该一致"
         assert "导出 CSV" in src, f"{page} 页有 exportCsv 但工具栏上没有那个按钮"
 
         for fn in ("doExport", "load"):
@@ -3041,7 +3075,25 @@ def test_every_list_page_exports_exactly_what_the_screen_is_showing():
             assert m, f"{page} 页没找到 {fn}() —— 探测方式可能已过期"
             assert "filterParams()" in m.group(0), (
                 f"{page} 页的 {fn}() 没走共用的 filterParams()："
-                f"列表与导出各算一份筛选，导出的 CSV 会和屏幕上不是同一批行")
+                f"列表与导出各算一份筛选，导出的 CSV 会和屏幕上不是同一批行"
+            )
+
+    for page in sorted(EXEMPT):
+        src = pages[page]
+        assert "exportCsv(" not in src, (
+            f"{page} 页已经有导出了 —— 它不该再留在 EXEMPT，"
+            "请移进 EXPORTS，让共用筛选参数那一条也管到它"
+        )
+        # 豁免的前提：筛选只有 load() 一个消费者，所以内联拼参数还不会产生分歧。
+        script = src.split("<script", 1)[1]
+        m = re.search(r"async function load\(\).*?\n\}", script, re.S)
+        assert m, f"{page} 页没找到 load() —— 探测方式可能已过期"
+        in_load = m.group(0).count("filters.")
+        assert in_load > 0, f"{page} 页的 load() 不读 filters —— 探测方式可能已过期"
+        assert in_load == script.count("filters."), (
+            f"{page} 页的筛选已经有第二个消费者了。豁免的前提没了："
+            "两处各自内联拼参数迟早对不上，请先抽出 filterParams() 再说"
+        )
 
 
 def test_every_ledger_page_serialises_writes_to_the_same_row():
@@ -5024,3 +5076,42 @@ def test_the_fulfillment_status_filter_matches_what_the_column_shows(client, ses
     assert not bad, (
         "「显示什么」与「按什么筛得到」对不上（Python 属性与 SQL 筛选是两份实现）：\n  "
         + "\n  ".join(map(str, bad[:8])))
+
+
+def test_the_settings_page_does_not_call_a_failed_fetch_an_empty_rate_table():
+    """设置页：**拉不到汇率**与**库里没有汇率**必须说两句不同的话。
+
+    `fx` 的初值是 `{}`，而 `load()` 的 catch 原先只写「拦截器已提示」——
+    于是后端挂掉时 `fx.rate` 同样为假，界面照旧显示「库里还没有汇率」。
+    那句话在这一刻是**假的**，而它带来的动作是错的：用户会去填手填汇率、
+    或去装汇率插件，真问题却在别处；期间每张新单都拿不到日元
+    （正是看板「被吞掉的钱」那条路）。拦截器那句 toast 三秒就没了，
+    这句假话一直挂在那儿。
+
+    与集运页「没有未挂靠的商品订单」是同一个形态（§242）——同一句话的第三种说谎方式。
+
+    判据**先剥注释**：这一处恰好有一段解释性注释，里面必然出现 `fxFailed`、
+    「库里还没有汇率」这些词，不剥就会被自己的解释满足（记忆里踩过七次的形态）。
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2]
+           / "frontend/src/views/Settings/index.vue").read_text(encoding="utf-8")
+    body = re.sub(r"<!--.*?-->", "", src, flags=re.S)
+    body = re.sub(r"(?<![\w/])/\*.*?\*/", "", body, flags=re.S)
+    body = re.sub(r"(?<![:\w])//[^\n]*", "", body)
+
+    assert "fxFailed" in body, (
+        "设置页没有「汇率拉失败」这个状态——后端挂掉时它会说「库里还没有汇率」，"
+        "而那句话此刻是假的")
+    # 失败那一支必须排在「库里还没有汇率」**前面**，否则永远轮不到
+    i_fail = body.find("fxFailed")
+    i_empty = body.find("库里还没有汇率")
+    assert 0 <= i_fail < i_empty, (
+        f"「库里还没有汇率」排在失败分支前面（{i_empty} < {i_fail}），失败态永远显示不出来")
+    assert re.search(r'v-else-if="fxFailed"', body), (
+        "失败态不是 `v-else-if`，与空态不在同一条链上——两句话可能同时出现或都不出现")
+    # catch 里必须真的立旗，否则那个 ref 恒为 false
+    assert re.search(r"catch[^{]*\{[^}]*fxFailed\.value\s*=\s*true", body, re.S), (
+        "`load()` 的 catch 没有把 fxFailed 置真——那个状态永远不会亮")

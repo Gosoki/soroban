@@ -3405,3 +3405,34 @@ def test_account_names_that_break_on_windows_are_refused_at_add_time(client, tmp
     for name in ok:
         r = client.post("/api/plugins/demo/account", params={"name": name})
         assert r.status_code == 200, f"正常昵称「{name}」被误挡了：{r.status_code} {r.text[:160]}"
+
+
+def test_runlog_take_actually_clears_the_entry():
+    """`take()` 必须**取走并清掉**——它的 docstring 写着「收尾时调一次，天然不会泄漏」。
+
+    2026-09-02 变异实测：把 `_RUNS.pop(run, None)` 换成 `_RUNS.get(run)`
+    （取到但不清），全套 1379 条**一条都不红**。
+
+    不清的后果不是内存爆掉——上限 256 兜着——而是**上限被死记录占满**：
+    每次 `note_rejected` 发现表满就丢最早的一条，于是**真正发生拒收的那一次**
+    会被 256 条早已收尾的死记录挤掉。挤掉之后插件卡片显示的就是插件自报的那句
+    绿色的「已导入 N 单」，而核心其实一条都没收——**这正是 runlog 存在的全部理由**
+    （见模块开头：「一个不看回执的插件……会让卡片显示绿色的成功而库里零写入」）。
+
+    连带钉住 `take` 的另一半语义：**第二次 take 必须是 None**。
+    收尾路径只调一次，但「调两次会拿到两份」会让重试/重入逻辑悄悄多报一遍。
+    """
+    from app.plugins import runlog
+
+    runlog.reset()
+    runlog.note_rejected("run-A", "demo", "暂存订单", 3, "订单号缺失")
+
+    assert runlog.peek("run-A") is not None, "夹具没造对：记录没进去"
+    got = runlog.take("run-A")
+    assert got and got["rejected"] == 3, f"take 没取到内容：{got}"
+
+    assert runlog.peek("run-A") is None, (
+        "take 之后记录还在——收尾时清不掉，`_RUNS` 会被死记录填满，"
+        "而上限一满就丢最早的，真正发生拒收的那次会被挤掉，"
+        "卡片于是显示插件自报的绿色成功")
+    assert runlog.take("run-A") is None, "第二次 take 又拿到了一份，同一批拒收会被报两遍"

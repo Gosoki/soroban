@@ -177,16 +177,27 @@ async def _readonly_barrier(request: Request, call_next):
 # `/api/ingest`**，而唯一批量写数据的淘宝插件走的是 REST（`/api/staging`）——
 # 保证装在了不需要它的那一侧。
 #
+# **判据是黑名单，不是白名单。** 原先写的是 `_CORE_REFUSED = {400, 403, 422}`，
+# 于是同一个 ingest 端点里的 `413 batch_too_large` 掉在名单外：插件超量推一批，
+# 核心一条都没写、runlog 一个字都没记，卡片显示的还是插件自报的「已导入 30 单」
+# ——正是本机制存在的全部理由。白名单不会报错，它只是**安静地不覆盖**新的错误码
+# （413、405、500、507…），而每加一个错误码都要有人想起回来改这里。
+#
+# 反过来写只需要说清**哪些 4xx/5xx 不算拒收**，而这一共只有两个，理由都很具体：
+#
 # **刻意排除 409**：`POST /api/staging` 撞唯一键回 409，而那在淘宝插件那里是
 # 「这单已经在暂存里了」这个**正常结局**（它靠 409 做幂等 upsert）。
 # 把 409 记成拒收，每一次正常抓取的卡片都会变黄——那比不记更糟，
 # 因为黄色一旦成为常态，真正的黄就没人看了。
-# 503（只读屏障）同理排除：那是暂时状态，不是拒收。
-_CORE_REFUSED = frozenset({400, 403, 422})
+# 503（只读屏障 / 写锁冲突 / 连接池耗尽）同理排除：那是暂时状态，前端与插件都会重试。
+#
+# 500 **要记**：它既不是正常结局也不是暂时状态，它就是「核心炸了、什么都没写」，
+# 而用户看到的后果与被拒收一模一样。
+_NOT_A_REFUSAL = frozenset({409, 503})
 
 
 def _note_core_refusal(jti, plugin_id: str, request: Request, status: int) -> None:
-    if status in _CORE_REFUSED and jti:
+    if status >= 400 and status not in _NOT_A_REFUSAL and jti:
         from .plugins import runlog
 
         runlog.note_rejected(jti, plugin_id,
