@@ -272,49 +272,43 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Downgrade schema."""
-    op.drop_index(op.f('ix_stagingitem_staging_id'), table_name='stagingitem')
+    """Downgrade schema：**只 drop 表**。
+
+    自动生成的版本在每个 `drop_table` 前面还各自 `drop_index` 一遍（21 条）
+    外加三次 `drop_active_unique`。那些全是冗余的——`DROP TABLE` 本来就带走
+    它自己的全部索引和生成列，而这一步之后根本没有 schema 了。
+
+    **在 MySQL 上它们不只是冗余，是会把整条降级链卡死**：
+    `ix_stagingitem_staging_id` 是外键 `stagingitem.staging_id → taobaostaging.id`
+    唯一可用的索引，InnoDB 不许删：
+
+        (1553, "Cannot drop index 'ix_stagingitem_staging_id':
+                needed in a foreign key constraint")
+
+    2026-09-01 在真 MySQL 9.7 上实测：修掉 `a9b0c1d2e3f4` 那条之后，
+    27 条降级里前 26 条都通了，**只剩这最后一条**倒在同一个错误上。
+    而 MySQL 的 DDL 隐式提交 ⇒ 前 26 条已经全部落地不可回滚。
+
+    表的先后顺序保持原样（子表在前、父表在后），那是外键要求的，删不得。
+    """
     op.drop_table('stagingitem')
 
-    drop_active_unique(op, table='taobaostaging', index_name='ix_staging_order_no', gen_col='order_no_active_key')
-    op.drop_index(op.f('ix_taobaostaging_status'), table_name='taobaostaging')
     op.drop_table('taobaostaging')
 
-    op.drop_index(op.f('ix_orderitem_taobao_order_id'), table_name='orderitem')
     op.drop_table('orderitem')
 
-    drop_active_unique(op, table='taobaoorder', index_name='ix_taobaoorder_order_no_active', gen_col='order_no_active_key')
-    op.drop_index(op.f('ix_taobaoorder_taobao_account'), table_name='taobaoorder')
-    op.drop_index(op.f('ix_taobaoorder_status'), table_name='taobaoorder')
-    op.drop_index(op.f('ix_taobaoorder_source'), table_name='taobaoorder')
-    op.drop_index(op.f('ix_taobaoorder_shipment_order_id'), table_name='taobaoorder')
-    op.drop_index(op.f('ix_taobaoorder_express_no'), table_name='taobaoorder')
-    op.drop_index(op.f('ix_taobaoorder_deleted_at'), table_name='taobaoorder')
-    op.drop_index(op.f('ix_taobaoorder_date'), table_name='taobaoorder')
     op.drop_table('taobaoorder')
 
-    drop_active_unique(op, table='shipmentorder', index_name='ix_shipmentorder_shipment_no_active', gen_col='shipment_no_active_key')
-    op.drop_index(op.f('ix_shipmentorder_status'), table_name='shipmentorder')
-    op.drop_index(op.f('ix_shipmentorder_source'), table_name='shipmentorder')
-    op.drop_index(op.f('ix_shipmentorder_deleted_at'), table_name='shipmentorder')
-    op.drop_index(op.f('ix_shipmentorder_date'), table_name='shipmentorder')
     op.drop_table('shipmentorder')
 
-    op.drop_index(op.f('ix_miscexpense_source'), table_name='miscexpense')
-    op.drop_index(op.f('ix_miscexpense_deleted_at'), table_name='miscexpense')
-    op.drop_index(op.f('ix_miscexpense_date'), table_name='miscexpense')
     op.drop_table('miscexpense')
 
-    op.drop_index(op.f('ix_user_username'), table_name='user')
     op.drop_table('user')
 
-    op.drop_index('ix_tagoption_field_value', table_name='tagoption')
-    op.drop_index(op.f('ix_tagoption_field'), table_name='tagoption')
     op.drop_table('tagoption')
 
     op.drop_table('setting')
     op.drop_table('pluginconfig')
 
-    op.drop_index(op.f('ix_fxrate_date'), table_name='fxrate')
     op.drop_table('fxrate')
     op.drop_table('columnlayout')

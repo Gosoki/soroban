@@ -510,6 +510,25 @@ def _inherit_needs(d: Path) -> list[dict]:
                      + "。需要把它装进 soroban 自己的环境（打包版则要重新打包）"}]
 
 
+def _req_lines(req: Path) -> list[str]:
+    """读 requirements.txt。**不许因为编码把整个插件页干掉。**
+
+    三个读点（`_declared_reqs` / `_declared_dists` / `_wants_browser`）原先各自
+    `read_text(encoding="utf-8")`。而这个文件常常通篇是中文注释，用户拿一个按 GBK
+    存盘的编辑器改一下，`UnicodeDecodeError` 就会从 `needs_cached`（它没有 except）
+    一路逃到 `main.py` 的 `ValueError` 处理器（`UnicodeDecodeError` 是 `ValueError` 的子类）
+    ——`GET /api/plugins` 回 422，**所有插件一起从页面上消失**，
+    而出问题的只是其中一个的一行注释。同目录里的 `plugin.toml` 是专门做了容错的
+    （解析失败只把那一个插件标成 `manifest_error`），requirements.txt 没有理由更脆。
+
+    `errors="replace"` 而不是猜编码：真正要用的那部分（包名、版本约束）恒是 ASCII，
+    坏字节只可能出现在注释和它们的中文里，替换掉不影响任何判断。
+    猜编码（chardet 之类）要引依赖，而且猜错时的表现是「解析出一个不存在的包名」——
+    比替换更难查。
+    """
+    return req.read_text(encoding="utf-8", errors="replace").splitlines()
+
+
 def _declared_reqs(req: Path) -> list[str]:
     """requirements.txt 的**整行**（含版本约束），交给探测脚本去比。
 
@@ -518,7 +537,7 @@ def _declared_reqs(req: Path) -> list[str]:
     在这儿比一遍只会报出「soroban 该升级了」这种插件页管不了的事。
     """
     out = []
-    for line in req.read_text(encoding="utf-8").splitlines():
+    for line in _req_lines(req):
         line = line.strip()
         if line and not line.startswith(("#", "-")):
             out.append(line)
@@ -534,7 +553,7 @@ def _declared_dists(req: Path) -> list[str]:
     等于这个插件是块砖。requirements.txt 里写的本来就是发行包名，照着查就行。
     """
     out = []
-    for line in req.read_text(encoding="utf-8").splitlines():
+    for line in _req_lines(req):
         line = line.strip()
         if not line or line.startswith(("#", "-")):
             continue
@@ -571,31 +590,31 @@ def _has_pip(py: Path) -> bool:
 # 卡片照样显示「已就绪」，点运行才 AttributeError——而那个报错指向插件代码，
 # 没有任何一处会说「你的依赖是旧的」。
 #
-# 在子进程里做，因为要问的是**插件自己那个 venv**。用 packaging 解析约束；
-# 它是 pip 的依赖、venv 里必然有，真没有就退回只比包名——宁可漏报，
-# 也不能因为探测本身出问题就把用户卡在「装不完」（那比不报更让人摸不着头脑）。
+# **探测脚本只报事实，不做判断。** 它跑在插件自己那个 venv 里，
+# 而那个 venv 是 `python -m venv --without-pip` 建的、只装 requirements.txt 里那几行
+# —— 里面**连 pip 都没有**，更不会有 `packaging`。
+#
+# 上一版把约束解析放进了这个脚本，注释还写着「它是 pip 的依赖、venv 里必然有」。
+# **那句话是错的**：实测淘宝插件 venv 里之所以有 `packaging`，
+# 是因为我为了跑插件自己的测试往里装过 pytest（旁边就躺着 `iniconfig` / `pluggy`）。
+# 用户那边只装 playwright + httpx，`import packaging` 直接 ImportError，
+# 于是整段比对静默退回「只看包名在不在」——**那个功能在真实安装里一次都没跑过**，
+# 而卡片照旧显示绿色的「已就绪」。
+#
+# 所以现在分工是：子进程只回「这个名字装的是哪个版本」（纯 stdlib，任何 venv 都能跑），
+# 约束满不满足由**核心自己**判（核心的 `packaging` 已写进 requirements.txt）。
 _PROBE_DISTS = r"""
 import re, sys
 from importlib.metadata import PackageNotFoundError, distribution
-try:
-    from packaging.requirements import Requirement
-except Exception:
-    Requirement = None
-miss = []
 for line in sys.argv[1:]:
+    name = re.split(r"[<>=!~\[; ]", line, maxsplit=1)[0].strip()
     try:
-        if Requirement is None:
-            distribution(re.split(r"[<>=!~\[; ]", line, maxsplit=1)[0].strip())
-            continue
-        req = Requirement(line)
-        got = distribution(req.name).version
-        if req.specifier and not req.specifier.contains(got, prereleases=True):
-            miss.append(line + "（装的是 " + got + "）")
+        print(name + "\t" + distribution(name).version)
     except PackageNotFoundError:
-        miss.append(line)
+        print(name + "\t")                 # 空版本 = 没装
     except Exception:
-        pass                      # 元数据坏了/约束写歪了不算缺，别把用户卡在「装不完」
-print("\n".join(miss))
+        print(name + "\t?")                # 元数据坏了：不当成缺，也不当成满足
+print("\n".join([]))
 """
 
 
@@ -614,12 +633,50 @@ def _missing_dists(py: Path, names: list[str]) -> list[str]:
         return []
     if r.returncode != 0:
         return []
-    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+    got = {}
+    for ln in r.stdout.splitlines():
+        if "\t" in ln:
+            name, ver = ln.split("\t", 1)
+            got[name.strip()] = ver.strip()
+    return _unsatisfied(names, got)
+
+
+def _unsatisfied(lines: list[str], installed: dict[str, str]) -> list[str]:
+    """哪些 requirement 行没被满足。**判断在核心这一侧做**，理由见 `_PROBE_DISTS`。
+
+    `installed` 是探测脚本回来的 `{包名: 版本}`：空字符串 = 没装，`"?"` = 元数据坏了。
+    元数据坏了既不算缺、也不算满足——把用户卡在「装不完」比不报更让人摸不着头脑。
+
+    `packaging` 缺席时退回只比包名（宁可漏报）。它已经写进 `requirements.txt`，
+    但源码部署里有人手工删依赖这种事是会发生的，而探测本身不该因此变成故障。
+    """
+    try:
+        from packaging.requirements import Requirement
+    except Exception:                                   # noqa: BLE001
+        return [ln for ln in lines
+                if not installed.get(re.split(r"[<>=!~\[; ]", ln, maxsplit=1)[0].strip())]
+
+    out = []
+    for line in lines:
+        name = re.split(r"[<>=!~\[; ]", line, maxsplit=1)[0].strip()
+        ver = installed.get(name)
+        if ver is None or ver == "":
+            out.append(line)                            # 压根没装
+            continue
+        if ver == "?":
+            continue
+        try:
+            req = Requirement(line)
+        except Exception:                               # noqa: BLE001  约束写歪了
+            continue
+        if req.specifier and not req.specifier.contains(ver, prereleases=True):
+            out.append(f"{line}（装的是 {ver}）")
+    return out
 
 
 def _wants_browser(d: Path) -> bool:
     req = d / "requirements.txt"
-    return req.exists() and "playwright" in req.read_text(encoding="utf-8").lower()
+    return req.exists() and any("playwright" in ln.lower() for ln in _req_lines(req))
 
 
 def _browser_ready(py: Path) -> bool:

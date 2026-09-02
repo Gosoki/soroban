@@ -157,7 +157,7 @@ async function saveCell(row, key, value) {
 async function addRow(data = {}, done) {
   try {
     const created = await miscApi.create({ date: today(), name: '', ...data })
-    await afterCreate(created, { rows, total, page, filters, load, pageSize })
+    await afterCreate(created, { rows, total, page, filters, load, pageSize, sumJpy, unconverted })
     done?.(true)
   } catch (e) {
     // 超时/断网 = **结果未知**（请求已经发出去了，可能已经落库）。

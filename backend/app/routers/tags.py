@@ -358,20 +358,41 @@ def _plugin_owns_account(session: Session, field: str, value: str) -> bool:
     探测失败一律当「不归插件管」——最坏是本地改个名（数据自身仍然一致），
     而反过来误判会把用户堵死在一个他打不开的端点上。
     惰性 import：`plugins.py` 已经 import 了本模块，顶层互相 import 会成环。
+
+    ⚠️ **失败的作用域必须是「一个插件」，不是「整个循环」。**
+    原先整段共用一个 `try`：装了一个把 `accounts_ledger_field` 写错的第三方插件
+    （而 `_ledger_field` 对此会 `raise HTTPException(400, …)`，它是 `Exception` 的子类），
+    只要它的目录名排在正常插件之前，循环就在第一圈中止并返回 False——
+    **排在它后面的插件根本没被检查过**，这道闸对所有插件一起失效。
+
+    后果不是报错，是静默错账：`rename_tag` 的两道「这是插件管理的账号，
+    改名请去插件管理页」放行 → 账本里 `platform_account='甲'` 全改成 '乙'、
+    前端弹绿字「已改名」；而插件侧 `params_json` 里还是「甲」、磁盘
+    `.state/甲.json` 也还在 → 下一轮抓取继续写「甲」，同一个人的单从此劈成两半，
+    按账号筛选和合计两边都不对，全程零报错。
+    2026-09-01 实测 A/B：只有淘宝插件时返回 True（拦住），
+    加一个与「甲」毫无关系的坏声明插件后变成 False。
     """
     try:
         from .plugins import PluginConfig, _known_names, _ledger_field, discover
 
-        for m in discover():
+        found = discover()
+    except Exception as e:                                   # noqa: BLE001  连插件都发现不了
+        log.warning("判断 %s=%s 是否由插件管理时出错，按「无插件」处理：%s", field, value, e)
+        return False
+
+    for m in found:
+        try:
             if _ledger_field(m) != field:               # 这个插件的账号不落在这一列上
                 continue
             cfg = session.get(PluginConfig, m["id"])
             if value in _known_names(cfg, m):           # 配置账号 ∪ 磁盘残留会话
                 return True
-        return False
-    except Exception as e:                                   # noqa: BLE001
-        log.warning("判断 %s=%s 是否由插件管理时出错，按「无插件」处理：%s", field, value, e)
-        return False
+        except Exception as e:                               # noqa: BLE001
+            # 一个插件的声明有问题，**只跳过它**，继续检查别的。
+            log.warning("插件 %s 的账号声明有问题，跳过它继续检查其余插件：%s",
+                        (m or {}).get("id", "?"), e)
+    return False
 
 
 @router.post("/{field}/rename", response_model=list[TagOut])

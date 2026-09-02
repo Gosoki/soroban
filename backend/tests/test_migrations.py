@@ -481,3 +481,62 @@ def test_the_collation_downgrade_checks_before_it_drops_anything():
     assert check < drop, (
         f"预检（第 {check} 行）排在了 drop_active_unique（第 {drop} 行）后面。"
         "MySQL 的 DDL 隐式提交，drop 之后再拦已经晚了——约束此后永远建不回来")
+
+
+def test_no_downgrade_drops_an_index_on_a_table_it_also_drops():
+    """`downgrade()` 里不许对**自己随后就要 drop 掉的表**再单独 drop 索引。
+
+    那种写法是 alembic 自动生成的默认形状，在 SQLite 上只是冗余
+    （`DROP TABLE` 本来就带走它全部的索引和生成列），**在 MySQL 上会把整条降级链卡死**：
+
+        (1553, "Cannot drop index 'ix_stagingitem_staging_id':
+                needed in a foreign key constraint")
+
+    InnoDB 要求外键列上有一根以它打头的索引，全表只有那一根时就删不掉。
+    而 **MySQL 的 DDL 是隐式提交的** —— 降级链在半路倒下时，前面每一条都已经落地
+    且不可回滚：`pluginrecord` 整张表被 DROP、`pluginconfig` 五列被删、
+    `d2e3f4a5b6c7` 的降级还 `DELETE FROM fxrate`。
+    库停在一个既不是旧版也不是新版的半降级态，而这正是 README 写着
+    「全部迁移在真 MySQL 上跑通 upgrade→downgrade→upgrade」的那条路。
+
+    2026-09-01 实测：修掉 `a9b0c1d2e3f4` 那条之后 27 条里通了 26 条，
+    最后一条（baseline → base）倒在同款错误上；删掉那 24 条冗余语句之后全通。
+
+    判据走 AST，不按字符串——这条测试自己的说明里就写着 `drop_index`。
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "alembic" / "versions"
+    files = sorted(root.glob("*.py"))
+    assert len(files) >= 20, f"只扫到 {len(files)} 个迁移，探测方式可能已过期"
+
+    offenders = []
+    for f in files:
+        tree = ast.parse(f.read_text(encoding="utf-8"))
+        fn = next((n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "downgrade"), None)
+        if fn is None:
+            continue
+        dropped_tables, index_drops = set(), []
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            name = (node.func.attr if isinstance(node.func, ast.Attribute)
+                    else getattr(node.func, "id", ""))
+            if name == "drop_table" and node.args and isinstance(node.args[0], ast.Constant):
+                dropped_tables.add(node.args[0].value)
+            elif name in ("drop_index", "drop_active_unique"):
+                for kw in node.keywords:
+                    if kw.arg in ("table_name", "table") and isinstance(kw.value, ast.Constant):
+                        index_drops.append((kw.value.value, node.lineno))
+        for tbl, line in index_drops:
+            if tbl in dropped_tables:
+                offenders.append(f"{f.name}:{line}  表 {tbl} 随后就被 drop_table 了")
+
+    assert not offenders, (
+        "这些 downgrade 在 drop 掉整张表之前还单独 drop 了它的索引：\n  "
+        + "\n  ".join(offenders)
+        + "\n在 SQLite 上只是冗余，在 MySQL 上会撞 1553 把整条降级链卡在半路（DDL 已隐式提交）。"
+          "\n直接删掉那些 drop_index —— DROP TABLE 本来就带走它们。")
+

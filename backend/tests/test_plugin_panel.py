@@ -3157,34 +3157,38 @@ def test_a_version_constraint_in_requirements_is_actually_checked():
     卡片照样显示「已就绪」，点运行才 AttributeError，
     **而那个报错指向插件代码，没有任何一处会说「你的依赖是旧的」**。
 
-    这与 §187.1（打包版换 exe 不更新插件）是同一个形状：判据只看表面。
-    那条看的是没人改过的 version 字符串，这条看的是包名在不在。
+    ⚠️ **这条测试的上一版是在 soroban 自己的解释器上跑探测脚本**，理由写的是
+    「要问的环境是哪一个，是调用方的事」。**那正是它失明的原因**：
+    soroban 的解释器有 `packaging`，而插件 venv 是 `venv --without-pip` 建的，
+    连 pip 都没有。约束解析当时放在探测脚本里，一到真实 venv 就 ImportError、
+    静默退回只比包名——这条测试全程绿着，而那个功能一次都没跑过。
 
-    在 soroban 自己的解释器上跑探测脚本即可验证判据——
-    要问的环境是哪一个，是调用方 `_missing_dists(py, …)` 的事。
+    所以现在分两层各测各的：
+      · 这一条钉**核心侧的判断**（`_unsatisfied`），用一张用例表，跑得快；
+      · `test_version_constraints_are_checked_even_in_a_venv_without_packaging`
+        造一个真的、没有 `packaging` 的 venv 走完整条路——
+        那才是「这个功能在用户机器上到底跑不跑」的判据。
     """
-    import subprocess
-    import sys
+    from app.routers.plugins import _unsatisfied
 
-    from app.routers.plugins import _PROBE_DISTS
+    installed = {
+        "httpx": "0.27.0",        # 装着，版本偏低
+        "playwright": "1.62.0",   # 装着，满足
+        "weird": "?",             # 元数据坏了
+        "gone": "",               # 没装
+    }
+    got = _unsatisfied(
+        ["httpx>=0.28", "playwright>=1.40", "weird>=1.0", "gone>=1.0", "httpx"], installed)
 
-    r = subprocess.run(
-        [sys.executable, "-c", _PROBE_DISTS,
-         "pytest>=1.0",          # 装着且满足 → 不该报
-         "pytest>=9999.0",       # 装着但版本不够 → 该报
-         "no-such-dist-xyz"],    # 压根没装 → 该报
-        capture_output=True, text=True, timeout=60)
-    assert r.returncode == 0, r.stderr[-300:]
-    out = r.stdout.strip().splitlines()
-
-    assert not any(x.startswith("pytest>=1.0") for x in out), (
-        f"装着且满足约束的包被报成缺失：{out}")
-    stale = [x for x in out if x.startswith("pytest>=9999.0")]
-    assert stale, f"版本不满足约束却没报出来：{out}"
-    assert "装的是" in stale[0], (
-        f"报了但没说实际装的是哪一版，用户不知道该升到哪：{stale}")
-    assert any(x.startswith("no-such-dist-xyz") for x in out), (
-        f"完全没装的包漏报了：{out}")
+    assert not any(x.startswith("playwright") for x in got), f"满足约束的被报成缺失：{got}"
+    stale = [x for x in got if x.startswith("httpx>=0.28")]
+    assert stale, f"版本不满足约束却没报出来：{got}"
+    assert "0.27.0" in stale[0], f"报了但没说实际装的是哪一版，用户不知道该升到哪：{stale}"
+    assert any(x.startswith("gone") for x in got), f"完全没装的漏报了：{got}"
+    assert not any(x == "httpx" for x in got), f"没写约束的行被报成缺失：{got}"
+    assert not any(x.startswith("weird") for x in got), (
+        f"元数据坏了被当成「缺依赖」：{got}——那会把用户送去点安装，"
+        f"而点了也不会变，比不报更让人摸不着头脑")
 
 
 def test_the_venv_dependency_check_passes_the_whole_requirement_line():
@@ -3206,3 +3210,138 @@ def test_the_venv_dependency_check_passes_the_whole_requirement_line():
     body = re.sub(r"^\s*#.*$", "", body, flags=re.M)
     assert "_declared_reqs" in body, (
         "venv 依赖检查仍在传只剩包名的列表——版本约束在到达探测脚本前就丢了")
+
+
+def test_version_constraints_are_checked_even_in_a_venv_without_packaging(tmp_path):
+    """插件 venv 里**没有** `packaging` 时，版本约束照样要比出来。
+
+    这是这个功能的真实运行条件，不是边角：插件 venv 由
+    `python -m venv --without-pip` 建，只装 requirements.txt 里那几行——
+    **连 pip 都没有**，更不会有 `packaging`。
+
+    上一版把约束解析放进了跑在插件 venv 里的探测脚本，注释还写着
+    「它是 pip 的依赖、venv 里必然有」。那句话是错的：
+    实测淘宝插件 venv 里之所以有 `packaging`，是因为为了跑插件自己的测试
+    往里装过 pytest（旁边就躺着 `iniconfig` / `pluggy`）。用户那边一装就
+    `ImportError` → 静默退回「只看包名在不在」→ **那段比对一次都没跑过**，
+    而卡片照旧显示绿色的「已就绪」，点运行才 AttributeError。
+
+    所以这条测试真的造一个**干净的 venv**（`--without-pip`，与线上同款），
+    往里放一个版本明确偏低的假发行包，再走真实的 `_missing_dists`。
+    **不 mock 子进程**——被 mock 掉的恰恰是出问题的那一环。
+    """
+    import subprocess
+    import sys
+    import venv
+
+    from app.routers.plugins import _missing_dists
+
+    vdir = tmp_path / "v"
+    venv.EnvBuilder(with_pip=False).create(vdir)
+    py = vdir / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    assert py.exists(), "临时 venv 没建出来"
+
+    # 干净 venv 里确实没有 packaging —— 这条测试的前提
+    probe = subprocess.run([str(py), "-c", "import packaging"], capture_output=True)
+    assert probe.returncode != 0, "这个 venv 里有 packaging，前提不成立（那就测不到降级那条路）"
+
+    # 造一个 0.1.0 版的假发行包（只要 .dist-info 就够 importlib.metadata 认）
+    site = next(vdir.glob("lib/python*/site-packages"), None) or (vdir / "Lib" / "site-packages")
+    site.mkdir(parents=True, exist_ok=True)
+    info = site / "fakepkg-0.1.0.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Metadata-Version: 2.1\nName: fakepkg\nVersion: 0.1.0\n",
+                                   encoding="utf-8")
+
+    miss = _missing_dists(py, ["fakepkg>=9.0"])
+    assert miss, ("插件 venv 里没有 packaging 时，版本约束一个字都没报——"
+                  "判断必须由核心来做，不能指望插件 venv 里有 packaging")
+    assert "0.1.0" in miss[0], f"报了但没说装的是哪个版本，用户不知道该升到哪：{miss}"
+
+    # 反面一：满足约束时**不许**报，否则用户被永久卡在「装不完」
+    assert _missing_dists(py, ["fakepkg>=0.1"]) == [], "约束满足却报缺"
+    # 反面二：压根没装的照旧要报
+    assert _missing_dists(py, ["nosuchpkg>=1.0"]) == ["nosuchpkg>=1.0"]
+
+
+def test_one_plugin_with_a_broken_manifest_does_not_take_the_whole_page_down(client, tmp_path,
+                                                                            monkeypatch):
+    """**一个插件写错，不许连累别的插件。** `GET /api/plugins` 是前端秒级轮询的接口。
+
+    三种手误各走一条不同的崩法，全都会让整页 500 / 422、**连正常的那个也一起消失**：
+
+    | 手误 | 崩在哪 | 异常 |
+    |---|---|---|
+    | `min = "1"`（TOML 里最常见的引号手误） | `params._coerce` 的 `n < p.minimum` | `TypeError` |
+    | `choices = 5` | `manifest._param` 的 `list(raw["choices"])` | `TypeError` |
+    | requirements.txt 存成 GBK | `_declared_reqs` 等三处 `read_text(utf-8)` | `UnicodeDecodeError` |
+
+    前两个的 `TypeError` 直接逃到 ASGI 层 ⇒ 真 500；第三个是 `ValueError` 的子类，
+    被 `main.py` 的处理器接住 ⇒ 422 —— **两种都让整页一个插件都列不出来**，
+    而同目录里的 `plugin.toml` 解析本来就是专门做了容错的
+    （坏了只把那一个插件标成 `manifest_error`）。requirements.txt 与参数字段没有理由更脆。
+
+    判据不只看状态码：**正常那个插件必须还在列表里**。只判 200 的话，
+    「返回 200 但列表是空的」照样绿，而那对用户是同一件事。
+    """
+    from app.routers import plugins as mod
+
+    root = tmp_path / "plugins"
+    root.mkdir(parents=True)
+
+    def mk(name: str, body: str, reqs: bytes = None):
+        d = root / name
+        d.mkdir(parents=True)
+        (d / "plugin.toml").write_text(body, encoding="utf-8")
+        if reqs is not None:
+            (d / "requirements.txt").write_bytes(reqs)
+        return d
+
+    base = ('id = "{id}"\nname = "{nm}"\nversion = "1.0.0"\npython = "venv"\n'
+            '[[commands]]\nname = "run"\nlabel = "跑"\nargv = ["-m", "x"]\n')
+    mk("soroban-plugin-ok", base.format(id="ok", nm="正常插件"))
+    mk("soroban-plugin-badmin", base.format(id="badmin", nm="引号手误")
+       + '\n[[params]]\nkey = "n"\nlabel = "数"\ntype = "int"\ndefault = 3\nmin = "1"\n')
+    mk("soroban-plugin-badchoices", base.format(id="badchoices", nm="choices 手误")
+       + '\n[[params]]\nkey = "s"\nlabel = "选"\ntype = "select"\nchoices = 5\n')
+    mk("soroban-plugin-gbk", base.format(id="gbk", nm="坏编码"),
+       reqs="# 中文注释：说明为什么要这个包\nhttpx>=0.27\n".encode("gbk"))
+
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(root))
+    monkeypatch.setattr(mod, "_SOROBAN_ROOT", tmp_path)
+    mod._needs_cache.clear()
+
+    r = client.get("/api/plugins")
+    assert r.status_code == 200, f"一个写错的插件把整页干掉了：{r.status_code} {r.text[:250]}"
+    ids = {p["id"] for p in r.json()}
+    assert "ok" in ids, f"正常插件不在列表里（只有 {sorted(ids)}）——返回 200 但列表空着是同一件事"
+    assert {"badmin", "badchoices", "gbk"} <= ids, (
+        f"写错的插件被整个吞掉了（只有 {sorted(ids)}）——用户会以为它没装上，"
+        f"而真正该做的是把它列出来并说清哪里写错了")
+
+    # 手误的那两项**不生效**，但参数本身照常可用（不是把整个插件废掉）
+    badmin = next(p for p in r.json() if p["id"] == "badmin")
+    assert any(x["key"] == "n" for x in badmin["params"]), f"参数被整个丢了：{badmin['params']}"
+
+
+def test_requirements_that_are_not_utf8_still_parse(tmp_path):
+    """requirements.txt 不是 UTF-8 时，包名与版本约束照样要解析出来。
+
+    上一条钉的是「整页不许崩」；这一条钉的是**内容没丢**——
+    只要求不崩的话，`try: ... except: return []` 也能过，
+    而那等于「这个插件的依赖检查从此永远说『不缺』」，卡片会一直显示绿色的「已就绪」。
+
+    真正要用的那部分恒是 ASCII（包名、版本约束），坏字节只会出现在注释里。
+    """
+    from app.routers.plugins import _declared_dists, _declared_reqs, _wants_browser
+
+    d = tmp_path / "p"
+    d.mkdir()
+    req = d / "requirements.txt"
+    req.write_bytes("# 中文注释：这里说明为什么要这个包\nhttpx>=0.28\nplaywright>=1.40\n"
+                    .encode("gbk"))
+
+    assert _declared_reqs(req) == ["httpx>=0.28", "playwright>=1.40"]
+    assert _declared_dists(req) == ["httpx", "playwright"]
+    assert _wants_browser(d) is True, "浏览器判据也读这个文件，同样不能因为编码失灵"
+

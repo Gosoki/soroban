@@ -54,6 +54,39 @@ def _never_touch_the_real_backups_dir():
 
 
 @pytest.fixture(autouse=True)
+def _the_global_engine_never_leaves_the_temp_dir():
+    """每条用例跑完，**进程级的数据库指向必须还在会话临时目录里**。
+
+    `DATABASE_URL` 在 import `app.*` 之前就被指到临时目录了，那是结构性的防线。
+    但 `set_data_engine()` 是**进程级全局**，用例中途换掉它、跑完忘了换回来，
+    后面每一条用例都会跟着跑到别的库上去。
+
+    2026-09-01 真踩过：一条恢复相关的用例调了 `set_data_engine(临时库)` 不还原，
+    单跑绿，全量跑时后面 4 条用例一起 ERROR，而报错内容与那条用例毫无关系——
+    最难查的正是这种「红的地方不是错的地方」。
+    本文件里 `ledger` 夹具那套（`monkeypatch` 掉 `get_engine`）之所以是对的，
+    就是因为 monkeypatch 会自动还原；直接调 `set_data_engine` 不会。
+
+    判据落在**路径**上而不是「跟用例前一样」：后者会把「用例故意换了又换回来」
+    和「换到别处没还」当成同一件事，而只有后一种是问题。
+    """
+    import app.database as dbmod
+
+    yield
+    try:
+        url = str(dbmod.get_engine().url)
+    except Exception:                                   # noqa: BLE001  引擎没初始化
+        return
+    ok = str(_TMPDIR) in url or ":memory:" in url or "/tmp/" in url or "pytest-" in url
+    assert ok, (
+        f"这条用例跑完之后，进程级的数据引擎还指着 {url}\n"
+        f"——它必须留在会话临时目录（{_TMPDIR}）里，否则后面每一条用例都会跑到别的库上，"
+        f"而它们报的错与真正出问题的这一条毫无关系。\n"
+        f"用 `monkeypatch.setattr(app.database, \"get_engine\", ...)`（会自动还原），"
+        f"不要直接调 `set_data_engine()`。")
+
+
+@pytest.fixture(autouse=True)
 def _reset_plugin_process_state():
     """每条用例前后清掉插件的两张进程级全局表。
 

@@ -156,17 +156,41 @@ def store(session: Session, rate: Decimal, source: str,
 
 
 def rate_age_hours(row: Optional[FxRate]) -> Optional[float]:
-    """这条汇率距今多少小时。没有行则 None。"""
-    if row is None or row.fetched_at is None:
+    """这条汇率有多旧。没有行则 None。
+
+    **按它是哪一天的（`date`）算，不是按什么时候被写进库的（`fetched_at`）。**
+
+    这两者只在一种情形下分叉，而那一种恰恰是最要命的：用户去汇率页
+    「补填哪一天」补一条历史汇率——那正是这个页面存在的理由（F2 就是为补历史做的）。
+    `store()` 建的行 `date` 是那个历史日期，而 `fetched_at` 是**现在**。
+    于是（2026-09-02 实测）：
+
+        补填前  expired=True   age_hours=2160   （最新汇率是 90 天前抓的）
+        补填一条 30 天前的历史汇率
+        补填后  expired=False  age_hours≈0      ← 告警被关掉了
+
+    界面把那个 30 天前的值当成新鲜的当前汇率显示，每建一单本该记的那条
+    「用的汇率已过期，日元金额可能不准」也一起消失。
+    **一个纯粹的补录动作，把一个关于钱的告警静默关掉了。**
+
+    按 `date` 算就没有这个分叉：这条汇率描述的是**那一天**的价，
+    什么时候被录进来不改变它有多旧。
+
+    起点取「那一天的 24:00(JST)」而不是 00:00：当天的汇率恒为 0 小时旧
+    （不然一条早上抓的汇率到了晚上就快到 24 小时，接近默认阈值 48 的一半，
+    毫无道理）；昨天的 0–24 小时、前天的 24–48 小时，与「48 小时上限」这个
+    默认值的直觉正好对齐。
+    """
+    if row is None or row.date is None:
         return None
-    t = row.fetched_at
-    if t.tzinfo is None:                      # SQLite 取回可能是 naive，统一按 UTC
-        t = t.replace(tzinfo=dt.timezone.utc)
-    return max(0.0, (utcnow() - t).total_seconds() / 3600)
+    end_of_that_day = dt.datetime.combine(row.date, dt.time.max, tzinfo=JST)
+    return max(0.0, (dt.datetime.now(JST) - end_of_that_day).total_seconds() / 3600)
 
 
 def is_expired(session: Session, row: Optional[FxRate]) -> bool:
-    """超过 `fx.stale_hours` 没更新 → 视为过期。
+    """这条汇率比 `fx.stale_hours` 还旧 → 视为过期。
+
+    「旧」按它是哪一天的算，不是按什么时候取到的——理由见 `rate_age_hours`。
 
     与 FxRead.not_today（「不是今天的」）**不是一回事**：那个是日粒度、1 天前和 3 个月前
     长得一模一样；这个才是「还能不能信」的判断，可配置、并且会进日志。

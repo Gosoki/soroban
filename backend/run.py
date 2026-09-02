@@ -14,6 +14,7 @@ API 与页面同端口。运行前把工作目录切到 exe 同级，使 .env、
 import os
 import secrets
 import sys
+from typing import Optional
 from pathlib import Path
 
 # 首次启动生成的 .env 模板。刻意内联而不是读 .env.example：那要求把示例文件也打进包，
@@ -105,6 +106,20 @@ def ensure_env(rt: Path) -> bool:
     return True
 
 
+def _trailing_comment(val: str) -> Optional[int]:
+    """值里「行尾注释」从哪个下标开始；没有则 None。
+
+    判据是**前面有空白的 `#`**，而不是任何 `#`。理由见调用点：
+    这个函数也用来读 `SOROBAN_ADMIN_PASS`，而 `Str0ng#Pass!2026` 里那个 `#`
+    是口令的一部分，不是注释。值以 `#` 开头时同理——那是一个以 `#` 开头的值，
+    不是「整行都是注释」（真正的整行注释在上面已经被 `startswith("#")` 跳过了）。
+    """
+    for i in range(1, len(val)):
+        if val[i] == "#" and val[i - 1].isspace():
+            return i
+    return None
+
+
 def _runtime_setting(rt: Path, key: str, default: str) -> str:
     """启动器自己的配置项：环境变量 > 运行目录的 `.env` > 默认值。
 
@@ -130,8 +145,21 @@ def _runtime_setting(rt: Path, key: str, default: str) -> str:
                 # 所以只在**没被引号包起来**时剥。不剥的话 `int()` 会抛 ValueError，
                 # 落到 __main__ 的兜底里，而那句提示写的是「数据库文件损坏或被占用、
                 # SECRET_KEY 被改坏、磁盘满」——把用户往完全错误的方向指。
+                #
+                # ⚠️ 但**只剥前面有空白的那种** `#`，而且值以 `#` 开头时一个字都不剥。
+                # 原先是无脑 `val.split("#", 1)[0]`，而这个函数也用来读
+                # `SOROBAN_ADMIN_PASS`（见下面 `_ENV_TEMPLATE` 里就列着它）。
+                # 2026-09-02 实测：
+                #     SOROBAN_ADMIN_PASS=Str0ng#Pass!2026  → 读出 'Str0ng'（6 位）
+                #     SOROBAN_ADMIN_PASS=#StartsWithHash1  → 读出 ''  ⇒ 回落到
+                #                                            README 里公开的默认口令
+                # 用户自以为设了强口令，控制台还照常打印「初始口令见 .env 的
+                # SOROBAN_ADMIN_PASS」——**口令被静默削弱，而且没有任何迹象**。
+                # 「注释前面有空白」是 python-dotenv 的口径，也符合人写注释的习惯。
                 if val[:1] not in ("'", '"'):
-                    val = val.split("#", 1)[0].strip()
+                    cut = _trailing_comment(val)
+                    if cut is not None:
+                        val = val[:cut].strip()
                 return val.strip("'\"") or default
     except OSError:
         pass

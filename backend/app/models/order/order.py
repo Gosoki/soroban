@@ -102,16 +102,38 @@ class Order(LedgerBase, table=True):
             return ship.shipment_no
         return None
 
-    def sync_from_items(self) -> None:
+    def sync_from_items(self, *, derive_price: bool = True) -> None:
         """订单价 = Σ(物品单价×数量) + 邮费，再重算日元。改动 items/邮费 后必须调用。
 
-        **派生不出来就什么都不做**，理由见 `items_carry_no_price`：
+        `derive_price=False` = **调用方已经知道这次不该派生货款**，只重算日元。
+        它挡的是一个 `items_carry_no_price` 看不见的漏洞：带 items 的 PATCH 会先过
+        `build_items`，而那里把「没单价」重新编码成 `(0.00, auto=True)`
+        （那段注释自己写着「没给种子就是不知道单价，一律记 0 + auto」）——
+        等到这里，NULL 已经没了，闸形同虚设。
+        实测：一张 ¥320.00 / 6400 円、物品单价全 NULL 的历史订单，
+        在展开面板里**改一个物品名**，保存后变成 **¥0.00 / 0 円**，HTTP 200、零提示。
+        而下面 `items_carry_no_price` 的 docstring 承诺的正是「任何一次 PATCH 都不会」。
+
+        **为什么不让判据去认 `(0.00, auto=True)`**：那个编码有歧义——
+        `build_items` 对「订单价种子就是 0」（包邮/赠品单）产出的也是它。
+        认它的话，一张真的 0 元单会永远派生不出价。
+        而在 `update_order` 那一层，「这次 payload 到底带没带价」是**明确的**，
+        就在那里判、把结论传下来。
+
+        **派生不出来就不动 `price_cny`**，理由见 `items_carry_no_price`：
         「不知道多少钱」不是「这单值 0 元」，而按后者算出来的恰好是 `0 + 邮费`。
         暂存侧（`OrderStaging.sync_from_items`）用的是同一条判据——
         它先补的是「零物品」那一半，这里补齐的是「有物品、单价全 NULL」那一半，
         而后者才是历史订单的真实形态（`f6a7b8c9d0e1` 只加列、回填靠一个没人跑过的脚本）。
+
+        **但 `compute_money()` 不在那道闸里面。** 闸问的是「能不能**从物品**派生出货款」，
+        重算日元问的是「按现有的 `price_cny` / `fx_rate` / `jpy_override`，结算该是多少」
+        ——两件事没有关系。早先把它一起圈进去的后果很具体：物品单价全 NULL 的订单
+        （正是上面说的那种历史形态，`app/demo.py` 今天仍在造）填「覆盖（円）」永远不生效，
+        HTTP 200、响应里 `jpy_override` 是新值而 `jpy_settled` 还是旧值——
+        而这两列在订单页是**并排显示**的，用户同时看到「覆盖 3500」和「结算 6000」，
+        看板也仍按旧值算。改汇率、`stamp_fx` 自愈存量脏行，同样一并被跳过。
         """
-        if items_carry_no_price(self.items):
-            return
-        self.price_cny = price_from_items(self.items) + (self.postage_cny or 0)
+        if derive_price and not items_carry_no_price(self.items):
+            self.price_cny = price_from_items(self.items) + (self.postage_cny or 0)
         self.compute_money()

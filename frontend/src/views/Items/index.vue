@@ -7,6 +7,12 @@
     <NotionTable :columns="columns" :rows="rows" :loading="loading" :load-failed="loadFailed" :actions-width="60"
                  :empty-text="loadFailed ? MSG_LOAD_FAILED : '没有符合条件的记录'"
                  table-name="items" hide-id :addable="false" :deletable="false" @reload="load" @tags-changed="onTagsChanged">
+      <template #toolbar-right>
+        <!-- 导出当前筛选的全部行（不是这一页）。放 toolbar-right 与订单页/集运页同侧：
+             它们都是「对整张表做一件事」，而左边那排是筛选。 -->
+        <el-button :loading="exporting" @click="doExport">导出 CSV</el-button>
+      </template>
+
       <template #toolbar>
         <el-input v-model="filters.q" :placeholder="MSG_SEARCH_ORDER_LIKE" clearable style="width: 200px" @change="applyFilters" />
         <el-select v-model="filters.platform" placeholder="来源" clearable style="width: 120px" @change="applyFilters">
@@ -82,28 +88,40 @@ import PageHeader from '@/components/PageHeader.vue'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { itemsApi, ordersApi, shipmentApi, tagsApi } from '@/api'
-import { MSG_FILTER_CLEARED, MSG_LOAD_FAILED, MSG_SEARCH_ORDER_LIKE, ORDER_SOURCES, PAGE_SIZE, PURCHASE_STATUS, SHIPMENT_STATUS, platformSemanticStyle, statusStyle, tagStyleAt } from '@/constants'
+import { MSG_FILTER_CLEARED, MSG_LOAD_FAILED, MSG_NOTHING_TO_EXPORT, MSG_SEARCH_ORDER_LIKE, ORDER_SOURCES, PAGE_SIZE, PURCHASE_STATUS, SHIPMENT_STATUS, platformSemanticStyle, statusStyle, tagStyleAt } from '@/constants'
+import { exportCsv } from '@/utils/exportCsv'
 import NotionTable from '@/components/NotionTable.vue'
 import OrderEditPanel from '@/components/OrderEditPanel.vue'
 
 // 默认列顺序 + 宽度；用户可拖动改序/改宽，持久化到后端（table-name="items"）
 const columns = [
   { key: 'date', label: '下单日期', readonly: true, width: 100 },
-  { key: 'platform_account', label: '账号', readonly: true, width: 100 },
-  { key: 'platform', label: '来源', readonly: true, width: 80 },
+  { key: 'platform_account', label: '账号', readonly: true, width: 100,
+    // 同上：只是上色，文字仍是 row.platform_account
+    exportRaw: true },
+  { key: 'platform', label: '来源', readonly: true, width: 80,
+    // 插槽只是把值套进 el-tag 上色，文字仍是 row.platform
+    exportRaw: true },
   { key: 'title', label: '商品', readonly: true, width: 130 },
-  { key: 'name', label: '物品名', readonly: true, width: 180 },
+  { key: 'name', label: '物品名', readonly: true, width: 180,
+    // 插槽只是给「物品名=商品标题」的行加个灰字样式，文字仍是 row.name —— 导出原始值就是屏幕上那个
+    exportRaw: true },
   { key: 'quantity', label: '数量', readonly: true, width: 64 },
   { key: 'unit_price_cny', label: '单价（元）', format: 'cny', readonly: true, width: 100 },
   { key: 'amount_cny', label: '金额（元）', format: 'cny', readonly: true, width: 100 },
   // 与商品订单页同一口径：挂了集运单就显示继承来的集运状态、整格置灰（标签仍是原色）。
   // 本页所有列都是只读的（物品要改去订单页展开面板），这里的 lock 纯粹是**视觉提示**：
   // 让人一眼看出这行的状态不是订单自己的，而是跟着集运单走的。
-  // 状态：值由 #cell-purchase_status 插槽自己取（插槽优先于 GotionCell，col.display 在这里是**死代码**，
-  // 所以不写 display —— 写了只会误导下一个人以为它在起作用）。
+  // 状态：**屏幕上**的值由 #cell-purchase_status 插槽自己取（插槽优先于 GotionCell）。
+  // 这里以前写着「col.display 是死代码、不要写」——那句话在导出功能出现之前是对的，
+  // 现在不是了：`utils/exportCsv.js` 的 `cell()` 就以 `col.display` 为准。
+  // 不写的话，屏幕上按「已发出」筛出来的一批，导出的文件里那一格写着「待发货」
+  // ——筛的是 A、导出的是 B，而这份文件正是要发给别人的。
+  // 所以 display 在这一列的作用是：**屏幕上不起作用（插槽优先），导出时它是唯一真相**。
   // lock 仍然有效：它作用在 <td> 上，与插槽无关，负责把整格置灰做视觉提示。
   {
     key: 'purchase_status', label: '状态', readonly: true, width: 84,
+    display: (row) => row.fulfillment_status ?? row.purchase_status,
     lock: (row) => !!row.shipment_order_id,
     lockHint: '该订单已挂靠集运订单，状态跟随那张单',
   },
@@ -146,18 +164,42 @@ async function loadAcctColors() {
 // 请求序号：筛选/翻页可以在上一次响应回来前再发一次，慢的那次后到会把新数据整个覆盖掉
 // （表现为「清了筛选却只剩一部分」「内容是第2页、页码高亮第3页」）。只认最后一次发出的请求。
 const loadFailed = ref(false)   // 上一次加载是否失败：空态文案据此说实话
+const exporting = ref(false)
+
+// 当前筛选 → 查询参数。**列表与导出共用这一份**：各写一份的话，
+// 导出的 CSV 会和屏幕上看到的不是同一批行，而这种文件往往是要发给别人的。
+function filterParams() {
+  const params = {}
+  if (filters.q) params.q = filters.q
+  if (filters.platform) params.platform = filters.platform
+  if (filters.fulfillmentStatus) params.fulfillment_status = filters.fulfillmentStatus
+  if (filters.platform_account) params.platform_account = filters.platform_account
+  if (filters.range) { params.date_from = filters.range[0]; params.date_to = filters.range[1] }
+  return params
+}
+
+// 两条口径都在 utils/exportCsv.js 里说明了理由——反过来做会产出
+// 「看起来对、其实少了东西」的文件，而这种文件往往会被当成完整账目发给别人。
+async function doExport() {
+  exporting.value = true
+  try {
+    const n = await exportCsv({
+      fetchPage: (limit, offset) => itemsApi.list({ ...filterParams(), limit, offset }),
+      columns,
+      name: 'items',
+    })
+    if (!n) ElMessage.info(MSG_NOTHING_TO_EXPORT)
+    else ElMessage.success(`已导出 ${n} 件物品`)
+  } catch (_) { /* 拦截器已提示 */ } finally { exporting.value = false }
+}
+
 let loadSeq = 0
 async function load() {
   const my = ++loadSeq
   loading.value = true
   try {
-    const params = { limit: pageSize, offset: (page.value - 1) * pageSize }
-    if (filters.q) params.q = filters.q
-    if (filters.platform) params.platform = filters.platform
-    if (filters.fulfillmentStatus) params.fulfillment_status = filters.fulfillmentStatus
-    if (filters.platform_account) params.platform_account = filters.platform_account
-    if (filters.range) { params.date_from = filters.range[0]; params.date_to = filters.range[1] }
-    const res = await itemsApi.list(params)
+    const res = await itemsApi.list(
+      { ...filterParams(), limit: pageSize, offset: (page.value - 1) * pageSize })
     if (my !== loadSeq) return          // 已有更新的请求发出，丢弃这次的结果
     rows.value = res.items
     total.value = res.total

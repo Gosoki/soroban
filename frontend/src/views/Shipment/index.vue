@@ -206,9 +206,13 @@ const columns = [
   // 备注：`note` 一直在 `LedgerBase` 上、每次响应都在回，只是前端列里没有它。
   // 库里就存着「日本空运-广东直飞EMS」这样的值——渠道没有蒸发，是没人显示。
   { key: 'note', label: '备注', type: 'text', long: true, minWidth: 160 },
-  { key: 'orders', label: '商品订单', readonly: true, minWidth: 160, expand: true },
+  { key: 'orders', label: '商品订单', readonly: true, minWidth: 160, expand: true,
+    // 数组列：cell() 的数组分支按 order_no 拼，与屏幕摘要同源（屏幕多一个「N 单：」前缀，不构成矛盾）
+    exportRaw: true },
   // 虚拟列（行上无同名字段）：只作「内含快递」截图的投放区，见 #cell-bind_express
-  { key: 'bind_express', label: '绑定快递单', readonly: true, width: 150 },
+  { key: 'bind_express', label: '绑定快递单', readonly: true, width: 150,
+    // 虚拟列（拖放区），行上没有同名字段 —— exportCsv 会因为「没有一行有这个 key」把它整列排掉
+    exportRaw: true },
 ]
 
 const rows = ref([])
@@ -366,7 +370,7 @@ async function saveCell(row, key, value) {
 async function addRow(data = {}, done) {
   try {
     const created = await shipmentApi.create({ date: today(), shipment_status: '打包中', ...data })
-    await afterCreate(created, { rows, total, page, filters, load, pageSize })
+    await afterCreate(created, { rows, total, page, filters, load, pageSize, sumJpy, unconverted })
     done?.(true)
     return created                    // OCR 建单据此判断是否真的建成（失败时拦截器已提示）
   } catch (e) {

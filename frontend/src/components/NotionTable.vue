@@ -208,6 +208,7 @@ const DEFAULT_COL_W = 160   // 无显式 width 的列默认宽
 const ID_COL_W = 56         // 最左 ID/删除/新建 列
 const EXPAND_COL_W = 30     // 展开箭头列
 const layoutReady = ref(false)   // 列布局拉取完成前禁用拖拽/拖宽，避免用默认序覆盖已存布局
+const layoutFailed = ref(false)  // 拉**失败**（≠ 没有布局）：此后一直不开闸，理由见 onMounted
 
 const open = reactive(new Set())
 const newRow = reactive({})
@@ -264,9 +265,25 @@ onMounted(async () => {
       // 拉取期间不可能有用户改动：拖拽/拖宽都由 layoutReady 门控，而它到本函数末尾才置 true。
       savedLayout = (await layoutApi.get(props.tableName)).columns || []
       buildCols()
-    } catch (_) { /* 忽略：用默认列 */ }
+    } catch (_) {
+      // **拉失败 ≠ 没有布局。** 这一句原先是 `catch (_) {}`，而下面那行
+      // `layoutReady = true` 在 try 外面 —— 成功和失败走的是同一个出口。
+      //
+      // 后果不是「这次看到默认列序」，是**把别人存的布局删掉**：
+      // `ColumnLayout` 以表名为唯一主键，**8 个人共用同一行**。
+      // 请求挂掉（后端刚重启 ERR_NETWORK / 迁移期 DB 被锁 15s 超时 / 503 重试两次后放弃）
+      // → 屏幕上渲染出默认列序列宽，而它与「用户存过的布局」长得一模一样、
+      // 没有任何提示区分 → 用户随手拖一下列宽 → `saveLayout()` 只问 `layoutReady`
+      // （它是 true）→ 把**默认布局**整份写回去，覆盖掉所有人调好的列序与列宽。
+      //
+      // 所以失败时**不开闸**：不知道别人存的是什么，就不许写。
+      // 代价是这一屏不能拖列（刷新一下就好），而那比静默毁掉共享配置轻得多。
+      layoutFailed.value = true
+      ElMessage.warning('列布局没能拉取到，本次暂不能拖动列宽/列序（避免覆盖大家已存的布局）——刷新一下再试')
+    }
   }
-  layoutReady.value = true   // 布局就绪，开放拖拽/拖宽
+  // 只有**确实知道**存的是什么（拿到了，哪怕是空的）才开闸。
+  layoutReady.value = !layoutFailed.value
 })
 function saveLayout() {
   if (!props.tableName || !layoutReady.value) return   // 布局未就绪不保存，避免用默认序覆盖已存布局

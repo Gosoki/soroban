@@ -17,6 +17,7 @@
  *     而「存了但没显示」只要说清楚就不会被误解成没存上。
  */
 import { ElMessage } from 'element-plus'
+import { isUnconverted } from './money'
 
 /** 筛选是否生效。空串/null/undefined/空数组/**false** 都算「没筛」。
  *
@@ -60,12 +61,26 @@ export function sortByDateDesc(rows, dateKey = 'date') {
  * 拿它排序会让本地插入的顺序与刷新后的顺序对不上。
  */
 export async function afterCreate(created, {
-  rows, total, page, filters, load, dateKey = 'date', pageSize,
+  rows, total, page, filters, load, dateKey = 'date', pageSize, sumJpy, unconverted,
 }) {
   if (!anyFilterActive(filters) && page.value === 1) {
     rows.value.unshift(created)
     sortByDateDesc(rows.value, dateKey)
     total.value++
+    // **页脚那三个数必须一起动。** 条数走这条增量路径，而 `sum_jpy` / `unconverted`
+    // 只在 `load()` 里赋值——而快路径零请求。于是页脚会变成
+    // 「共 91 条 · 筛选合计 500,000 円」，屏幕上那 91 条其实是 530,000 円，
+    // 少的正好是刚录的几笔，而且一直保持到下一次 load()。
+    // `TableFooterSum` 自己的注释把「合计静默变小而条数照旧、界面上没有任何异常」
+    // 称作这一栏最危险的失败形态——快路径正好造出这个形状。
+    //
+    // 增量是**精确**的，不是估算：后端的 `sum_jpy` 就是 `SUM(jpy_settled)`，
+    // `unconverted` 就是逐行套 `is_unconverted`，两者都只看这一行自己的字段，
+    // 而这两个字段都在新建的响应里（`MoneyOut`）。
+    if (sumJpy && typeof sumJpy.value === 'number') {
+      sumJpy.value += Number(created.jpy_settled) || 0
+    }
+    if (unconverted && isUnconverted(created)) unconverted.value++
     // **插完要截回每页条数。** 不截的话第 1 页会显示 31 行，而分页器仍按 30/页 算 ——
     // 翻到第 2 页时，第 1 页底部那条会**再出现一次**（同一个 id 显示两次），刷新才恢复。
     // 上面那几条注释逐条列了本地插入会与后端对不上的几种表现，独独漏了这一种。
@@ -75,7 +90,23 @@ export async function afterCreate(created, {
     // 多一个别名 import 就要多一个桩，而这个文件的价值恰恰在于「能被原样跑起来」。
     // 漏传由 `test_every_after_create_call_passes_the_page_size` 守着。
     if (pageSize && rows.value.length > pageSize) rows.value.length = pageSize
-    return true
+    // **截断可能把刚建的那条自己截掉。** 补录一条日期靠前的记录时就会发生
+    // （杂项最常见：补上个月的手续费）——它按日期倒序排到末尾，
+    // 而第 1 页已经满 30 行，正好落在截断线外。
+    //
+    // 原先这里无条件 `return true`：格子清空了、列表里从上到下找不到、
+    // **一句提示都没有**（分页器那个「共 N 条」+1 没人会盯）。
+    // 用户合理地判断「没存上」，再录一次——**而杂项支出没有任何唯一约束，
+    // 同一笔钱就干干净净地记了两遍**（商品/集运还有唯一索引兜底，杂项没有）。
+    // 这与本文件下面那段「刷新失败 ≠ 新建失败」防的是同一个结局，
+    // 只是触发路径不同：那条是刷新挂了，这条是自己把它截掉了。
+    //
+    // 慢路径对同一结局是明确说话的，快路径不能哑。但**措辞不能照抄**：
+    // 那句说的是「不在当前筛选条件内」，而这里一个筛选都没有——
+    // 真实原因是它排到了当前页之后。说错原因和不说一样会把人引偏。
+    const shown = rows.value.some((r) => r.id === created.id)
+    if (!shown) ElMessage.info('已保存，但它按日期排在当前页之后，翻页或刷新即可看到')
+    return shown
   }
   page.value = 1
   // **刷新失败 ≠ 新建失败。** 这一句原先是裸 await：列表页的 `load()` 只有 try/finally

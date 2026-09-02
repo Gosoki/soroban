@@ -154,6 +154,132 @@ def test_a_snapshot_never_carries_the_control_tables(ledger, tmp_path):
         f"快照里带上了控制表：{sorted(names)}"
 
 
+def test_the_file_level_snapshot_also_drops_the_control_tables(ledger, tmp_path):
+    """上一条钉的是 `make_backup`；**文件级快照是第二个生产者，它天然不满足那条不变量。**
+
+    `replace_data` 只搬 `SQLModel.metadata` 里的业务表，所以控制表跟不过去——
+    那是「设计的一部分」。可 `snapshot_sqlite_file` 是**字节拷贝**，而 SQLite 模式下
+    数据引擎复用控制引擎（同一个 `soroban.db` 里既有业务表也有控制表），
+    字节拷贝把 `app_db_config` / `db_connection` / `migrate_state` 一起带走。
+
+    要紧的是 `app_db_config.url`——Fernet 加密的 MySQL 连接串，
+    而**同一次快照还会把 `.env` 拷成同目录的 `env-<同一时间戳>.txt`**，
+    里面的 `SECRET_KEY` 正是解开它的唯一钥匙。两个文件躺在一起 = 明文生产库口令，
+    而备份目录恰恰是最常被整个拷到别处的那个目录。
+
+    判据分三层，各钉各的：
+
+      1. **表名**——控制表不许出现在快照里；
+      2. **字节**——整个文件里搜不到 Fernet 密文。只查表名是不够的：
+         页被标成空闲不等于内容被抹掉；
+      3. **`freelist_count == 0`**——这一条才是钉住 `VACUUM` 的。
+
+    第 2 条**单独钉不住 VACUUM**：实测光 DROP 之后密文就已经不在字节里了
+    （2026-09-01，232KB 的快照搜不到）——把 VACUUM 拆掉这条照样绿。
+    这一点是破坏验证当场发现的：那一向没红，说明我原来给它写的理由是假的。
+    密文会不会留在空闲页取决于 `secure_delete` pragma 与页布局，各构建可以不同，
+    所以要 VACUUM 把它从「碰巧成立」变成「由构造成立」——而钉住「VACUUM 真的跑过」
+    的可观测量是空闲页数，不是字节搜索。
+    """
+    import sqlite3
+
+    from app.backup import snapshot_sqlite_file
+    from app.db import control
+
+    marker = "MARKER-" + "PLAINTEXT-CONN-STRING"
+    control.ensure_schema(ledger)
+    control.write_config(ledger, "mysql", f"mysql+pymysql://u:{marker}@10.0.0.9:3306/x")
+    _fill(ledger, title="X", jpy=1)
+
+    url = str(ledger.url)
+    with sqlite3.connect(f"file:{url.split('///')[-1]}?mode=ro", uri=True) as c:
+        before = {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
+    assert "app_db_config" in before, "夹具没把控制表建到同一个库里，这条测试的前提不成立"
+
+    snap = snapshot_sqlite_file(url, tmp_path / "out", "pre-probe")
+
+    with sqlite3.connect(f"file:{snap}?mode=ro&immutable=1", uri=True) as c:
+        names = {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
+    assert "orders" in names, "把业务表也剥掉了——快照就没用了"
+    leaked = sorted(set(control.control_metadata.tables) & names)
+    assert not leaked, f"文件级快照带上了控制表：{leaked}"
+
+    raw = snap.read_bytes()
+    assert b"gAAAAA" not in raw, "快照文件的字节里还搜得到 Fernet 密文"
+
+    with sqlite3.connect(f"file:{snap}?mode=ro&immutable=1", uri=True) as c:
+        free = c.execute("PRAGMA freelist_count").fetchone()[0]
+    assert free == 0, (
+        f"快照里还有 {free} 个空闲页——`VACUUM` 没跑。DROP 释放的页是否被抹干净"
+        f"取决于 `secure_delete` 与页布局，不是标准保证；VACUUM 重写整个文件才是确定的")
+
+
+def test_restore_still_leaves_an_undo_point_when_the_ledger_is_behind_head(tmp_path, monkeypatch):
+    """**账本停在旧修订号时，`restore()` 必须照样留下撤销点。**
+
+    这正是 `--restore` 的头号场景：某次迁移跑挂了 ⇒ 库停在半路 ⇒ 应用起不来 ⇒
+    打包版唯一的出路就是 `soroban.exe --restore <快照>`。
+
+    原先这一步走 `make_backup`，而它按**模型声明的列**去 SELECT：
+    缺列的库当场 `no such column: pluginconfig.last_ok_at` ⇒
+    「⚠️ 恢复前的安全备份失败……已中止」⇒ `return 1`。
+    **撤销点在唯一需要它的时刻用不了。**
+
+    这与 `snapshot_sqlite_file` 文档里那段是同一个坑的两个调用点——
+    迁移前快照那处早就改成文件级了，恢复这处一直留着。
+
+    判据钉三件事，缺一不可：
+      · `restore()` 真的成功（rc == 0），不是「报了个警告但继续」；
+      · 撤销点文件真的在；
+      · **它忠于旧 schema**（`alembic_version` 还是那个旧修订号）——
+        要是它被顺手升级过，就不再是「动手之前那一刻」，撤销的意义就没了。
+    """
+    import io
+    import sqlite3
+
+    from alembic import command
+    from alembic.config import Config
+
+    import app.database as dbmod
+    from app import backup as bk
+    from app.database import build_engine, run_migrations
+
+    STALE = "c3d4e5f6a7b8"          # 「加 pluginconfig.last_ok_at」之前的那一版
+    led = tmp_path / "soroban.db"
+    cfg = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    cfg.set_main_option("script_location", str(Path(__file__).resolve().parents[1] / "alembic"))
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{led}")
+    command.upgrade(cfg, STALE)
+
+    eng = build_engine(f"sqlite:///{led}")
+    with sqlite3.connect(led) as c:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(pluginconfig)")}
+    assert "last_ok_at" not in cols, "夹具没造出缺列的库，这条测试的前提不成立"
+
+    # 与本文件 `ledger` 夹具同一套接线：只换 `get_engine`，**不碰 `set_data_engine`**——
+    # 那是进程级全局，改了不还原会把后面每一条用例都连累掉（本条第一版就是这么干的）。
+    monkeypatch.setattr(dbmod, "get_engine", lambda: eng)
+    # conftest 里有条 autouse 防护把 `_default_dir` 统一改道到会话临时目录，
+    # 所以这里必须自己再改一次，否则撤销点会落到那个共享目录里、本条找不到它。
+    monkeypatch.setattr(bk, "_default_dir", lambda: tmp_path / "backups")
+
+    good = tmp_path / "good.db"
+    run_migrations(f"sqlite:///{good}")
+
+    buf = io.StringIO()
+    rc = bk.restore(good, assume_yes=True, stream=buf)
+    assert rc == 0, f"账本停在 {STALE} 时恢复被拒了——撤销点在唯一需要它的时刻用不了：\n{buf.getvalue()}"
+
+    undo = sorted((tmp_path / "backups").glob("*pre-restore*.db"))
+    assert undo, f"没留下撤销点：\n{buf.getvalue()}"
+    with sqlite3.connect(f"file:{undo[0]}?mode=ro&immutable=1", uri=True) as c:
+        rev = c.execute("select version_num from alembic_version").fetchone()[0]
+    assert rev == STALE, (
+        f"撤销点被升级过（{rev}），它记的就不再是「动手之前那一刻」——"
+        f"要撤销的那次迁移要是删过列，那一列就永远拿不回来了")
+    eng.dispose()
+
+
 def test_backup_keeps_only_the_recent_ones_and_touches_nothing_else(ledger, tmp_path):
     """轮换只删**本模块自己造的**那种文件名，绝不碰目录里别的东西。
 

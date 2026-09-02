@@ -143,7 +143,29 @@ def source_fingerprint(engine) -> str:
 
     用途：`migrate` 拷完记一份，`switch` 前再算一次做对比——两者不同就说明**迁移之后源库又被
     改过**，那些改动不会跟着过去，切换后就静默消失了。指纹只需要「能发现变了」，不需要精确
-    到哪一行，所以行数 + 最新时间戳足够便宜也足够灵敏（增/删看行数，改看时间戳）。
+    到哪一行。
+
+    **有 `updated_at` 的表**：行数 + 最大 `updated_at`（增删看行数，原地改看时间戳），
+    既便宜又灵敏。
+
+    **没有 `updated_at` 的表**：只有行数是**看不见「原地改」的**，而这里有两个真实的盲点：
+
+      · `user` —— 改共用口令只改 `password_hash`，行数永远是 1（没人会新建用户）。
+        后果很具体：改完口令之后点「切换到此库」，那道本该 409 说
+        「迁移之后当前库又有改动」的闸**一声不吭**，口令静默回滚到迁移那天。
+        而「改密码不使旧 token 失效」是已拍板的设计 ⇒ 8 个人的 90 天 token 全部照常能用，
+        谁都不会立刻发现；直到某人重新登录，被告知「用户名或密码错误」。
+      · `tagoption` —— 改标签名只改 `value`，行数也不变。
+
+    （`orderitem` / `stagingitem` 的父表带 `updated_at`，改物品会连带改父行；
+    `fxrate` 只追加不修改。但**不按表名硬编码这些结论**——那种名单会随着加表而过时，
+    §194 那份 `BinStr` 名单栽的就是这个。规则统一按「有没有 `updated_at`」走。）
+
+    所以没有 `updated_at` 的表改算**整表内容摘要**。代价可以承受：指纹在一次
+    migrate / switch 里只算一两次，而那次操作本身要把整个库拷一遍。
+    2026-09-02 实测（SQLite，2000 单 × 5 件 = 1 万条 `orderitem`）：
+    **算一次完整指纹 108.9 ms**（空库 7.1 ms）。`switch` 里这一次落在只读屏障内，
+    也就是把全站写入多冻这 0.1 秒——而紧接着的整库拷贝是秒级到分钟级。
 
     刻意不含 Setting/ColumnLayout：前者压根没在用，后者是界面偏好、丢了也无所谓，
     把它们算进来只会让「拖一下列宽」也触发变更告警。"""
@@ -155,11 +177,33 @@ def source_fingerprint(engine) -> str:
             if name in noise:
                 continue
             count = s.exec(select(sa_func.count()).select_from(model)).one()
-            newest = None
             if "updated_at" in model.__table__.columns:
                 newest = s.exec(select(sa_func.max(model.updated_at))).one()
-            out[name] = [int(count), str(newest) if newest is not None else None]
+                mark = str(newest) if newest is not None else None
+            else:
+                mark = _content_digest(s, model)
+            out[name] = [int(count), mark]
     return json.dumps(out, sort_keys=True)
+
+
+def _content_digest(session: Session, model) -> str:
+    """整表内容的稳定摘要。只给**没有 `updated_at`** 的表用，理由见 `source_fingerprint`。
+
+    **必须按主键排序再逐行喂进 sha256。** 不加 `ORDER BY` 时行序由引擎和查询计划决定，
+    没有任何保证——同一份内容可能算出两个值。而这个摘要是拿来做**相等比较**的：
+    只要它不稳定，那道 409 就从「迁移后又改过才拦」变成「每次都拦」，比不拦更糟
+    （用户会学会无脑点确认，而那正是它要防的动作）。
+    只取前 16 位十六进制——指纹要回答的是「变没变」，不是「变成了什么」。
+    """
+    import hashlib
+
+    table = model.__table__
+    cols = list(table.columns)
+    order = [c for c in cols if c.primary_key] or cols[:1]
+    h = hashlib.sha256()
+    for row in session.exec(select(*cols).order_by(*order)):
+        h.update(repr(tuple(row)).encode("utf-8"))
+    return h.hexdigest()[:16]
 
 
 def describe_fingerprint_diff(before: str, after: str) -> list[str]:

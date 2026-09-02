@@ -37,11 +37,25 @@ def _clean_rates(session):
     yield
 
 
-def _put_rate(session, *, hours_ago: float, rate="20.0", source="boc", date=None):
-    """直接落一条指定「多久以前取到」的汇率行。"""
-    d = date or (dt.datetime.now(fx.JST).date() - dt.timedelta(days=int(hours_ago // 24)))
+def _put_rate(session, *, hours_ago: float = 0, days_ago: int = None,
+              rate="20.0", source="boc", date=None):
+    """直接落一条汇率行。
+
+    **口径以「它是哪一天的」为准**（`days_ago`），`fetched_at` 只是附带写上去的。
+    2026-09-02 起 `rate_age_hours` 按 `date` 算而不是按 `fetched_at`——
+    理由见那个函数：按后者算的话，用户去汇率页补填一条历史汇率，
+    会把「汇率已过期」这个关于钱的告警静默关掉。
+
+    所以「20 小时旧的汇率」这个说法**在新口径下不存在**：当天的汇率恒为 0 小时旧
+    （不然早上抓的一条到晚上就快到 24 小时，接近默认阈值 48 的一半，毫无道理）。
+    要表达「旧」，说的是**差几天**。`hours_ago` 保留给还在用它的几条，
+    按 `//24` 折成天——与原先的行为一致。
+    """
+    if days_ago is None:
+        days_ago = int(hours_ago // 24)
+    d = date or (dt.datetime.now(fx.JST).date() - dt.timedelta(days=days_ago))
     row = session.exec(select(FxRate).where(FxRate.date == d)).first()
-    fetched = fx.utcnow() - dt.timedelta(hours=hours_ago)
+    fetched = fx.utcnow() - dt.timedelta(hours=hours_ago or days_ago * 24)
     if row:
         row.rate, row.source, row.fetched_at = Decimal(rate), source, fetched
     else:
@@ -51,52 +65,105 @@ def _put_rate(session, *, hours_ago: float, rate="20.0", source="boc", date=None
     return row
 
 
-def test_age_is_measured_from_fetched_at(session):
-    row = _put_rate(session, hours_ago=5)
-    age = fx.rate_age_hours(row)
-    assert 4.5 < age < 5.5, f"算出来的年龄是 {age}，与实际不符"
+def test_age_is_measured_from_the_rate_date_not_from_when_it_was_typed(session):
+    """汇率的「年龄」按**它是哪一天的**算，不是按什么时候被写进库的。
+
+    这两者只在一种情形下分叉，而那一种恰恰最要命：用户去汇率页「补填哪一天」补一条
+    历史汇率——那正是这个页面存在的理由。补出来的行 `date` 是历史日期、
+    `fetched_at` 是**现在**。按 `fetched_at` 算的话（2026-09-02 实测）：
+
+        补填前  expired=True   age_hours=2160    （最新汇率是 90 天前的）
+        补填一条 30 天前的汇率
+        补填后  expired=False  age_hours≈0       ← 告警被静默关掉
+
+    界面于是把那个 30 天前的值当成新鲜的当前汇率显示，
+    每建一单本该记的那条「用的汇率已过期，日元金额可能不准」也一起消失。
+    **一个纯粹的补录动作，关掉了一个关于钱的告警。**
+
+    判据的两半缺一不可：
+      · 刚写进去的历史行，年龄必须约等于它离今天的天数（而不是 0）；
+      · 当天的行年龄必须是 0（不然早上抓的一条到晚上就快 24 小时旧，
+        接近默认阈值 48 的一半，毫无道理）。
+    """
+    old = _put_rate(session, days_ago=30, rate="21.0")
+    old.fetched_at = fx.utcnow()                       # 就是刚刚才写进库的
+    session.add(old)
+    session.commit()
+
+    age = fx.rate_age_hours(old)
+    assert age is not None and 29 * 24 <= age < 31 * 24, (
+        f"30 天前那一天的汇率，算出来的年龄是 {age} 小时——"
+        f"按写入时刻算的话它会是 0，补填一次就能把过期告警关掉")
+
+    today = _put_rate(session, days_ago=0, rate="22.0")
+    assert fx.rate_age_hours(today) == 0, (
+        f"当天的汇率年龄应恒为 0，实际 {fx.rate_age_hours(today)}")
 
 
 def test_naive_timestamp_does_not_blow_up(session):
-    """SQLite 取回的时间戳可能是 naive。拿它和带时区的 now 相减会 TypeError，
-    整个建单路径当场 500——这条守着那次转换。"""
-    row = _put_rate(session, hours_ago=3)
-    row.fetched_at = row.fetched_at.replace(tzinfo=None)
-    assert fx.rate_age_hours(row) is not None
+    """SQLite 取回的时间戳可能是 naive。拿它和带时区的比较会 TypeError。
+
+    **这条原先指向 `rate_age_hours`**，而 2026-09-02 起那个函数按 `date` 算、
+    根本不碰 `fetched_at` 了——留在原处它会变成一条永远不会红的测试。
+    naive 的风险现在实际在 `_recency_key`（`pick_from` 的排序键）与
+    `routers/fx._jst_hm`（汇率页显示「那天几点」）两处，所以改指向前者：
+    它在建单路径上（`pick_on` → `pick_from`），炸了就是整条建单 500。
+    """
+    a = _put_rate(session, days_ago=0, rate="20.0")
+    b = _put_rate(session, days_ago=0, rate="21.0", date=a.date)
+    a.fetched_at = a.fetched_at.replace(tzinfo=None) if a.fetched_at.tzinfo else a.fetched_at
+    got = fx.pick_from([a, b])
+    assert got is not None, "naive 时间戳让挑选当天汇率炸了——建单路径会整条 500"
 
 
 def test_expired_follows_the_setting(session):
-    prefs.save(session, {"fx.stale_hours": 10})
-    assert not fx.is_expired(session, _put_rate(session, hours_ago=5))
-    assert fx.is_expired(session, _put_rate(session, hours_ago=20))
-    prefs.save(session, {"fx.stale_hours": 48})     # 还原，免得影响后面的用例
+    """过期与否跟着 `fx.stale_hours` 走。
+
+    用**天**来表达「旧」，不用小时：新口径下当天的汇率恒为 0 小时旧，
+    昨天的是 0–24 小时（取决于现在几点）——拿昨天配一个 10 小时的阈值，
+    这条测试的绿会取决于它几点跑。前天的恒 ≥24 小时，任何时刻都稳。
+    """
+    try:
+        prefs.save(session, {"fx.stale_hours": 10})
+        assert not fx.is_expired(session, _put_rate(session, days_ago=0)), "当天的汇率不该算过期"
+        assert fx.is_expired(session, _put_rate(session, days_ago=2)), \
+            "前天的汇率至少 24 小时旧，阈值 10 小时下必须算过期"
+    finally:
+        # **必须 try/finally。** 写在函数末尾的话，上面任何一个断言挂掉都跑不到它，
+        # 于是 `fx.stale_hours` 停在 10，后面 `test_settings_roundtrip` 报
+        # `assert 1 == 48` ——红的地方不是错的地方，最难查的那一种。
+        prefs.save(session, {"fx.stale_hours": 48})
 
 
 def test_expired_rate_is_still_served(session):
     """过期**不**等于拒绝供给。拒绝会让建单直接失去日元金额，那更糟。"""
-    prefs.save(session, {"fx.stale_hours": 1})
-    _put_rate(session, hours_ago=100, rate="19.5")
-    assert fx.current_rate(session) is not None, "过期就不给值了？建单会整批失去日元金额"
-    prefs.save(session, {"fx.stale_hours": 48})
+    try:
+        prefs.save(session, {"fx.stale_hours": 1})
+        _put_rate(session, days_ago=4, rate="19.5")
+        assert fx.current_rate(session) is not None, "过期就不给值了？建单会整批失去日元金额"
+    finally:
+        prefs.save(session, {"fx.stale_hours": 48})
 
 
 def test_rate_lookup_warns_when_expired(session, caplog):
     """核心：用了过期汇率必须留痕。没有这条，链路断掉时账本会安静地一路记错。"""
-    prefs.save(session, {"fx.stale_hours": 1})
-    _put_rate(session, hours_ago=100, rate="18.0")
-    with caplog.at_level("WARNING"):
-        got = fx.rate_for_date(session, None, "建商品订单 TEST-1")
-    assert got == Decimal("18.0000") or got == Decimal("18.0")
-    # 用 getMessage()：日志是 %-风格惰性格式化，直接对 r.message 做 % r.args 会在
-    # 参数个数对不上时抛 TypeError（第一版就是这么炸的），而且 r.message 本身是模板不是成品。
-    assert any("过期" in r.getMessage() for r in caplog.records), "用了过期汇率却没有任何警告"
-    prefs.save(session, {"fx.stale_hours": 48})
+    try:
+        prefs.save(session, {"fx.stale_hours": 1})
+        _put_rate(session, days_ago=4, rate="18.0")
+        with caplog.at_level("WARNING"):
+            got = fx.rate_for_date(session, None, "建商品订单 TEST-1")
+        assert got == Decimal("18.0000") or got == Decimal("18.0")
+        # 用 getMessage()：日志是 %-风格惰性格式化，直接对 r.message 做 % r.args 会在
+        # 参数个数对不上时抛 TypeError（第一版就是这么炸的），而且 r.message 本身是模板不是成品。
+        assert any("过期" in r.getMessage() for r in caplog.records), "用了过期汇率却没有任何警告"
+    finally:
+        prefs.save(session, {"fx.stale_hours": 48})     # 断言挂了也要还原，理由见上一条
 
 
 def test_rate_lookup_is_quiet_when_fresh(session, caplog):
     """反面：新鲜时不该刷警告——狼来了喊多了就没人看了。"""
     prefs.save(session, {"fx.stale_hours": 48})
-    _put_rate(session, hours_ago=1, rate="20.5")
+    _put_rate(session, days_ago=0, rate="20.5")
     with caplog.at_level("WARNING"):
         fx.rate_for_date(session, None, "建商品订单 TEST-2")
     assert not [r for r in caplog.records if "过期" in r.getMessage()], "汇率还新鲜却报了过期"
@@ -105,12 +172,17 @@ def test_rate_lookup_is_quiet_when_fresh(session, caplog):
 def test_api_exposes_age_and_expired(client, session):
     """前端要靠这两个字段把「已过期多久」显示出来。
     只有 `stale`（日粒度）的话，1 天前和 3 个月前长得一模一样。"""
-    prefs.save(session, {"fx.stale_hours": 1})
-    _put_rate(session, hours_ago=100)
-    got = client.get("/api/fx").json()
-    assert got["expired"] is True
-    assert got["age_hours"] and got["age_hours"] > 90
-    prefs.save(session, {"fx.stale_hours": 48})
+    try:
+        prefs.save(session, {"fx.stale_hours": 1})
+        _put_rate(session, days_ago=4)
+        got = client.get("/api/fx").json()
+        assert got["expired"] is True
+        # 4 天前的汇率：年龄 = 3 整天 + 今天已过的时数 ∈ [72, 96)。
+        # 原先这里写 `> 90`，那是按 `fetched_at` 的 100 小时校准的；
+        # 按日期算的话它会随「现在几点」在 72–96 之间浮动，`> 90` 一天里大半时间是假的。
+        assert got["age_hours"] and 72 <= got["age_hours"] < 96, got["age_hours"]
+    finally:
+        prefs.save(session, {"fx.stale_hours": 48})
 
 
 def test_every_rate_stamping_path_can_warn():

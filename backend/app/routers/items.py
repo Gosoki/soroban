@@ -12,6 +12,7 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import Session, select
 
 from ..auth import get_current_user
+from .common import MAX_OFFSET
 from ..database import get_session
 from ..db.dialect import ci_contains
 from ..models import OrderItem, Order, ShipmentOrder
@@ -38,7 +39,7 @@ def list_items(
         None, alias="status", include_in_schema=False,
         description="已废弃：查询参数 status 已按业务段改名"),
     limit: int = Query(50, ge=1, le=500),
-    offset: int = Query(0, ge=0),
+    offset: int = Query(0, ge=0, le=MAX_OFFSET),
 ):
     # FastAPI 对未知 query 参数**默认忽略**：改名后漏改一处调用方，
     # 表现就是「筛选点了没反应、返回全量、HTTP 200、零日志」。响亮拒掉比静默返回错数据强。

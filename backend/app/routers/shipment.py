@@ -19,6 +19,7 @@ from ..schemas import (
     ShipmentCreate, ShipmentOcrAttachResult, ShipmentRead, ShipmentUpdate, OrderItemRead, OrderBrief,
 )
 from .common import (
+    MAX_OFFSET,
     guarded_bump, list_totals, mirror_to_staging, raise_conflict, raise_not_found, run_ocr,
     soft_delete, stamp_fx
 )
@@ -135,8 +136,17 @@ def _read_many(session: Session, shipments: list[ShipmentOrder],
     return [_shipment_read(s, by_parent.get(s.id, [])) for s in shipments]
 
 
-def _read(session: Session, shipment: ShipmentOrder) -> ShipmentRead:
-    return _read_many(session, [shipment])[0]
+def _read(session: Session, shipment: ShipmentOrder, *, current=None) -> ShipmentRead:
+    """单条响应。**给了 `current` 就按调用方的授权收窄**，与列表同一条闸。
+
+    `current` 默认 `None` = 不收窄，保留给那些中间件本来就不放插件进来的端点
+    （它们没声明 `x-scope`，插件令牌拿到的是 403，压根到不了这里）。
+    实测过五个返回 `ShipmentRead` 的端点：列表自己过闸，
+    GET 单条 / POST 挂订单 / DELETE 摘订单都被中间件挡在 403，
+    **只有 PATCH 声明了 `x-scope` 又没过闸**——所以那一处必须显式传 `current`。
+    """
+    brief = current is not None and not _may_see_orders(current)
+    return _read_many(session, [shipment], brief=brief)[0]
 
 
 @router.get("", openapi_extra={"x-scope": "shipment:read"})
@@ -152,7 +162,7 @@ def list_orders(
         None, alias="status", include_in_schema=False,
         description="已废弃：查询参数 status 已按业务段改名"),
     limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    offset: int = Query(0, ge=0, le=MAX_OFFSET),
     current=Depends(get_current_user),
 ):
     # FastAPI 对未知 query 参数**默认忽略**：改名后漏改一处调用方，
@@ -353,7 +363,9 @@ def get_shipment(shipment_id: int, session: Session = Depends(get_session)):
 
 @router.patch("/{shipment_id}", response_model=ShipmentRead,
                openapi_extra={"x-scope": "shipment:update"})
-def update_shipment(shipment_id: int, payload: ShipmentUpdate, session: Session = Depends(get_session)):
+def update_shipment(shipment_id: int, payload: ShipmentUpdate,
+                    session: Session = Depends(get_session),
+                    current=Depends(get_current_user)):
     shipment = session.get(ShipmentOrder, shipment_id)
     if not shipment or shipment.is_delete:
         raise_not_found("集运订单")
@@ -369,7 +381,14 @@ def update_shipment(shipment_id: int, payload: ShipmentUpdate, session: Session 
     session.add(shipment)
     session.commit()
     session.refresh(shipment)
-    return _read(session, shipment)
+    # **这一条也要过 `_may_see_orders`。** 它是唯一一个既声明了 `x-scope`
+    # （所以插件令牌进得来）、又回整份 `ShipmentRead` 的写端点：
+    # 一个只勾了「读集运单」+「改集运单」、**刻意没勾**「读商品订单」的插件，
+    # 发一个什么字段都不改的 `PATCH {version}`，响应里 orders 数组就是满的——
+    # 订单号、商品标题、采购状态、结算日元、每件物品的名称与数量全在。
+    # `_may_see_orders` 的文档说的「他留下的那道闸，从另一个门整个绕开了」，
+    # 说的是 GET；这里是第二个门。
+    return _read(session, shipment, current=current)
 
 
 @router.post("/{shipment_id}/order/{order_id}", response_model=ShipmentRead)

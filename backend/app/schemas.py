@@ -637,7 +637,9 @@ class FxRead(SQLModel):
     source_label: str = ""                  # 上面那个的中文名，供前端提示显示
     # not_today 是**日粒度**（不是今天的），1 天前和 3 个月前长得一样；
     # 下面两个才说得清「还能不能信」。
-    age_hours: Optional[float] = None       # 距上次成功取到多少小时
+    # 这条汇率有多旧——按它**是哪一天的**算，不是按什么时候取到的。
+    # （按后者算的话，补填一条历史汇率会把过期告警静默关掉；见 services/fx.rate_age_hours）
+    age_hours: Optional[float] = None
     expired: bool = False                   # 超过 fx.stale_hours → 界面明确标出、建单时记警告
     # 现在有没有插件能自动提供汇率（名字，没有则空）。界面据此说实话：
     # 插件被删掉之后还写着「自动获取由插件负责」，那句话就是假的——点过去什么都没有。

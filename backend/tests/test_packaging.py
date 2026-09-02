@@ -94,6 +94,64 @@ def test_plugins_are_bundled_but_secrets_never_are(spec_text):
     assert "_PLUG_SKIP_DIRS" in spec_text and "set(rel.parts[:-1]) & _PLUG_SKIP_DIRS" in spec_text
 
 
+def test_what_actually_gets_bundled_carries_no_developer_data():
+    """**跑真的 `_bundle_plugins`，看它到底产出什么**——不是看剔除清单里写了哪些名字。
+
+    上一条 `test_plugins_are_bundled_but_secrets_never_are` 检查的是 spec 的**文本**
+    里出现过 `.state` / `.env` / `.venv` 这些词。它是对的，但它管不住**没被想到的东西**：
+
+    `plugins/soroban-plugin-taobao/docs/captures/fetch-c233-20260806-133510.json`
+    是一份 607 KB 的**真实淘宝抓包**——43 个订单号、167 个 orderId、94 个商品标题、
+    182 处金额，全是打包者本人的单。它一路畅通地进了 exe，
+    并由 `seed_bundled_plugins()` 写到**每个用户的磁盘上**；
+    而它恰恰是所有被打包插件文件里**最大的那一个**。
+    上一条守卫全程绿着，因为清单里确实写着 `.state`——**它验的是规则，不是结果**。
+
+    这一条验结果，两道判据各挡一类：
+
+      · **目录**：产物里不许出现开发期目录（docs / tests / captures / examples / …）。
+        挡住「同类东西又冒出来一个」。
+      · **体积**：单个文件不许超过 256 KB。插件运行时要的东西是源码、
+        plugin.toml、requirements.txt、README、LICENSE——最大的是 34 KB 的 LICENSE。
+        **超过这个数量级的一定是数据不是代码**，与它叫什么、在哪个目录无关。
+        这一道是名字无关的兜底，正是上一条缺的那种（与
+        `test_no_sqlite_database_can_reach_this_public_repository` 用文件头判、
+        不用文件名判，是同一个思路）。
+    """
+    import pathlib
+
+    spec = (_REPO / "soroban.spec").read_text(encoding="utf-8")
+    i = spec.index("_PLUG_SKIP_DIRS")
+    # **`rindex` 不是 `index`**：`_bundle_plugins` 里有两个 `return out`
+    # （`if not base.is_dir()` 那个早退，和末尾那个）。取第一个会把函数从早退处截断，
+    # 于是拿真目录调它会走到函数体末尾、返回 None——本条第一版就是这么炸的，
+    # 而报错是 `object of type 'NoneType' has no len()`，与真正的原因八竿子打不着。
+    j = spec.rindex("return out") + len("return out")
+    ns = {"Path": pathlib.Path}
+    exec(spec[i:j], ns)                      # noqa: S102  跑的是本仓自己的 spec
+
+    base = _REPO / "plugins"
+    if not base.is_dir():
+        pytest.skip("本机没有 plugins/ 目录（插件仓是单独版本管理的）")
+    bundled = ns["_bundle_plugins"](base)
+    assert len(bundled) >= 5, f"只打进 {len(bundled)} 个文件——探测方式可能已过期"
+
+    DEV_DIRS = {"docs", "tests", "captures", "examples", ".github", ".idea", ".vscode"}
+    dirty = [src for src, _ in bundled
+             if DEV_DIRS & set(pathlib.Path(src).relative_to(base).parts)]
+    assert not dirty, (
+        f"这些开发期文件会被打进 exe 并写到每个用户磁盘上：{dirty}\n"
+        f"与 `.state`（打包者的登录 cookie）同一类：随包分发还能事后删，打进 exe 就删不掉了。")
+
+    LIMIT = 256 * 1024
+    huge = [(src, pathlib.Path(src).stat().st_size // 1024)
+            for src, _ in bundled if pathlib.Path(src).stat().st_size > LIMIT]
+    assert not huge, (
+        f"这些文件超过 {LIMIT // 1024} KB，几乎必然是数据而不是代码：{huge}\n"
+        f"插件运行时只需要源码 + plugin.toml + requirements.txt + README/LICENSE，"
+        f"最大的一个是 34 KB 的 LICENSE。")
+
+
 def test_bundled_plugins_are_released_to_a_writable_dir():
     """打进包的插件必须在启动时**释放到磁盘**，不能就地跑。
 
@@ -648,3 +706,46 @@ def test_the_packaged_exe_can_restore_a_backup():
           ).read_text(encoding="utf-8")
     assert "--restore" in ui and "soroban.exe" in ui, (
         "界面还在只教那条 exe 用户执行不了的命令——只加入口不改文案，他照样找不到")
+
+
+@pytest.mark.parametrize("written,expected,why", [
+    ("Str0ng#Pass!2026", "Str0ng#Pass!2026", "口令里的 # 是内容，不是注释"),
+    ("#StartsWithHash1", "#StartsWithHash1", "以 # 开头的是一个值，不是整行注释"),
+    ("'Str0ng#Pass!'", "Str0ng#Pass!", "加了引号的照旧脱引号"),
+    ("PlainPass123", "PlainPass123", "普通值不受影响"),
+    ("pw with spaces", "pw with spaces", "值里的空格不是分隔符"),
+    ("8621  # 换个端口", "8621", "**前面有空白**的 # 仍然按行尾注释剥掉"),
+])
+def test_a_password_with_a_hash_is_not_silently_truncated(tmp_path, written, expected, why):
+    """`.env` 里带 `#` 的口令**不许**被剥注释的逻辑削掉。
+
+    那段剥注释是为 `BACKEND_PORT=8621  # 换个端口` 加的（不剥的话 `int()` 抛
+    ValueError，落到一句「数据库损坏 / SECRET_KEY 被改坏 / 磁盘满」的兜底提示上，
+    把用户往完全错误的方向指）。可**同一个函数也用来读 `SOROBAN_ADMIN_PASS`**
+    ——`_ENV_TEMPLATE` 里就列着它，双击 exe 的用户照着模板填的就是它。
+
+    2026-09-02 实测（修之前）：
+
+        SOROBAN_ADMIN_PASS=Str0ng#Pass!2026  → 读出 'Str0ng'（6 位）
+        SOROBAN_ADMIN_PASS=#StartsWithHash1  → 读出 ''  ⇒ `ensure_admin` 回落到
+                                               README 里公开的默认口令 admin123
+
+    用户自以为设了强口令，控制台还照常打印「初始口令见 .env 的 SOROBAN_ADMIN_PASS」。
+    **口令被静默削弱，全程没有任何迹象。**
+
+    判据把六种形态一起钉住，**最后一条是反面**：只钉「别剥」的话，
+    把剥注释整段删掉也能绿，而那会让端口那条重新掉进它当初被加进来要解决的坑。
+    """
+    import os
+    from typing import Optional
+
+    src = (_REPO / "backend" / "run.py").read_text(encoding="utf-8")
+    i = src.index("def _trailing_comment")
+    j = src.index("def _check_port_free")
+    ns = {"Path": Path, "os": os, "Optional": Optional}
+    exec(src[i:j], ns)                       # noqa: S102  跑的是本仓自己的 run.py
+
+    (tmp_path / ".env").write_text(f"SOROBAN_ADMIN_PASS={written}\n", encoding="utf-8")
+    got = ns["_runtime_setting"](tmp_path, "SOROBAN_ADMIN_PASS", "FALLBACK")
+    assert got == expected, f"{why}：写入 {written!r} 读出 {got!r}，应为 {expected!r}"
+

@@ -1388,3 +1388,147 @@ def test_shipment_read_does_not_hand_over_the_orders_that_orders_read_gates(clie
                        headers={"Authorization": f"Bearer {tok2}"}).json()
     m2 = next(x for x in body2["items"] if x["shipment_no"] == "SCOPE-1")
     assert len(m2["orders"]) == 1, "给了 orders:read 反而看不到了"
+
+
+def test_patching_a_shipment_does_not_hand_back_what_orders_read_gates(client, session):
+    """`PATCH /api/shipment/{id}` 的响应也要过 `_may_see_orders`——**它是第二个门**。
+
+    `_may_see_orders` 的文档写的是 `GET /api/shipment`：用户取消勾选「读商品订单」，
+    界面上就是这么写的，而列表会把每张集运单挂着的订单号、标题、状态、结算日元、
+    以及每件物品的名称/数量原样发出去——「他留下的那道闸，从另一个门整个绕开了」。
+    GET 那扇门当时堵上了，**同前缀的 PATCH 一直开着**。
+
+    五个返回 `ShipmentRead` 的端点实测过一遍：列表自己过闸；
+    GET 单条 / POST 挂订单 / DELETE 摘订单都因为没声明 `x-scope` 被中间件挡在 403；
+    **只有 PATCH 既声明了 `x-scope`（插件进得来）、又回整份响应**。
+    所以这条测试只钉 PATCH，并且顺带把「另外四个门确实进不来」也钉住——
+    哪天有人给它们补上 `x-scope`，这里会当场提醒。
+
+    发的是一个**什么字段都不改**的 PATCH（只带 version）：拿数据不需要真去改什么。
+    """
+    import datetime as dt
+
+    from app.models import Order, ShipmentOrder
+    from app.plugins import scopes
+
+    SECRET = "绝密商品标题ABC"
+    o = Order(date=dt.date(2027, 4, 1), title=SECRET, order_no="SECRET-ORDER-001",
+              price_cny=100, fx_rate=20, purchase_status="待收货")
+    o.compute_money()
+    sh = ShipmentOrder(date=dt.date(2027, 4, 2), shipment_no="SH-SCOPE-PROBE")
+    session.add(o)
+    session.add(sh)
+    session.commit()
+    session.refresh(o)
+    session.refresh(sh)
+    o.shipment_order_id = sh.id
+    session.add(o)
+    session.commit()
+    session.refresh(sh)
+
+    class _U:
+        id, username = 1, "admin"
+
+    # 勾了「读集运单」+「改集运单」，**刻意没勾**「读商品订单」
+    tok, jti = scopes.issue(_U(), "scope-probe", {"shipment:read", "shipment:update"})
+    hdr = {"Authorization": f"Bearer {tok}"}
+    try:
+        r = client.patch(f"/api/shipment/{sh.id}", json={"version": sh.version}, headers=hdr)
+        assert r.status_code == 200, f"夹具没走到那条路：{r.status_code} {r.text[:200]}"
+        assert SECRET not in r.text and "SECRET-ORDER-001" not in r.text, (
+            f"PATCH 把 orders:read 挡住的订单明细原样发回去了：{r.text[:400]}")
+        assert r.json().get("orders") == [], f"orders 没有被收窄：{r.json().get('orders')}"
+
+        # 另外四个门此刻确实进不来——哪天有人给它们补上 x-scope，这里会提醒
+        closed = {
+            "GET 单条": client.get(f"/api/shipment/{sh.id}", headers=hdr),
+            "POST 挂订单": client.post(f"/api/shipment/{sh.id}/order/{o.id}", headers=hdr),
+            "DELETE 摘订单": client.delete(f"/api/shipment/{sh.id}/order/{o.id}", headers=hdr),
+        }
+        for name, resp in closed.items():
+            assert resp.status_code == 403, (
+                f"{name} 现在放插件令牌进来了（{resp.status_code}）——"
+                f"它也回整份 ShipmentRead，得跟 PATCH 一样过 `_may_see_orders`")
+    finally:
+        scopes.revoke(jti)
+
+    # 反面：勾上 orders:read 就该看得见，否则这道闸是把插件一刀切了
+    tok2, jti2 = scopes.issue(_U(), "scope-probe2",
+                              {"shipment:read", "shipment:update", "orders:read"})
+    try:
+        r2 = client.patch(f"/api/shipment/{sh.id}",
+                          json={"version": sh.version + 1},
+                          headers={"Authorization": f"Bearer {tok2}"})
+        assert r2.status_code == 200, r2.text
+        assert SECRET in r2.text, "勾了「读商品订单」却还是看不到——这道闸把插件一刀切了"
+    finally:
+        scopes.revoke(jti2)
+
+
+def test_one_plugin_with_a_bad_account_declaration_does_not_open_the_gate_for_the_others(
+        client, session, tmp_path, monkeypatch):
+    """一个插件的账号声明写错，**不许**让「这是插件管理的账号」这道闸对别的插件失效。
+
+    `_plugin_owns_account` 原先整个循环共用一个 `try`。装一个把
+    `accounts_ledger_field` 写成核心不认识的列名的第三方插件——而 `_ledger_field`
+    对此会 `raise HTTPException(400, …)`，它是 `Exception` 的子类——
+    只要它的目录名排在正常插件之前，循环就在第一圈中止、返回 False，
+    **排在后面的插件根本没被检查过**。
+
+    后果不是报错，是**静默错账**：改名的两道闸放行 → 账本里 `platform_account='甲'`
+    全改成 '乙'、前端弹绿字「已改名」；而插件侧 `params_json` 里还是「甲」、
+    磁盘 `.state/甲.json` 也还在 → 下一轮抓取继续写「甲」，
+    同一个人的单从此劈成两半，按账号筛选和合计两边都不对，全程零报错。
+
+    判据用 **A/B**，这是关键：先证明「只有正常插件时闸是拦住的」（基线为真），
+    再加一个与这个账号毫无关系的坏插件，闸必须**照样拦住**。
+    少了基线那一半，一条永远返回 False 的实现也能过。
+    """
+    import json
+    import shutil
+    from pathlib import Path
+
+    from app.config import settings
+    from app.models import PluginConfig
+    from app.routers import plugins as pmod
+    from app.routers.tags import _plugin_owns_account
+
+    real = (Path(__file__).resolve().parents[2] / "plugins"
+            / "soroban-plugin-taobao" / "plugin.toml")
+    if not real.is_file():
+        pytest.skip("仓库里没有淘宝插件清单，这条测试的前提不成立")
+
+    def build(where, with_bad):
+        where.mkdir(parents=True)
+        g = where / "soroban-plugin-taobao"
+        g.mkdir()
+        shutil.copy(real, g / "plugin.toml")
+        if with_bad:
+            # 目录名排在 taobao **之前**——这正是触发条件
+            b = where / "soroban-plugin-aaa"
+            b.mkdir()
+            (b / "plugin.toml").write_text(
+                'id = "aaa"\nname = "坏声明"\nversion = "1.0.0"\npython = "inherit"\n'
+                'accounts = true\naccounts_ledger_field = "platform_accounts"\n'
+                '[[commands]]\nname = "run"\nlabel = "跑"\n', encoding="utf-8")
+        return where
+
+    # `merge` 而不是 `add`：同一个会话库里别的用例可能已经建过 taobao 那行，
+    # `add` 会撞 `UNIQUE constraint failed: pluginconfig.plugin_id`——
+    # 单跑绿、全量跑红，而红的原因与本条要测的事情毫无关系。
+    session.merge(PluginConfig(plugin_id="taobao", params_json=json.dumps(
+        {"accounts": [{"name": "甲", "platform": "淘宝", "enabled": True}]},
+        ensure_ascii=False)))
+    session.commit()
+
+    def owns(root) -> bool:
+        monkeypatch.setattr(settings, "PLUGIN_DIR", str(root))
+        pmod._needs_cache.clear()
+        return _plugin_owns_account(session, "platform_account", "甲")
+
+    assert owns(build(tmp_path / "only", False)) is True, (
+        "基线不成立：只有淘宝插件时这道闸就没拦住——那么下面那半也证明不了什么")
+    assert owns(build(tmp_path / "both", True)) is True, (
+        "多了一个与「甲」毫无关系的坏声明插件之后，这道闸就放行了——"
+        "一个插件写错，把所有插件的账号保护一起关掉了")
+

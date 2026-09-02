@@ -4,7 +4,10 @@
     账本里的<b>商品订单</b>。一单可含多件物品，订单价 = Σ(单价×数量) + 邮费，由物品派生。
     已导入的暂存单也落在这里。<b>截图 OCR 录单在「暂存」页</b>——这一页没有接拖拽，
     往这儿拖图会被浏览器当成打开文件，整个页面被顶掉、没保存的编辑一起没。
-    列可拖动换位/拖宽，宽度按浏览器记住。
+    <!-- 「按浏览器记住」是假话：`ColumnLayout` 以表名为唯一主键，**8 个人共用同一行**，
+         存在后端。说成浏览器本地的话，甲发现自己的列序被改了会去清缓存、换浏览器找原因，
+         而真实原因是乙拖了一下；反过来乙也会以为「我这台机器上怎么摆是我自己的事」。 -->
+    列可拖动换位/拖宽，<b>列序与列宽是大家共用的一份</b>（存在服务端，不是你这台机器上的）。
     </PageHeader>
 
     <NotionTable :columns="columns" :rows="rows" :loading="loading" :load-failed="loadFailed" expandable hide-id :open-id="focusId"
@@ -130,7 +133,9 @@ const columns = [
   { key: 'platform_account', label: '账号昵称', type: 'tag', field: 'platform_account', width: COL_W },
   { key: 'platform', label: '来源', type: 'tag', field: 'platform', width: COL_W, placeholder: '来源' },
   { key: 'title', label: '商品', type: 'text', long: true, width: COL_W },
-  { key: 'items', label: '物品', readonly: true, width: COL_W, expand: true },
+  { key: 'items', label: '物品', readonly: true, width: COL_W, expand: true,
+    // 数组列：cell() 的数组分支产出的正是「（2x）名称」，与 itemSummary 同形；空数组导出空串比屏幕上那个「—」更适合 CSV
+    exportRaw: true },
   // 状态：点标签就能选（和其它标签列一致）。挂着集运单时**按行锁定**——显示继承来的集运状态、
   // 整格置灰不可点，但标签本身保持原色；释放后自动恢复可选。
   // display 只影响显示，写回仍走 key='status'（订单自己的国内段状态）。
@@ -140,7 +145,12 @@ const columns = [
     lock: (row) => !!row.shipment_order_id,
     lockHint: '跟随所挂集运订单的状态；从集运单里释放后可改',
   },
-  { key: 'shipment_order_id', label: '集运订单', readonly: true, width: COL_W, placeholder: '选择' },
+  // display 只给导出用（屏幕上这一列走 #cell-shipment_order_id 插槽，插槽优先）。
+  // 不写的话导出的是数据库自增 id：屏幕上「SP-777」，文件里「1」。
+  {
+    key: 'shipment_order_id', label: '集运订单', readonly: true, width: COL_W, placeholder: '选择',
+    display: (row) => row.shipment_no || (row.shipment_order_id ? '#' + row.shipment_order_id : ''),
+  },
   { key: 'jpy_settled', label: '结算（円）', format: 'jpy', readonly: true, width: COL_W },
   { key: 'jpy_override', label: '覆盖（円）', type: 'int', format: 'jpy', width: COL_W, placeholder: '实付日元' },
   // help：口径 + 「为什么和淘宝实付差几分」，表头点「?」可见（见 docs/README.md 第五十三版）
@@ -389,7 +399,7 @@ async function addRow(data = {}, done) {
       done?.(true)
       return created
     }
-    await afterCreate(created, { rows, total, page, filters, load, pageSize })
+    await afterCreate(created, { rows, total, page, filters, load, pageSize, sumJpy, unconverted })
     done?.(true)
     return created
   } catch (e) {

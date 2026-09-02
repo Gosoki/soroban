@@ -117,7 +117,21 @@ datas += collect_data_files("certifi")
 #   3. **构建垃圾**：__pycache__、*.pyc、.git、node_modules。
 # 除此之外一律照带（含 README、tests、LICENSE）——「打包机上有什么就有什么」
 # 是一条不需要维护的规则，而白名单要求每加一种文件就回来改一次这里。
-_PLUG_SKIP_DIRS = {".venv", ".state", "__pycache__", ".git", "node_modules", ".pytest_cache"}
+# 打包插件时剔除的三类东西。**这不是优化，是前提条件**：
+# 随包分发一个文件夹时，多带的东西还能事后删；**打进 exe 就再也删不掉了**。
+#
+# 后一半（docs / tests / captures / examples）是 2026-09-02 补的，起因很具体：
+# `plugins/soroban-plugin-taobao/docs/captures/fetch-c233-20260806-133510.json`
+# 是一份 607 KB 的**真实淘宝抓包**——43 个订单号、167 个 orderId、94 个商品标题、
+# 182 处金额，全是打包者本人的单。它是所有被打包插件文件里**最大的那一个**，
+# 会随 exe 分发、并由 `seed_bundled_plugins()` 写到**每个用户的磁盘上**。
+# 与 `.state`（打包者的登录 cookie）是同一类东西，只是当时的清单没想到它。
+#
+# 现在的口径是「只带跑得起来所必需的」：源码、plugin.toml、requirements.txt、
+# README、LICENSE。开发期产物一律不带——运行时代码里没有任何一处读插件的
+# docs/ 或 tests/（已 grep 确认）。
+_PLUG_SKIP_DIRS = {".venv", ".state", "__pycache__", ".git", "node_modules", ".pytest_cache",
+                   "docs", "tests", "captures", "examples", ".github", ".idea", ".vscode"}
 _PLUG_SKIP_NAMES = {".env"}
 _PLUG_SKIP_SUFFIXES = (".pyc", ".pyo", ".log")
 

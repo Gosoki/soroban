@@ -113,11 +113,46 @@ def _param(raw: dict, plugin_id: str) -> Optional[Param]:
         type=typ,
         default=raw.get("default"),
         hint=str(raw.get("hint") or ""),
-        choices=list(raw["choices"]) if raw.get("choices") else None,
-        minimum=raw.get("min"),
-        maximum=raw.get("max"),
+        # `choices` 必须是可迭代的容器。写成 `choices = 5` 时 `list(5)` 抛 TypeError，
+        # 而这里是 `GET /api/plugins`（前端秒级轮询）的必经之路——**整页 500**，
+        # 连隔壁那个完全正常的插件也一起看不见。
+        choices=_as_list(raw.get("choices"), key, plugin_id),
+        # `min = "1"`（TOML 里最常见的引号手误）会一路存成字符串，
+        # 到 `params._coerce` 里 `n < p.minimum` 抛
+        # `TypeError: '<' not supported between instances of 'int' and 'str'`。
+        # 而 `_coerce` 只 catch `ValueError`，`TypeError` 直接逃到 ASGI 层 ⇒ **整页 500**。
+        # 与上面那几条一样：**一个插件写错，不许连累别的插件**。
+        minimum=_as_int(raw.get("min"), "min", key, plugin_id),
+        maximum=_as_int(raw.get("max"), "max", key, plugin_id),
         secret=bool(raw.get("secret") or typ == "secret"),
     )
+
+
+def _as_int(v, field: str, key: str, plugin_id: str) -> Optional[int]:
+    """`min` / `max` 只接受整数；别的一律当没写过并记一条。
+
+    **不做「字符串也试着转成 int」**：那会把 `min = "1"` 悄悄当成 1，
+    于是清单里写的和实际生效的不一样，而这正是插件作者需要知道的那个错。
+    宁可这一项不生效（参数照常可用），也不要静默按一个他没写的值去卡。
+    """
+    if v is None or isinstance(v, bool):        # bool 是 int 的子类，但 min=true 显然是手误
+        if v is not None:
+            log.warning("插件 %s 的参数 %s 的 %s 写成了布尔值，已忽略", plugin_id, key, field)
+        return None
+    if isinstance(v, int):
+        return v
+    log.warning("插件 %s 的参数 %s 的 %s 需要整数，收到 %r，已忽略", plugin_id, key, field, v)
+    return None
+
+
+def _as_list(v, key: str, plugin_id: str) -> Optional[list]:
+    """`choices` 只接受列表/元组；写成标量时当没写过（上面会因此把 select 降级成 str）。"""
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)):
+        return list(v) or None
+    log.warning("插件 %s 的参数 %s 的 choices 需要是数组，收到 %r，已忽略", plugin_id, key, v)
+    return None
 
 
 def _command(raw: dict, plugin_id: str, has_accounts: bool) -> Optional[Command]:

@@ -12,9 +12,23 @@
  * 编码带 BOM：不带的话 Excel 打开中文全是乱码，而这份文件多半就是给 Excel 用的。
  */
 
-/** 一个格子 → CSV 里的一段文本。数组（物品列）拼成人读的一句，null/undefined 出空串。 */
+/** 一个格子 → CSV 里的一段文本。数组（物品列）拼成人读的一句，null/undefined 出空串。
+ *
+ * **取值以 `col.display` 为准，不是 `row[col.key]`。** 有几列屏幕上显示的与列的原始值
+ * 根本不是一个东西：
+ *   · 订单页「状态」列 key 是 `purchase_status`（订单自己的国内段状态），
+ *     而屏幕显示 `fulfillment_status`（挂了集运单就跟随集运段）。
+ *     用户按「状态=已发出」筛出一批、点导出，**文件里那一格写着「待发货」**——
+ *     筛的是 A、导出的是 B，而这份文件正是要发给别人的。
+ *   · 订单页「集运订单」列显示集运单号，原始值是数据库自增 id，导出写的是「1」。
+ *   · 物品页「状态」列同上。
+ *
+ * `display` 是既有约定（`GotionCell` 渲染时就调它）。插槽渲染的列屏幕上走插槽、
+ * 不走 `display`，所以给它们补一个 `display` 对界面**没有任何影响**，
+ * 只是把「这一格的规范文本」这件事写下来给导出用。
+ */
 function cell(row, col) {
-  const v = row[col.key]
+  const v = typeof col.display === 'function' ? col.display(row) : row[col.key]
   if (v === null || v === undefined) return ''
   if (Array.isArray(v)) {
     // 物品/子订单这类嵌套列表：拼成「（2x）名称」的形式，与表格里的摘要一致
@@ -46,7 +60,9 @@ function esc(s) {
  * @returns {Promise<number>}     实际导出的行数
  */
 export async function exportCsv({ fetchPage, columns, name }) {
-  const PAGE = 200                     // 与后端 limit 上限一致
+  // 200 是四个列表端点里**最小**的那个上限（物品端点是 500，其余三个 200）。
+  // 取最小值而不是各页各配一个：多一个每页条数就多一处会和后端悄悄走散的常量。
+  const PAGE = 200
   const rows = []
   let total = null
   for (let offset = 0; ; offset += PAGE) {

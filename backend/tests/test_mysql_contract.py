@@ -195,15 +195,41 @@ def test_server_provides_expected_collations(mysql_engine):
             "该服务端没有 utf8mb4_0900_bin，已回退到 PAD SPACE 的 utf8mb4_bin（尾空格仍会折叠）"
 
 
+def _declared_binstr_columns() -> set[tuple[str, str]]:
+    """模型里**所有**声明成 `BinStr` 的列。
+
+    从元数据推导，不写死名单。原先这里是一份手抄的 11 项集合，而模型上实际有 15 根——
+    `miscexpense.category`（专门为它做过一次迁移 `e5f6a7b8c0d1`）与
+    `pluginrecord` 的 `plugin_id`/`kind`/`key` 三根都不在名单里，
+    等于插件私有存储的命名空间隔离在 MySQL 上**从来没被验过**。
+    偏偏这套契约测试默认跳过（要真 MySQL 才跑），是全套里最少运行的一部分——
+    手工名单落后了多久没人知道。
+
+    `BinStr` 是工厂函数不是类型类，`isinstance` 认不出来；它的标记是
+    mysql variant 上的 `collation`。"""
+    from sqlmodel import SQLModel
+
+    import app.models  # noqa: F401  触发全部表注册
+    from app.db.dialect import BIN_COLLATION
+
+    out = set()
+    for tname, tbl in SQLModel.metadata.tables.items():
+        for col in tbl.columns:
+            variant = (getattr(col.type, "_variant_mapping", None) or {}).get("mysql")
+            if getattr(variant, "collation", None) == BIN_COLLATION:
+                out.add((tname, col.name))
+    return out
+
+
 def test_key_columns_actually_have_binary_collation(mysql_engine):
     """直接查 information_schema：模型声明与真实建出来的表可能脱节（比如老库漏跑迁移）。"""
     from sqlalchemy import text
 
-    expected = {("tagoption", "value"), ("tagoption", "field"), ("user", "username"),
-                ("orders", "order_no"), ("orders", "platform"), ("orders", "platform_account"),
-                ("orderstaging", "order_no"), ("orderstaging", "platform"),
-                ("orderstaging", "platform_account"),
-                ("shipmentorder", "shipment_no"), ("shipmentorder", "recipient")}
+    expected = _declared_binstr_columns()
+    assert len(expected) >= 15, (
+        f"只推导出 {len(expected)} 根 BinStr 列——探测方式多半已过期。"
+        f"这个断言存在的意义是：推导要是悄悄返回空集，下面那句 `expected <= actual` 恒真，"
+        f"整条测试会变成一句永远绿的废话。")
     with mysql_engine.connect() as conn:
         rows = conn.execute(text(
             "SELECT TABLE_NAME, COLUMN_NAME, COLLATION_NAME FROM information_schema.COLUMNS "
@@ -278,3 +304,73 @@ def test_the_collation_downgrade_precheck_finds_case_only_duplicates(mysql_engin
     finally:
         with mysql_engine.begin() as c:
             c.execute(text("DELETE FROM tagoption WHERE value IN ('EMS-DG', 'ems-dg')"))
+
+
+def test_the_whole_chain_survives_a_real_round_trip_on_mysql(mysql_engine):
+    """`head → base → head` 在**真 MySQL** 上必须整条跑通。
+
+    README 写着「全部迁移在真 MySQL 上跑通 upgrade→downgrade→upgrade」，
+    而 2026-09-01 实测：**跑不通**。27 条降级在第 9 条
+    （`a9b0c1d2e3f4`，删 `ix_orderstaging_imported_order_id`）倒在
+
+        (1553, "Cannot drop index ...: needed in a foreign key constraint")
+
+    InnoDB 要求外键列上有一根以它打头的索引。而 **MySQL 的 DDL 隐式提交** ⇒
+    倒下之前那 8 条已经全部落地且不可回滚：`pluginrecord` 整张表被 DROP、
+    `pluginconfig` 五列被删、`d2e3f4a5b6c7` 的降级还 `DELETE FROM fxrate`。
+    也就是说，**照着仓库自己的文档做一次回滚，会永久丢掉插件私有存储和汇率历史，
+    而且停在一个既不是旧版也不是新版的状态**。
+
+    `test_no_downgrade_drops_an_index_on_a_table_it_also_drops` 从静态那一侧钉住
+    同一件事，跑得快、到处都跑；这一条是端到端的，只有给了真 MySQL 才跑。
+    两条都要，因为静态那条看不见 `a9b0c1d2e3f4` 这种「不 drop 表、只 drop 索引」的形状。
+
+    收尾必须回到 head：这个库是别的契约测试的共用夹具。
+    """
+    from pathlib import Path
+
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import text
+
+    root = Path(__file__).resolve().parents[1]
+    cfg = Config(str(root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(root / "alembic"))
+    cfg.set_main_option("sqlalchemy.url", MYSQL_URL.replace("%", "%%"))
+
+    def tables() -> int:
+        with mysql_engine.connect() as c:
+            return c.execute(text("SELECT COUNT(*) FROM information_schema.TABLES "
+                                  "WHERE TABLE_SCHEMA = DATABASE()")).scalar()
+
+    before = tables()
+    assert before > 10, f"夹具没把 schema 建起来（只有 {before} 张表），前提不成立"
+    try:
+        command.downgrade(cfg, "base")
+        left = tables()
+        assert left <= 1, f"降到 base 之后还剩 {left} 张表（只该剩 alembic_version 或空）"
+    finally:
+        command.upgrade(cfg, "head")          # 别的用例还要用这个库
+    assert tables() == before, f"往返之后表数变了：{before} → {tables()}"
+
+
+def test_the_migration_chain_is_a_straight_line(mysql_engine):
+    """迁移链必须是一条直线——没有分叉、没有多个 head。
+
+    这条几乎是零成本的自检，但它是上面那条往返测试的**前提**：
+    链上要是有两个 head，`downgrade base` 只会走其中一条，
+    另一条上的表原样留着，而上面那句 `left <= 1` 会红得莫名其妙。
+    与其让人去猜，不如让这条先说清楚。
+    """
+    from pathlib import Path
+
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    root = Path(__file__).resolve().parents[1]
+    cfg = Config(str(root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(root / "alembic"))
+    script = ScriptDirectory.from_config(cfg)
+    heads = script.get_heads()
+    assert len(heads) == 1, f"迁移链有 {len(heads)} 个 head：{heads}"
+

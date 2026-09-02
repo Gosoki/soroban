@@ -14,6 +14,7 @@ from pydantic import ConfigDict, ValidationError
 from sqlmodel import Field, Session, SQLModel
 
 from ..auth import get_current_user
+from .common import MAX_OFFSET
 from ..database import get_session
 from ..plugins import runlog, scopes
 from ..services import ingest
@@ -150,7 +151,7 @@ def _first_error(e: ValidationError) -> str:
 def list_records(kind: str,
                  # 必须有下界：`?limit=-1` 在 SQLite 上等于「不限」，在 MySQL 上是语法错 500。
                  # 零消费者的现在改最便宜——一旦有第一个真消费者，这些边界就再也改不动了。
-                 limit: int = Query(200, ge=1, le=1000), offset: int = Query(0, ge=0),
+                 limit: int = Query(200, ge=1, le=1000), offset: int = Query(0, ge=0, le=MAX_OFFSET),
                  session: Session = Depends(get_session),
                  current=Depends(get_current_user)):
     """读本插件自己存的数据。**只回自己的**——命名空间隔离在这里落实。"""

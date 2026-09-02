@@ -670,3 +670,211 @@ def test_preflight_catches_text_columns_that_overflow_mysql(tmp_path):
     assert hits, f"超长 TEXT 没被捞出来：{problems}"
     assert "90000" in hits[0], f"报的不是字节数（一个汉字 3 字节）：{hits[0]}"
     assert len(hits) == 1, f"把正常长度的那条也报了：{hits}"
+
+
+def _seed_one_order_at(db_path, revision: str) -> None:
+    """把一个 SQLite 库升到 `revision`，塞一张状态为「集运中」的订单。
+
+    直接写 SQL 而不是走模型：模型是 head 的形状，而这里要的恰恰是**旧 schema**。
+    必填列按 `PRAGMA table_info` 现问现填——写死列名的话，
+    哪天基线加一根 NOT NULL 列，这个夹具会以 IntegrityError 的形式莫名其妙地红。
+    """
+    import sqlite3
+
+    from alembic import command
+    from alembic.config import Config
+
+    root = Path(__file__).resolve().parents[1]
+    cfg = Config(str(root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(root / "alembic"))
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+    command.upgrade(cfg, revision)
+
+    con = sqlite3.connect(db_path)
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(orders)")}
+        scol = "purchase_status" if "purchase_status" in cols else "status"
+        vals = {"date": "2027-01-01", "title": "目标库自己的单", scol: "集运中",
+                "is_delete": 0, "version": 1, "created_via": "manual",
+                "created_at": "2027-01-01 00:00:00", "updated_at": "2027-01-01 00:00:00"}
+        keys = [k for k in vals if k in cols]
+        con.execute(f"INSERT INTO orders ({','.join(keys)}) VALUES "
+                    f"({','.join('?' * len(keys))})", [vals[k] for k in keys])
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_the_overwrite_409_does_not_claim_the_data_is_untouched_when_it_is_not(
+        client, tmp_path, monkeypatch):
+    """目标库落后时，那句 409 **不许**说「数据一个字都没动」。
+
+    409 之前必须先 `run_migrations(url)`（不建表就数不出行数），而迁移链里有好几条
+    是**改数据**的：`c5d6e7f8a9b0` 把订单的「集运中」「已到达」并成「已签收」
+    ——**它的 downgrade 是空的，不可逆**；`d0e1f2a3b4c5` 对单号列做 UPPER/TRIM
+    并把空串改成 NULL；`e7f8a9b0c1d2` 重写 `fxrate.source`。
+
+    用户看到 409 点了取消，会以为什么都没发生。而他刚被告知的那句话是假的：
+    目标库里那张「集运中」的单，此刻已经是「已签收」了。
+
+    这条测试**真的把目标库停在旧修订号**，不 mock `pending_revision`——
+    被 mock 掉的正是「到底有没有落后」这个唯一的判据。
+    """
+    import sqlite3
+
+    from app.routers import dbadmin as mod
+
+    tgt = tmp_path / "behind.db"
+    _seed_one_order_at(tgt, "b4c5d6e7f8a9")        # 「集运中」还合法的那一版
+
+    eng = build_engine(f"sqlite:///{tgt}")
+    monkeypatch.setattr(mod, "_resolve_target", lambda t: ("sqlite", str(eng.url), eng, False))
+    monkeypatch.setattr(mod, "_is_same_as_active", lambda backend, url: False)
+    try:
+        r = client.post("/api/db/migrate", json={"backend": "sqlite"})
+        assert r.status_code == 409, f"目标非空却没拦：{r.status_code} {r.text[:200]}"
+        detail = r.json()["detail"]
+        assert "数据一个字都没动" not in detail, (
+            f"目标库原先落后，升级过程改写了它的数据，而 409 说没动：{detail}")
+        assert "数据也被改写" in detail, f"没告诉用户数据被改过：{detail}"
+
+        # 判据不能只看文案——真去看那一行到底变没变
+        with sqlite3.connect(tgt) as con:
+            got = con.execute("SELECT purchase_status FROM orders").fetchone()[0]
+        assert got == "已签收", (
+            f"这条测试的前提不成立：那条迁移没有改写状态（现在是 {got}），"
+            f"那么「数据被改写」这句话反而成了新的假话")
+    finally:
+        eng.dispose()
+
+
+def test_the_overwrite_409_still_says_nothing_moved_when_the_target_is_current(
+        client, tmp_path, monkeypatch):
+    """反面：目标库**本来就是最新版**时，那句「数据一个字都没动」是真的，必须照说。
+
+    只钉上一条的话，把那句话无条件删掉也能绿——而那会让用户在真的什么都没发生时
+    也以为数据被改过，白白吓一跳，还可能因此不敢点确认。
+    """
+    from app.routers import dbadmin as mod
+
+    tgt = tmp_path / "current.db"
+    _seed_one_order_at(tgt, "head")
+
+    eng = build_engine(f"sqlite:///{tgt}")
+    monkeypatch.setattr(mod, "_resolve_target", lambda t: ("sqlite", str(eng.url), eng, False))
+    monkeypatch.setattr(mod, "_is_same_as_active", lambda backend, url: False)
+    try:
+        r = client.post("/api/db/migrate", json={"backend": "sqlite"})
+        assert r.status_code == 409, r.text
+        detail = r.json()["detail"]
+        assert "数据一个字都没动" in detail, (
+            f"目标本来就是最新版，什么都没被改写，却没照实说：{detail}")
+        assert "数据也被改写" not in detail, f"白白吓用户一跳：{detail}"
+    finally:
+        eng.dispose()
+
+
+def test_switching_while_a_backup_runs_is_409_not_a_bare_500(client, tmp_path, monkeypatch):
+    """切库撞上正在跑的备份/迁移要回 **409**，与同一张页面上另外两个按钮一致。
+
+    `barrier.hold` 在已有别的维护操作时抛
+    `RuntimeError("已有另一项维护操作在进行：…")`。
+    `create_backup` 和 `migrate` 都把它映射成 409 + 准确原因，**只有 switch 漏了**
+    ——而这三个是同一张页面上并排的按钮，8 个人共用一个 admin，
+    「甲在备份、乙点切换」是常态，不是边角。
+
+    漏掉的表现不只是状态码难看：FastAPI 默认的 500 响应体是纯文本
+    `Internal Server Error`，**没有 `detail` 字段**，前端 `api/http.js` 取不到，
+    回落到 axios 的英文 `err.message` —— 用户看到
+    「Request failed with status code 500」，而真正的原因（备份正在跑）一个字都没有。
+
+    判据要连 detail 一起钉：只判 409 的话，回一个没有原因的 409 也能绿，
+    而用户拿到的信息量与 500 一样是零。
+    """
+    from app.maintenance import barrier
+    from app.routers import dbadmin as mod
+
+    tgt = tmp_path / "t.db"
+    run_migrations(f"sqlite:///{tgt}")
+    eng = build_engine(f"sqlite:///{tgt}")
+    monkeypatch.setattr(mod, "_resolve_target", lambda t: ("sqlite", str(eng.url), eng, False))
+    monkeypatch.setattr(mod, "_is_same_as_active", lambda backend, url: False)
+    monkeypatch.setattr(mod.db_migrate, "is_target_empty", lambda e: False)
+    try:
+        with barrier.hold("备份中"):                 # 另一个人正在备份
+            r = client.post("/api/db/switch", json={"backend": "sqlite"})
+        assert r.status_code == 409, (
+            f"切库撞上备份回了 {r.status_code}，而备份/迁移两个同级端点都回 409："
+            f"{r.text[:200]}")
+        detail = r.json().get("detail", "")
+        assert "备份中" in detail, (
+            f"409 里没说清是被什么挡住的：{detail!r}——"
+            f"用户拿到的信息量与那句英文 500 一样是零")
+    finally:
+        eng.dispose()
+
+
+def test_the_change_fingerprint_sees_an_in_place_edit_with_no_new_rows(tmp_path):
+    """指纹必须看得见「**行数不变、内容改了**」——`user` 与 `tagoption` 是两个真实盲点。
+
+    指纹的用途是：`migrate` 拷完记一份，`switch` 前再算一次，不同就 409 说
+    「迁移之后当前库又有改动（…），这些改动不在目标库里，直接切换会丢失」。
+
+    原先它是「行数 + 最大 `updated_at`」，而这两张表**都没有 `updated_at`**：
+
+      · `user`：改共用口令只改 `password_hash`，行数永远是 1（没人会新建用户）。
+        于是改完口令再切库，那道闸**一声不吭**，口令静默回滚到迁移那天。
+        而「改密码不使旧 token 失效」是已拍板的设计 ⇒ 8 个人的 90 天 token 照常能用、
+        谁都不会立刻发现；直到某人重新登录，被告知「用户名或密码错误」。
+      · `tagoption`：改标签名只改 `value`，行数也不变。
+
+    2026-09-02 修之前实测：两种改动之后 `describe_fingerprint_diff` 都返回**空列表**
+    （逐字是「没有任何改动」）。
+
+    判据钉两半：指纹要变，**而且要说得出是哪张表**——只判「变了」的话，
+    一个把整份指纹换成随机数的实现也能过，而那会让 409 每次都触发。
+    """
+    from app.auth import hash_password
+    from app.models import TagOption, User
+    from app.services import db_migrate
+
+    url = f"sqlite:///{tmp_path / 'fp.db'}"
+    run_migrations(url)
+    eng = build_engine(url)
+    try:
+        with Session(eng) as s:
+            s.add(User(username="admin", password_hash=hash_password("old-pass")))
+            # **多放几行不是凑数**：摘要必须按主键排序才稳定，而只有一行时
+            # 「排没排序」根本看不出来——第一版就是这样，把 order_by 拆掉照样绿。
+            # 三行以上，行序一变摘要就变，那条「什么都没改，指纹必须稳定」的断言才真的承重。
+            for v in ("淘宝", "闲鱼", "京东"):
+                s.add(TagOption(field="platform", value=v))
+            s.commit()
+
+        fp0 = db_migrate.source_fingerprint(eng)
+
+        with Session(eng) as s:
+            u = s.exec(select(User)).one()
+            u.password_hash = hash_password("brand-new-pass")
+            s.add(u)
+            s.commit()
+        fp1 = db_migrate.source_fingerprint(eng)
+        assert fp1 != fp0, (
+            "改了共用口令，指纹却没变——切库时那道「迁移之后又有改动」的闸不会响，"
+            "口令会静默回滚到迁移那天")
+        assert any("用户" in x for x in db_migrate.describe_fingerprint_diff(fp0, fp1)), (
+            f"指纹变了但说不出是哪张表：{db_migrate.describe_fingerprint_diff(fp0, fp1)}")
+
+        with Session(eng) as s:
+            tag = s.exec(select(TagOption).where(TagOption.value == "淘宝")).one()
+            tag.value = "拼多多"
+            s.add(tag)
+            s.commit()
+        fp2 = db_migrate.source_fingerprint(eng)
+        assert fp2 != fp1, "改了标签名，指纹却没变"
+
+        # 反面：什么都不动，指纹必须**稳定**。不然 409 会次次触发，比不拦更糟。
+        assert db_migrate.source_fingerprint(eng) == fp2, "什么都没改，两次指纹却不一样"
+    finally:
+        eng.dispose()
+

@@ -75,7 +75,14 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Downgrade schema."""
+    """Downgrade schema。
+
+    **不单独 drop 索引**：`DROP TABLE` 本来就带走它自己的全部索引。
+    这里那根 `ix_pluginrecord_owner` 没背任何外键，所以在 MySQL 上删得掉——
+    但形状与 baseline 里那 21 条、以及 `a9b0c1d2e3f4` 那条完全一样，
+    而后两者在真 MySQL 上会撞 1553 把整条降级链卡在半路（DDL 已隐式提交、不可回滚）。
+    留一个「今天恰好不炸」的同款写法，只是等下一个人照抄。
+    `test_no_downgrade_drops_an_index_on_a_table_it_also_drops` 钉住这条。
+    """
     op.drop_column("pluginconfig", "granted_scopes")
-    op.drop_index("ix_pluginrecord_owner", table_name="pluginrecord")
     op.drop_table("pluginrecord")

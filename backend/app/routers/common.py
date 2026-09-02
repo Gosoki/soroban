@@ -15,6 +15,18 @@ from ..models.base import guard_cny
 
 log = logging.getLogger("soroban")
 
+
+# 分页 offset 的上界。**必须有**，而且两个引擎都要能接住同一个值：
+# `?offset=99999999999999999999` 在 SQLite 上是
+# `OverflowError: Python int too large to convert to SQLite INTEGER`，
+# 在真 MySQL 上是 `(1064, 'You have an error in your SQL syntax')` ——
+# 两者都不在 `main.py` 那五个 exception handler 的类型里，**双双裸 500**。
+# 而「接受哪一段」本身两边还不一样，等于同一个请求换个后端就是两种行为。
+#
+# 取一千万：这本账本几万条到头了，一千万条早已远超任何真实翻页；
+# 越界回 422（FastAPI 自带的参数校验），说得清、可预期。
+MAX_OFFSET = 10_000_000
+
 _CNY_Q = Decimal("0.01")     # 人民币量化到分
 MAX_OCR_BYTES = 10 * 1024 * 1024      # 截图上限 10MB（手机截图通常 < 2MB）
 _OCR_CONCURRENCY = 2         # 同时在解码/推理的 OCR 请求数上限，见 run_ocr

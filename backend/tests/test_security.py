@@ -240,10 +240,17 @@ def test_entry_table_is_bounded():
     assert len(t._fails) <= MAX_ENTRIES
 
 
-def test_backoff_survives_username_flooding():
+def test_backoff_survives_username_flooding(monkeypatch):
     """退避中的条目**恰恰是最旧的**（它一直被 429 挡回、时间戳不再刷新）。
     只按「最旧」淘汰，攻击者刷几千个不存在的用户名就能把它挤出表、计数归零，
-    白拿一轮免罚尝试（实测把 900s 惩罚压成 27s）。淘汰必须优先丢**没有惩罚**的条目。"""
+    白拿一轮免罚尝试（实测把 900s 惩罚压成 27s）。淘汰必须优先丢**没有惩罚**的条目。
+
+    时钟必须冻住。灌注要跑几千次，victim 那时的退避只有 8 秒：机器一忙，
+    灌注还没跑完退避就自然到期，`retry_after` 归零，而断言消息会说「被挤掉了」——
+    **那是假话，条目还好端端在表里**。实测单跑 1.28s、跟全量一起跑就穿了。
+    冻住之后这条测试只剩一个变量：淘汰顺序。
+    """
+    from app import ratelimit
     from app.ratelimit import FREE_TRIES, MAX_ENTRIES, LoginThrottle
 
     t = LoginThrottle()
@@ -252,10 +259,80 @@ def test_backoff_survives_username_flooding():
         t.record_failure(victim)
     assert t.retry_after(victim) > 0, "夹具没把目标打进退避"
 
+    frozen = ratelimit.time.monotonic()
+    monkeypatch.setattr(ratelimit.time, "monotonic", lambda: frozen)
+
     for i in range(MAX_ENTRIES + 500):           # 灌满无惩罚条目
         t.record_failure((f"ghost{i}", "9.9.9.9"))
 
-    assert t.retry_after(victim) > 0, "退避条目被无惩罚条目挤掉了"
+    # 「被挤掉」逐字就是「键不在表里了」——直接判它，不要拐弯去判退避秒数。
+    assert victim in t._fails, "退避条目被无惩罚条目挤出表了"
+    assert t.retry_after(victim) > 0, "退避条目还在表里，但计数被清了"
+
+
+def test_an_old_count_does_not_resurrect_when_the_key_fails_again(monkeypatch):
+    """过了遗忘窗口再错一次，计数必须**从头数**。
+
+    记一笔失败原先直接读 `self._fails[key]` 里的旧计数，指望 `_prune` 已经把过期项删掉了。
+    可 `record_failure` 是**先加一再 prune**，加一那步写进去的是**新时间戳**——
+    过期项被自己救活，`_prune` 再也看不见它。于是一年前手滑五次的键，
+    今天再错一次算第 6 次，直接进退避。模块开头「手滑不该留一整天」那句就落空了。
+
+    判据必须落在**计数值**上：只判 `retry_after == 0` 会被「第 6 次的退避是 2 秒、
+    而断言时刚好还没到 1 秒」这类边界蒙混过去。
+    """
+    from app import ratelimit
+    from app.ratelimit import FREE_TRIES, LoginThrottle
+
+    t = LoginThrottle()
+    k = ("admin", "1.2.3.4")
+    for _ in range(FREE_TRIES):          # 打到「再错一次就罚」的边缘，但还没罚
+        t.record_failure(k)
+    assert t.retry_after(k) == 0, "夹具打过头了，这里还不该罚"
+
+    base = ratelimit.time.monotonic()
+    monkeypatch.setattr(ratelimit.time, "monotonic",
+                        lambda: base + ratelimit.FORGET_AFTER + 1)
+    t.record_failure(k)                  # 遗忘窗口之后的第一次失败
+    assert t._fails[k][0] == 1, (
+        f"旧计数没被忘掉，接着往上数：{t._fails[k]}——"
+        f"过了遗忘窗口再错一次会被当成第 {FREE_TRIES + 1} 次，直接进退避")
+    assert t.retry_after(k) == 0
+
+
+def test_flooding_does_not_run_a_full_table_pass_on_every_attempt():
+    """表被灌满之后，每次失败的开销不能跟着表长走。
+
+    `_prune` 原先**每次失败都跑**：全表扫过期，越限时再全表排序、且一次只丢一条。
+    实测表满 1.585ms / 表小 0.065ms——**24 倍**，单核每秒只扛得住 631 次。
+    而表正是攻击者自己灌满的（`auth.py` 对不存在的用户名短路、不跑 bcrypt），
+    于是「几乎零成本」那条路被他自己变成全应用最贵的单请求路径。
+
+    判据刻意**不用耗时**：绝对耗时换台机器就失真，两个小数相除更是噪声。
+    这里直接数「真正动手的全表淘汰跑了几次」——退化成每次都跑时它约等于溢出条数。
+    """
+    from app.ratelimit import MAX_ENTRIES, PRUNE_DOWN_TO, LoginThrottle
+
+    passes = []
+
+    class _Counted(LoginThrottle):
+        def _prune(self, now):
+            before = len(self._fails)
+            super()._prune(now)
+            if len(self._fails) != before:       # 只算真的删了东西的那几次
+                passes.append(before)
+
+    t = _Counted()
+    overflow = 2000
+    for i in range(MAX_ENTRIES + overflow):
+        t.record_failure((f"u{i}", "1.1.1.1"))
+
+    # 每砍一次腾出 MAX_ENTRIES - PRUNE_DOWN_TO 个位置，所以次数应该是溢出量除以这个步长。
+    budget = overflow // (MAX_ENTRIES - PRUNE_DOWN_TO) + 2
+    assert len(passes) <= budget, (
+        f"全表淘汰跑了 {len(passes)} 次（预算 ≤{budget}）：它退化成每次失败都过一遍全表，"
+        f"攻击者灌满表之后每个请求都要付 O(n log n)")
+    assert len(t._fails) <= MAX_ENTRIES, f"批量淘汰把上限放跑了：{len(t._fails)}"
 
 
 def test_prune_is_fail_open():

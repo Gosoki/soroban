@@ -28,7 +28,7 @@ from ..models import (
     utcnow,
 )
 from ..schemas import StagingCreate, StagingItemRead, StagingRead, StagingUpdate, OrderRead
-from .common import build_items, goods_seed, guarded_bump, raise_conflict, raise_not_found, stamp_fx
+from .common import MAX_OFFSET, build_items, goods_seed, guarded_bump, raise_conflict, raise_not_found, stamp_fx
 
 router = APIRouter(
     prefix="/api/staging", tags=["staging"], dependencies=[Depends(get_current_user)]
@@ -130,7 +130,7 @@ def list_staging(
         None, alias="status", include_in_schema=False,
         description="已废弃：查询参数 status 已按业务段改名"),
     limit: int = Query(100, ge=1, le=500),
-    offset: int = Query(0, ge=0),
+    offset: int = Query(0, ge=0, le=MAX_OFFSET),
 ):
     # FastAPI 对未知 query 参数**默认忽略**：改名后漏改一处调用方，
     # 表现就是「筛选点了没反应、返回全量、HTTP 200、零日志」。响亮拒掉比静默返回错数据强。
@@ -458,6 +458,16 @@ def import_staging(row_id: int, session: Session = Depends(get_session)):
         express_no=row.express_no,
         express_company=row.express_company,   # 快递公司与单号是一对，一起迁移
         postage_cny=row.postage_cny,         # 邮费随单迁移
+        # **货款也要随单迁移，不能全指望物品派生。** 下面那句 `sync_from_items()`
+        # 在物品单价全是 NULL 时**什么都不派生**（那是历史形态，`demo.py` 今天仍在造），
+        # 于是这张单从来没有过价：暂存页明明显示 ¥45.00，导入之后订单页和暂存页
+        # 双双变成「—」，`jpy_auto` / `jpy_settled` 全是 None。
+        # 更难查的是看板那个「被吞掉的钱」告警——它的判据是
+        # 「有 price_cny 却没折算」，而这里 price_cny 也是 None，所以它报 0。
+        # 钱在三个地方同时消失，没有任何一处会响。
+        # 带上之后：物品能派生时下面那句照旧覆盖成同一个值（原注释说的「= 暂存价，一致」），
+        # 派生不出来时这一份就是最后的真相。
+        price_cny=row.price_cny,
         # 优先暂存记录的汇率；否则按下单日期匹配（库里空则按手填值兜底，过期会留痕）
         fx_rate=row.fx_rate or rate_for_date(
             session, row.order_date, what=f"暂存导入建单 {row.order_no or '(无单号)'}"),

@@ -320,20 +320,95 @@ def test_items_filter_matches_what_items_page_displays():
         "物品列表的状态筛选没跟显示口径对齐"
 
 
-def test_slot_columns_do_not_rely_on_col_display():
-    """通用陷阱：任何列一旦有 `#cell-xxx` 插槽，它的 `col.display` 就是死代码。
-    两者同时存在几乎必然是写错了——本项目已经栽过一次。"""
+def test_a_failed_layout_fetch_does_not_open_the_drag_gate():
+    """列布局**拉失败**时不许开放拖拽——否则一次网络抖动会毁掉全员共用的那份布局。
+
+    `ColumnLayout` 以 `table_name` 为唯一主键，**8 个人共用同一行**。
+    原先 `catch (_) {}` 吞掉异常、而 `layoutReady = true` 写在 try **外面**，
+    成功与失败走同一个出口。于是：
+
+      GET /api/layout/orders 挂掉（后端刚重启 ERR_NETWORK ／ 迁移期 DB 被锁 15s 超时
+      ／ 503 被 retry.js 重试两次后放弃）
+        → 屏幕渲染默认列序列宽，**与「用户存过的布局」长得一模一样、没有任何提示**
+        → 用户随手拖一下列宽
+        → `saveLayout()` 只问 `layoutReady`（true）→ 把**默认布局**整份写回去
+        → 所有人调好的列序与列宽一起没了
+
+    页面上那条「这次刷新没成功」只覆盖行数据、重试按钮也只 `emit('reload')` 重拉行，
+    完全不管布局。
+
+    判据落在**开闸条件**上：`layoutReady` 不许被无条件置 true，
+    而且 catch 分支必须把失败记下来。这条只能做结构闸——
+    组件跑不进 node（要整套 Vue 运行时），而 `layoutReady` 的赋值是唯一的可观测点。
+    """
+    import re
+
+    src = (_REPO / "frontend" / "src" / "components" / "NotionTable.vue").read_text(encoding="utf-8")
+    assigns = re.findall(r"layoutReady\.value\s*=\s*([^\n]+)", src)
+    assert assigns, "找不到 layoutReady 的赋值——探测方式可能已过期"
+    unconditional = [a for a in assigns if a.strip().rstrip(";").split("//")[0].strip() == "true"]
+    assert not unconditional, (
+        f"`layoutReady` 被无条件置 true：{unconditional}\n"
+        f"拉失败时也会开闸，用户随手一拖就把 8 个人共用的那份列布局覆盖成默认值。\n"
+        f"只有**确实知道存的是什么**（拿到了，哪怕是空的）才许开闸。")
+
+    # 反面：catch 里必须真的记下失败，否则上面那条可以用一个恒 true 的变量绕过去
+    m = re.search(r"layoutApi\.get\(props\.tableName\)(.*?)\n  \}", src, re.S)
+    assert m, "找不到布局拉取那一段——探测方式可能已过期"
+    assert "layoutFailed" in m.group(1), (
+        "拉取那一段的 catch 里没有把失败记下来——"
+        "只改开闸条件而不记失败，等于换个写法回到原样")
+
+
+def test_every_slot_column_says_what_the_export_should_write():
+    """插槽渲染的列，必须**显式**说清导出那一格取什么：`display` 或 `exportRaw: true`。
+
+    背景：`utils/exportCsv.js` 的 `cell()` 以 `col.display` 为准。插槽列屏幕上走插槽、
+    不走 `display`，所以「屏幕显示什么」和「导出写什么」在这类列上是两件事——
+    订单页「集运订单」屏幕上是 `SP-777`、原始值是自增 id `1`；
+    订单页/物品页「状态」屏幕上是继承来的集运状态、原始值是订单自己的国内段状态。
+    用户按「状态=已发出」筛出一批点导出，文件里那一格写着「待发货」——
+    **筛的是 A、导出的是 B**，而这份文件正是要发给别人的。
+
+    **判据刻意不去推断「插槽渲染了什么」。** 我为此写过三版预测式判据，三版全错：
+      ① 「往回找最近的 queueRowWrite」——箭头函数本来就在它之后，正确写法被判违规；
+      ② 非贪婪 `(.*?)</template>`——Element Plus 控件里嵌着 `<template>`，
+         一个插槽的内容里混进隔壁的；
+      ③ 只认 `{{ row.X }}`——订单页那个插槽的主体是 `shipNo(value, row)` 函数调用，
+         而它里面附带的一个状态标签让判据得出了完全相反的结论。
+    插槽可以调任意 helper、可以渲染好几段，**「它显示的是哪个字段」不是源码里
+    读得出来的东西**。所以改成要求作者**明说**：
+      · `display: (row) => …`   —— 导出取这个（屏幕上不生效，插槽优先）
+      · `exportRaw: true`       —— 这一列的原始值就是对的（文本列、数组列等）
+    两者都没有 = 没人想过这件事，红。
+
+    这与 §211.1、§191.1、§197.3 是同一条教训的第四次复发：
+    **判据落在「从代码推断意图」上时，它迟早会推断错。能让作者明说就别猜。**
+    """
     import re
 
     root = _REPO / "frontend" / "src" / "views"
-    bad = []
-    for f in root.rglob("index.vue"):
+    silent, checked = [], 0
+    for f in sorted(root.rglob("index.vue")):
         src = f.read_text(encoding="utf-8")
-        slots = set(re.findall(r"#cell-(\w+)", _template_of(f)))
-        for m in re.finditer(r"key: '(\w+)'[^}]*?display:", src, re.S):
-            if m.group(1) in slots:
-                bad.append(f"{f.relative_to(_REPO)} 的 {m.group(1)} 列同时有插槽和 display")
-    assert not bad, "插槽会让 col.display 变成死代码：\n  " + "\n  ".join(bad)
+        if "exportCsv" not in src:
+            continue                                  # 这一页根本不导出
+        tpl = _template_of(f)
+        m = re.search(r"const columns = \[(.*?)\n\]", src, re.S)
+        assert m, f"{f.name} 没找到 columns —— 探测方式可能已过期"
+        body = m.group(1)
+        keys = set(re.findall(r"key: '(\w+)'", body))
+        for key in sorted(set(re.findall(r"#cell-(\w+)", tpl)) & keys):
+            checked += 1
+            blk = re.search(rf"key: '{key}'((?:[^{{}}]|\{{[^{{}}]*\}})*)", body, re.S)
+            decl = blk.group(1) if blk else ""
+            if "display:" not in decl and "exportRaw" not in decl:
+                silent.append(f"{f.parent.name}.{key}")
+    assert checked >= 4, f"只扫到 {checked} 个插槽列——探测方式可能已过期"
+    assert not silent, (
+        f"这些列是插槽渲染的，却没说清导出该写什么：{silent}\n"
+        f"屏幕上显示的和这一列的原始值可能不是一个东西，而导出默认写原始值。\n"
+        f"加 `display: (row) => …`（导出取它）或 `exportRaw: true`（原始值就是对的）。")
 
 
 def test_items_api_exposes_inherited_status():
@@ -1343,6 +1418,7 @@ def test_after_create_treats_a_failed_refresh_as_saved():
                              "真没有 node 请设 SOROBAN_NO_NODE=1。")
 
     # 把 listRows.js 里那句 element-plus 的 import 换成本地桩，其余一字不改
+    money = (_REPO / "frontend" / "src" / "utils" / "money.js").read_text(encoding="utf-8")
     src = (_REPO / "frontend" / "src" / "utils" / "listRows.js").read_text(encoding="utf-8")
     assert "from 'element-plus'" in src, "listRows.js 的依赖变了，这条测试要跟着更新"
     src = src.replace("import { ElMessage } from 'element-plus'",
@@ -1350,7 +1426,9 @@ def test_after_create_treats_a_failed_refresh_as_saved():
                       " warning: (m) => globalThis.__m.push(m) }")
 
     harness = _REPO / "node-after-create.test.mjs"
-    harness.write_text(src + r"""
+    # `./money` 那句 import 在 node 里解析不到（harness 落在仓库根），把它整个内联进来。
+    src = src.replace("import { isUnconverted } from './money'", "")
+    harness.write_text(money + "\n" + src + r"""
 globalThis.__m = []
 const out = {}
 
@@ -1381,6 +1459,241 @@ const out = {}
   })
   out.real_filter_miss_still_reported =
     globalThis.__m.some((m) => m.includes('不在当前筛选条件内'))
+}
+
+console.log(JSON.stringify(out))
+""", encoding="utf-8")
+    try:
+        r = subprocess.run([node, str(harness)], cwd=_REPO, capture_output=True,
+                           text=True, timeout=60)
+    finally:
+        harness.unlink(missing_ok=True)
+    assert r.returncode == 0, f"node 跑挂了：{r.stderr[-800:]}"
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    failed = [k for k, v in got.items() if not v]
+    assert not failed, f"这些行为不成立：{failed}"
+
+
+def test_the_unconverted_rule_says_the_same_thing_in_python_and_in_the_browser():
+    """「有钱、却没折算成日元」这条判据现在有**三种形态**，三边必须逐条一致。
+
+    · `app/models/base.py::is_unconverted`      —— Python，全仓唯一真相
+    · `app/models/base.py::unconverted_clause`  —— SQL，给页脚/看板聚合用
+    · `frontend/src/utils/money.js::isUnconverted` —— JS，本轮为「快路径同步页脚」新增
+
+    前两份的文档写着它们分叉过两次（§151.3、§169），每次都是漏抄 `!= 0`，
+    而现象不是报错，是**两个数字互相打脸**：同一件事，页脚说 1 条、看板说 0 条，
+    用户没有任何办法判断该信哪个。加第三份的前提，是把「记得三处都改」这条**约定**
+    换成一条**测试**——否则就是把已经咬过两次的东西再养一只。
+
+    这里同时喂三份：同一张用例表 → Python 直接调、SQL 塞进临时表用 `case()` 算、
+    JS 拿 node 跑。用例表**必须包含 0 与 "0.00"**：那正是历史上两次分叉的位置，
+    而 JS 那份还多一层风险——Decimal 走 JSON 是**字符串**，`"0.00"` 是真值。
+    """
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        import os
+        if os.environ.get("SOROBAN_NO_NODE"):
+            pytest.skip("显式声明了本机没有 node（SOROBAN_NO_NODE=1）")
+        raise AssertionError("找不到 node，而这是前端行为测试的唯一途径；"
+                             "真没有 node 请设 SOROBAN_NO_NODE=1。")
+
+    from decimal import Decimal
+
+    from app.models.base import is_unconverted
+
+    # (price_cny, jpy_settled)。0 与 "0.00" 是历史上两次分叉的正中心。
+    CASES = [
+        (None, None), (None, 100),
+        (0, None), (0, 100),
+        ("0.00", None), ("0.00", 100),
+        ("100.00", None), ("100.00", 2200),
+        ("0.01", None), ("-5.00", None),
+    ]
+
+    py = [is_unconverted(None if p is None else Decimal(str(p)), j) for p, j in CASES]
+
+    src = (_REPO / "frontend" / "src" / "utils" / "money.js").read_text(encoding="utf-8")
+    harness = _REPO / "node-unconverted.test.mjs"
+    harness.write_text(src + "\nconsole.log(JSON.stringify("
+                       + json.dumps([{"price_cny": p, "jpy_settled": j} for p, j in CASES])
+                       + ".map(isUnconverted)))\n", encoding="utf-8")
+    try:
+        r = subprocess.run([node, str(harness)], cwd=_REPO, capture_output=True,
+                           text=True, timeout=60)
+    finally:
+        harness.unlink(missing_ok=True)
+    assert r.returncode == 0, f"node 跑挂了：{r.stderr[-800:]}"
+    js = json.loads(r.stdout.strip().splitlines()[-1])
+
+    diff = [(c, a, b) for c, a, b in zip(CASES, py, js) if a != b]
+    assert not diff, (
+        "Python 版与 JS 版对同一行给出不同答案（(price_cny, jpy_settled), python, js）："
+        f"{diff}\n三份判据必须一起改：models/base.py 两份 + utils/money.js 一份")
+    assert any(py) and not all(py), f"用例表已经退化成一边倒，钉不住任何东西：{py}"
+
+
+def test_the_local_insert_moves_the_footer_total_with_the_row_count():
+    """快路径 `total++` 时，**页脚那三个数必须一起动**。
+
+    `sum_jpy` / `unconverted` 原先只在 `load()` 里赋值，而快路径零请求。
+    连录三笔一万円之后页脚是「共 90 条 · 筛选合计 500,000 円」，
+    而屏幕上那 90 条实际 530,000 円——少的正好是刚录的三笔，
+    而且一直保持到下一次 load()（翻页/改筛选/删行）。
+    `TableFooterSum` 自己的注释把这个形状称作这一栏最危险的失败形态。
+
+    反面也要钉：**缺汇率的那一笔不许计进合计，但必须计进「N 条未折算」**——
+    只钉合计的话，把 `unconverted` 那一句删掉照样绿，而那正是「合计静默变小」
+    的另一半。
+    """
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        import os
+        if os.environ.get("SOROBAN_NO_NODE"):
+            pytest.skip("显式声明了本机没有 node（SOROBAN_NO_NODE=1）")
+        raise AssertionError("找不到 node；真没有 node 请设 SOROBAN_NO_NODE=1。")
+
+    money = (_REPO / "frontend" / "src" / "utils" / "money.js").read_text(encoding="utf-8")
+    src = (_REPO / "frontend" / "src" / "utils" / "listRows.js").read_text(encoding="utf-8")
+    assert "from './money'" in src, "listRows.js 不再从 money.js 取判据了，这条测试要跟着更新"
+    src = src.replace("import { ElMessage } from 'element-plus'",
+                      "const ElMessage = { info: () => {}, warning: () => {} }")
+    src = src.replace("import { isUnconverted } from './money'", "")
+
+    harness = _REPO / "node-footer-delta.test.mjs"
+    harness.write_text(money + "\n" + src + r"""
+const out = {}
+const noFilters = { q: '', category: '', range: null }
+const never = async () => { throw new Error('快路径不该发请求') }
+const ctx = (extra) => ({
+  rows: { value: [] }, total: { value: 0 }, page: { value: 1 },
+  filters: noFilters, load: never, pageSize: 30, ...extra,
+})
+
+// ① 折算过的一笔：合计跟着涨，未折算数不动
+{
+  const sumJpy = { value: 500000 }, unconverted = { value: 0 }
+  await afterCreate({ id: 1, date: '2026-12-31', price_cny: '100.00', jpy_settled: 10000 },
+                    ctx({ sumJpy, unconverted }))
+  out.sum_follows_the_row = sumJpy.value === 510000
+  out.converted_row_is_not_flagged = unconverted.value === 0
+}
+// ② 有钱但缺汇率：不计进合计，但要计进「未折算」
+{
+  const sumJpy = { value: 510000 }, unconverted = { value: 0 }
+  await afterCreate({ id: 2, date: '2026-12-30', price_cny: '100.00', jpy_settled: null },
+                    ctx({ sumJpy, unconverted }))
+  out.unconverted_row_does_not_inflate_the_sum = sumJpy.value === 510000
+  out.unconverted_row_is_flagged = unconverted.value === 1
+}
+// ③ 显式填 0 的一笔：既不进合计，也**不该**报未折算（那是噪音）
+{
+  const sumJpy = { value: 0 }, unconverted = { value: 0 }
+  await afterCreate({ id: 3, date: '2026-12-29', price_cny: '0.00', jpy_settled: null },
+                    ctx({ sumJpy, unconverted }))
+  out.explicit_zero_is_not_noise = sumJpy.value === 0 && unconverted.value === 0
+}
+// ④ 页面没传这两个 ref 时不许炸（暂存页就没有页脚合计）
+{
+  let threw = false
+  try { await afterCreate({ id: 4, date: '2026-12-28' }, ctx({})) } catch (_) { threw = true }
+  out.pages_without_a_footer_still_work = !threw
+}
+console.log(JSON.stringify(out))
+""", encoding="utf-8")
+    try:
+        r = subprocess.run([node, str(harness)], cwd=_REPO, capture_output=True,
+                           text=True, timeout=60)
+    finally:
+        harness.unlink(missing_ok=True)
+    assert r.returncode == 0, f"node 跑挂了：{r.stderr[-800:]}"
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    failed = [k for k, v in got.items() if not v]
+    assert not failed, f"这些行为不成立：{failed}"
+
+
+def test_a_backdated_row_is_not_silently_truncated_away_by_the_local_insert():
+    """**本地插入把刚建的那条自己截掉时，必须说话。**
+
+    快路径（无筛选 + 第 1 页）是 `unshift` → 按日期倒序排 → `total++` → 截回每页条数。
+    补录一条日期靠前的记录时（杂项最常见：补上个月的手续费），它排到末尾；
+    第 1 页已经满 30 行 ⇒ 正好落在截断线外 ⇒ 被切掉。
+
+    原先这里无条件 `return true`：草稿格清空了、列表里找不到、**一句提示都没有**。
+    用户合理地判断「没存上」，再录一次——**而 `MiscExpense` 没有任何唯一约束，
+    同一笔钱干干净净地记两遍**（商品/集运还有唯一索引兜底）。
+    与上面那条「刷新失败 ≠ 新建失败」防的是同一个结局，只是触发路径不同。
+
+    反面同样要钉：**正常新建（排在最前）不许弹这句话**。
+    只钉正面的话，把提示改成无条件弹一遍也能绿，而那是每建一条都骚扰用户一次。
+
+    照例直接拿 node 跑真函数，不 grep 源码。
+    """
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        import os
+        if os.environ.get("SOROBAN_NO_NODE"):
+            pytest.skip("显式声明了本机没有 node（SOROBAN_NO_NODE=1）")
+        raise AssertionError("找不到 node，而这是前端行为测试的唯一途径；"
+                             "真没有 node 请设 SOROBAN_NO_NODE=1。")
+
+    money = (_REPO / "frontend" / "src" / "utils" / "money.js").read_text(encoding="utf-8")
+    src = (_REPO / "frontend" / "src" / "utils" / "listRows.js").read_text(encoding="utf-8")
+    assert "from 'element-plus'" in src, "listRows.js 的依赖变了，这条测试要跟着更新"
+    src = src.replace("import { ElMessage } from 'element-plus'",
+                      "const ElMessage = { info: (m) => globalThis.__m.push(m),"
+                      " warning: (m) => globalThis.__m.push(m) }")
+    # `./money` 那句 import 在 node 里解析不到（harness 落在仓库根），把它整个内联进来。
+    src = src.replace("import { isUnconverted } from './money'", "")
+
+    harness = _REPO / "node-backdated-insert.test.mjs"
+    harness.write_text(money + "\n" + src + r"""
+const out = {}
+const PAGE = 30
+// 满满一页「本月」的记录，日期倒序，与后端 `date desc, id desc` 同口径
+const full = () => ({ value: Array.from({ length: PAGE }, (_, i) => (
+  { id: 100 + i, date: `2026-08-${String(PAGE - i).padStart(2, '0')}` })) })
+const noFilters = { q: '', category: '', range: null }
+const never = async () => { throw new Error('快路径不该发请求') }
+
+// ① 补录一条日期靠前的：被截掉 ⇒ 必须说话，且返回 false
+{
+  globalThis.__m = []
+  const rows = full(), total = { value: 90 }
+  const shown = await afterCreate({ id: 999, date: '2026-06-01' }, {
+    rows, total, page: { value: 1 }, filters: noFilters, load: never, pageSize: PAGE,
+  })
+  out.truncated_row_is_really_gone = !rows.value.some((r) => r.id === 999)
+  out.user_is_told_it_was_saved = globalThis.__m.some((m) => m.includes('已保存'))
+  out.returns_false_when_not_shown = shown === false
+  out.does_not_blame_filters =
+    !globalThis.__m.some((m) => m.includes('不在当前筛选条件内'))
+  out.count_still_advanced = total.value === 91
+}
+
+// ② 反面：正常新建（排最前）不许弹提示
+{
+  globalThis.__m = []
+  const rows = full()
+  const shown = await afterCreate({ id: 998, date: '2026-12-31' }, {
+    rows, total: { value: 90 }, page: { value: 1 }, filters: noFilters,
+    load: never, pageSize: PAGE,
+  })
+  out.normal_create_is_shown = shown === true && rows.value[0].id === 998
+  out.normal_create_says_nothing = globalThis.__m.length === 0
+  out.page_still_capped = rows.value.length === PAGE
 }
 
 console.log(JSON.stringify(out))
@@ -1627,11 +1940,14 @@ def test_sort_by_date_desc_is_a_total_order_even_with_nulls():
             pytest.skip("显式声明了本机没有 node（SOROBAN_NO_NODE=1）")
         raise AssertionError("找不到 node；真没有请设 SOROBAN_NO_NODE=1。")
 
+    money = (_REPO / "frontend" / "src" / "utils" / "money.js").read_text(encoding="utf-8")
     src = (_REPO / "frontend" / "src" / "utils" / "listRows.js").read_text(encoding="utf-8")
     src = src.replace("import { ElMessage } from 'element-plus'",
                       "const ElMessage = { info() {}, warning() {} }")
     harness = _REPO / "node-sort.test.mjs"
-    harness.write_text(src + r"""
+    # `./money` 那句 import 在 node 里解析不到（harness 落在仓库根），把它整个内联进来。
+    src = src.replace("import { isUnconverted } from './money'", "")
+    harness.write_text(money + "\n" + src + r"""
 const mk = () => [
   { id: 1, d: '2026-08-01' }, { id: 2, d: null }, { id: 3, d: '2026-08-03' },
   { id: 4, d: null }, { id: 5, d: '2026-08-02' }, { id: 6, d: null }]
@@ -2093,13 +2409,16 @@ def test_after_create_keeps_the_first_page_at_page_size():
         raise AssertionError("找不到 node，而这是前端行为测试的唯一途径；"
                              "真没有 node 请设 SOROBAN_NO_NODE=1。")
 
+    money = (_REPO / "frontend" / "src" / "utils" / "money.js").read_text(encoding="utf-8")
     src = (_REPO / "frontend" / "src" / "utils" / "listRows.js").read_text(encoding="utf-8")
     assert "from 'element-plus'" in src, "listRows.js 的依赖变了，这条测试要跟着更新"
     src = src.replace("import { ElMessage } from 'element-plus'",
                       "const ElMessage = { info() {}, warning() {} }")
 
     harness = _REPO / "node-page-size.test.mjs"
-    harness.write_text(src + r"""
+    # `./money` 那句 import 在 node 里解析不到（harness 落在仓库根），把它整个内联进来。
+    src = src.replace("import { isUnconverted } from './money'", "")
+    harness.write_text(money + "\n" + src + r"""
 const out = {}
 const mkRows = (n) => Array.from({ length: n }, (_, i) => ({ id: 100 + i, date: '2026-08-01' }))
 
@@ -2275,6 +2594,242 @@ def test_every_filter_initial_value_counts_as_not_filtering():
     assert not missing, (
         f"有页面用这些初值表示「没筛」，但 anyFilterActive 里没排掉它们：{missing}\n"
         f"当前的判断体：\n{body}")
+
+
+def test_no_sqlite_database_can_reach_this_public_repository():
+    """仓库里**不许**出现 SQLite 库文件——已提交的不许有，等着被 `git add -A` 的也不许有。
+
+    这个仓库是公开的。`backend/soroban.db` 是 2.8 MB 的真账本：8 个人的代购记录、
+    收件人、订单号。它被 `.gitignore` 的 `*.db` 挡着，看起来很安全——
+    **但那道闸是按扩展名的**。`a1e36ad` 里真的进去过一个叫 `backend/dst` 的
+    221 KB SQLite 库（`test_dbadmin.py` 那条用例当时写死了 `"sqlite:///dst"`，
+    每跑一次就在 cwd 造一个），`*.db` 一点没拦住，`git add -A` 直接带走。
+    那次是空库，泄的只有 15 张表的 DDL；换成 `sqlite3 soroban.db ".backup dst"`
+    这么一次手滑，推上去的就是真账本。
+
+    修完那条用例之后 `.gitignore` 补了一行 `/backend/dst`——**按名字堵，只堵住了这一个**。
+    下一个叫 `out` / `tmp` / `target` / `backup` 的照样进得来。
+    所以这里改判**文件内容**：SQLite 库的前 16 字节恒为 `SQLite format 3\0`，
+    这个判据与文件叫什么、有没有扩展名、`.gitignore` 怎么写全都无关。
+
+    两条各挡一个时机：
+      · 已跟踪的 —— 挡「已经进去了」，等于给历史一个持续的回归闸；
+      · 未跟踪且未被忽略的 —— 挡「下一次 `git add -A`」，这才是真正的预防。
+        它在本地有残留文件时会红，那正是它该做的事。
+    """
+    import subprocess
+
+    root = Path(__file__).resolve().parents[2]
+    MAGIC = b"SQLite format 3\x00"
+
+    def is_sqlite(rel: str) -> bool:
+        f = root / rel
+        try:
+            with open(f, "rb") as fh:
+                return fh.read(16) == MAGIC
+        except (OSError, ValueError):
+            return False        # 目录/软链/权限——不是我们要找的东西
+
+    def git(*args) -> list[str]:
+        out = subprocess.run(["git", "-C", str(root), *args],
+                             capture_output=True, text=True, timeout=60)
+        assert out.returncode == 0, f"git {args} 失败：{out.stderr[:200]}"
+        return [ln for ln in out.stdout.split("\0") if ln]
+
+    tracked = git("ls-files", "-z")
+    assert len(tracked) > 50, f"只列出 {len(tracked)} 个跟踪文件——探测方式可能已过期"
+    bad = sorted(f for f in tracked if is_sqlite(f))
+    assert not bad, (
+        f"这些 SQLite 库**已经在公开仓库里**了：{bad}\n"
+        f"判据是文件头 `SQLite format 3`，与文件名无关。先确认里面有没有真实账本数据。")
+
+    # `--untracked-files=all` 才会逐个列出目录里的文件；默认的 normal 只报目录名。
+    untracked = [ln[3:] for ln in git("status", "--porcelain", "-z", "--untracked-files=all")
+                 if ln.startswith("?? ")]
+    pending = sorted(f for f in untracked if is_sqlite(f))
+    assert not pending, (
+        f"这些 SQLite 库没被 .gitignore 挡住，下一次 `git add -A` 就会进公开仓库：{pending}\n"
+        f"要么删掉，要么在 .gitignore 里加规则——**别只加这一个名字**，"
+        f"`backend/dst` 那次就是按名字补的，只堵住了那一个。")
+
+
+def test_the_before_snapshot_is_always_taken_inside_the_write_queue():
+    """`applyRowUpdate` 的 `before` 必须在 `queueRowWrite` 的回调**里面**拍。
+
+    它的定义逐字是「**发请求那一刻** target 的浅拷贝」，用来回答
+    「这一格是不是用户在这次往返期间动过」。而 `queueRowWrite` 会让这次写入
+    **排队等前一次写完**——在入队之前拍，拍到的是「排队之前」的样子，
+    中间隔着前一次写入的整个往返。
+
+    于是前一次写入的结果会被误判成「用户动过」。真实序列（订单页展开面板）：
+    草稿行填好新物品后，用户先在邮费框敲 10、再直接点草稿行的 ✓——
+    mousedown 让邮费框失焦触发 W1(PATCH postage)，click 触发 W2(PATCH items)。
+    W2 在入队前拍下 `before.price_cny = 100.00`，然后在队列里等 W1；
+    W1 的响应把 price_cny 写成 110.00。轮到 W2 时它的 patch 只含 `{version, items}`，
+    `applyRowUpdate` 判 `target(110.00) !== before(100.00)` ⇒「用户正在改这一格」
+    ⇒ **不采纳**服务端算出来的 160.00。面板里明明列着 A+B+邮费，
+    上面那行却显示旧金额，无任何提示，刷新前一直是错的。
+
+    `OrderItemsEditor.saveItems` 曾经是全仓唯一一处拍在外面的；
+    同文件的 `savePostage` 与 `OrderEditPanel.saveField` 一直都拍在里面。
+    **一处写法不同就是一个 bug**，所以把它变成一条能自动检查的不变量。
+
+    判据：每一处 `const before = ` 往回找，最近的 `queueRowWrite(` 必须出现在
+    最近的函数起点**之后**——也就是「我在某个函数里，而且已经进了队列」。
+    """
+    import re
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    files = [f for f in sorted(root.rglob("*.vue")) + sorted(root.rglob("*.js"))
+             if "queueRowWrite" in f.read_text(encoding="utf-8")]
+    assert len(files) >= 4, f"只扫到 {[f.name for f in files]}——探测方式可能已过期"
+
+    def call_spans(src: str) -> list:
+        """每一次 `queueRowWrite(...)` 的实参范围（靠括号配对，不靠正则）。
+
+        第一版判据是「往回找最近的 `queueRowWrite(` 和最近的函数起点，比谁靠后」——
+        **它把正确的写法也判成了违规**：传给 `queueRowWrite` 的就是个箭头函数，
+        `=> {` 本来就出现在 `queueRowWrite(` 之后。判据本身写反了，
+        而它第一次跑就红在三处（其中两处一直是对的），当场暴露。
+        括号配对没有这个歧义：要么在实参里，要么不在。
+        """
+        out = []
+        for m in re.finditer(r"queueRowWrite\(", src):
+            depth, i = 0, m.end() - 1
+            while i < len(src):
+                if src[i] == "(":
+                    depth += 1
+                elif src[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        out.append((m.end(), i))
+                        break
+                i += 1
+        return out
+
+    offenders = []
+    checked = 0
+    for f in files:
+        src = f.read_text(encoding="utf-8")
+        spans = call_spans(src)
+        for m in re.finditer(r"const before = ", src):
+            checked += 1
+            if not any(a <= m.start() <= b for a, b in spans):
+                offenders.append(f"{f.name}:{src[:m.start()].count(chr(10)) + 1}")
+    assert checked >= 3, f"只查到 {checked} 处 `const before`——探测方式可能已过期"
+    assert not offenders, (
+        f"这些地方在进队列**之前**就拍了 `before`：{offenders}\n"
+        f"排队期间前一次写入的结果会被当成「用户正在改」，服务端算出来的新金额不被采纳，"
+        f"而界面上没有任何提示。挪进 `queueRowWrite` 的回调里即可。")
+
+
+def test_the_exported_cell_is_the_one_on_screen_not_the_raw_column_value():
+    """导出的每一格必须是**屏幕上那一格**，不是这一列的原始值。
+
+    有几列两者根本不是一个东西：
+
+    | 列 | 屏幕显示 | 原始值 |
+    |---|---|---|
+    | 订单页「状态」 | `fulfillment_status`（挂了集运就跟随集运段） | `purchase_status` |
+    | 订单页「集运订单」 | 集运单号 `SP-777` | 数据库自增 id `1` |
+    | 物品页「状态」 | 同订单页 | `purchase_status` |
+
+    后果不是难看，是**自相矛盾**：用户按「状态=已发出」筛出一批、点导出，
+    文件里那一格写着「待发货」——**筛的是 A、导出的是 B**，
+    而 `exportCsv.js` 开头那两条口径的存在理由逐字就是「这种文件往往会被当成完整账目发给别人」。
+    挂了集运单的订单在这个应用里是常态，不是边角情形。
+
+    判据**直接拿 node 跑真的 `cell()`**，不 grep 源码：
+    喂一行「订单自己待发货、跟随集运已发出、挂在 SP-777 上」的真实形状，
+    要求导出的两格分别是「已发出」和「SP-777」。
+    """
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        import os
+        if os.environ.get("SOROBAN_NO_NODE"):
+            pytest.skip("显式声明了本机没有 node（SOROBAN_NO_NODE=1）")
+        raise AssertionError("找不到 node；真没有 node 请设 SOROBAN_NO_NODE=1。")
+
+    src = (_REPO / "frontend" / "src" / "utils" / "exportCsv.js").read_text(encoding="utf-8")
+    # `cell` 不是导出符号——把整个模块跑起来，末尾自己调它。
+    harness = _REPO / "node-export-cell.test.mjs"
+    harness.write_text(src + r"""
+const row = {
+  id: 7, purchase_status: '待发货', fulfillment_status: '已发出',
+  shipment_order_id: 1, shipment_no: 'SP-777',
+}
+// 与两个页面的列定义同形状（display 就是它们写的那两个）
+const cols = [
+  { key: 'purchase_status', label: '状态',
+    display: (r) => r.fulfillment_status ?? r.purchase_status },
+  { key: 'shipment_order_id', label: '集运订单',
+    display: (r) => r.shipment_no || (r.shipment_order_id ? '#' + r.shipment_order_id : '') },
+  { key: 'id', label: 'ID' },                       // 没有 display 的照旧取原始值
+]
+console.log(JSON.stringify(cols.map((c) => cell(row, c))))
+""", encoding="utf-8")
+    try:
+        r = subprocess.run([node, str(harness)], cwd=_REPO, capture_output=True,
+                           text=True, timeout=60)
+    finally:
+        harness.unlink(missing_ok=True)
+    assert r.returncode == 0, f"node 跑挂了：{r.stderr[-800:]}"
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert got[0] == "已发出", (
+        f"导出的「状态」是 {got[0]!r}，而屏幕上显示的是「已发出」——"
+        f"用户按「已发出」筛出来的文件里逐行写着相反的话")
+    assert got[1] == "SP-777", (
+        f"导出的「集运订单」是 {got[1]!r}，而屏幕上显示的是集运单号 SP-777")
+    assert got[2] == "7", f"没有 display 的列不该受影响，却得到 {got[2]!r}"
+
+
+def test_every_list_page_exports_exactly_what_the_screen_is_showing():
+    """四个列表页都要能导出，而且**导出与列表必须共用同一份筛选参数**。
+
+    两件事各有各的失败方式：
+
+    · **没有导出**。物品列表原先是四页里唯一没有的一个，而它用的是同一套
+      `NotionTable` + 列配置 + 分页 + 筛选，导出工具（`utils/exportCsv.js`）本来就是通用的。
+      少这一个按钮不会报错，只会让人在那一页上手抄。
+
+    · **各写一份筛选参数**。这个更危险：导出的 CSV 与屏幕上看到的**不是同一批行**，
+      而这种文件往往是要发给别人的。加一个筛选条件时只改了 `load()`，
+      导出就悄悄多带出被筛掉的行——文件本身看不出任何异常。
+
+    判据必须先剥注释再匹配：这条测试自己的说明里就写着 `filterParams`，
+    而页面顶上那句「列表与导出共用这一份」同样含这个词。不剥的话，
+    一个只有注释、没有调用的页面也能过。
+    """
+    import re
+
+    root = Path(__file__).resolve().parents[2] / "frontend" / "src" / "views"
+    pages = ["Orders", "Shipment", "Misc", "Items"]
+
+    def strip_comments(text: str) -> str:
+        """剥注释。**块注释的开头前面不能是字母或斜杠**——否则
+        `accept="image/*"` 里那个 `/*` 会被当成注释起点，一路吃到几十行之后的
+        `*/`，把中间真正的代码整段吞掉。这条测试第一版就栽在这里：它吞了集运页的
+        `exportCsv(`，然后理直气壮地报「这页没有导出」。"""
+        text = re.sub(r"<!--.*?-->", "", text, flags=re.S)      # 模板注释
+        text = re.sub(r"(?<![\w/])/\*.*?\*/", "", text, flags=re.S)   # 块注释
+        return re.sub(r"//[^\n]*", "", text)                    # 行注释
+
+    for page in pages:
+        src = strip_comments((root / page / "index.vue").read_text(encoding="utf-8"))
+
+        assert "exportCsv(" in src, f"{page} 页没有导出——四个列表页应该一致"
+        assert "导出 CSV" in src, f"{page} 页有 exportCsv 但工具栏上没有那个按钮"
+
+        for fn in ("doExport", "load"):
+            m = re.search(rf"async function {fn}\(\).*?\n\}}", src, re.S)
+            assert m, f"{page} 页没找到 {fn}() —— 探测方式可能已过期"
+            assert "filterParams()" in m.group(0), (
+                f"{page} 页的 {fn}() 没走共用的 filterParams()："
+                f"列表与导出各算一份筛选，导出的 CSV 会和屏幕上不是同一批行")
 
 
 def test_every_ledger_page_serialises_writes_to_the_same_row():
@@ -3417,24 +3972,53 @@ def test_the_test_suite_leaves_no_files_in_the_repository():
     匹配的，`sqlite:///./probe.db` 就算真建了也会被 `*.db` 挡住，而裸名字挡不住。
     内存库（`:memory:`）不落盘，也不在此列。
     """
-    import re
+    import ast
+
+    # 模式拆开拼，别让源码里出现那个连续串——否则这条守卫会**匹配到自己**
+    # （判据被自身满足，本仓踩过很多次的老毛病的又一形态）。
+    prefix = "sqlite" + ":///"
+
+    def value_strings(src: str):
+        """文件里**会被当值用**的字符串字面量 →（行号, 值）。**docstring 不算。**
+
+        原先是逐行正则，只跳过了 `#` 开头的行。于是当另一条测试在自己的 docstring 里
+        **引用**这个坏 URL 来解释它为什么坏时，这条守卫就红了——
+        「解释一件事的文字，必然包含描述这件事的那些词」，本仓的老毛病换了个方向复发。
+
+        判据的命题是「被测代码会**照着这个 URL** 去建库」，
+        而 docstring 里的字符串永远不会被当成 URL 用，所以它本来就不该被看。
+        改成走 AST：把模块/类/函数体第一句的裸字符串（= docstring）摘出去，其余照看。
+        顺带比正则更准——单引号写的也认，跨行的也认。
+        """
+        tree = ast.parse(src)
+        docs = set()
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if (isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                    and body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                docs.add(id(body[0].value))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docs:
+                yield node.lineno, node.value
 
     tests = _REPO / "backend" / "tests"
     offenders = []
     for f in tests.rglob("test_*.py"):
-        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
-            if line.lstrip().startswith("#"):
+        for i, val in value_strings(f.read_text(encoding="utf-8")):
+            if not val.startswith(prefix):
                 continue
-            # 模式拆开拼，别让源码里出现那个连续串——否则这条守卫会**匹配到自己**
-            # （判据被自身满足，本仓踩过很多次的老毛病的又一形态）。
-            pat = '"' + "sqlite" + ':///' + r'(?!/)([^"{}\s]+)"'
-            for m in re.finditer(pat, line):
-                path = m.group(1)
-                if path.startswith(":"):            # :memory: —— 不落盘
-                    continue
-                if "." in path.rsplit("/", 1)[-1]:  # 有扩展名 ⇒ 被 *.db 之类挡得住
-                    continue
-                offenders.append(f"{f.name}:{i}  sqlite:///{path}")
+            path = val[len(prefix):]
+            if path == "":                      # f"...{tmp_path}" —— 路径是动态拼的，正是该用的写法
+                continue
+            if path.startswith("/"):            # 四斜杠 = 绝对路径，落不到仓库里
+                continue
+            if path.startswith(":"):            # :memory: —— 不落盘
+                continue
+            if "." in path.rsplit("/", 1)[-1]:  # 有扩展名 ⇒ 被 *.db 之类挡得住
+                continue
+            offenders.append(f"{f.name}:{i}  {prefix}{path}")
     assert not offenders, (
         "测试里写死了相对路径的 sqlite URL，被测代码会照着它在**仓库里**建库：\n  "
         + "\n  ".join(offenders)

@@ -219,26 +219,29 @@ def restore(snapshot: Path, *, assume_yes: bool = False, stream=None) -> int:
 
     # 恢复之前先给当前状态留一份。恢复错了还有退路。
     #
-    # **`keep=0`（这一次不轮换）是必须的，不是保守。** 安全备份默认落在
-    # `_default_dir()`——跟着账本走，也就是用户放快照的**同一个** `backups/`。
-    # 稳定态（cron 每天一次、keep=30）目录里正好 30 份，安全备份写进去变 31 份，
-    # `_prune` 就会删掉 `snaps[30:]`——**最旧的那一份**。而人来拿最旧那份的动机，
-    # 通常正是「新的几份已经是坏数据」。于是这条命令在读它之前先把它删了，
-    # 下面 `shutil.copy2` 裸抛 FileNotFoundError，恢复一步没跑。
-    # 屏幕上确实会有一行「已清理旧备份 <那个文件名>」，但它夹在一段备份输出里、
-    # 措辞是「清理旧备份」——没有任何东西说明它就是崩溃的原因。
-    # 连带删掉的还有配对的 `env-<同一时间戳>.txt`（那天的 SECRET_KEY 副本）。
+    # **SQLite 侧必须走文件级快照，不能走 `make_backup`。** 后者按**模型声明的列**
+    # SELECT（`replace_data`），而人来跑 `--restore` 的**头号场景**恰恰是
+    # 「某次迁移跑挂了、库停在旧 revision、应用起不来」——那种库缺列，
+    # `make_backup` 当场 `no such column: pluginconfig.last_ok_at`，
+    # 这里 `return 1`，于是**撤销点在唯一需要它的时刻用不了**。
+    # （2026-09-01 实测：把库停在 `c3d4e5f6a7b8` 再调 `restore()`，逐字复现。）
     #
-    # 而且这不只发生在失败那次：恢复**任何**一份快照都会驱逐最旧那份，
-    # 保留窗口每恢复一次就静默少一天。README 里写的 `--keep 60` 更糟——
-    # 安全备份用的是模块默认的 30，61 份里 `snaps[30:]` 是**一次删 31 份**，
-    # 而这次恢复本身还成功了，用户没有任何理由回头去数文件。
+    # 这与 `snapshot_sqlite_file` 文档里那段是**同一个坑的另一个调用点**——
+    # 迁移前快照那处 2026-08-22 就修了，这处一直留着。
     #
-    # `tag` 是另一件事，理由独立：这份快照是**某一次危险操作的撤销点**，
-    # 与迁移前快照 `soroban-<时间戳>-pre-<revision>.db` 同一类，
-    # 被后来的 30 次日常备份轮换掉就完全失去了意义。带 tag 即永不参与轮换。
+    # 文件级快照顺带解决另外两件事：
+    #   · 它不参与轮换（`_prune` 只认不带 tag 的文件名），所以不会像
+    #     `make_backup(keep=0)` 那样需要专门论证「别把最旧那份挤掉」——
+    #     而人来拿最旧那份的动机，通常正是「新的几份已经是坏数据」；
+    #   · 它拷的是磁盘上真实的那个库，WAL 里的内容也一并带走。
+    #
+    # MySQL 侧没有「文件旁边」可言，只能退回 `make_backup`，并且**说实话**：
+    # 库要是也停在旧 revision，这一步会失败，那就不动手。
     try:
-        safety, _ = make_backup(stream=out, keep=0, tag="pre-restore")
+        if str(target.url).startswith("sqlite"):
+            safety = snapshot_sqlite_file(str(target.url), _default_dir(), "pre-restore")
+        else:
+            safety, _ = make_backup(stream=out, keep=0, tag="pre-restore")
         say(f"（已先把当前账本备份到 {safety.name}，恢复错了可以用它退回来）")
     except Exception as e:  # noqa: BLE001
         say(f"⚠️ 恢复前的安全备份失败（{e}）。已中止——没有退路就不动手。")
@@ -262,6 +265,48 @@ def restore(snapshot: Path, *, assume_yes: bool = False, stream=None) -> int:
             src.dispose()
     say(f"已恢复 {sum(counts.values())} 行。")
     return 0
+
+
+def _scrub_control_tables(db: Path) -> None:
+    """把控制表从一份**文件级**快照里剥掉。
+
+    本模块开头把「快照里没有控制表、不会把加密的 MySQL 连接串复制出去」写成设计不变量，
+    而 `replace_data` 那条路天然满足它（只搬 `SQLModel.metadata` 里的业务表）。
+    **文件级拷贝不满足**：SQLite 模式下数据引擎复用控制引擎（`database.py` 里
+    `_data_engine = _control_engine`），同一个 `soroban.db` 里既有业务表，
+    也有 `app_db_config` / `db_connection` / `migrate_state`——字节拷贝把它们一起带走。
+
+    要紧的是 `app_db_config.url`：那是 Fernet 加密的 MySQL 连接串，而
+    **同一次备份还会把 `.env` 拷成同目录的 `env-<同一时间戳>.txt`**，
+    里面的 `SECRET_KEY` 正是解开它的唯一钥匙。两个文件躺在一起 = 明文生产库口令。
+
+    剥掉不影响快照的用途：它被 `restore()` 消费时走的是 `replace_data`，
+    只读业务表；就算有人把它直接当账本文件用，`control.ensure_schema` 会把这三张表
+    重新建成空的——那正是这条不变量想要的结果（快照不携带「连的是哪个库」）。
+
+    **`DROP` 之后还要 `VACUUM`**，理由要说准：实测在本机的 SQLite 上，
+    光 DROP 之后密文**已经**不在文件字节里了（2026-09-01 实测，232KB 的快照搜不到）。
+    但那取决于 `secure_delete` pragma 与页布局，**不是标准保证的行为**——
+    freed page 上的旧内容是否被抹掉，各构建/各版本可以不同。
+    VACUUM 重写整个文件、空闲页归零（实测 `freelist_count` 从 4 变 0），
+    让「密文不在文件里」从「碰巧成立」变成「由构造成立」。顺带把文件也缩小了。
+
+    表名从 `control_metadata` 推导，不手抄——手抄的名单会落后于新增的控制表，
+    而这份名单落后一次就是漏一张表的内容（§194 那份 `BinStr` 名单栽的就是这个）。
+    """
+    import sqlite3
+
+    from .db.control import control_metadata
+
+    names = sorted(control_metadata.tables)
+    assert names, "control_metadata 里一张表都没有——推导方式多半已过期"
+    conn = sqlite3.connect(db, isolation_level=None)     # VACUUM 不能在事务里跑
+    try:
+        for name in names:
+            conn.execute(f'DROP TABLE IF EXISTS "{name}"')
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
 
 
 def snapshot_sqlite_file(src_url: str, dest_dir: Path, tag: str) -> Path:
@@ -303,6 +348,7 @@ def snapshot_sqlite_file(src_url: str, dest_dir: Path, tag: str) -> Path:
             src.backup(dst)                     # 在线一致拷贝，不需要停写
         finally:
             dst.close()
+        _scrub_control_tables(part)
     except BaseException:
         part.unlink(missing_ok=True)            # 失败不留残file
         raise

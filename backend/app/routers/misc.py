@@ -11,7 +11,8 @@ from ..auth import get_current_user
 from ..database import get_session
 from ..models import MiscExpense
 from ..schemas import MiscCreate, MiscRead, MiscUpdate
-from .common import (guarded_bump, list_totals, raise_conflict, raise_not_found,
+from .common import (
+    MAX_OFFSET, guarded_bump, list_totals, raise_conflict, raise_not_found,
                      soft_delete, stamp_fx)
 
 router = APIRouter(
@@ -27,7 +28,7 @@ def list_expenses(
     category: Optional[str] = None,
     q: Optional[str] = Query(None, description="按名称搜索"),
     limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    offset: int = Query(0, ge=0, le=MAX_OFFSET),
 ):
     conds = [MiscExpense.is_delete.is_(False)]
     if date_from:

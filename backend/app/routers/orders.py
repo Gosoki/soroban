@@ -14,8 +14,10 @@ from ..auth import get_current_user
 from ..database import get_session
 from ..db.dialect import ci_contains
 from ..models import ShipmentOrder, OrderItem, ImportStatus, Order, OrderStaging, utcnow
+from ..models.base import items_carry_no_price
 from ..schemas import OrderCreate, OrderRead, OrderUpdate, norm_code, norm_id
 from .common import (
+    MAX_OFFSET,
     build_items, goods_seed, guarded_bump, list_totals, mirror_to_staging, raise_conflict,
     raise_not_found, run_ocr, soft_delete, stamp_fx
 )
@@ -77,7 +79,7 @@ def list_orders(
         None, alias="status", include_in_schema=False,
         description="已废弃：查询参数 status 已按业务段改名"),
     limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    offset: int = Query(0, ge=0, le=MAX_OFFSET),
 ):
     # FastAPI 对未知 query 参数**默认忽略**：改名后漏改一处调用方，
     # 表现就是「筛选点了没反应、返回全量、HTTP 200、零日志」。响亮拒掉比静默返回错数据强。
@@ -241,6 +243,16 @@ def update_order(order_id: int, payload: OrderUpdate, session: Session = Depends
     for key, value in data.items():
         setattr(order, key, value)
 
+    # **在替换 items 之前**记下存量状态。这是区分下面两件事的唯一信号——
+    # 它们送来的 payload 形状**完全相同**（items 都不带 unit_price_cny）：
+    #   · 存量有价 + 传来无价 = 用户**主动清空了**  → 记 0 + auto、货款归零
+    #     （这是有意的决定，与「只清空一条」同口径，见 test_clearing_all_prices_zeroes_them）
+    #   · 存量本来就无价 + 传来无价 = 价格这次**根本没被碰过**（历史形态：`f6a7b8c9d0e1`
+    #     只加列不回填），用户多半只是改了个物品名 → 一个字都不该动货款
+    # 光看 payload 分不出这两者，光看替换后的 items 更分不出——`build_items` 已经把
+    # 「没单价」重新编码成 `(0.00, auto=True)` 了。
+    stored_had_no_price = items_carry_no_price(order.items)
+
     built = None
     if payload.items is not None:            # 给了 items 就整体替换（[] → 自动补 1 条占位）
         # 种子价**只**认本次显式传来的 price_cny，绝不回退到订单当前价。
@@ -251,6 +263,11 @@ def update_order(order_id: int, payload: OrderUpdate, session: Session = Depends
         seed_goods = goods_seed(payload.price_cny, order.postage_cny, payload.items)
         built = build_items(payload.items, seed_goods, order.title)
         order.items = [OrderItem(**d) for d in built]
+        # 这次 payload 带没带价。与上面的 `stored_had_no_price` 合起来才够判：
+        # 两者都「无价」时，说明价格这次没被碰过——实测那条漏洞就在这里，
+        # ¥320.00 / 6400 円 的历史单改一个物品名 → ¥0.00 / 0 円，HTTP 200、零提示。
+        priced = seed_goods is not None or any(
+            it.unit_price_cny is not None for it in payload.items)
     elif not order.items:
         # 兜底：历史订单可能一条物品都没有 → 补占位，守住「≥1 物品」不变量。
         # 这条路径**必须**用订单当前价当种子：此时价格只存在于订单行上，不接过来就丢了。
@@ -258,7 +275,8 @@ def update_order(order_id: int, payload: OrderUpdate, session: Session = Depends
         order.items = [OrderItem(**d)
                        for d in build_items([], goods_seed(seed, order.postage_cny), order.title)]
     stamp_fx(session, order)                 # 同上：缺汇率的行每次 PATCH 都重试补，顺带自愈存量脏行
-    order.sync_from_items()                  # 无论是否改物品：价格恒由物品派生，并按新 fx/override 重算日元
+    # 日元恒重算；货款只在「这次确实知道钱是多少」时才由物品派生（理由见上面 `priced`）。
+    order.sync_from_items(derive_price=(built is None or priced or not stored_had_no_price))
     mirror_to_staging(session, order, built)  # 若由暂存导入：镜像回暂存行，避免删单后重导丢失编辑
 
     session.add(order)

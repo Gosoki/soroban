@@ -151,10 +151,23 @@ async function saveItems() {
   }
   const items = toPayload(all)
   const sent = JSON.stringify(items)   // 送出去的那一份，回来时拿它比对（见下）
-  const before = { ...props.order }    // 标量那半边的同一件事，见 applyRowUpdate 的 `before`
   try {
     // 整个「读 version→PATCH→回写」入队串行，避免与同订单的其它保存并发撞 version 互相 409
     await queueRowWrite(`order:${props.order.id}`, async () => {
+      // **`before` 必须在队列里面拍**（与下面 `savePostage`、以及 `OrderEditPanel.saveField`
+      // 逐字一致）。`applyRowUpdate` 对它的定义是「**发请求那一刻** target 的浅拷贝」，
+      // 用来回答「这一格是不是用户在这次往返期间动过」。
+      //
+      // 拍早了就会把**前一次写入的结果**误判成「用户动过」。真实序列：
+      // 草稿行填好新物品后，用户先在邮费框敲 10、再直接点草稿行的 ✓——
+      // mousedown 让邮费框失焦触发 W1(PATCH postage)，click 触发 W2(PATCH items)。
+      // W2 在入队前拍下 before.price_cny=100.00，然后在队列里等 W1；
+      // W1 的响应把 price_cny 写成 110.00。轮到 W2 时它的 patch 只含 {version, items}，
+      // `applyRowUpdate` 判 `target(110.00) !== before(100.00)` ⇒「用户正在改这一格」
+      // ⇒ **不采纳**服务端算出来的 160.00。
+      // 结果：面板里明明列着 A(100)+B(50)+邮费(10)，上面那行却显示 ¥110.00 / 2,200 円，
+      // 无任何提示，刷新前一直是错的。
+      const before = { ...props.order }
       const patch = { version: props.order.version, items }
       const updated = await ordersApi.update(props.order.id, patch)
       // **响应回来时，本地数组还是我送出去的那一份吗？** 不是就别整体覆盖。

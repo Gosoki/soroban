@@ -224,3 +224,35 @@ def test_ocr_rejects_oversized(client):
     big = b"\x89PNG\r\n\x1a\n" + b"0" * (10 * 1024 * 1024 + 1)
     r = client.post("/api/orders/ocr", files={"file": ("a.png", big, "image/png")})
     assert r.status_code == 413
+
+
+@pytest.mark.parametrize("path", [
+    "/api/orders", "/api/shipment", "/api/items", "/api/staging", "/api/misc",
+])
+def test_a_huge_offset_is_rejected_not_a_crash(client, path):
+    """`?offset=` 超界必须回 422，不能裸 500——**而且两个引擎要接住同一个值**。
+
+    原先 offset 只卡了下界。`?offset=99999999999999999999`：
+      · SQLite → `OverflowError: Python int too large to convert to SQLite INTEGER`
+      · 真 MySQL → `(1064, 'You have an error in your SQL syntax')`
+    两者都不在 `main.py` 那五个 exception handler 的类型里，**双双裸 500**。
+    更麻烦的是「接受哪一段」两边还不一样：同一个请求换个后端就是两种行为，
+    而本项目的一等能力就是运行期热切换后端。
+
+    422 是 FastAPI 自带的参数校验，说得清、可预期，前端拦截器也认得。
+    """
+    r = client.get(path, params={"offset": 99999999999999999999})
+    assert r.status_code == 422, f"{path} 对超界 offset 回了 {r.status_code}：{r.text[:150]}"
+
+
+@pytest.mark.parametrize("path", [
+    "/api/orders", "/api/shipment", "/api/items", "/api/staging", "/api/misc",
+])
+def test_a_normal_offset_still_works(client, path):
+    """反面：正常翻页不许被这道闸误伤。
+
+    只钉上一条的话，把上界设成 0 也能绿——而那会让第二页开始的所有请求全部 422。
+    """
+    r = client.get(path, params={"offset": 50, "limit": 10})
+    assert r.status_code == 200, f"{path} 正常翻页被拦了：{r.status_code} {r.text[:150]}"
+

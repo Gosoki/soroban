@@ -17,6 +17,8 @@
 """
 from __future__ import annotations
 
+import contextlib
+
 import datetime as dt
 import io
 import logging
@@ -33,6 +35,7 @@ from ..database import (
     control_url,
     current_backend,
     get_engine,
+    pending_revision,
     run_migrations,
     set_data_engine,
 )
@@ -259,6 +262,14 @@ def migrate(t: Target):
                 raise HTTPException(status_code=400, detail=f"目标库创建失败：{e}")
             _remember(host, port, user, pw, db)
         # 目标建/更新 schema（Alembic，含方言生成列）；本地 SQLite 目标同样确保升到 head
+        #
+        # **先问一句「它落后没有」**，因为下面那条 409 要据此说话。
+        # 读不出来时 `pending_revision` 回 None（当成「不用迁移」）——那一支下面按
+        # 「不确定」措辞，不会把「没动」说成确定的事。
+        try:
+            target_was_behind = pending_revision(url) is not None
+        except Exception:                                       # noqa: BLE001
+            target_was_behind = None                            # 读不出来：别下结论
         try:
             run_migrations(url)
         except Exception as e:                                  # noqa: BLE001
@@ -289,16 +300,30 @@ def migrate(t: Target):
             # 表结构升到 head 了——那是 DDL，MySQL 上隐式提交、本仓库也没有 downgrade 路径。
             # 顺序是被迫的：表还没建就数不出行数（`target_rows` 要 select 业务表），
             # 反过来排会让「目标尚未建表」被误报成「目标是空的」，把用户推向覆盖。
-            # 但用户看到这句 409 点了取消，会以为**什么都没发生**——而如果另一台机器
-            # 还在用旧版 soroban 连同一个库，它下次启动就会撞上「库比代码新」。
-            # 数据没动是真的，schema 动了也是真的，两句都要说。
+            # 但用户看到这句 409 点了取消，会以为**什么都没发生**。
+            #
+            # ⚠️ 这句话原先写的是「数据一个字都没动」——**目标库落后时那是假话**。
+            # 迁移链里有好几条是**改数据**的：`c5d6e7f8a9b0` 把订单的「集运中」「已到达」
+            # 并成「已签收」（而它的 downgrade 是空的，不可逆）、`d0e1f2a3b4c5` 对单号列
+            # 做 UPPER/TRIM 并把空串改成 NULL、`e7f8a9b0c1d2` 重写 `fxrate.source`、
+            # `f8a9b0c1d2e3` 重写 `columnlayout.columns_json` 里的列键。
+            # 2026-09-01 实测：目标库停在 `b4c5d6e7f8a9`、里面一张「集运中」的单，
+            # 走完这一句就变成「已签收」——而用户刚被告知「数据一个字都没动」。
+            # 所以按**它到底落后没有**分两句说；读不出版本时不下结论。
+            if target_was_behind is False:
+                moved = "数据一个字都没动"
+            elif target_was_behind is True:
+                moved = ("而且它原先落后于本版，升级过程中**数据也被改写了**"
+                         "（状态值合并、单号大小写规整等，其中有不可逆的步骤）")
+            else:
+                moved = "而它原先是不是最新版没能读出来，数据有没有被升级步骤改写无法确定"
             raise HTTPException(status_code=409, detail=(
                 "目标库里已经有数据（"
                 + "、".join(f"{k} {v} 条" for k, v in existing.items())
                 + "），迁移会先把它们全部删除，再用当前库整表覆盖。"
                 "请先确认目标库里没有当前库所没有的东西——这一步没有备份，无法撤销。"
                 "（注意：为了能数出上面这些行数，目标库的**表结构**已经升到本版；"
-                "数据一个字都没动，但若还有旧版 soroban 连着同一个库，它需要一并升级。）"))
+                f"{moved}。若还有旧版 soroban 连着同一个库，它需要一并升级。）"))
 
         problems = db_migrate.preflight(get_engine(), tgt)
         if problems:
@@ -403,7 +428,27 @@ def switch(t: Target):
     #
     # 顺带把指纹也挪进屏障内计算：这样「指纹之后没有新的写」是由构造保证的，
     # 而不是靠窗口足够窄。
-    with barrier.hold("切换数据库中"):
+    # `barrier.hold` 在已有别的维护操作时抛 `RuntimeError("已有另一项维护操作在进行：…")`。
+    # **这是 409 不是 500**：没出错，只是现在轮不到，等几秒再点就行。
+    # 同一个屏障的另外两个使用者（`create_backup` / `migrate`）都做了这个映射，
+    # 只有切换漏了——而三者是同一张页面上并排的三个按钮，8 个人共用一个 admin，
+    # 「甲在备份、乙点切换」是常态。
+    # 漏掉的表现不只是状态码难看：FastAPI 默认的 500 响应体是纯文本
+    # `Internal Server Error`，没有 `detail` 字段，前端 `api/http.js` 取不到，
+    # 回落到 axios 的英文 `err.message` ——用户看到一句
+    # 「Request failed with status code 500」，而真正的原因（备份正在跑）一个字都没有。
+    # 用 ExitStack 而不是直接 `with`：`hold` 是 `@contextmanager`，
+    # 那句 `RuntimeError` 在 `__enter__` 里才抛。裸 `try: ... with ...:` 会把
+    # **块内**的 RuntimeError 也一起映射成 409，而块内那些（指纹、切引擎）
+    # 是真故障，报成「等几秒再点」会把人引到完全错误的方向。
+    # `enter_context` 让「进入屏障」单独成为一句可捕获的语句。
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(barrier.hold("切换数据库中"))
+        except RuntimeError as e:                              # 已有另一项维护操作在进行
+            if owns:
+                tgt.dispose()
+            raise HTTPException(status_code=409, detail=str(e)) from e
         # 「迁移之后源库又被改过没有」——改过的那些**不会**跟着切换过去，切完就静默消失了。
         # 拿不到指纹（老版本迁的 / 换过机器）时不拦，只是没法给出这层保护。
         recorded = control.read_migrate_fingerprint(control_engine(), _target_key(t))
