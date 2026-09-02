@@ -4940,3 +4940,87 @@ console.log(JSON.stringify({{
         f"`fmtDate` 给的是 {got['localDate']}——它该显示本地(JST)日期")
     assert got["ago25h"] == "1 天前", (
         f"25 小时前被说成 {got['ago25h']!r}——小时/天的进位错了")
+
+
+def test_the_fulfillment_status_filter_matches_what_the_column_shows(client, session, request):
+    """「显示状态」这条规则有**两份实现**，必须逐组合等价。
+
+      · `Order.fulfillment_status` —— Python 属性，列表里那一格显示的就是它；
+      · `orders.list_orders` 里的 `case(...)` —— SQL 形态，`fulfillment_status=` 筛选用它。
+
+    `list_orders` 的注释逐字写着「筛选口径必须与**显示**口径一致」，理由也写了：
+    「显示的是集运单状态、筛选却按订单自身状态，就会出现『列表里明明显示着一堆已发出，
+    筛已发出却一条都搜不到』」。但那句话此前**只是注释**——两份实现之间没有任何守卫。
+
+    2026-09-02 实测它真的会漂：把采购终态压过集运状态这条规则只加进属性、没加进 SQL，
+    结果是**「列表显示『退款』，按『退款』筛却 0 条」**——比原来的错法更难查，
+    因为用户看到的那个词就在筛选框里，他会以为是筛选坏了。
+
+    这条守卫不比源码文本，它**把两边放在同一组数据上跑**：
+    对每一种「采购状态 × 集运状态（含未挂靠）」的组合，
+    断言「属性给出的那个词」用来筛时**恰好**能筛到这一单。
+    """
+    import datetime as dt
+
+    from app.models import Order, PurchaseStatus, ShipmentStatus
+
+    # **本条要造 4 张集运单 + 30 张订单，跑完必须自己清干净。**
+    # 套件共用一个库，不清的话后面按列表取 `items[0]` 的用例会取到我造的行——
+    # 2026-09-02 实测：不清理时 `test_staging_mirror.py` 有 12 条变红，
+    # 而它们**单独跑全是绿的**（「红的地方不是错的地方」的标准形态）。
+    def _cleanup():
+        from sqlmodel import delete as _delete
+
+        from sqlmodel import select as _select
+
+        from app.models import OrderItem as _OI
+        from app.models import ShipmentOrder as _SO
+        # 先删子行：每张订单都带一条自动生成的占位物品，外键会挡住硬删
+        ids = list(session.exec(_select(Order.id).where(Order.order_no.like("FS-%"))))
+        if ids:
+            session.exec(_delete(_OI).where(_OI.order_id.in_(ids)))
+        session.exec(_delete(Order).where(Order.order_no.like("FS-%")))
+        session.exec(_delete(_SO).where(_SO.shipment_no.like("FS-%")))
+        session.commit()
+
+    request.addfinalizer(_cleanup)
+
+    ships = {}
+    for st in ShipmentStatus:
+        sh = client.post("/api/shipment", json={
+            "date": "2027-06-01", "shipment_no": f"FS-{st.value}"}).json()
+        client.patch(f"/api/shipment/{sh['id']}",
+                     json={"version": sh["version"], "shipment_status": st.value})
+        ships[st.value] = sh["id"]
+
+    made = []
+    for i, ps in enumerate(PurchaseStatus):
+        for ss in [None, *ships]:
+            o = client.post("/api/orders", json={
+                "date": "2027-06-01", "title": f"组合-{ps.value}-{ss}",
+                "order_no": f"FS-{i}-{ss}", "purchase_status": ps.value}).json()
+            if ss is not None:
+                o = client.patch(f"/api/orders/{o['id']}", json={
+                    "version": o["version"], "shipment_order_id": ships[ss]}).json()
+            made.append((o["id"], ps.value, ss, o["fulfillment_status"]))
+
+    session.expire_all()
+    bad = []
+    for oid, ps, ss, shown in made:
+        # 属性说这一单显示成 `shown` ⇒ 用 `shown` 去筛，必须筛得到它
+        # 定位单条的 wire 名是 `id`（`only_id` 只是 Python 侧的形参名，避免遮蔽内建 id()）——
+        # 传 `only_id=` 会被 FastAPI 当未知参数**静默忽略**，判据就变成「全表里有没有」。
+        hit = client.get("/api/orders", params={"fulfillment_status": shown,
+                                                "id": oid}).json()["total"]
+        if hit != 1:
+            bad.append((oid, f"采购={ps}", f"集运={ss}", f"显示={shown}", f"筛到={hit}"))
+        # 反面：拿**另一个**词去筛，不该筛到它（否则判据恒真）
+        other = "已签收" if shown != "已签收" else "待付款"
+        miss = client.get("/api/orders", params={"fulfillment_status": other,
+                                                 "id": oid}).json()["total"]
+        if miss != 0:
+            bad.append((oid, f"显示={shown}", f"却被「{other}」筛到了"))
+
+    assert not bad, (
+        "「显示什么」与「按什么筛得到」对不上（Python 属性与 SQL 筛选是两份实现）：\n  "
+        + "\n  ".join(map(str, bad[:8])))

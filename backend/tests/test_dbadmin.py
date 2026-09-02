@@ -878,3 +878,57 @@ def test_the_change_fingerprint_sees_an_in_place_edit_with_no_new_rows(tmp_path)
     finally:
         eng.dispose()
 
+
+
+def test_switching_after_editing_the_source_is_refused_until_confirmed(client, dst_engine, monkeypatch):
+    """迁移之后又改了源库 → **切换必须被 409 拦下**，明确确认后才放行。
+
+    这道闸防的是一次**静默的数据丢失**：迁移是「拷一份过去」，切换是「改指向」。
+    两者之间对源库做的任何编辑都**不会**跟过去——切完之后它们就在你眼前消失了，
+    而界面上不会有任何提示（切换本身是成功的）。
+
+    2026-09-02 变异实测，这道闸此前**零覆盖**：
+
+        把 `if recorded is not None and not t.confirm_changed:` 改成 `if False:`
+            → 全套 1374 条一条都不红
+        把迁移后那句 `save_migrate_fingerprint(...)` 换成 `pass`
+            → 同样一条都不红
+
+    本文件里唯一碰到它的地方（上面那条 switch 用例）是**显式绕过**的
+    （`confirm_changed: True`，注释还写着「那道闸不是这条用例要测的东西」）——
+    绕过不等于覆盖。
+
+    判据分两半，缺一不可：
+      ① 改了源就**拦**——否则闸形同虚设；
+      ② 明确确认后**放行**——否则闸变成一堵墙，用户再也切不过去。
+    """
+    from app.database import get_engine
+    from app.routers import dbadmin as mod
+
+    # 1. 先迁一份过去（目标是 dst_engine 那个空库）
+    url = str(dst_engine.url)
+    monkeypatch.setattr(mod, "_resolve_target", lambda t: ("sqlite", url, dst_engine, False))
+    monkeypatch.setattr(mod, "_is_same_as_active", lambda backend, u: False)
+
+    r = client.post("/api/db/migrate", json={"backend": "sqlite", "confirm_overwrite": True})
+    assert r.status_code == 200, f"迁移就没成功，后面的判据无从谈起：{r.text[:200]}"
+
+    # 2. 迁移**之后**改源库：这一笔不会跟着切换过去
+    r = client.post("/api/orders", json={"date": "2027-11-01", "title": "迁移后才录的单",
+                                         "order_no": "FPGATE-1", "purchase_status": "待收货"})
+    assert r.status_code == 200, r.text
+
+    # 3. 直接切 → 必须 409，且话要说得让人看懂丢的是什么
+    r = client.post("/api/db/switch", json={"backend": "sqlite"})
+    assert r.status_code == 409, (
+        f"迁移之后改过源库，切换却直接放行了（{r.status_code}）——"
+        f"「迁移后才录的单」会在切换的瞬间从眼前消失，而界面上不会有任何提示")
+    detail = r.json()["detail"]
+    assert "改动" in detail and ("丢失" in detail or "不在目标库" in detail), (
+        f"409 了，但没说清丢的是什么：{detail!r}")
+
+    # 4. 明确确认后必须放行——闸不能变成一堵墙
+    r = client.post("/api/db/switch", json={"backend": "sqlite", "confirm_changed": True})
+    assert r.status_code == 200, (
+        f"用户已经明确表示放弃那些改动，还是切不过去：{r.status_code} {r.text[:200]}")
+    assert "sqlite" in str(get_engine().url)

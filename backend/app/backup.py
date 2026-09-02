@@ -293,6 +293,20 @@ def _scrub_control_tables(db: Path) -> None:
 
     表名从 `control_metadata` 推导，不手抄——手抄的名单会落后于新增的控制表，
     而这份名单落后一次就是漏一张表的内容（§194 那份 `BinStr` 名单栽的就是这个）。
+
+    ⚠️ **`alembic_version` 必须留着，别把它一起剥了。** 它不在 `control_metadata` 里
+    （alembic 自己建的），所以今天是「碰巧」留下的——但它是**承重**的：
+    上面说的「有人把快照直接当账本文件用」那条路，靠的正是它。
+    2026-09-02 实测两种做法：
+
+        留着 alembic_version → 迁移通过，订单读得出来，版本 e5f6a7b8c0d1
+        剥掉 alembic_version → **失败**：no such table: taobaoorder
+
+    没有它，alembic 认为这是一个全新的空库，从第一条迁移开始跑，
+    当场撞上早已改名的 `taobaoorder` —— 快照变成一个打不开的文件。
+    而它里面只有一个 revision 哈希，**不含任何秘密**，与上面那条
+    「不把加密连接串复制出去」的不变量并不冲突。
+    `test_the_file_level_snapshot_keeps_alembic_version` 钉住这一条。
     """
     import sqlite3
 

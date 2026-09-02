@@ -314,11 +314,51 @@ def _state_file(manifest: dict, account: str) -> Path:
     return f
 
 
+# Windows 上文件名不能含的字符（外加控制字符），以及保留的设备名。
+# **这道闸只能在这里把**——`_state_file` 的 `f.parent == d` 拦得住 `/` 和 `\`
+# （它们会改变父目录），但拦不住下面这些：`resolve()` 在 Linux 上把 `:` `?` `*`
+# 当普通字符，父目录不变，于是校验通过、Windows 上却出事。
+_WIN_BAD_CHARS = set('<>:"/\\|?*') | {chr(i) for i in range(32)}
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL",
+                 *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
 def _check_account_name(manifest: dict, account: str) -> Path:
-    """账号名合法性统一校验：非空、不含逗号（逗号是历史 accounts 分隔符），且不穿越 state 目录。
-    add/login/fetch 共用同一把尺子，避免 login/fetch 收下 add 不允许的名字而产生孤儿会话文件。"""
+    """账号名合法性统一校验：非空、不含逗号、**在 Windows 上也是个合法文件名**、且不穿越 state 目录。
+
+    add/login/fetch 共用同一把尺子，避免 login/fetch 收下 add 不允许的名字而产生孤儿会话文件。
+
+    **为什么要管 Windows**：账号名同时是本地会话文件名（`<state_dir>/<账号>.json`），
+    而这个应用的主力形态就是打包成 exe 双击运行。三类名字在 Linux 上毫无问题、
+    在 Windows 上各有各的坏法，且**都能通过原来那道目录穿越校验**：
+
+      · **非法字符**（`< > : " | ? *`）——`淘宝:主号` 这种昵称很自然，
+        而 NTFS 会把冒号后面当成「备用数据流」；`? * " < > |` 则在真正写文件时
+        抛裸 `OSError`。表现是「添加成功，一登录就报个看不懂的错」。
+      · **保留设备名**（`CON` / `NUL` / `COM1` …）——`NUL.json` 写进空设备，
+        **会话永远存不下来**：用户登录成功、下次还要再登，一次报错都没有。
+      · **结尾的点**——Windows 静默去掉它，于是 `淘宝.` 与 `淘宝` 共用一份会话。
+        这与上面 `add_account` 里那段大小写折叠是同一类坑（两个账号一份 cookie），
+        只是成因不同。结尾空格不用管：调用方都先 `strip()` 过。
+
+    在**添加时**拒绝，而不是等到写文件时——那时用户已经在界面上看到这个账号了，
+    删掉它还要走另一条路。
+    """
     if not account or "," in account:
         raise HTTPException(status_code=400, detail="账号昵称不能为空、且不能含逗号")
+    if bad := sorted(_WIN_BAD_CHARS & set(account)):
+        shown = "".join(c for c in bad if c.isprintable()) or "控制字符"
+        raise HTTPException(status_code=400, detail=(
+            f"账号昵称不能含这些字符：{shown}（它同时是本地会话文件名，"
+            f"Windows 上这些字符不允许出现在文件名里）"))
+    if account.rstrip(".") != account:
+        raise HTTPException(status_code=400, detail=(
+            "账号昵称不能以「.」结尾（Windows 会把结尾的点去掉，"
+            "于是它和去掉点的那个账号共用同一份登录会话）"))
+    if account.split(".")[0].upper() in _WIN_RESERVED:
+        raise HTTPException(status_code=400, detail=(
+            f"「{account}」是 Windows 的保留设备名，不能用作账号昵称——"
+            f"它对应的会话文件会被写进空设备，登录状态永远保存不下来"))
     return _state_file(manifest, account)
 
 

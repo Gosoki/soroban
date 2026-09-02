@@ -5,7 +5,7 @@ from typing import Optional
 
 from fastapi.concurrency import run_in_threadpool
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy import update as sa_update
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, select
@@ -14,7 +14,7 @@ from ..auth import get_current_user
 from ..database import get_session
 from ..db.dialect import ci_contains
 from ..models import ShipmentOrder, OrderItem, ImportStatus, Order, OrderStaging, utcnow
-from ..models.base import items_carry_no_price, not_deleted
+from ..models.base import PURCHASE_TERMINAL_STATUSES, items_carry_no_price, not_deleted
 from ..schemas import OrderCreate, OrderRead, OrderUpdate, norm_code, norm_id
 from .common import (
     MAX_OFFSET,
@@ -114,7 +114,15 @@ def list_orders(
                    not_deleted(ShipmentOrder))
             .scalar_subquery()
         )
-        conds.append(func.coalesce(ship_status, Order.purchase_status) == fulfillment_status)
+        # **这是 `Order.fulfillment_status` 的第二份实现（SQL 形态），两边必须逐行等价。**
+        # 采购终态（退款/交易关闭）压过集运状态——理由见那个属性的 docstring。
+        # 2026-09-02 实测过它们真的会漂：只改属性、不改这里，
+        # 结果是「列表显示『退款』，按『退款』筛却 0 条」——比原来的错法更难查。
+        # `test_the_fulfillment_status_filter_matches_what_the_column_shows` 逐组合钉住两者。
+        conds.append(
+            case((Order.purchase_status.in_(tuple(PURCHASE_TERMINAL_STATUSES)),
+                  Order.purchase_status),
+                 else_=func.coalesce(ship_status, Order.purchase_status)) == fulfillment_status)
     if purchase_status:
         conds.append(Order.purchase_status == purchase_status)
     if platform:

@@ -3345,3 +3345,63 @@ def test_requirements_that_are_not_utf8_still_parse(tmp_path):
     assert _declared_dists(req) == ["httpx", "playwright"]
     assert _wants_browser(d) is True, "浏览器判据也读这个文件，同样不能因为编码失灵"
 
+
+
+def test_account_names_that_break_on_windows_are_refused_at_add_time(client, tmp_path, monkeypatch):
+    """账号昵称必须是**Windows 上也合法的文件名**——它同时是本地会话文件名。
+
+    这个应用的主力形态是打包成 exe 双击运行（Windows），而下面三类名字
+    在 Linux 上毫无问题、在 Windows 上各有各的坏法，**且都能通过原来那道目录穿越校验**
+    （`_state_file` 的 `f.parent == d` 只拦得住 `/` 和 `\\`，它们会改变父目录）：
+
+      · **非法字符** `< > : " | ? *` —— `淘宝:主号` 这种昵称很自然，
+        NTFS 会把冒号后面当「备用数据流」；其余几个在真正写文件时抛裸 OSError。
+        表现是「添加成功，一登录就报个看不懂的错」。
+      · **保留设备名** `CON` / `NUL` / `COM1` … —— `NUL.json` 写进空设备，
+        **登录状态永远存不下来**，而且一次报错都没有。
+      · **结尾的点** —— Windows 静默去掉，于是 `淘宝.` 与 `淘宝` 共用一份会话
+        （与既有的大小写折叠是同一类坑：两个账号一份 cookie，成因不同）。
+
+    ⚠️ **这条测试验的是校验器，不是 Windows 的行为**——跑在 Linux 上，
+    没法真的去触发 NTFS 的语义。所以判据是「这些名字被**拒绝**」，
+    而不是「这些名字在 Windows 上会怎样」。后者只能靠推理，已写在
+    `_check_account_name` 的 docstring 里。
+    """
+    import sys
+    from pathlib import Path
+
+    from app.routers import plugins as mod
+
+    d = tmp_path / "plugins" / "soroban-plugin-demo"          # 与本文件其它用例同一范式
+    d.mkdir(parents=True)
+    (d / "plugin.toml").write_text(_ACCT_TOML, encoding="utf-8")
+    monkeypatch.setattr(mod.settings, "PLUGIN_DIR", str(tmp_path / "plugins"))
+    monkeypatch.setattr(mod, "_SOROBAN_ROOT", tmp_path)
+    monkeypatch.setattr(mod, "_python", lambda m: Path(sys.executable))
+    mod._needs_cache.clear()
+
+    bad = [
+        ("淘宝:主号", "冒号——NTFS 备用数据流"),
+        ('账号"引号', "双引号"),
+        ("账号?号", "问号"),
+        ("账号*星", "星号"),
+        ("账号|竖", "竖线"),
+        ("账号<左", "尖括号"),
+        ("NUL", "保留设备名"),
+        ("con", "保留设备名（小写也算）"),
+        ("COM1", "保留设备名"),
+        ("nul.json", "保留设备名带扩展名"),
+        ("淘宝.", "结尾的点"),
+    ]
+    for name, why in bad:
+        r = client.post("/api/plugins/demo/account", params={"name": name})
+        assert r.status_code == 400, (
+            f"「{name}」（{why}）被收下了，状态码 {r.status_code}——"
+            f"它会变成 <state_dir>/{name}.json，在 Windows 上出事")
+
+    # **反面：正常昵称不许被误伤。** 判据写宽了的话，中文/英数/常见符号都会被挡，
+    # 而那才是用户真正会输入的东西。
+    ok = ["淘宝主号", "taobao_1", "闲鱼-小号", "账号 带空格", "a.b.c", "账号（备用）", "N U L"]
+    for name in ok:
+        r = client.post("/api/plugins/demo/account", params={"name": name})
+        assert r.status_code == 200, f"正常昵称「{name}」被误挡了：{r.status_code} {r.text[:160]}"

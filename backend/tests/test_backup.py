@@ -910,3 +910,56 @@ def test_the_ui_backup_button_never_prunes_anything(tmp_path, monkeypatch):
     assert not gone, (
         f"界面点一次「立刻备份」删掉了 {len(gone)} 份历史：{sorted(gone)[:4]}…\n"
         "它读不到 crontab 里的 --keep，就不该猜一个值去执行轮换策略")
+
+
+def test_the_file_level_snapshot_keeps_alembic_version(ledger, tmp_path):
+    """上一条钉的是「控制表必须被剥掉」；**这一条钉相反的一半：`alembic_version` 必须留着。**
+
+    它不在 `control_metadata` 里（alembic 自己建的），所以今天是「碰巧」没被剥——
+    但它是**承重**的：`_scrub_control_tables` 的说明里那句「就算有人把快照直接当账本文件用」
+    完全靠它。2026-09-02 实测两种做法：
+
+        留着 alembic_version → 迁移通过，订单读得出来
+        剥掉 alembic_version → **失败**：no such table: taobaoorder
+
+    没有它，alembic 认为这是一个全新的空库，从第一条迁移开始跑，
+    当场撞上早已改名的 `taobaoorder`——快照变成一个打不开的文件，
+    而这一切发生在**用户真正需要它的那一刻**。
+
+    它里面只有一个 revision 哈希，**不含任何秘密**，与上一条那个
+    「不把加密连接串复制出去」的不变量并不冲突。
+
+    ⚠️ 会打破它的改法长这样：把剥离规则从「删 `control_metadata` 里的表」
+    收紧成「凡不在 `SQLModel.metadata` 里的都删」——听起来更彻底。
+    实测这么破坏之后（2026-09-02）本文件里**共 3 条**变红：本条，
+    加上 `..._when_the_ledger_is_behind_head` 与 `..._when_the_schema_is_actually_behind`。
+    **上一条守卫（控制表必须被剥掉）照样是绿的**——它只查控制表被删了，不查这张表没被删。
+
+    所以这条不变式**此前并非无人守**，那两条会兜住它。
+    但它们钉的是「schema 落后于 head 时也要能恢复」，`alembic_version` 只是其中一环，
+    从测试名与断言都读不出「这张表必须留着」这条规则本身。
+    本条的价值在于**把理由说出来**：谁在收紧剥离规则时看到那两条红，
+    大概率会以为是自己动了别的东西；看到本条红，能直接读到「为什么不能删它」。
+    """
+    import sqlite3
+
+    from app.backup import snapshot_sqlite_file
+
+    _fill(ledger, title="AV", jpy=1)
+    url = str(ledger.url)
+    snap = snapshot_sqlite_file(url, tmp_path / "out", "keep-av")
+
+    with sqlite3.connect(f"file:{snap}?mode=ro", uri=True) as c:
+        tables = {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
+        assert "alembic_version" in tables, (
+            "快照里没有 alembic_version——把它当账本文件直接用时，"
+            "alembic 会从第一条迁移开始跑，撞上早已改名的表，文件打不开")
+        ver = c.execute("select version_num from alembic_version").fetchone()
+    assert ver and ver[0], f"alembic_version 表在、却是空的：{ver}"
+
+    # 光有表名不够：真的拿它当账本跑一次迁移，必须通过且数据还在
+    from app.database import run_migrations
+    run_migrations(f"sqlite:///{snap}")
+    with sqlite3.connect(f"file:{snap}?mode=ro", uri=True) as c:
+        n = c.execute("select count(*) from orders").fetchone()[0]
+    assert n >= 1, f"快照当账本用之后订单没了：{n} 条"

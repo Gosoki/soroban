@@ -7,7 +7,8 @@ from sqlalchemy import Column, Index, Text, text
 from sqlmodel import Field, Relationship
 
 from ...db.dialect import BinStr
-from ..base import PURCHASE_EXCLUDED, LedgerBase, PurchaseStatus, items_carry_no_price, price_from_items
+from ..base import (PURCHASE_EXCLUDED, LedgerBase, PurchaseStatus, is_purchase_terminal,
+                    items_carry_no_price, price_from_items)
 
 
 class Order(LedgerBase, table=True):
@@ -77,9 +78,26 @@ class Order(LedgerBase, table=True):
         集运单被软删时也回落到自身状态：那张单在界面上已经看不见了，
         再拿它的状态显示会是个查无此处的幽灵值。
 
+        **但采购**终态**（退款 / 交易关闭）压过集运状态。** 上面那套理由讲的全是
+        「国际段**进行中**的状态归集运单所有」，与终态无关；而本仓别处对终态的口径是统一的：
+        `can_advance_purchase` 说「终态是明确结论，自动识别不该推翻它」，
+        `ledger_exclusions` 让它不计入合计。只有这里曾经让集运状态盖掉它，后果很具体
+        （2026-09-02 端到端实测）：
+
+            一张已退款、又挂在「已发出」集运单上的订单
+            → 列表里显示「已发出」
+            → **按「退款」筛，0 条**（筛选口径与显示口径是刻意一致的，见 orders.py）
+            → 按「已发出」筛，1 条
+
+        钱一直是对的（`counted=False`，对账单上标着「不计入合计」），
+        但这一单在订单列表里**找不回来了**——而「把退了款的单找出来」正是月底要做的事。
+        包裹确实发出去了，可交易已经退款；两个都是事实，而后者才是看列表的人要的那个。
+
         ⚠️ 读它会触碰 `shipment_order` 关系。列表接口必须 `selectinload(Order.shipment_order)`，
         否则整页逐行懒加载 = N+1（tests/test_queries.py 钉着这条）。
         """
+        if is_purchase_terminal(self.purchase_status):
+            return self.purchase_status
         ship = self.shipment_order
         if ship is not None and not ship.is_delete:
             return ship.shipment_status
