@@ -184,6 +184,93 @@ def test_stale_patch_after_someone_else_wrote_is_409(client):
     assert client.get(f"/api/orders/{o['id']}").json()["title"] == "A 改的"
 
 
+def test_stale_patch_on_a_misc_expense_is_409_too(client):
+    """杂项支出页也要有乐观锁——**四个账本页里只有它没被测过**。
+
+    上面那条 `test_stale_patch_after_someone_else_wrote_is_409` 只测了订单页。
+    暂存页与集运页各自在 test_staging.py / test_shipment.py 里有同款用例，
+    唯独杂项没有：变异实测（2026-09-02）把 `misc.update_expense` 里那句
+    `if not guarded_bump(...)` 改成永不成立，**全套 1395 条一条都不红**。
+
+    这条闸挡的正是用户点名要防的那件事：约 8 个人共用一个 admin、2-3 人可能同时编辑。
+    前端 `queueRowWrite` 只串行化**同一个标签页**里对同一行的写，两个人两个标签页
+    靠的就是这道服务端乐观锁。它失效时不会报错——后提交的静默盖掉先提交的，
+    前端连「数据已变，已刷新」都不会弹，先改的那个人看不出自己的修改没了。
+
+    两半都钉：旧 version 必须 409，**且库里留下的是先提交的那份**。
+
+    第二半是对**用户看得见的结果**的兜底，不是对「守卫排在写字段之前」的检查——
+    实测把 `guarded_bump` 挪到 `setattr` 之后，这条测试**仍然绿**：
+    `raise_conflict()` 抛出后 `get_session` 的 with 块会隐式回滚，
+    那几个 `setattr` 一起被撤掉（同一机制在 §319 的导入门闸上也验过）。
+    """
+    m = client.post("/api/misc", json={"date": "2027-04-01", "name": "打包胶带"}).json()
+    tab_a, tab_b = dict(m), dict(m)
+    assert client.patch(f"/api/misc/{m['id']}",
+                        json={"version": tab_a["version"], "name": "A 改的"}).status_code == 200
+    r = client.patch(f"/api/misc/{m['id']}", json={"version": tab_b["version"], "name": "B 改的"})
+    assert r.status_code == 409, (
+        f"乙拿着过期的 version 保存，却被放行了（{r.status_code}）——"
+        f"甲刚改的那笔会被静默盖掉，而甲不会收到任何提示")
+    listed = client.get("/api/misc")
+    assert listed.status_code == 200, listed.text
+    got = next(x for x in listed.json()["items"] if x["id"] == m["id"])
+    assert got["name"] == "A 改的", f"409 了，但字段还是被写进去了：{got['name']!r}"
+
+
+def test_editing_staging_refuses_when_the_ledger_row_moved_underneath(client, monkeypatch):
+    """改暂存行会写穿账本；**账本那一侧被人同时改过，就必须 409**。
+
+    `update_staging` 对账本侧也上乐观锁，但它比的是**本请求刚读到的** `order.version`
+    ——所以顺序请求永远撞不上，只有竞态才走得到。变异实测（2026-09-02）把这句
+    `guarded_bump(session, Order, ...)` 改成永不成立，全套 1395 条一条都不红。
+
+    删掉它的后果：甲在订单页改了金额，乙在暂存页改同一条的标题并保存，
+    乙的写穿会**静默盖掉**甲刚改的那笔——两边都不会看到 409，甲的修改凭空消失。
+
+    注入点是 `_linked_order`：它返回账本行、且返回值的 `version` 正是下一句要比的那个。
+    在它返回**之后**推进账本 version，拿到的就是「读完之后被人改过」这个精确状态。
+    """
+    from sqlalchemy import update as sa_update
+
+    from app.database import get_engine
+    from app.models import Order, utcnow
+    from app.routers import staging as mod
+
+    s = client.post("/api/staging", json={"order_no": "CC-RACE", "title": "初始"}).json()
+    o = client.post(f"/api/staging/{s['id']}/import").json()
+    row = next(x for x in client.get("/api/staging", params={"limit": 500}).json()["items"]
+               if x["id"] == s["id"])
+
+    original = mod._linked_order
+    bumped = []
+
+    def load_then_someone_else_writes(session, staging_row):
+        order = original(session, staging_row)
+        if order is not None and not bumped:
+            bumped.append(True)
+            # **只推进账本行，不能走 PATCH /api/orders。** 那条路径会顺带把镜像的暂存行
+            # version 也推进（`test_order_edit_bumps_mirrored_staging_version` 钉着这一点），
+            # 于是 409 会由**暂存那一侧**的闸给出——这条测试就变成在验另一道闸，
+            # 把账本侧那道删掉照样绿（第一版就是这么写的，破坏验证当场抓到）。
+            with Session(get_engine()) as other:
+                other.execute(sa_update(Order).where(Order.id == o["id"])
+                              .values(title="甲改的", version=Order.version + 1,
+                                      updated_at=utcnow()))
+                other.commit()
+        return order
+
+    monkeypatch.setattr(mod, "_linked_order", load_then_someone_else_writes)
+    r = client.patch(f"/api/staging/{s['id']}", json={"version": row["version"], "title": "乙改的"})
+
+    assert bumped, "注入点没被调用 —— _linked_order 的位置变了，这条测试已经不测那个竞态了"
+    assert r.status_code == 409, (
+        f"账本行在读完之后被改过，写穿却放行了（{r.status_code}）——"
+        f"甲刚改的那笔会被静默盖掉，而甲不会收到任何提示")
+    assert client.get(f"/api/orders/{o['id']}").json()["title"] == "甲改的", \
+        "409 了，但账本还是被写穿了"
+
+
 def test_staging_write_through_bumps_both_versions(client):
     """暂存写穿账本：两边 version 都要推进，否则另一页拿旧版本能悄悄覆盖。"""
     s = client.post("/api/staging", json={"order_no": "CC-WT", "title": "a"}).json()

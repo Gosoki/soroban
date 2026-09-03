@@ -357,6 +357,80 @@ def test_ocr_attach_reports_orders_already_on_another_shipment(client, session, 
     assert client.get(f"/api/orders/{od['id']}").json()["shipment_order_id"] == a["id"]
 
 
+def test_an_order_snatched_mid_scan_is_reported_as_skipped_not_attached(client, monkeypatch, caplog):
+    """截图扫到一半，那张订单被别人挂走了 —— 必须报进 `skipped`，不能报成「已关联」。
+
+    这条支路**只有竞态走得到**：循环前面两道预检已经把「已挂别单」「已挂本单」都摘掉了，
+    所以 `res.rowcount != 1` 只在「SELECT 之后、UPDATE 之前被人抢走」时才成立。
+    变异实测（2026-09-02）把这一支改成 `if False:`，全套 1395 条一条都不红。
+
+    删掉它的后果不是报错，是**报喜**：那张订单会照常进 `attached`，
+    界面弹「已关联 N 单」，而库里它根本没挂到这张集运单上。
+    用户不会再去查，那一单就此漏在集运单外——到岸成本少算它，包裹清单也少它一件。
+
+    注入点是 `utcnow`：它在 `ocr-express` 这个 handler 里**只出现一次**，
+    就在建 UPDATE 的 `values` 里（第 316 行），位置在 `matches` 的 SELECT 与两道预检**之后**
+    ——所以这一刻抢走它，走到的必定是竞态那一支，而不是预检那一支。
+    """
+    import uuid
+
+    from sqlalchemy import update as sa_update
+    from sqlmodel import Session
+
+    from app.database import get_engine
+    from app.models import Order, utcnow as real_utcnow
+    from app.routers import shipment as mod
+
+    no = "SFRACE" + uuid.uuid4().hex[:10].upper()
+    target = client.post("/api/shipment", json={"date": "2026-03-02", "shipment_no": "RACE-B"}).json()
+    thief = client.post("/api/shipment", json={"date": "2026-03-02", "shipment_no": "RACE-C"}).json()
+    od = client.post("/api/orders", json={
+        "date": "2026-03-02", "title": "扫到一半被抢走", "express_no": no}).json()
+    assert od["shipment_order_id"] is None
+
+    stolen = []
+
+    def steal_then_now():
+        if not stolen:
+            stolen.append(True)
+            with Session(get_engine()) as other:
+                n = other.execute(
+                    sa_update(Order)
+                    .where(Order.id == od["id"], Order.shipment_order_id.is_(None))
+                    .values(shipment_order_id=thief["id"],
+                            version=Order.version + 1, updated_at=real_utcnow())
+                ).rowcount
+                other.commit()
+            assert n == 1, "抢走没成功，这条用例的前提不成立"
+        return real_utcnow()
+
+    async def fake_ocr(file, recognizer):
+        return {"express_nos": [no], "unreadable": 0}
+
+    monkeypatch.setattr(mod, "run_ocr", fake_ocr)
+    monkeypatch.setattr(mod, "utcnow", steal_then_now)
+    r = client.post(f"/api/shipment/{target['id']}/ocr-express",
+                    files={"file": ("x.png", b"\x89PNG", "image/png")})
+    assert r.status_code == 200, r.text
+    assert stolen, "注入点一次都没被调用 —— utcnow 的位置变了，这条测试已经不测那个竞态了"
+
+    got = r.json()
+    assert [o["id"] for o in got["attached"]] == [], (
+        f"它没挂上，却报成了「已关联」：attached={got['attached']}——"
+        f"用户看到绿色的成功，而这一单漏在集运单外")
+    assert od["id"] in [o["id"] for o in got["skipped"]], f"也没报进 skipped：{got['skipped']}"
+    assert client.get(f"/api/orders/{od['id']}").json()["shipment_order_id"] == thief["id"], \
+        "库里被改了 —— 抢先的那次挂靠应该是最终结果"
+
+    # **这一支必须留下日志。** 它与「已挂别的集运单」共用同一个 `skipped` 桶，
+    # 而两者对用户完全不同：前者他在列表里看得见，后者是刚刚才发生的、界面上毫无线索。
+    # 尤其「集运单被并发软删」那个子情况会让每一单都落进 skipped，
+    # 用户只看到「已关联 0 单」。这个 handler 原先一行日志都没有，事后无从查起。
+    assert any("OCR 挂靠落空" in r.getMessage() for r in caplog.records), (
+        "落空了却什么都没记 —— 出了这种事只能靠猜：" 
+        f"{[r.getMessage()[:60] for r in caplog.records][-3:]}")
+
+
 def test_deleting_a_shipment_also_detaches_its_soft_deleted_sub_orders(client, session):
     """删集运单时，**连软删的子订单一起解挂**。
 

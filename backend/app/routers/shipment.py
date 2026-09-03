@@ -1,6 +1,7 @@
 """集运订单 CRUD。金额 = 运费(CNY→JPY) + 特殊费_日元。"""
 
 import datetime as dt
+import logging
 from typing import Optional
 
 from fastapi.concurrency import run_in_threadpool
@@ -23,6 +24,8 @@ from .common import (
     guarded_bump, list_totals, mirror_to_staging, raise_conflict, raise_not_found, run_ocr,
     soft_delete, stamp_fx
 )
+
+log = logging.getLogger("soroban.shipment")
 
 router = APIRouter(
     prefix="/api/shipment", tags=["shipment"], dependencies=[Depends(get_current_user)]
@@ -336,7 +339,18 @@ async def ocr_attach_express(
                     )
                     .values(**values)
                 )
-                if res.rowcount != 1:                        # 并发被抢走/集运单被并发删除
+                if res.rowcount != 1:
+                    # 并发被抢走 / 集运单在这一瞬被软删。**必须留一行日志。**
+                    # 这一支与上面那句 `已挂别的集运单` 共用同一个 `skipped` 桶，
+                    # 而两者对用户是完全不同的事：前者他自己在列表里看得见（那单挂着谁），
+                    # 后者是「刚刚才发生的」，界面上什么线索都没有。
+                    # 尤其是「集运单被并发软删」这个子情况：那会让**每一单**都落进 skipped，
+                    # 用户只看到一句「已关联 0 单」，而他正在扫的那张单已经没了。
+                    # 这个 handler 此前一行日志都没有，出了这种事**事后无从查起**。
+                    log.warning(
+                        "OCR 挂靠落空：订单 %s（快递号 %s）没能挂上集运单 %s"
+                        "——要么这一瞬被并发挂到别处，要么该集运单刚被软删",
+                        od.id, no, shipment_id)
                     skipped.append(od)
                     continue
                 session.refresh(od)                          # 裸 UPDATE 绕过身份映射，重读拿新状态
